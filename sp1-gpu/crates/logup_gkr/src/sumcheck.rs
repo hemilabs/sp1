@@ -1164,18 +1164,21 @@ where
         );
     }
 
-    // --- Remaining rounds: fix_and_sum with standard sum_dim reduction ---
+    // --- Remaining rounds: fix_and_sum with inline atomic reduction ---
     for _round in 1..num_variables as usize {
         let current_alpha = point[0];
 
-        let (raw_evals, next_poly) = fix_and_sum_materialized_round_raw(
+        // Use _with_reduction variant to avoid a separate sum_dim kernel dispatch.
+        let mut reduced_output =
+            Tensor::<Ext, TaskScope>::zeros_in([3], backend.clone());
+        let (_raw_evals, next_poly) = fix_and_sum_materialized_round_raw_with_reduction(
             poly,
             current_alpha,
+            &mut reduced_output,
         );
         poly = next_poly;
 
-        // Reduce the [3, grid_dim] tensor to [3] via sum_dim.
-        let reduced_evals = reduce_univariate_evals(raw_evals);
+        let reduced_evals = DeviceTensor::from_raw(reduced_output);
 
         let point_last = *poly.point.last().unwrap();
         saved_params.push(RoundParams {
