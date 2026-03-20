@@ -18,6 +18,7 @@ use slop_tensor::Tensor;
 use sp1_gpu_air::instruction::Instruction16;
 use sp1_gpu_air::{air_block::BlockAir, SymbolicProverFolder};
 use sp1_gpu_cudart::sys::runtime::KernelPtr;
+use sp1_gpu_challenger::FromHostChallengerSync;
 use sp1_gpu_cudart::sys::v2_kernels::{
     jagged_constraint_poly_eval_1024_koala_bear_extension_kernel,
     jagged_constraint_poly_eval_1024_koala_bear_kernel,
@@ -514,6 +515,90 @@ where
     interpolate_univariate_polynomial(&xs, &ys)
 }
 
+/// Like evaluate_zerocheck but returns the [3] reduced tensor on device without D2H.
+/// Also returns (eq_adjustment, point_last) needed by the GPU observe-and-sample kernel.
+pub fn evaluate_zerocheck_device<'b, K: Field>(
+    input: &'b ZeroCheckJaggedPoly<'b, K>,
+) -> (DeviceTensor<Ext>, Ext, Ext)
+where
+    TaskScope: JaggedConstraintPolyEvalKernel<K>,
+{
+    let backend = input.data.backend();
+    const BLOCK_SIZE: usize = 256;
+    const NUM_EVAL_POINT: usize = 3;
+
+    let n_chunks = input.total_len.div_ceil(1 << 12);
+    let grid_size_x = n_chunks.max(256);
+    let grid_size = (grid_size_x, 1, NUM_EVAL_POINT);
+
+    let num_tiles = BLOCK_SIZE.div_ceil(32);
+    let shared_mem = num_tiles * std::mem::size_of::<Ext>();
+
+    let (rest, last) = input.zeta.split_at(input.zeta.dimension() - 1);
+    let last = *last[0];
+    let thresholds = input.virtual_geq.iter().map(|geq| geq.threshold).collect::<Buffer<_>>();
+    let eq_coefficients =
+        input.virtual_geq.iter().map(|geq| geq.eq_coefficient).collect::<Buffer<_>>();
+
+    let rest_point = DevicePoint::from_host(&rest, backend).unwrap();
+    let thresholds = DeviceBuffer::from_host(&thresholds, backend).unwrap().into_inner();
+    let eq_coefficients = DeviceBuffer::from_host(&eq_coefficients, backend).unwrap().into_inner();
+
+    let partial_lagrange = rest_point.partial_lagrange();
+    let rest_point_dim = rest.dimension() as u32;
+
+    let global_bucket = memory_size_bucket(input.program.f_ctr);
+
+    let reduced = {
+        let mut output: Tensor<Ext, TaskScope> =
+            Tensor::with_sizes_in([NUM_EVAL_POINT, grid_size_x], backend.clone());
+
+        unsafe {
+            output.assume_init();
+            let args = args!(
+                input.program.constraint_indices.as_ptr(),
+                input.program.operations,
+                input.program.operations_indices.as_ptr(),
+                input.program.f_constants.as_ptr(),
+                input.program.f_constants_indices.as_ptr(),
+                input.program.ef_constants.as_ptr(),
+                input.program.ef_constants_indices.as_ptr(),
+                input.data.as_raw(),
+                input.info.as_raw(),
+                partial_lagrange.as_ptr(),
+                thresholds.as_ptr(),
+                eq_coefficients.as_ptr(),
+                (input.total_len / 2) as u32,
+                input.padded_row_adjustment.as_ptr(),
+                input.public_values.as_ptr(),
+                input.powers_of_alpha.as_ptr(),
+                input.gkr_powers.as_ptr(),
+                input.powers_of_lambda.as_ptr(),
+                input.preprocessed_column.as_ptr(),
+                input.main_column.as_ptr(),
+                input.total_num_preprocessed_column,
+                output.as_mut_ptr(),
+                rest_point_dim
+            );
+            backend
+                .launch_kernel(
+                    <TaskScope as JaggedConstraintPolyEvalKernel<K>>::jagged_constraint_poly_eval_kernel(
+                        global_bucket,
+                    ),
+                    grid_size,
+                    (BLOCK_SIZE, 1, 1),
+                    &args,
+                    shared_mem,
+                )
+                .unwrap();
+        }
+
+        DeviceTensor::from_raw(output).sum_dim(1)
+    };
+
+    (reduced, input.eq_adjustment, last)
+}
+
 pub fn zerocheck_fix_last_variable<'b, K: Field>(
     input: ZeroCheckJaggedPoly<'b, K>,
     point: Ext,
@@ -569,6 +654,57 @@ where
     let point = challenger.sample_ext_element();
     let claim = input_poly.eval_at_point(point);
     (point, claim)
+}
+
+/// Trait for selecting the GPU observe-and-sample quartic kernel based on challenger type.
+pub unsafe trait ObserveAndSampleQuarticKernel {
+    fn observe_and_sample_quartic_kernel() -> KernelPtr;
+}
+
+unsafe impl<F> ObserveAndSampleQuarticKernel for sp1_gpu_challenger::DuplexChallenger<F, TaskScope> {
+    fn observe_and_sample_quartic_kernel() -> KernelPtr {
+        unsafe { sp1_gpu_cudart::sys::sumcheck::sumcheck_observe_and_sample_quartic_duplex() }
+    }
+}
+
+unsafe impl<F, PF> ObserveAndSampleQuarticKernel
+    for sp1_gpu_challenger::MultiField32Challenger<F, PF, TaskScope>
+{
+    fn observe_and_sample_quartic_kernel() -> KernelPtr {
+        unsafe {
+            sp1_gpu_cudart::sys::sumcheck::sumcheck_observe_and_sample_quartic_multi_field_32()
+        }
+    }
+}
+
+/// Launch the GPU observe-and-sample kernel for a quartic (degree-4) zerocheck round.
+fn launch_observe_and_sample_quartic<
+    DC: sp1_gpu_jagged_sumcheck::AsMutRawChallenger + ObserveAndSampleQuarticKernel,
+>(
+    reduced_evals: &DeviceTensor<Ext>,
+    device_challenger: &mut DC,
+    alpha_buf: &mut DeviceBuffer<Ext>,
+    next_claim_buf: &mut DeviceBuffer<Ext>,
+    claim: Ext,
+    eq_adjustment: Ext,
+    point_last: Ext,
+    backend: &TaskScope,
+) {
+    let challenger_raw = device_challenger.as_mut_raw();
+    unsafe {
+        let args = args!(
+            reduced_evals.as_ptr(),
+            challenger_raw,
+            alpha_buf.as_mut_ptr(),
+            claim,
+            next_claim_buf.as_mut_ptr(),
+            eq_adjustment,
+            point_last
+        );
+        backend
+            .launch_kernel(DC::observe_and_sample_quartic_kernel(), 1usize, 1usize, &args, 0)
+            .unwrap();
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -689,6 +825,7 @@ where
         jagged_point.add_dimension(point);
         next_poly = zerocheck_fix_last_variable(next_poly, point, next_claim);
     }
+    let current_claim = next_claim;
 
     let final_jagged_data =
         unsafe { next_poly.data.as_ref().dense_data.dense.copy_into_host_vec() };
@@ -738,7 +875,7 @@ where
     let partial_sumcheck_proof = PartialSumcheckProof {
         univariate_polys,
         claimed_sum: claim,
-        point_and_eval: (jagged_point, next_claim),
+        point_and_eval: (jagged_point, current_claim),
     };
 
     let shard_open_values = ShardOpenedValues { chips: opened_values };

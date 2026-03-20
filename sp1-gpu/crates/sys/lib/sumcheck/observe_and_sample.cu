@@ -22,3 +22,14 @@ extern "C" void* sumcheck_observe_and_sample_cubic_duplex() {
 extern "C" void* sumcheck_observe_and_sample_cubic_multi_field_32() {
     return (void*)sumcheckObserveAndSampleCubic<kb31_t, kb31_extension_t, MultiField32Challenger>;
 }
+
+// Export kernel function pointers for the quartic observe-and-sample kernel (zerocheck).
+// These handle degree-4 polynomials with eq-correction and 5-point interpolation.
+
+extern "C" void* sumcheck_observe_and_sample_quartic_duplex() {
+    return (void*)sumcheckObserveAndSampleQuartic<kb31_t, kb31_extension_t, DuplexChallenger>;
+}
+
+extern "C" void* sumcheck_observe_and_sample_quartic_multi_field_32() {
+    return (void*)sumcheckObserveAndSampleQuartic<kb31_t, kb31_extension_t, MultiField32Challenger>;
+}

@@ -343,3 +343,122 @@ __global__ __launch_bounds__(256) void sumcheckObserveAndSampleCubic(
     // Step 13: Write next_claim
     next_claim_out[0] = result;
 }
+
+/// Lagrange interpolation through 5 points to get degree-4 polynomial coefficients.
+template <typename F, typename EF>
+__device__ void interpolateQuarticSumcheck(
+    EF x[5], EF y[5], EF coefficients[5]) {
+
+    // Compute Lagrange weights w_i = y_i / prod_{j!=i}(x_i - x_j)
+    EF w[5];
+    for (int i = 0; i < 5; i++) {
+        EF denom = EF(F::one());
+        for (int j = 0; j < 5; j++) {
+            if (j != i) denom *= (x[i] - x[j]);
+        }
+        w[i] = y[i] * denom.reciprocal();
+    }
+
+    // Each Lagrange basis L_i(x) = prod_{j!=i}(x - x_j) expands as:
+    //   x^4 - e1*x^3 + e2*x^2 - e3*x + e4
+    // Accumulate monomial coefficients c0..c4.
+    for (int k = 0; k < 5; k++) coefficients[k] = EF::zero();
+
+    for (int i = 0; i < 5; i++) {
+        // Collect the 4 roots (all x_j where j != i)
+        EF roots[4];
+        int ri = 0;
+        for (int j = 0; j < 5; j++) {
+            if (j != i) roots[ri++] = x[j];
+        }
+        // Elementary symmetric polynomials of 4 roots
+        EF e1 = roots[0] + roots[1] + roots[2] + roots[3];
+        EF e2 = roots[0]*roots[1] + roots[0]*roots[2] + roots[0]*roots[3]
+               + roots[1]*roots[2] + roots[1]*roots[3] + roots[2]*roots[3];
+        EF e3 = roots[0]*roots[1]*roots[2] + roots[0]*roots[1]*roots[3]
+               + roots[0]*roots[2]*roots[3] + roots[1]*roots[2]*roots[3];
+        EF e4 = roots[0]*roots[1]*roots[2]*roots[3];
+
+        coefficients[4] += w[i];
+        coefficients[3] -= w[i] * e1;
+        coefficients[2] += w[i] * e2;
+        coefficients[1] -= w[i] * e3;
+        coefficients[0] += w[i] * e4;
+    }
+}
+
+/// GPU-side Fiat-Shamir observe-and-sample for the zerocheck sumcheck (degree-4 / quartic case).
+///
+/// The zerocheck evaluates constraints at x ∈ {0, 2, 4}, then constructs a degree-4 polynomial
+/// through 5 points: (0, y0), (2, y1), (4, y2), (1, claim-y0), (b_const, 0).
+///
+/// Parameters:
+///   evals          - [in]  device buffer with [eval_0, eval_2, eval_4] (raw constraint evals)
+///   challenger     - [mut] device challenger state
+///   alpha_out      - [out] sampled challenge alpha
+///   claim          - [in]  current claim value
+///   next_claim_out - [out] p(alpha)
+///   eq_adjustment  - [in]  cumulative eq correction factor
+///   point_last     - [in]  last coordinate of zeta (the eq evaluation point)
+template <typename F, typename EF, typename Challenger>
+__global__ __launch_bounds__(256) void sumcheckObserveAndSampleQuartic(
+    const EF* __restrict__ evals,
+    Challenger challenger,
+    EF* __restrict__ alpha_out,
+    EF claim,
+    EF* __restrict__ next_claim_out,
+    EF eq_adjustment,
+    EF point_last) {
+
+    if (blockIdx.x != 0 || threadIdx.x != 0)
+        return;
+
+    // Read raw constraint evaluation results
+    EF raw_0 = evals[0];  // constraint eval at x=0
+    EF raw_2 = evals[1];  // constraint eval at x=2
+    EF raw_4 = evals[2];  // constraint eval at x=4
+
+    // Apply eq correction: y = raw * eq(last, x) * eq_adjustment
+    // eq(last, x) = (1-x)*(1-last) + x*last
+    EF one = EF(F::one());
+    EF two = EF(F(2));
+    EF four = EF(F(4));
+
+    EF eq_0 = (one - point_last);                     // eq(last, 0) = 1 - last
+    EF eq_2 = (one - two) * (one - point_last) + two * point_last;  // eq(last, 2)
+    EF eq_4 = (one - four) * (one - point_last) + four * point_last; // eq(last, 4)
+
+    EF y0 = raw_0 * eq_0 * eq_adjustment;
+    EF y1 = raw_2 * eq_2 * eq_adjustment;
+    EF y2 = raw_4 * eq_4 * eq_adjustment;
+    EF y3 = claim - y0;  // eval at x=1: p(1) = claim - p(0)
+    EF y4 = EF::zero();  // eval at b_const: p(b_const) = 0
+
+    // b_const = (last - 1) / (2*last - 1)
+    EF b_const = (point_last - one) * (two * point_last - one).reciprocal();
+
+    // Interpolation points
+    EF x[5] = {EF::zero(), two, four, one, b_const};
+    EF y[5] = {y0, y1, y2, y3, y4};
+
+    EF coefficients[5];
+    interpolateQuarticSumcheck<F, EF>(x, y, coefficients);
+
+    // Observe all 5 coefficients
+    for (int i = 0; i < 5; i++) {
+        challenger.observe_ext(&coefficients[i]);
+    }
+
+    // Sample alpha
+    EF alpha = challenger.sample_ext();
+    alpha_out[0] = alpha;
+
+    // Evaluate p(alpha) using Horner's method
+    EF result = coefficients[4];
+    result *= alpha; result += coefficients[3];
+    result *= alpha; result += coefficients[2];
+    result *= alpha; result += coefficients[1];
+    result *= alpha; result += coefficients[0];
+
+    next_claim_out[0] = result;
+}
