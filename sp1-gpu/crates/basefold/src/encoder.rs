@@ -119,7 +119,11 @@ pub type SpparkDftKoalaBear = SpparkDft<SpparkB31Kernels, Felt>;
 
 impl Default for SpparkB31Kernels {
     fn default() -> Self {
-        unsafe { sppark_init_default_stream() };
+        use std::sync::Once;
+        static SPPARK_INIT: Once = Once::new();
+        SPPARK_INIT.call_once(|| {
+            unsafe { sppark_init_default_stream() };
+        });
         Self
     }
 }

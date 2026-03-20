@@ -166,7 +166,18 @@ __device__ void absorbRow(
     size_t width,
     size_t height,
     HasherState_t* state) {
-    for (int j = 0; j < width; j++) {
+    constexpr int RATE = poseidon2_kb31_16::constants::RATE; // 8
+    int j = 0;
+    // Fast path: absorb RATE elements at a time, call permute directly.
+    // Avoids per-element branch checking in absorb().
+    for (; j + RATE <= (int)width; j += RATE) {
+        for (int k = 0; k < RATE; k++) {
+            (*state).data[k] = in[(j + k) * height + rowIdx];
+        }
+        hasher.permute((*state).data, (*state).data);
+    }
+    // Handle remaining elements (< RATE)
+    for (; j < (int)width; j++) {
         kb31_t* row = &in[j * height + rowIdx];
         (*state).absorb(hasher, row, 1);
     }

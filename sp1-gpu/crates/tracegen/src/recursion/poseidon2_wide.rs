@@ -46,7 +46,7 @@ impl<const DEGREE: usize> CudaTracegenAir<F> for Poseidon2WideChip<DEGREE> {
         let mut trace = Tensor::<F, TaskScope>::zeros_in([width, height], scope.clone());
 
         unsafe {
-            const BLOCK_DIM: usize = 64;
+            const BLOCK_DIM: usize = 256;
             let grid_dim = height.div_ceil(BLOCK_DIM);
             // args:
             // T *trace,
@@ -97,7 +97,7 @@ impl<const DEGREE: usize> CudaTracegenAir<F> for Poseidon2WideChip<DEGREE> {
         let mut trace = Tensor::<F, TaskScope>::zeros_in([width, height], scope.clone());
 
         unsafe {
-            const BLOCK_DIM: usize = 64;
+            const BLOCK_DIM: usize = 256;
             let grid_dim = height.div_ceil(BLOCK_DIM);
             // args:
             // kb31_t *trace,
