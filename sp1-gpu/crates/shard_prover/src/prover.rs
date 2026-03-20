@@ -56,6 +56,7 @@ pub trait CudaShardProverComponents<GC: IopCtx>: Send + Sync + 'static {
         + AsMutRawChallenger
         + ObserveAndSampleKernel
         + ObserveAndSampleCubicKernel
+        + sp1_gpu_zerocheck::ObserveAndSampleQuarticKernel
         + Clone
         + Send
         + Sync;
@@ -697,6 +698,12 @@ impl<GC: IopCtx<F = Felt, EF = Ext>, PC: CudaShardProverComponents<GC>>
         let gkr_opening_batch_challenge = challenger.sample_ext_element::<GC::EF>();
 
         // Generate the zerocheck proof.
+        // Create a device challenger for GPU-side Fiat-Shamir in zerocheck.
+        let zc_backend = traces.dense_data.backend();
+        let mut device_challenger =
+            PC::DeviceChallenger::from_host_challenger_sync(
+                &challenger, &zc_backend,
+            );
         let (shard_open_values, zerocheck_partial_sumcheck_proof) =
             tracing::debug_span!("zerocheck").in_scope(|| {
                 zerocheck(
@@ -708,6 +715,7 @@ impl<GC: IopCtx<F = Felt, EF = Ext>, PC: CudaShardProverComponents<GC>>
                     &logup_gkr_proof.logup_evaluations,
                     public_values.clone(),
                     &mut challenger,
+                    &mut device_challenger,
                     self.max_log_row_count,
                 )
             });
