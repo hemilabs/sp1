@@ -4,7 +4,7 @@
 #include "poseidon2/poseidon2_bn254_3.cuh"
 
 template <typename Hasher_t, typename HashParams, typename HasherState_t>
-__global__ __launch_bounds__(256, 1) void leafHash(
+__global__ __launch_bounds__(256, 2) void leafHash(
     Hasher_t hasher,
     kb31_t* input,
     typename HashParams::F_t (*digests)[HashParams::DIGEST_WIDTH],
