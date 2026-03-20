@@ -12,6 +12,8 @@ use sp1_gpu_cudart::{
     args,
     sys::{
         merkle_tree::{
+            compress_batched_merkle_tree_bn254_kernel,
+            compress_batched_merkle_tree_koala_bear_16_kernel,
             compress_merkle_tree_bn254_kernel, compress_merkle_tree_koala_bear_16_kernel,
             compute_openings_merkle_tree_bn254_kernel,
             compute_openings_merkle_tree_koala_bear_16_kernel,
@@ -35,6 +37,8 @@ pub unsafe trait MerkleTreeSingleLayerKernels<GC: IopCtx>: 'static + Send + Sync
     fn leaf_hash_kernel() -> KernelPtr;
 
     fn compress_layer_kernel() -> KernelPtr;
+
+    fn compress_batched_kernel() -> KernelPtr;
 
     fn compute_paths_kernel() -> KernelPtr;
 
@@ -130,12 +134,41 @@ where
         }
 
         // Iterate over the layers and compute the compressions.
-        for k in (0..height).rev() {
+        // For large layers (>= 128 nodes), launch individual kernels.
+        // For small layers (< 128 nodes), batch them into a single kernel launch.
+        let batch_threshold: usize = 7; // layers with < 2^7 = 128 nodes are batched
+        let batch_start = height.min(batch_threshold);
+
+        // Large layers: individual launches
+        for k in (batch_start..height).rev() {
             let block_dim: Dim3 = (128u32, 1, 1).into();
             let grid_dim: Dim3 = ((1u32 << k).div_ceil(block_dim.x), 1, 1).into();
             let args = args!(hasher_device.as_raw(), tree.digests.as_mut_ptr(), k);
             unsafe {
                 scope.launch_kernel(K::compress_layer_kernel(), grid_dim, block_dim, &args, 0)?;
+            }
+        }
+
+        // Small layers: single batched launch (all fit in one block)
+        if batch_start > 0 {
+            let block_dim: Dim3 = (128u32, 1, 1).into();
+            let grid_dim: Dim3 = (1u32, 1, 1).into();
+            let start_layer = batch_start - 1; // highest small layer (inclusive)
+            let end_layer = 0u32; // lowest layer (inclusive)
+            let args = args!(
+                hasher_device.as_raw(),
+                tree.digests.as_mut_ptr(),
+                start_layer,
+                end_layer
+            );
+            unsafe {
+                scope.launch_kernel(
+                    K::compress_batched_kernel(),
+                    grid_dim,
+                    block_dim,
+                    &args,
+                    0,
+                )?;
             }
         }
 
@@ -335,6 +368,11 @@ unsafe impl MerkleTreeSingleLayerKernels<SP1GlobalContext> for Poseidon2SP1Field
     }
 
     #[inline]
+    fn compress_batched_kernel() -> KernelPtr {
+        unsafe { compress_batched_merkle_tree_koala_bear_16_kernel() }
+    }
+
+    #[inline]
     fn compute_paths_kernel() -> KernelPtr {
         unsafe { compute_paths_merkle_tree_koala_bear_16_kernel() }
     }
@@ -356,6 +394,11 @@ unsafe impl MerkleTreeSingleLayerKernels<BNGC<SP1Field, SP1ExtensionField>>
     #[inline]
     fn compress_layer_kernel() -> KernelPtr {
         unsafe { compress_merkle_tree_bn254_kernel() }
+    }
+
+    #[inline]
+    fn compress_batched_kernel() -> KernelPtr {
+        unsafe { compress_batched_merkle_tree_bn254_kernel() }
     }
 
     #[inline]
