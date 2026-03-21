@@ -345,46 +345,70 @@ __global__ __launch_bounds__(256) void sumcheckObserveAndSampleCubic(
 }
 
 /// Lagrange interpolation through 5 points to get degree-4 polynomial coefficients.
+/// Explicit (non-loop) implementation matching the pattern of interpolateCubicSumcheck.
 template <typename F, typename EF>
 __device__ void interpolateQuarticSumcheck(
-    EF x[5], EF y[5], EF coefficients[5]) {
+    EF x0, EF x1, EF x2, EF x3, EF x4,
+    EF y0, EF y1, EF y2, EF y3, EF y4,
+    EF coefficients[5]) {
 
-    // Compute Lagrange weights w_i = y_i / prod_{j!=i}(x_i - x_j)
-    EF w[5];
-    for (int i = 0; i < 5; i++) {
-        EF denom = EF(F::one());
-        for (int j = 0; j < 5; j++) {
-            if (j != i) denom *= (x[i] - x[j]);
-        }
-        w[i] = y[i] * denom.reciprocal();
-    }
+    // Pairwise differences
+    EF d01 = x0 - x1, d02 = x0 - x2, d03 = x0 - x3, d04 = x0 - x4;
+    EF d12 = x1 - x2, d13 = x1 - x3, d14 = x1 - x4;
+    EF d23 = x2 - x3, d24 = x2 - x4;
+    EF d34 = x3 - x4;
 
-    // Each Lagrange basis L_i(x) = prod_{j!=i}(x - x_j) expands as:
-    //   x^4 - e1*x^3 + e2*x^2 - e3*x + e4
-    // Accumulate monomial coefficients c0..c4.
-    for (int k = 0; k < 5; k++) coefficients[k] = EF::zero();
+    // Lagrange basis denominators
+    EF denom_0 = d01 * d02 * d03 * d04;
+    EF denom_1 = (-d01) * d12 * d13 * d14;
+    EF denom_2 = (-d02) * (-d12) * d23 * d24;
+    EF denom_3 = (-d03) * (-d13) * (-d23) * d34;
+    EF denom_4 = (-d04) * (-d14) * (-d24) * (-d34);
 
-    for (int i = 0; i < 5; i++) {
-        // Collect the 4 roots (all x_j where j != i)
-        EF roots[4];
-        int ri = 0;
-        for (int j = 0; j < 5; j++) {
-            if (j != i) roots[ri++] = x[j];
-        }
-        // Elementary symmetric polynomials of 4 roots
-        EF e1 = roots[0] + roots[1] + roots[2] + roots[3];
-        EF e2 = roots[0]*roots[1] + roots[0]*roots[2] + roots[0]*roots[3]
-               + roots[1]*roots[2] + roots[1]*roots[3] + roots[2]*roots[3];
-        EF e3 = roots[0]*roots[1]*roots[2] + roots[0]*roots[1]*roots[3]
-               + roots[0]*roots[2]*roots[3] + roots[1]*roots[2]*roots[3];
-        EF e4 = roots[0]*roots[1]*roots[2]*roots[3];
+    // Lagrange weights
+    EF w0 = y0 * denom_0.reciprocal();
+    EF w1 = y1 * denom_1.reciprocal();
+    EF w2 = y2 * denom_2.reciprocal();
+    EF w3 = y3 * denom_3.reciprocal();
+    EF w4 = y4 * denom_4.reciprocal();
 
-        coefficients[4] += w[i];
-        coefficients[3] -= w[i] * e1;
-        coefficients[2] += w[i] * e2;
-        coefficients[1] -= w[i] * e3;
-        coefficients[0] += w[i] * e4;
-    }
+    // Elementary symmetric polynomials for each basis (4 roots each)
+    // Basis 0: roots = x1, x2, x3, x4
+    EF e1_0 = x1 + x2 + x3 + x4;
+    EF e2_0 = x1*x2 + x1*x3 + x1*x4 + x2*x3 + x2*x4 + x3*x4;
+    EF e3_0 = x1*x2*x3 + x1*x2*x4 + x1*x3*x4 + x2*x3*x4;
+    EF e4_0 = x1*x2*x3*x4;
+
+    // Basis 1: roots = x0, x2, x3, x4
+    EF e1_1 = x0 + x2 + x3 + x4;
+    EF e2_1 = x0*x2 + x0*x3 + x0*x4 + x2*x3 + x2*x4 + x3*x4;
+    EF e3_1 = x0*x2*x3 + x0*x2*x4 + x0*x3*x4 + x2*x3*x4;
+    EF e4_1 = x0*x2*x3*x4;
+
+    // Basis 2: roots = x0, x1, x3, x4
+    EF e1_2 = x0 + x1 + x3 + x4;
+    EF e2_2 = x0*x1 + x0*x3 + x0*x4 + x1*x3 + x1*x4 + x3*x4;
+    EF e3_2 = x0*x1*x3 + x0*x1*x4 + x0*x3*x4 + x1*x3*x4;
+    EF e4_2 = x0*x1*x3*x4;
+
+    // Basis 3: roots = x0, x1, x2, x4
+    EF e1_3 = x0 + x1 + x2 + x4;
+    EF e2_3 = x0*x1 + x0*x2 + x0*x4 + x1*x2 + x1*x4 + x2*x4;
+    EF e3_3 = x0*x1*x2 + x0*x1*x4 + x0*x2*x4 + x1*x2*x4;
+    EF e4_3 = x0*x1*x2*x4;
+
+    // Basis 4: roots = x0, x1, x2, x3
+    EF e1_4 = x0 + x1 + x2 + x3;
+    EF e2_4 = x0*x1 + x0*x2 + x0*x3 + x1*x2 + x1*x3 + x2*x3;
+    EF e3_4 = x0*x1*x2 + x0*x1*x3 + x0*x2*x3 + x1*x2*x3;
+    EF e4_4 = x0*x1*x2*x3;
+
+    // Accumulate monomial coefficients
+    coefficients[4] = w0 + w1 + w2 + w3 + w4;
+    coefficients[3] = -(w0*e1_0 + w1*e1_1 + w2*e1_2 + w3*e1_3 + w4*e1_4);
+    coefficients[2] = w0*e2_0 + w1*e2_1 + w2*e2_2 + w3*e2_3 + w4*e2_4;
+    coefficients[1] = -(w0*e3_0 + w1*e3_1 + w2*e3_2 + w3*e3_3 + w4*e3_4);
+    coefficients[0] = w0*e4_0 + w1*e4_1 + w2*e4_2 + w3*e4_3 + w4*e4_4;
 }
 
 /// GPU-side Fiat-Shamir observe-and-sample for the zerocheck sumcheck (degree-4 / quartic case).
@@ -437,12 +461,12 @@ __global__ __launch_bounds__(256) void sumcheckObserveAndSampleQuartic(
     // b_const = (last - 1) / (2*last - 1)
     EF b_const = (point_last - one) * (two * point_last - one).reciprocal();
 
-    // Interpolation points
-    EF x[5] = {EF::zero(), two, four, one, b_const};
-    EF y[5] = {y0, y1, y2, y3, y4};
-
+    // Interpolation points: (0, y0), (2, y1), (4, y2), (1, y3), (b_const, y4=0)
     EF coefficients[5];
-    interpolateQuarticSumcheck<F, EF>(x, y, coefficients);
+    interpolateQuarticSumcheck<F, EF>(
+        EF::zero(), two, four, one, b_const,
+        y0, y1, y2, y3, y4,
+        coefficients);
 
     // Observe all 5 coefficients
     for (int i = 0; i < 5; i++) {

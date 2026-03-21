@@ -723,7 +723,9 @@ pub fn zerocheck<A, C, DC>(
 where
     A: ZerocheckAir<Felt, Ext> + for<'a> BlockAir<SymbolicProverFolder<'a>>,
     C: FieldChallenger<Felt>,
-    DC: sp1_gpu_jagged_sumcheck::AsMutRawChallenger + ObserveAndSampleQuarticKernel,
+    DC: sp1_gpu_jagged_sumcheck::AsMutRawChallenger
+        + ObserveAndSampleQuarticKernel
+        + FromHostChallengerSync<C>,
 {
     let data_input_heights = &trace_mle.column_heights;
     let initial_heights = trace_mle
@@ -813,7 +815,9 @@ where
         claim,
     );
 
-    // CPU challenger path (GPU quartic kernel exists but needs interpolation debugging).
+    // CPU challenger path. GPU quartic kernel infrastructure is wired but the kernel's
+    // Lagrange interpolation produces incorrect coefficients (needs unit test debugging).
+    let _ = device_challenger; // suppress unused warning
     let mut univariate_polys = vec![];
     let mut jagged_point: Point<Ext> = Point::from(vec![]);
     let mut result = evaluate_zerocheck(&main_poly);
