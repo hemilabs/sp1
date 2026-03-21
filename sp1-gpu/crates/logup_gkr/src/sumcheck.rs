@@ -1097,6 +1097,9 @@ where
         alpha_buf.set_len(1);
         next_claim_buf.set_len(1);
     }
+    // Pre-allocated pinned staging buffers for D2H of alpha and claim (avoid per-round Vec alloc).
+    let mut alpha_staging = sp1_gpu_cudart::pinned::PinnedBuffer::<Ext>::with_capacity(1);
+    let mut claim_staging = sp1_gpu_cudart::pinned::PinnedBuffer::<Ext>::with_capacity(1);
 
     // Save reduced evals and poly snapshots for batch D2H at the end.
     let mut saved_reduced_evals: Vec<DeviceTensor<Ext>> =
@@ -1134,8 +1137,8 @@ where
 
         saved_reduced_evals.push(reduced_evals);
 
-        let alpha = alpha_buf.to_host().unwrap()[0];
-        current_claim = next_claim_buf.to_host().unwrap()[0];
+        let alpha = alpha_buf.to_host_pinned(&mut alpha_staging).unwrap()[0];
+        current_claim = next_claim_buf.to_host_pinned(&mut claim_staging).unwrap()[0];
         gpu_claims.push(current_claim);
         point.push(alpha);
     }
@@ -1201,8 +1204,8 @@ where
 
         saved_reduced_evals.push(reduced_evals);
 
-        let alpha = alpha_buf.to_host().unwrap()[0];
-        current_claim = next_claim_buf.to_host().unwrap()[0];
+        let alpha = alpha_buf.to_host_pinned(&mut alpha_staging).unwrap()[0];
+        current_claim = next_claim_buf.to_host_pinned(&mut claim_staging).unwrap()[0];
         gpu_claims.push(current_claim);
         point.insert(0, alpha);
     }
