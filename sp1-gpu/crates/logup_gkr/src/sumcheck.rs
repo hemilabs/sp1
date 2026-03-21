@@ -1137,8 +1137,8 @@ where
 
         saved_reduced_evals.push(reduced_evals);
 
-        let alpha = alpha_buf.to_host_pinned(&mut alpha_staging).unwrap()[0];
-        current_claim = next_claim_buf.to_host_pinned(&mut claim_staging).unwrap()[0];
+        let alpha = alpha_buf.to_host().unwrap()[0];
+        current_claim = next_claim_buf.to_host().unwrap()[0];
         gpu_claims.push(current_claim);
         point.push(alpha);
     }
@@ -1204,8 +1204,8 @@ where
 
         saved_reduced_evals.push(reduced_evals);
 
-        let alpha = alpha_buf.to_host_pinned(&mut alpha_staging).unwrap()[0];
-        current_claim = next_claim_buf.to_host_pinned(&mut claim_staging).unwrap()[0];
+        let alpha = alpha_buf.to_host().unwrap()[0];
+        current_claim = next_claim_buf.to_host().unwrap()[0];
         gpu_claims.push(current_claim);
         point.insert(0, alpha);
     }

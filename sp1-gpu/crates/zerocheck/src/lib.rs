@@ -866,8 +866,8 @@ where
             &reduced_device, device_challenger, &mut alpha_buf, &mut next_claim_buf,
             current_claim, eq_adj, pt_last, &backend,
         );
-        let point = alpha_buf.to_host_pinned(&mut alpha_staging).unwrap()[0];
-        current_claim = next_claim_buf.to_host_pinned(&mut claim_staging).unwrap()[0];
+        let point = alpha_buf.to_host().unwrap()[0];
+        current_claim = next_claim_buf.to_host().unwrap()[0];
 
         // Reconstruct CPU polynomial (for proof) + update replay_claim
         univariate_polys.push(reconstruct_poly(&reduced_device, eq_adj, pt_last, &mut replay_claim, point));
@@ -884,8 +884,8 @@ where
             &reduced_device, device_challenger, &mut alpha_buf, &mut next_claim_buf,
             current_claim, eq_adj, pt_last, &backend,
         );
-        let point = alpha_buf.to_host_pinned(&mut alpha_staging).unwrap()[0];
-        current_claim = next_claim_buf.to_host_pinned(&mut claim_staging).unwrap()[0];
+        let point = alpha_buf.to_host().unwrap()[0];
+        current_claim = next_claim_buf.to_host().unwrap()[0];
 
         univariate_polys.push(reconstruct_poly(&reduced_device, eq_adj, pt_last, &mut replay_claim, point));
         drop(reduced_device);
