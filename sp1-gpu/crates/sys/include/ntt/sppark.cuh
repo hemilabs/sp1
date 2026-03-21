@@ -69,21 +69,20 @@ extern "C" rustCudaError_t batch_coset_dft(
     try {
         for (size_t c = 0; c < poly_count; c++) {
 
-            NTT::bit_rev(
-                &d_out[(c + 1) * ext_domain_size - domain_size],
-                &d_in[c * domain_size],
-                lg_domain_size,
-                stream);
-
+            // Fused: skip separate bit_rev pass. LDE_spread reads from un-permuted
+            // input with input_natural_order=true, doing the bit-reversal inline.
+            // This eliminates one full memory pass over the data.
             NTT::LDE_launch(
                 stream,
                 &d_out[c * ext_domain_size],
-                &d_out[(c + 1) * ext_domain_size - domain_size],
+                &d_in[c * domain_size],
                 gen_powers,
                 lg_domain_size,
                 lg_blowup,
                 true,
-                shift);
+                shift,
+                false,  // ext_pow
+                true);  // input_natural_order: read in[bit_rev(idx)] instead of in[idx]
 
             NTT::Base_dev_ptr(
                 stream,
