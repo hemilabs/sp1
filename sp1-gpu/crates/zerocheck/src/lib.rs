@@ -815,24 +815,90 @@ where
         claim,
     );
 
-    // CPU challenger path. GPU quartic kernel infrastructure is wired but the kernel's
-    // Lagrange interpolation produces incorrect coefficients (needs unit test debugging).
-    let _ = device_challenger; // suppress unused warning
-    let mut univariate_polys = vec![];
-    let mut jagged_point: Point<Ext> = Point::from(vec![]);
-    let mut result = evaluate_zerocheck(&main_poly);
-    let (mut point, mut next_claim) = challenger_update(&result, challenger);
-    univariate_polys.push(result);
-    jagged_point.add_dimension(point);
-    let mut next_poly = zerocheck_fix_last_variable(main_poly, point, next_claim);
-    for _ in 0..max_log_row_count - 1 {
-        result = evaluate_zerocheck(&next_poly);
-        (point, next_claim) = challenger_update(&result, challenger);
-        univariate_polys.push(result);
-        jagged_point.add_dimension(point);
-        next_poly = zerocheck_fix_last_variable(next_poly, point, next_claim);
+    // GPU challenger path: use GPU kernel for observe-and-sample, CPU for polynomial construction.
+    let backend = trace_mle.dense_data.backend();
+    *device_challenger = DC::from_host_challenger_sync(challenger, &backend);
+
+    let mut alpha_buf = DeviceBuffer::<Ext>::with_capacity_in(1, backend.clone());
+    let mut next_claim_buf = DeviceBuffer::<Ext>::with_capacity_in(1, backend.clone());
+    unsafe {
+        alpha_buf.set_len(1);
+        next_claim_buf.set_len(1);
     }
-    let current_claim = next_claim;
+
+    let mut univariate_polys: Vec<UnivariatePolynomial<Ext>> =
+        Vec::with_capacity(max_log_row_count as usize);
+    let mut jagged_point: Point<Ext> = Point::from(vec![]);
+    let mut current_claim = claim;
+    let mut replay_claim = claim;
+
+    // Helper: reconstruct polynomial from reduced evals + D2H one at a time
+    let reconstruct_poly = |reduced: &DeviceTensor<Ext>, eq_adj: Ext, last: Ext, rclaim: &mut Ext, alpha: Ext| -> UnivariatePolynomial<Ext> {
+        let host_evals = reduced.to_host().unwrap();
+        let raw = host_evals.as_slice();
+        let xs = vec![
+            Ext::from_canonical_u32(0), Ext::from_canonical_u32(2),
+            Ext::from_canonical_u32(4), Ext::from_canonical_u32(1),
+            (last - Ext::one()) / (last + last - Ext::one()),
+        ];
+        let eq_0 = Ext::one() - last;
+        let eq_2 = (Ext::one() - Ext::from_canonical_u32(2)) * (Ext::one() - last)
+            + Ext::from_canonical_u32(2) * last;
+        let eq_4 = (Ext::one() - Ext::from_canonical_u32(4)) * (Ext::one() - last)
+            + Ext::from_canonical_u32(4) * last;
+        let y0 = raw[0] * eq_0 * eq_adj;
+        let y1 = raw[1] * eq_2 * eq_adj;
+        let y2 = raw[2] * eq_4 * eq_adj;
+        let y3 = *rclaim - y0;
+        let ys = vec![y0, y1, y2, y3, Ext::zero()];
+        let uni_poly = interpolate_univariate_polynomial(&xs, &ys);
+        *rclaim = uni_poly.eval_at_point(alpha);
+        uni_poly
+    };
+
+    // Round 0
+    let mut next_poly;
+    {
+        let (reduced_device, eq_adj, pt_last) = evaluate_zerocheck_device(&main_poly);
+        launch_observe_and_sample_quartic(
+            &reduced_device, device_challenger, &mut alpha_buf, &mut next_claim_buf,
+            current_claim, eq_adj, pt_last, &backend,
+        );
+        let point = alpha_buf.to_host().unwrap()[0];
+        current_claim = next_claim_buf.to_host().unwrap()[0];
+
+        // Reconstruct CPU polynomial (for proof) + update replay_claim
+        univariate_polys.push(reconstruct_poly(&reduced_device, eq_adj, pt_last, &mut replay_claim, point));
+        drop(reduced_device); // free GPU memory
+
+        jagged_point.add_dimension(point);
+        next_poly = zerocheck_fix_last_variable(main_poly, point, current_claim);
+    }
+
+    // Remaining rounds
+    for _ in 0..max_log_row_count - 1 {
+        let (reduced_device, eq_adj, pt_last) = evaluate_zerocheck_device(&next_poly);
+        launch_observe_and_sample_quartic(
+            &reduced_device, device_challenger, &mut alpha_buf, &mut next_claim_buf,
+            current_claim, eq_adj, pt_last, &backend,
+        );
+        let point = alpha_buf.to_host().unwrap()[0];
+        current_claim = next_claim_buf.to_host().unwrap()[0];
+
+        univariate_polys.push(reconstruct_poly(&reduced_device, eq_adj, pt_last, &mut replay_claim, point));
+        drop(reduced_device);
+
+        jagged_point.add_dimension(point);
+        next_poly = zerocheck_fix_last_variable(next_poly, point, current_claim);
+    }
+
+    // Replay CPU challenger to sync state
+    for uni_poly in &univariate_polys {
+        let coefficients: Vec<Felt> =
+            uni_poly.coefficients.iter().flat_map(|c| c.as_base_slice()).copied().collect();
+        challenger.observe_slice(&coefficients);
+        let _: Ext = challenger.sample_ext_element();
+    }
 
     let final_jagged_data =
         unsafe { next_poly.data.as_ref().dense_data.dense.copy_into_host_vec() };
