@@ -5,7 +5,7 @@
 
 
 SP1_KERNEL void
-jaggedSumAsPoly(ext_t* evaluations, const JaggedMle<JaggedSumcheckData> inputJaggedMle) {
+jaggedSumAsPoly(ext_t* __restrict__ evaluations, const JaggedMle<JaggedSumcheckData> inputJaggedMle) {
 
     ext_t evalZero = ext_t::zero();
     ext_t evalHalf = ext_t::zero();
@@ -54,10 +54,10 @@ jaggedSumAsPoly(ext_t* evaluations, const JaggedMle<JaggedSumcheckData> inputJag
 
 
 SP1_KERNEL void jaggedFixAndSum(
-    ext_t* evaluations,
+    ext_t* __restrict__ evaluations,
     const JaggedMle<JaggedSumcheckData> inputJaggedMle,
-    ext_t* output_p,
-    ext_t* output_q,
+    ext_t* __restrict__ output_p,
+    ext_t* __restrict__ output_q,
     ext_t alpha) {
 
     Hadamard hadamard;
@@ -116,12 +116,12 @@ SP1_KERNEL void jaggedFixAndSum(
 }
 
 SP1_KERNEL void paddedHadamardFixAndSum(
-    const ext_t* base_input,
-    const ext_t* ext_input,
-    ext_t* __restrict base_output,
-    ext_t* __restrict ext_output,
+    const ext_t* __restrict__ base_input,
+    const ext_t* __restrict__ ext_input,
+    ext_t* __restrict__ base_output,
+    ext_t* __restrict__ ext_output,
     ext_t alpha,
-    ext_t* univariate_result,
+    ext_t* __restrict__ univariate_result,
     size_t inputHeight) {
 
     size_t outputHeight = (inputHeight + 1) >> 1;

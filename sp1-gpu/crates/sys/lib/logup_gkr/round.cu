@@ -225,7 +225,7 @@ SP1_KERNEL void sumAsPolyInteractionsLayer(
 }
 
 SP1_KERNEL void fixLastVariableInteractionsLayer(
-    const ext_t* input,
+    const ext_t* __restrict__ input,
     ext_t* __restrict__ output,
     ext_t alpha,
     size_t height,
@@ -398,12 +398,12 @@ SP1_KERNEL void fixAndSumLastCircuitLayer(
 // Invoke this one for interactions layers
 SP1_KERNEL void fixAndSumInteractionsLayer(
     ext_t* __restrict__ univariate_result,
-    const ext_t* input,
+    const ext_t* __restrict__ input,
     ext_t* __restrict__ output,
     ext_t alpha,
     size_t height,
     size_t outputHeight,
-    const ext_t* eqInteraction,
+    const ext_t* __restrict__ eqInteraction,
     const ext_t lambda) {
 
     ext_t evalZero = ext_t::zero();

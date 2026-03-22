@@ -274,7 +274,7 @@ __device__ __forceinline__ SumAsPolyResult sumAsPolyCircuitLayerInner(
 }
 
 __device__ __forceinline__ void fixLastVariableInteractionsLayerInner(
-    const ext_t* input,
+    const ext_t* __restrict__ input,
     ext_t* __restrict__ output,
     ext_t alpha,
     size_t height,
