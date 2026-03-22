@@ -61,7 +61,12 @@ class kb31_t {
 
             unpack(tl, th, val);
 
+            // M = 2^31 - 2^24 - 1: use shifts instead of quarter-rate mul on RDNA3
+#ifdef __HIPCC__
+            red = (tl << 31) - (tl << 24) - tl;
+#else
             mul_lo(red, tl, M);
+#endif
 #ifdef __HIPCC__
             // Shift optimization: MOD = 2^31 - 2^24 + 1
             // red * MOD = (red<<31) - (red<<24) + red
@@ -294,7 +299,11 @@ class kb31_t {
 
         mul_wide(t, val, b.val);
         unpack(tl, th, t);
+#ifdef __HIPCC__
+        red = (tl << 31) - (tl << 24) - tl;  // M = 2^31 - 2^24 - 1
+#else
         mul_lo(red, tl, M);
+#endif
 #ifdef __HIPCC__
         // Shift optimization: MOD = 2^31 - 2^24 + 1
         uint64_t wide = ((uint64_t)red << 31) - ((uint64_t)red << 24) + (uint64_t)red + tl;
@@ -313,7 +322,7 @@ class kb31_t {
         uint32_t tmp[2], red;
 
 #ifdef __HIPCC__
-        red = val * M;
+        red = (val << 31) - (val << 24) - val;  // M = 2^31 - 2^24 - 1
         // Shift optimization: MOD = 2^31 - 2^24 + 1
         uint64_t wide = ((uint64_t)red << 31) - ((uint64_t)red << 24) + (uint64_t)red + val;
         tmp[1] = (uint32_t)(wide >> 32);
@@ -422,7 +431,7 @@ class kb31_t {
             final_sub(acc[1]);
         }
 
-        uint32_t red = acc[0] * M;
+        uint32_t red = (acc[0] << 31) - (acc[0] << 24) - acc[0];  // M = 2^31 - 2^24 - 1
         {
             // Shift optimization: MOD = 2^31 - 2^24 + 1
             uint64_t w = ((uint64_t)red << 31) - ((uint64_t)red << 24) + (uint64_t)red + ((uint64_t)acc[1] << 32 | acc[0]);
@@ -495,7 +504,7 @@ class kb31_t {
             final_sub(acc[1]);
         }
 
-        uint32_t red = acc[0] * M;
+        uint32_t red = (acc[0] << 31) - (acc[0] << 24) - acc[0];  // M = 2^31 - 2^24 - 1
         {
             // Shift optimization: MOD = 2^31 - 2^24 + 1
             uint64_t w = ((uint64_t)red << 31) - ((uint64_t)red << 24) + (uint64_t)red + ((uint64_t)acc[1] << 32 | acc[0]);
@@ -553,7 +562,7 @@ class kb31_t {
                 tmp[0] = (uint32_t)w;
                 tmp[1] = (uint32_t)(w >> 32);
             }
-            red = tmp[0] * M;
+            red = (tmp[0] << 31) - (tmp[0] << 24) - tmp[0];  // M = 2^31 - 2^24 - 1
             {
                 // Shift optimization: MOD = 2^31 - 2^24 + 1
                 uint64_t w = ((uint64_t)red << 31) - ((uint64_t)red << 24) + (uint64_t)red + tmp[0];
