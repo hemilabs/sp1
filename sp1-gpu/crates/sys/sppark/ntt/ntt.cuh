@@ -356,12 +356,20 @@ public:
         };
 
         //3. launch
-        CUDA_UNWRAP_SPPARK(cudaLaunchCooperativeKernel((const void*)LDE_spread_distribute_powers, 
-                                    dim3(num_blocks), 
-                                    dim3(block_size),
-                                    args, 
-                                    shared_sz, 
-                                    stream));
+        if (input_natural_order) {
+            // Non-overlapping path: no cooperative launch needed (no grid sync required)
+            LDE_spread_distribute_powers<<<dim3(num_blocks), dim3(block_size), shared_sz, stream>>>(
+                ext_domain_data, domain_data, gen_powers,
+                lg_domain_size, lg_blowup, perform_shift, shift, ext_pow, input_natural_order);
+            CUDA_UNWRAP_SPPARK(cudaGetLastError());
+        } else {
+            CUDA_UNWRAP_SPPARK(cudaLaunchCooperativeKernel((const void*)LDE_spread_distribute_powers,
+                                        dim3(num_blocks),
+                                        dim3(block_size),
+                                        args,
+                                        shared_sz,
+                                        stream));
+        }
 
     }
 
