@@ -255,33 +255,31 @@ SP1_KERNEL void fixAndSumCircuitLayer(
     for (size_t i = blockIdx.x * blockDim.x + threadIdx.x; i < inputJaggedMle.denseData.height >> 1;
          i += blockDim.x * gridDim.x) {
 
-        // Process one fixLastVariable. Since height is always even, this is guaranteed to not
-        // require any padding checks.
+        // Process fixLastVariable for both indices, keeping computed values in registers
+        // to avoid the write-then-read pattern through global memory.
         size_t firstIdx = i << 1;
-        inputJaggedMle.fixLastVariableUnchecked(outputJaggedMle, firstIdx, alpha);
+        CircuitValues cv1;
+        inputJaggedMle.fixLastVariableUncheckedWithValues(outputJaggedMle, firstIdx, alpha, cv1);
 
-        // The second fix_last_variable could by trying to process the end of the row. We are
-        // guaranteed to be able to access the end of this row, but we need to make sure that the
-        // next row has even length too.
         size_t secondIdx = firstIdx + 1;
-
+        CircuitValues cv2;
         size_t restrictedIndex =
-            inputJaggedMle.fixLastVariableTwoPadding(outputJaggedMle, secondIdx, alpha);
+            inputJaggedMle.fixLastVariableTwoPaddingWithValues(outputJaggedMle, secondIdx, alpha, cv2);
 
         size_t outputIndex = restrictedIndex >> 1;
 
-        // Now set up the sum_as_poly.
+        // Use the register-held values directly for sumAsPoly (no re-read from global memory).
         size_t colIdx = outputJaggedMle.colIndex[outputIndex];
         size_t startIdx = outputJaggedMle.startIndices[colIdx];
-        SumAsPolyResult result = sumAsPolyCircuitLayerInner(
-            outputJaggedMle.denseData.layer,
+        SumAsPolyResult result = sumAsPolyCircuitLayerFromValues(
+            cv1,
+            cv2,
             colIdx,
             startIdx,
+            outputIndex,
             eqRow,
             eqInteraction,
-            lambda,
-            outputJaggedMle.denseData.height,
-            outputIndex);
+            lambda);
 
         evalZero += result.evalZero;
         evalHalf += result.evalHalf;

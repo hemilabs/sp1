@@ -127,6 +127,23 @@ struct JaggedGkrLayer {
         values.store(other.layer, restrictedIdx, other.height);
     }
 
+    // Like fixLastVariable but also returns the computed values in registers,
+    // avoiding the need to re-read them from global memory.
+    __forceinline__ __device__ CircuitValues fixLastVariableWithValues(
+        JaggedGkrLayer& other,
+        size_t restrictedIdx,
+        size_t zeroIdx,
+        size_t oneIdx,
+        ext_t alpha) const {
+
+        CircuitValues valuesZero = CircuitValues::load(layer, zeroIdx, height);
+        CircuitValues valuesOne = CircuitValues::load(layer, oneIdx, height);
+        CircuitValues values = CircuitValues::fix_last_variable(valuesZero, valuesOne, alpha);
+
+        values.store(other.layer, restrictedIdx, other.height);
+        return values;
+    }
+
     __forceinline__ __device__ void pad(JaggedGkrLayer& other, size_t restrictedIdx) const {
         CircuitValues values = CircuitValues::paddingValues();
         values.store(other.layer, restrictedIdx, other.height);
@@ -267,6 +284,43 @@ __device__ __forceinline__ SumAsPolyResult sumAsPolyCircuitLayerInner(
     valuesHalf.denominatorOne = valuesZero.denominatorOne + valuesOne.denominatorOne;
 
     // Compute the sumcheck sum values and add to the running aggregate
+    ext_t evalZero = valuesZero.sumAsPoly(lambda, eqValueZero);
+    ext_t evalHalf = valuesHalf.sumAsPoly(lambda, eqValueHalf);
+
+    return SumAsPolyResult{evalZero, evalHalf, eqSum};
+}
+
+// Like sumAsPolyCircuitLayerInner but accepts pre-computed CircuitValues from registers
+// instead of re-reading from global memory. Eliminates the write-then-read pattern.
+__device__ __forceinline__ SumAsPolyResult sumAsPolyCircuitLayerFromValues(
+    CircuitValues valuesZero,
+    CircuitValues valuesOne,
+    size_t colIdx,
+    size_t startIdx,
+    size_t i,
+    const ext_t* __restrict__ eqRow,
+    const ext_t* __restrict__ eqInteraction,
+    const ext_t lambda) {
+
+    size_t rowIdx = i - startIdx;
+    size_t eqRowZeroIdx = rowIdx << 1;
+    size_t eqRowOneIdx = eqRowZeroIdx + 1;
+
+    ext_t eqInteractionValue = ext_t::load(eqInteraction, colIdx);
+    ext_t eqRowZeroValue = ext_t::load(eqRow, eqRowZeroIdx);
+    ext_t eqRowOneValue = ext_t::load(eqRow, eqRowOneIdx);
+
+    ext_t eqValueZero = eqRowZeroValue * eqInteractionValue;
+    ext_t eqValueOne = eqRowOneValue * eqInteractionValue;
+    ext_t eqValueHalf = eqValueZero + eqValueOne;
+    ext_t eqSum = eqValueHalf;
+
+    CircuitValues valuesHalf;
+    valuesHalf.numeratorZero = valuesZero.numeratorZero + valuesOne.numeratorZero;
+    valuesHalf.numeratorOne = valuesZero.numeratorOne + valuesOne.numeratorOne;
+    valuesHalf.denominatorZero = valuesZero.denominatorZero + valuesOne.denominatorZero;
+    valuesHalf.denominatorOne = valuesZero.denominatorOne + valuesOne.denominatorOne;
+
     ext_t evalZero = valuesZero.sumAsPoly(lambda, eqValueZero);
     ext_t evalHalf = valuesHalf.sumAsPoly(lambda, eqValueHalf);
 
