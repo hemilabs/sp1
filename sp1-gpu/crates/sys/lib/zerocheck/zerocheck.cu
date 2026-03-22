@@ -12,7 +12,7 @@ __device__ inline EF zerocheckEval(EF a, F b) {
 }
 
 template <typename F, typename EF>
-__global__ void zerocheckFixLastVariableAndSumAsPoly(
+SP1_KERNEL void zerocheckFixLastVariableAndSumAsPoly(
     const F* base_input,
     const EF* ext_input,
     EF* __restrict base_output,
@@ -109,7 +109,7 @@ __global__ void zerocheckFixLastVariableAndSumAsPoly(
 }
 
 template <typename F, typename EF>
-__global__ void zerocheckSumAsPoly(
+SP1_KERNEL void zerocheckSumAsPoly(
     EF* __restrict__ result,
     const F* __restrict__ base_mle,
     const EF* __restrict__ ext_mle,

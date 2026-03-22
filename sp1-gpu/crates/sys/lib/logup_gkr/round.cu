@@ -6,7 +6,7 @@
 #include <cstdio>
 
 /// Currently not used.
-__global__ void fixLastVariableCircuitLayer(
+SP1_KERNEL void fixLastVariableCircuitLayer(
     ext_t* __restrict__ layer,
     const uint32_t* __restrict__ colIndex,
     const uint32_t* __restrict__ startIndices,
@@ -39,7 +39,7 @@ __global__ void fixLastVariableCircuitLayer(
     }
 }
 
-__global__ void sumAsPolyCircuitLayer(
+SP1_KERNEL void sumAsPolyCircuitLayer(
     ext_t* __restrict__ result,
     const JaggedMle<JaggedGkrLayer> inputJaggedMle,
     const ext_t* __restrict__ eqRow,
@@ -89,7 +89,7 @@ __global__ void sumAsPolyCircuitLayer(
     }
 }
 
-__global__ void firstSumAsPolyCircuitLayer(
+SP1_KERNEL void firstSumAsPolyCircuitLayer(
     ext_t* __restrict__ result,
     const JaggedMle<JaggedGkrLayer> inputJaggedMle,
     const ext_t* __restrict__ eqRow,
@@ -166,7 +166,7 @@ __global__ void firstSumAsPolyCircuitLayer(
     }
 }
 
-__global__ void fixLastVariableLastCircuitLayer(
+SP1_KERNEL void fixLastVariableLastCircuitLayer(
     const ext_t* __restrict__ layer,
     ext_t alpha,
     ext_t* __restrict__ output,
@@ -187,7 +187,7 @@ __global__ void fixLastVariableLastCircuitLayer(
     }
 }
 
-__global__ void sumAsPolyInteractionsLayer(
+SP1_KERNEL void sumAsPolyInteractionsLayer(
     ext_t* __restrict__ result,
     ext_t* __restrict__ layer,
     const ext_t* __restrict__ eqPoly,
@@ -224,7 +224,7 @@ __global__ void sumAsPolyInteractionsLayer(
     }
 }
 
-__global__ void fixLastVariableInteractionsLayer(
+SP1_KERNEL void fixLastVariableInteractionsLayer(
     const ext_t* input,
     ext_t* __restrict__ output,
     ext_t alpha,
@@ -238,7 +238,7 @@ __global__ void fixLastVariableInteractionsLayer(
 
 
 // Invoke this one during normal circuit layers
-__global__ void fixAndSumCircuitLayer(
+SP1_KERNEL void fixAndSumCircuitLayer(
     ext_t* __restrict__ univariate_result,
     const JaggedMle<JaggedGkrLayer> inputJaggedMle,
     JaggedMle<JaggedGkrLayer> outputJaggedMle,
@@ -306,7 +306,7 @@ __global__ void fixAndSumCircuitLayer(
 }
 
 // Invoke this one for the last circuit layer, when you transition to interactions.
-__global__ void fixAndSumLastCircuitLayer(
+SP1_KERNEL void fixAndSumLastCircuitLayer(
     ext_t* __restrict__ univariate_result,
     const JaggedGkrLayer inputJaggedMle,
     ext_t alpha,
@@ -396,7 +396,7 @@ __global__ void fixAndSumLastCircuitLayer(
 }
 
 // Invoke this one for interactions layers
-__global__ void fixAndSumInteractionsLayer(
+SP1_KERNEL void fixAndSumInteractionsLayer(
     ext_t* __restrict__ univariate_result,
     const ext_t* input,
     ext_t* __restrict__ output,

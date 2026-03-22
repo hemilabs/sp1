@@ -4,7 +4,7 @@
 #include "runtime/gpu_compat.cuh"
 
 
-__global__ void
+SP1_KERNEL void
 jaggedSumAsPoly(ext_t* evaluations, const JaggedMle<JaggedSumcheckData> inputJaggedMle) {
 
     ext_t evalZero = ext_t::zero();
@@ -53,7 +53,7 @@ jaggedSumAsPoly(ext_t* evaluations, const JaggedMle<JaggedSumcheckData> inputJag
 }
 
 
-__global__ void jaggedFixAndSum(
+SP1_KERNEL void jaggedFixAndSum(
     ext_t* evaluations,
     const JaggedMle<JaggedSumcheckData> inputJaggedMle,
     ext_t* output_p,
@@ -115,7 +115,7 @@ __global__ void jaggedFixAndSum(
     }
 }
 
-__global__ void paddedHadamardFixAndSum(
+SP1_KERNEL void paddedHadamardFixAndSum(
     const ext_t* base_input,
     const ext_t* ext_input,
     ext_t* __restrict base_output,

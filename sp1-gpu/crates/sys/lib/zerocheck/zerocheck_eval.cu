@@ -31,7 +31,7 @@ __device__ inline ext_t geq_eval(size_t idx, uint32_t threshold, ext_t eq_coeffi
 }
 
 template <typename K, size_t MEMORY_SIZE>
-__global__ void jaggedConstraintPolyEval(
+SP1_KERNEL void jaggedConstraintPolyEval(
     const uint32_t* __restrict__ constraintIndices,
     const Instruction* evalProgram,
     const uint32_t* __restrict__ evalProgramIndices,
