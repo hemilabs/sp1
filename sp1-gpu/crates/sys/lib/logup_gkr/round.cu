@@ -415,25 +415,21 @@ SP1_KERNEL void fixAndSumInteractionsLayer(
         size_t firstIdx = i << 1;
         size_t secondIdx = (i << 1) + 1;
 
-        // Fix last variable for the actual layer. TODO: this has some padding checks that aren't
-        // needed.
-        fixLastVariableInteractionsLayerInner(input, output, alpha, height, outputHeight, firstIdx);
+        // Fix last variable and keep values in registers to avoid write-then-read.
+        CircuitValues cv1 = fixLastVariableInteractionsLayerInnerWithValues(
+            input, output, alpha, height, outputHeight, firstIdx);
 
-        // Todo: instead of checking padding conditions twice here ad in sumAsPoly, we should do it
-        // once.
+        CircuitValues cv2;
         if (secondIdx < outputHeight) {
-            fixLastVariableInteractionsLayerInner(
-                input,
-                output,
-                alpha,
-                height,
-                outputHeight,
-                secondIdx);
+            cv2 = fixLastVariableInteractionsLayerInnerWithValues(
+                input, output, alpha, height, outputHeight, secondIdx);
+        } else {
+            cv2 = CircuitValues::paddingValues();
         }
 
-        // Now set up the sum_as_poly. Padding is handled in here.
+        // Compute sum_as_poly directly from register values, avoiding global memory re-read.
         SumAsPolyResult result =
-            sumAsPolyInteractionLayerInner(output, eqInteraction, lambda, outputHeight, i);
+            sumAsPolyInteractionLayerFromValues(cv1, cv2, eqInteraction, lambda, outputHeight, i);
 
         evalZero += result.evalZero;
         evalHalf += result.evalHalf;

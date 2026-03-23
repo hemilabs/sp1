@@ -419,3 +419,73 @@ __device__ __forceinline__ SumAsPolyResult sumAsPolyInteractionLayerInner(
     ext_t evalHalf = valuesHalf.sumAsPoly(lambda, eqValueHalf);
     return SumAsPolyResult{evalZero, evalHalf, eqSum};
 }
+
+/// Like fixLastVariableInteractionsLayerInner but returns computed values in registers,
+/// avoiding the global memory write-then-read round-trip.
+__device__ __forceinline__ CircuitValues fixLastVariableInteractionsLayerInnerWithValues(
+    const ext_t* __restrict__ input,
+    ext_t* __restrict__ output,
+    ext_t alpha,
+    size_t height,
+    size_t outputHeight,
+    size_t i) {
+
+    bool padding = height & 1;
+    size_t zeroIdx = i << 1;
+    size_t oneIdx = (i << 1) + 1;
+
+    CircuitValues valuesZero;
+    valuesZero.numeratorZero = ext_t::load(input, zeroIdx);
+    valuesZero.numeratorOne = ext_t::load(input, height + zeroIdx);
+    valuesZero.denominatorZero = ext_t::load(input, 2 * height + zeroIdx);
+    valuesZero.denominatorOne = ext_t::load(input, 3 * height + zeroIdx);
+
+    CircuitValues valuesOne;
+    if (padding && i == outputHeight - 1) {
+        valuesOne = CircuitValues::paddingValues();
+    } else {
+        valuesOne.numeratorZero = ext_t::load(input, oneIdx);
+        valuesOne.numeratorOne = ext_t::load(input, height + oneIdx);
+        valuesOne.denominatorZero = ext_t::load(input, 2 * height + oneIdx);
+        valuesOne.denominatorOne = ext_t::load(input, 3 * height + oneIdx);
+    }
+
+    CircuitValues values = CircuitValues::fix_last_variable(valuesZero, valuesOne, alpha);
+
+    ext_t::store(output, i, values.numeratorZero);
+    ext_t::store(output, outputHeight + i, values.numeratorOne);
+    ext_t::store(output, 2 * outputHeight + i, values.denominatorZero);
+    ext_t::store(output, 3 * outputHeight + i, values.denominatorOne);
+
+    return values;
+}
+
+/// Like sumAsPolyInteractionLayerInner but accepts pre-computed CircuitValues
+/// from fixLastVariableInteractionsLayerInnerWithValues, reading eq from global memory.
+__device__ __forceinline__ SumAsPolyResult sumAsPolyInteractionLayerFromValues(
+    CircuitValues valuesFirst,
+    CircuitValues valuesSecond,
+    const ext_t* __restrict__ eqPoly,
+    const ext_t lambda,
+    const size_t outputHeight,
+    size_t i) {
+
+    size_t zeroIdx = i << 1;
+    size_t oneIdx = (i << 1) + 1;
+
+    // valuesFirst is the fixed value at zeroIdx, valuesSecond at oneIdx
+    CircuitValues valuesHalf;
+    valuesHalf.numeratorZero = valuesFirst.numeratorZero + valuesSecond.numeratorZero;
+    valuesHalf.numeratorOne = valuesFirst.numeratorOne + valuesSecond.numeratorOne;
+    valuesHalf.denominatorZero = valuesFirst.denominatorZero + valuesSecond.denominatorZero;
+    valuesHalf.denominatorOne = valuesFirst.denominatorOne + valuesSecond.denominatorOne;
+
+    ext_t eqValueZero = ext_t::load(eqPoly, zeroIdx);
+    ext_t eqValueOne = ext_t::load(eqPoly, oneIdx);
+    ext_t eqValueHalf = eqValueZero + eqValueOne;
+    ext_t eqSum = eqValueHalf;
+
+    ext_t evalZero = valuesFirst.sumAsPoly(lambda, eqValueZero);
+    ext_t evalHalf = valuesHalf.sumAsPoly(lambda, eqValueHalf);
+    return SumAsPolyResult{evalZero, evalHalf, eqSum};
+}
