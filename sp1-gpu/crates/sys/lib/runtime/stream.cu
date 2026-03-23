@@ -47,11 +47,12 @@ typedef void* nvtxDomainHandle_t;
 // Use a caching allocator over synchronous hipMalloc/hipFree to avoid the
 // overhead of calling the driver for every allocation.
 #include <unordered_map>
+#include <map>
 #include <vector>
 #include <mutex>
 
 static std::mutex g_alloc_mutex;
-static std::unordered_map<size_t, std::vector<void*>> g_free_pool;
+static std::map<size_t, std::vector<void*>> g_free_pool;  // ordered for range lookups
 static std::unordered_map<void*, size_t> g_alloc_sizes;
 static size_t g_cached_bytes = 0;
 static constexpr size_t MAX_CACHED_BYTES = 2ULL * 1024 * 1024 * 1024; // 2 GB limit
@@ -59,12 +60,28 @@ static constexpr size_t MAX_CACHED_BYTES = 2ULL * 1024 * 1024 * 1024; // 2 GB li
 static hipError_t cachedHipMalloc(void** p, size_t s, hipStream_t) {
     if (s == 0) { *p = nullptr; return hipSuccess; }
     std::lock_guard<std::mutex> lock(g_alloc_mutex);
+    // Try exact-size match first.
     auto it = g_free_pool.find(s);
     if (it != g_free_pool.end() && !it->second.empty()) {
         *p = it->second.back();
         it->second.pop_back();
         g_cached_bytes -= s;
         return hipSuccess;
+    }
+    // Fallback: try a buffer up to 2x the requested size. This handles the
+    // sumcheck halving pattern where each round needs exactly half the previous
+    // size — the freed buffer from round N-1 (size 2S) satisfies round N (size S).
+    for (size_t try_size = s + 1; try_size <= s * 2; ) {
+        auto it2 = g_free_pool.lower_bound(try_size);
+        if (it2 != g_free_pool.end() && it2->first <= s * 2 && !it2->second.empty()) {
+            *p = it2->second.back();
+            it2->second.pop_back();
+            size_t actual_size = it2->first;
+            g_cached_bytes -= actual_size;
+            g_alloc_sizes[*p] = actual_size; // Track actual (larger) size for correct free
+            return hipSuccess;
+        }
+        break; // lower_bound found nothing in range
     }
     hipError_t err = hipMalloc(p, s);
     if (err != hipSuccess) {

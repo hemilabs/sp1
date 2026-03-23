@@ -8,21 +8,26 @@ partialBlockReduce(const TyBlock& block, const TyTile& tile, F val, F* shared) {
     // Warp-level reduction within tiles
     val = cg::reduce(tile, val, cg::plus<F>());
 
+    const int numWarps = block.size() / tile.size();
+
     // Only the first thread of each warp writes to shared memory
     if (tile.thread_rank() == 0) {
         shared[tile.meta_group_rank()] = val;
     }
-    // Synchronize after warp-level reduction
+    // Single sync after all warps write their partial sums
     block.sync();
 
-    // Perform tree-based reduction on shared memory
-    for (int stride = (block.size() / tile.size()) / 2; stride > 0; stride /= 2) {
-        if (block.thread_rank() < stride) {
-            shared[block.thread_rank()] += shared[block.thread_rank() + stride];
+    // Final reduction: first warp reads all partial sums and reduces via shuffle.
+    // This replaces log2(numWarps) tree-reduction steps (each with a __syncthreads)
+    // with a single warp-level shuffle reduction — saving 2-3 barrier syncs.
+    if (block.thread_rank() < tile.size()) {
+        F warpVal = (block.thread_rank() < numWarps) ? shared[block.thread_rank()] : F::zero();
+        warpVal = cg::reduce(tile, warpVal, cg::plus<F>());
+        if (block.thread_rank() == 0) {
+            shared[0] = warpVal;
         }
-        // Synchronize after each step
-        block.sync();
     }
+    block.sync();
     return shared[0];
 }
 
