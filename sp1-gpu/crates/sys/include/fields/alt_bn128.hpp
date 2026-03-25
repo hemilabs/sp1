@@ -2,7 +2,8 @@
 // Licensed under the Apache License, Version 2.0, see LICENSE for details.
 // SPDX-License-Identifier: Apache-2.0
 
-// #ifndef __SPPARK_FF_ALT_BN128_HPP__
+#ifndef __SPPARK_FF_ALT_BN128_HPP__
+#define __SPPARK_FF_ALT_BN128_HPP__
 // #define __SPPARK_FF_ALT_BN128_HPP__
 
 #include <cstdint>
@@ -97,3 +98,4 @@ typedef mont_t<
     device::ALT_BN128_rx4>
     fr_mont;
 #endif // !__HIPCC__
+#endif // __SPPARK_FF_ALT_BN128_HPP__
