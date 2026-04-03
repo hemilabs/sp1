@@ -654,10 +654,22 @@ impl PlonkProver {
         tracing::info!("Round 3: Quotient polynomial h(X)");
         let t = std::time::Instant::now();
 
-        // Convert per-proof polynomials to coefficient form + coset evals on GPU.
-        // Separate iFFT then coset_fft_to_device to control GPU memory usage.
-        // The fused approach (single function) is more efficient but 4 accumulated
-        // DeviceBuffers (17.2 GiB) + NTT scratch can exceed 24 GiB on AMD GPUs.
+        // Convert per-proof polynomials to coefficient form + coset evals.
+        // Two paths based on GPU VRAM:
+        //   ≥20 GiB: Keep 4 coset FFT results on GPU as DeviceBuffers, use GPU quotient kernel
+        //   <20 GiB: All coset FFTs return to CPU, compute quotient on CPU with rayon
+        #[cfg(feature = "cuda")]
+        let gpu_vram_bytes = {
+            let mut free: usize = 0;
+            let mut total: usize = 0;
+            unsafe {
+                sp1_gpu_sys::runtime::cuda_mem_get_info(&mut free as *mut _, &mut total as *mut _)
+            };
+            total
+        };
+        #[cfg(feature = "cuda")]
+        let use_gpu_quotient = gpu_vram_bytes >= 20 * 1024 * 1024 * 1024; // 20 GiB threshold
+
         #[cfg(feature = "cuda")]
         let (
             l_coeffs,
@@ -670,8 +682,11 @@ impl PlonkProver {
             d_r,
             d_o,
             d_z,
+            l_coset_cpu,
+            r_coset_cpu,
+            o_coset_cpu,
+            z_coset_cpu,
         ) = {
-            use crate::domain::gpu_ntt::gpu_coset_fft_to_device;
             let big_log = self.cached.big_domain.log_size;
 
             // Compute PI polynomial in evaluation form (needed for iFFT batch)
@@ -721,33 +736,72 @@ impl PlonkProver {
                 })
             };
 
-            // Coset FFTs: compute 4N evaluations and keep on GPU.
-            // Forward twiddle cache persists across all calls.
-            let d_l = gpu_coset_fft_to_device(&l_c, big_log);
-            let d_r = gpu_coset_fft_to_device(&r_c, big_log);
-            let d_o = gpu_coset_fft_to_device(&o_c, big_log);
+            // Coset FFTs: two paths based on VRAM
+            let cfft_padded = |c: &[Fr]| crate::domain::gpu_ntt::gpu_coset_fft_padded(c, big_log);
 
-            // pi + bsb22 coset FFTs (result goes to CPU, NTT buffer reused)
-            // Twiddles persist from L/R/O (22 GiB peak, fits)
-            let pi_evals = crate::domain::gpu_ntt::gpu_coset_fft_padded(&pi_poly_coeffs, big_log);
-            let bsb22_evals: Vec<Vec<Fr>> = bsb22
-                .iter()
-                .map(|p| crate::domain::gpu_ntt::gpu_coset_fft_padded(p, big_log))
-                .collect();
-            let qcp_evals = &self.cached.qcp_coset_evals;
-            let mut pi_bsb22 = pi_evals;
-            pi_bsb22.par_iter_mut().enumerate().for_each(|(i, v)| {
-                for (qcp_ev, bsb22_ev) in qcp_evals.iter().zip(bsb22_evals.iter()) {
-                    *v += qcp_ev[i] * bsb22_ev[i];
-                }
-            });
+            if use_gpu_quotient {
+                // ≥20 GiB path: keep L/R/O/Z coset evals on GPU as DeviceBuffers
+                use crate::domain::gpu_ntt::gpu_coset_fft_to_device;
+                let d_l = gpu_coset_fft_to_device(&l_c, big_log);
+                let d_r = gpu_coset_fft_to_device(&r_c, big_log);
+                let d_o = gpu_coset_fft_to_device(&o_c, big_log);
 
-            let d_z = gpu_coset_fft_to_device(&z_c, big_log);
+                let pi_evals = cfft_padded(&pi_poly_coeffs);
+                let bsb22_evals: Vec<Vec<Fr>> = bsb22.iter().map(|p| cfft_padded(p)).collect();
+                let qcp_evals = &self.cached.qcp_coset_evals;
+                let mut pi_bsb22 = pi_evals;
+                pi_bsb22.par_iter_mut().enumerate().for_each(|(i, v)| {
+                    for (qcp_ev, bsb22_ev) in qcp_evals.iter().zip(bsb22_evals.iter()) {
+                        *v += qcp_ev[i] * bsb22_ev[i];
+                    }
+                });
 
-            // Wait for inverse twiddle precomputation
-            inv_precompute.join().expect("inverse twiddle precompute failed");
+                let d_z = gpu_coset_fft_to_device(&z_c, big_log);
+                inv_precompute.join().expect("inverse twiddle precompute failed");
 
-            (l_c, r_c, o_c, z_c, bsb22, pi_bsb22, d_l, d_r, d_o, d_z)
+                (
+                    l_c,
+                    r_c,
+                    o_c,
+                    z_c,
+                    bsb22,
+                    pi_bsb22,
+                    Some(d_l),
+                    Some(d_r),
+                    Some(d_o),
+                    Some(d_z),
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                )
+            } else {
+                // <20 GiB path: all coset FFTs return to CPU (no DeviceBuffers)
+                // Each coset FFT uses ~8.5 GiB peak (NTT buf + twiddles), fits in 16 GiB
+                let l_coset = cfft_padded(&l_c);
+                let r_coset = cfft_padded(&r_c);
+                let o_coset = cfft_padded(&o_c);
+
+                let pi_evals = cfft_padded(&pi_poly_coeffs);
+                let bsb22_evals: Vec<Vec<Fr>> = bsb22.iter().map(|p| cfft_padded(p)).collect();
+                let qcp_evals = &self.cached.qcp_coset_evals;
+                let mut pi_bsb22 = pi_evals;
+                pi_bsb22.par_iter_mut().enumerate().for_each(|(i, v)| {
+                    for (qcp_ev, bsb22_ev) in qcp_evals.iter().zip(bsb22_evals.iter()) {
+                        *v += qcp_ev[i] * bsb22_ev[i];
+                    }
+                });
+
+                let z_coset = cfft_padded(&z_c);
+                crate::domain::gpu_ntt::free_ntt_buffer();
+                unsafe { sp1_gpu_sys::dft_bn254::bn254_ntt_clear_twiddle_cache() };
+                inv_precompute.join().expect("inverse twiddle precompute failed");
+
+                (
+                    l_c, r_c, o_c, z_c, bsb22, pi_bsb22, None, None, None, None, l_coset, r_coset,
+                    o_coset, z_coset,
+                )
+            }
         };
         #[cfg(not(feature = "cuda"))]
         let (l_coeffs, r_coeffs, o_coeffs, z_coeffs, bsb22_coeffs) = {
@@ -772,19 +826,36 @@ impl PlonkProver {
 
         // Compute quotient polynomial on coset domain (size 4N)
         #[cfg(feature = "cuda")]
-        let h_coeffs = self.compute_quotient_with_device_bufs(
-            n,
-            domain,
-            &alpha,
-            &beta,
-            &gamma,
-            &coset_shift,
-            pi_bsb22_evals,
-            d_l,
-            d_r,
-            d_o,
-            d_z,
-        );
+        let h_coeffs = if use_gpu_quotient {
+            self.compute_quotient_with_device_bufs(
+                n,
+                domain,
+                &alpha,
+                &beta,
+                &gamma,
+                &coset_shift,
+                pi_bsb22_evals,
+                d_l.unwrap(),
+                d_r.unwrap(),
+                d_o.unwrap(),
+                d_z.unwrap(),
+            )
+        } else {
+            // CPU quotient path for GPUs with <20 GiB VRAM
+            self.compute_quotient_cpu(
+                n,
+                domain,
+                &alpha,
+                &beta,
+                &gamma,
+                &coset_shift,
+                pi_bsb22_evals,
+                l_coset_cpu,
+                r_coset_cpu,
+                o_coset_cpu,
+                z_coset_cpu,
+            )
+        };
         #[cfg(not(feature = "cuda"))]
         let h_coeffs = self.compute_quotient(
             n,
@@ -1650,6 +1721,109 @@ impl PlonkProver {
     #[allow(clippy::too_many_arguments)]
     #[cfg(feature = "cuda")]
     #[allow(clippy::too_many_arguments)]
+    /// CPU quotient computation for GPUs with <20 GiB VRAM.
+    /// All coset evaluations are in host memory. The quotient is computed with rayon,
+    /// then uploaded to GPU for the coset iFFT.
+    #[cfg(feature = "cuda")]
+    #[allow(clippy::too_many_arguments)]
+    fn compute_quotient_cpu(
+        &self,
+        n: usize,
+        _domain: &Domain,
+        alpha: &Fr,
+        beta: &Fr,
+        gamma: &Fr,
+        coset_shift: &Fr,
+        pi_bsb22: Vec<Fr>,
+        l_coset: Vec<Fr>,
+        r_coset: Vec<Fr>,
+        o_coset: Vec<Fr>,
+        z_coset: Vec<Fr>,
+    ) -> Vec<Fr> {
+        use std::ffi::c_void;
+        let big_n = 4 * n;
+        let big_domain = &self.cached.big_domain;
+        let k1 = *coset_shift;
+        let k2 = k1 * k1;
+        let alpha_sq = alpha.square();
+        let alpha_v = *alpha;
+        let beta_v = *beta;
+        let gamma_v = *gamma;
+
+        let ql_evals = &self.cached.ql_coset_evals;
+        let qr_evals = &self.cached.qr_coset_evals;
+        let qm_evals = &self.cached.qm_coset_evals;
+        let qo_evals = &self.cached.qo_coset_evals;
+        let qk_evals = &self.cached.qk_coset_evals;
+        let s1_evals = &self.cached.s1_coset_evals;
+        let s2_evals = &self.cached.s2_coset_evals;
+        let s3_evals = &self.cached.s3_coset_evals;
+        let zh_inv = &self.cached.zh_inv;
+        let zh_values = &self.cached.zh_values;
+        let coset_points = &self.cached.coset_points;
+        let x_minus_one_n_inv = &self.cached.x_minus_one_n_inv;
+
+        let mut h_evals = vec![Fr::ZERO; big_n];
+        h_evals.par_iter_mut().enumerate().for_each(|(i, out)| {
+            let l = l_coset[i];
+            let r = r_coset[i];
+            let o = o_coset[i];
+            let z = z_coset[i];
+            let z_shifted = z_coset[(i + 4) % big_n];
+
+            let gate = ql_evals[i] * l
+                + qr_evals[i] * r
+                + qm_evals[i] * l * r
+                + qo_evals[i] * o
+                + qk_evals[i]
+                + pi_bsb22[i];
+
+            let x_beta = beta_v * coset_points[i];
+            let perm_num = z
+                * (l + x_beta + gamma_v)
+                * (r + x_beta * k1 + gamma_v)
+                * (o + x_beta * k2 + gamma_v);
+            let perm_den = z_shifted
+                * (l + beta_v * s1_evals[i] + gamma_v)
+                * (r + beta_v * s2_evals[i] + gamma_v)
+                * (o + beta_v * s3_evals[i] + gamma_v);
+            let perm = alpha_v * (perm_den - perm_num);
+
+            let l1_x = zh_values[i] * x_minus_one_n_inv[i];
+            let boundary = alpha_sq * (z - Fr::ONE) * l1_x;
+
+            *out = (gate + perm + boundary) * zh_inv[i];
+        });
+
+        // Upload to GPU for coset iFFT, then download result
+        let buf_bytes = big_n * std::mem::size_of::<Fr>();
+        let d_buf = crate::domain::gpu_ntt::get_device_buffer(buf_bytes);
+        unsafe {
+            sp1_gpu_sys::runtime::cuda_mem_copy_host_to_device(
+                d_buf,
+                h_evals.as_ptr() as *const c_void,
+                buf_bytes,
+            );
+        }
+        let stream = unsafe { sp1_gpu_sys::runtime::DEFAULT_STREAM };
+        let err = unsafe {
+            sp1_gpu_sys::dft_bn254::batch_coset_iNTT_bn254(d_buf, big_domain.log_size, 1, stream)
+        };
+        if err != unsafe { sp1_gpu_sys::runtime::CUDA_SUCCESS_CSL } {
+            panic!("GPU coset iNTT failed");
+        }
+        let mut h_coeffs = vec![Fr::ZERO; big_n];
+        unsafe {
+            sp1_gpu_sys::runtime::cuda_mem_copy_device_to_host(
+                h_coeffs.as_mut_ptr() as *mut c_void,
+                d_buf,
+                buf_bytes,
+            );
+        }
+
+        h_coeffs
+    }
+
     fn compute_quotient_with_device_bufs(
         &self,
         n: usize,
