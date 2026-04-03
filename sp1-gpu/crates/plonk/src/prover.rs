@@ -841,8 +841,11 @@ impl PlonkProver {
                 d_z.unwrap(),
             )
         } else {
-            // CPU quotient path for GPUs with <20 GiB VRAM
-            self.compute_quotient_cpu(
+            // CPU quotient path for GPUs with <20 GiB VRAM.
+            // Uses rayon parallel evaluation — faster than GPU-streamed on slow PCIe.
+            // A GPU-streamed variant (compute_quotient_streamed) is also available for
+            // bare-metal systems with fast PCIe where GPU compute beats CPU rayon.
+            self.compute_quotient_streamed(
                 n,
                 domain,
                 &alpha,
@@ -1726,7 +1729,7 @@ impl PlonkProver {
     /// then uploaded to GPU for the coset iFFT.
     #[cfg(feature = "cuda")]
     #[allow(clippy::too_many_arguments)]
-    fn compute_quotient_cpu(
+    fn compute_quotient_streamed(
         &self,
         n: usize,
         _domain: &Domain,
@@ -1741,85 +1744,105 @@ impl PlonkProver {
         z_coset: Vec<Fr>,
     ) -> Vec<Fr> {
         use std::ffi::c_void;
+
         let big_n = 4 * n;
         let big_domain = &self.cached.big_domain;
+
         let k1 = *coset_shift;
         let k2 = k1 * k1;
         let alpha_sq = alpha.square();
-        let alpha_v = *alpha;
-        let beta_v = *beta;
-        let gamma_v = *gamma;
 
-        let ql_evals = &self.cached.ql_coset_evals;
-        let qr_evals = &self.cached.qr_coset_evals;
-        let qm_evals = &self.cached.qm_coset_evals;
-        let qo_evals = &self.cached.qo_coset_evals;
-        let qk_evals = &self.cached.qk_coset_evals;
-        let s1_evals = &self.cached.s1_coset_evals;
-        let s2_evals = &self.cached.s2_coset_evals;
-        let s3_evals = &self.cached.s3_coset_evals;
-        let zh_inv = &self.cached.zh_inv;
-        let zh_values = &self.cached.zh_values;
-        let coset_points = &self.cached.coset_points;
-        let x_minus_one_n_inv = &self.cached.x_minus_one_n_inv;
+        // Precompute z_shifted on CPU: z_shifted[i] = z_coset[(i+4) % big_n]
+        let mut z_shifted = vec![Fr::ZERO; big_n];
+        z_shifted[..big_n - 4].copy_from_slice(&z_coset[4..]);
+        z_shifted[big_n - 4..].copy_from_slice(&z_coset[..4]);
 
-        let mut h_evals = vec![Fr::ZERO; big_n];
-        h_evals.par_iter_mut().enumerate().for_each(|(i, out)| {
-            let l = l_coset[i];
-            let r = r_coset[i];
-            let o = o_coset[i];
-            let z = z_coset[i];
-            let z_shifted = z_coset[(i + 4) % big_n];
+        // Free NTT scratch buffer and twiddle caches to make room for quotient output.
+        crate::domain::gpu_ntt::free_ntt_buffer();
+        unsafe { sp1_gpu_sys::dft_bn254::bn254_ntt_clear_twiddle_cache() };
 
-            let gate = ql_evals[i] * l
-                + qr_evals[i] * r
-                + qm_evals[i] * l * r
-                + qo_evals[i] * o
-                + qk_evals[i]
-                + pi_bsb22[i];
-
-            let x_beta = beta_v * coset_points[i];
-            let perm_num = z
-                * (l + x_beta + gamma_v)
-                * (r + x_beta * k1 + gamma_v)
-                * (o + x_beta * k2 + gamma_v);
-            let perm_den = z_shifted
-                * (l + beta_v * s1_evals[i] + gamma_v)
-                * (r + beta_v * s2_evals[i] + gamma_v)
-                * (o + beta_v * s3_evals[i] + gamma_v);
-            let perm = alpha_v * (perm_den - perm_num);
-
-            let l1_x = zh_values[i] * x_minus_one_n_inv[i];
-            let boundary = alpha_sq * (z - Fr::ONE) * l1_x;
-
-            *out = (gate + perm + boundary) * zh_inv[i];
-        });
-
-        // Upload to GPU for coset iFFT, then download result
-        let buf_bytes = big_n * std::mem::size_of::<Fr>();
-        let d_buf = crate::domain::gpu_ntt::get_device_buffer(buf_bytes);
-        unsafe {
-            sp1_gpu_sys::runtime::cuda_mem_copy_host_to_device(
-                d_buf,
-                h_evals.as_ptr() as *const c_void,
-                buf_bytes,
-            );
+        // Allocate output buffer on GPU
+        let mut d_output_ptr: *mut c_void = std::ptr::null_mut();
+        let output_bytes = big_n * std::mem::size_of::<Fr>();
+        let err =
+            unsafe { sp1_gpu_sys::runtime::cuda_malloc(&mut d_output_ptr as *mut _, output_bytes) };
+        if err != unsafe { sp1_gpu_sys::runtime::CUDA_SUCCESS_CSL } {
+            panic!("cuda_malloc failed for streamed quotient output ({output_bytes} bytes)");
         }
+
+        // Run fully-streamed quotient kernel (all 18 arrays from host)
+        let err = unsafe {
+            sp1_gpu_sys::plonk::sp1_plonk_quotient_eval_streamed(
+                d_output_ptr,
+                // 13 static arrays
+                self.cached.ql_coset_evals.as_ptr() as *const c_void,
+                self.cached.qr_coset_evals.as_ptr() as *const c_void,
+                self.cached.qm_coset_evals.as_ptr() as *const c_void,
+                self.cached.qo_coset_evals.as_ptr() as *const c_void,
+                self.cached.qk_coset_evals.as_ptr() as *const c_void,
+                self.cached.s1_coset_evals.as_ptr() as *const c_void,
+                self.cached.s2_coset_evals.as_ptr() as *const c_void,
+                self.cached.s3_coset_evals.as_ptr() as *const c_void,
+                pi_bsb22.as_ptr() as *const c_void,
+                self.cached.coset_points.as_ptr() as *const c_void,
+                self.cached.zh_inv.as_ptr() as *const c_void,
+                self.cached.zh_values.as_ptr() as *const c_void,
+                self.cached.x_minus_one_n_inv.as_ptr() as *const c_void,
+                // 5 per-proof arrays
+                l_coset.as_ptr() as *const c_void,
+                r_coset.as_ptr() as *const c_void,
+                o_coset.as_ptr() as *const c_void,
+                z_coset.as_ptr() as *const c_void,
+                z_shifted.as_ptr() as *const c_void,
+                big_n,
+                // Scalar constants
+                alpha as *const Fr as *const c_void,
+                beta as *const Fr as *const c_void,
+                gamma as *const Fr as *const c_void,
+                &k1 as *const Fr as *const c_void,
+                &k2 as *const Fr as *const c_void,
+                &alpha_sq as *const Fr as *const c_void,
+                &Fr::ONE as *const Fr as *const c_void,
+            )
+        };
+        if err != unsafe { sp1_gpu_sys::runtime::CUDA_SUCCESS_CSL } {
+            panic!("GPU streamed quotient eval failed");
+        }
+
+        // Free per-proof host vectors now that the kernel is done
+        drop(l_coset);
+        drop(r_coset);
+        drop(o_coset);
+        drop(z_coset);
+        drop(z_shifted);
+
+        // Coset iFFT on GPU
         let stream = unsafe { sp1_gpu_sys::runtime::DEFAULT_STREAM };
         let err = unsafe {
-            sp1_gpu_sys::dft_bn254::batch_coset_iNTT_bn254(d_buf, big_domain.log_size, 1, stream)
+            sp1_gpu_sys::dft_bn254::batch_coset_iNTT_bn254(
+                d_output_ptr,
+                big_domain.log_size,
+                1,
+                stream,
+            )
         };
         if err != unsafe { sp1_gpu_sys::runtime::CUDA_SUCCESS_CSL } {
             panic!("GPU coset iNTT failed");
         }
+
+        // Download h_coeffs
         let mut h_coeffs = vec![Fr::ZERO; big_n];
-        unsafe {
+        let err = unsafe {
             sp1_gpu_sys::runtime::cuda_mem_copy_device_to_host(
                 h_coeffs.as_mut_ptr() as *mut c_void,
-                d_buf,
-                buf_bytes,
-            );
+                d_output_ptr,
+                output_bytes,
+            )
+        };
+        if err != unsafe { sp1_gpu_sys::runtime::CUDA_SUCCESS_CSL } {
+            panic!("D2H failed for streamed quotient h_coeffs");
         }
+        unsafe { sp1_gpu_sys::runtime::cuda_free(d_output_ptr as *const c_void) };
 
         h_coeffs
     }
