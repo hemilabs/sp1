@@ -79,6 +79,19 @@ if(USE_HIP)
     set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY ${CSL_SOURCE_DIR}/target/hip-build/lib)
     set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${CSL_SOURCE_DIR}/target/hip-build/lib)
 
+    # BN254 PLONK: Separate INTERFACE library with FEATURE_BN254 (HIP path)
+    add_library(sp1_gpu_bn254 INTERFACE)
+    target_include_directories(sp1_gpu_bn254 INTERFACE
+        ${CSL_SOURCE_DIR}/include
+        ${CSL_SOURCE_DIR}/sppark
+        ${CSL_SOURCE_DIR}/sppark/util
+        ${CSL_SOURCE_DIR}/lib/msm          # for blst_t.hpp (needed by alt_bn128.hpp host-side)
+    )
+    target_compile_definitions(sp1_gpu_bn254 INTERFACE SPPARK FEATURE_BN254)
+    if(DEFINED CBINDGEN_INCLUDE_DIR)
+        target_include_directories(sp1_gpu_bn254 INTERFACE ${CBINDGEN_INCLUDE_DIR})
+    endif()
+
     # Add subdirectories for each module
     # The per-module CMakeLists.txt files list .cu sources which CMake will
     # compile with hipcc because the HIP language is enabled and .cu is
@@ -100,6 +113,8 @@ if(USE_HIP)
     add_subdirectory(lib/tracegen)
     add_subdirectory(lib/transpose)
     add_subdirectory(lib/zerocheck)
+    add_subdirectory(lib/msm)
+    add_subdirectory(lib/plonk)
 
     # Sppark sources -- compile as HIP (they include cuda2hip.hpp via __HIPCC__ guard)
     add_library(sppark_objs OBJECT
@@ -123,6 +138,7 @@ if(USE_HIP)
         logup_gkr_objs merkle_tree_objs mle_objs ntt_objs
         runtime_objs scan_objs sum_and_reduce_objs sumcheck_objs
         tracegen_objs transpose_objs zerocheck_objs
+        msm_objs
     )
     foreach(tgt ${_hip_targets})
         if(TARGET ${tgt})
@@ -157,6 +173,9 @@ if(USE_HIP)
         $<TARGET_OBJECTS:tracegen_objs>
         $<TARGET_OBJECTS:transpose_objs>
         $<TARGET_OBJECTS:zerocheck_objs>
+        $<TARGET_OBJECTS:msm_objs>
+        $<TARGET_OBJECTS:plonk_objs>
+        $<TARGET_OBJECTS:ntt_bn254_objs>
         $<TARGET_OBJECTS:sppark_objs>
     )
 
@@ -258,6 +277,21 @@ else()
     set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY ${CSL_SOURCE_DIR}/target/cuda-build/lib)
     set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${CSL_SOURCE_DIR}/target/cuda-build/lib)
 
+    # BN254 PLONK: Separate INTERFACE library with FEATURE_BN254 (not FEATURE_KOALA_BEAR)
+    # Used by MSM and future BN254 NTT modules. Cannot coexist with FEATURE_KOALA_BEAR
+    # in the same translation unit due to sppark's #elif chains in parameters.cuh.
+    add_library(sp1_gpu_bn254 INTERFACE)
+    target_include_directories(sp1_gpu_bn254 INTERFACE
+        ${CSL_SOURCE_DIR}/include
+        ${CSL_SOURCE_DIR}/sppark
+        ${CSL_SOURCE_DIR}/lib/msm          # for blst_t.hpp (needed by alt_bn128.hpp host-side)
+        ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES}
+    )
+    target_compile_definitions(sp1_gpu_bn254 INTERFACE SPPARK FEATURE_BN254)
+    if(DEFINED CBINDGEN_INCLUDE_DIR)
+        target_include_directories(sp1_gpu_bn254 INTERFACE ${CBINDGEN_INCLUDE_DIR})
+    endif()
+
     # Add subdirectories for each module
     add_subdirectory(lib/algebra)
     add_subdirectory(lib/basefold)
@@ -276,6 +310,8 @@ else()
     add_subdirectory(lib/tracegen)
     add_subdirectory(lib/transpose)
     add_subdirectory(lib/zerocheck)
+    add_subdirectory(lib/msm)
+    add_subdirectory(lib/plonk)
 
     # Sppark sources (external library, kept separate)
     # These are C++ files that need CUDA headers
@@ -304,6 +340,9 @@ else()
         $<TARGET_OBJECTS:tracegen_objs>
         $<TARGET_OBJECTS:transpose_objs>
         $<TARGET_OBJECTS:zerocheck_objs>
+        $<TARGET_OBJECTS:msm_objs>
+        $<TARGET_OBJECTS:plonk_objs>
+        $<TARGET_OBJECTS:ntt_bn254_objs>
         $<TARGET_OBJECTS:sppark_objs>
     )
 

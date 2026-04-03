@@ -1,0 +1,25 @@
+[package]
+name = "sp1-gpu-plonk"
+description = "GPU-accelerated BN254 PLONK prover for SP1"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[features]
+cuda = ["sp1-gpu-sys"]
+
+[dependencies]
+sha2 = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+rayon = { workspace = true }
+sp1-gpu-sys = { workspace = true, optional = true }
+
+[dev-dependencies]
+num-bigint = { workspace = true }
+
+[lints]
+workspace = true

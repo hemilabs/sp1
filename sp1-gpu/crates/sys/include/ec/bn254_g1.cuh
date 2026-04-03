@@ -21,7 +21,7 @@ struct bn254_g1_affine_t {
     bn254_fq_t x;
     bn254_fq_t y;
 
-    __device__ bool is_infinity() const {
+    __device__ __forceinline__ bool is_infinity() const {
         return x.is_zero() && y.is_zero();
     }
 };
@@ -36,22 +36,22 @@ struct bn254_g1_t {
     __host__ __device__ constexpr bn254_g1_t() : X(), Y(), Z() {}
 
     // Construct from affine point: (x, y) -> (x, y, 1)
-    __device__ bn254_g1_t(const bn254_g1_affine_t& p) {
+    __device__ __forceinline__ bn254_g1_t(const bn254_g1_affine_t& p) {
         X = p.x;
         Y = p.y;
         Z = bn254_fq_t::one();
     }
 
     // Check if this is the identity (point at infinity)
-    __device__ bool is_infinity() const {
+    __device__ __forceinline__ bool is_infinity() const {
         return Z.is_zero();
     }
 
     // Set to identity (point at infinity)
-    __device__ void set_infinity() {
+    __host__ __device__ __forceinline__ void set_infinity() {
         X.set_to_zero();
-        Y = bn254_fq_t::one(); // Convention: (0, 1, 0) for infinity
         Z.set_to_zero();
+        // Y convention: leave as-is (only Z==0 matters for infinity check)
     }
 
     // ================================================================
@@ -71,7 +71,7 @@ struct bn254_g1_t {
     // Y3 = E*(D - X3) - 8*C
     // Z3 = (Y1+Z1)^2 - B - Z1^2   (1S, avoids explicit 2*Y1*Z1 multiply)
     // ================================================================
-    __device__ bn254_g1_t dbl() const {
+    __device__ __forceinline__ bn254_g1_t dbl() const {
         if (is_infinity()) return *this;
 
         bn254_fq_t A = X.sqr();               // X1^2
@@ -111,7 +111,7 @@ struct bn254_g1_t {
     //
     // Used for MSM bucket accumulation (SRS points are affine).
     // ================================================================
-    __device__ bn254_g1_t& add_affine(const bn254_g1_affine_t& p) {
+    __device__ __forceinline__ bn254_g1_t& add_affine(const bn254_g1_affine_t& p) {
         if (p.is_infinity()) return *this;
         if (is_infinity()) {
             X = p.x;
@@ -165,7 +165,7 @@ struct bn254_g1_t {
     // Input: this = (X1, Y1, Z1), other = (X2, Y2, Z2)
     // Output: (X3, Y3, Z3) = (X1,Y1,Z1) + (X2,Y2,Z2)
     // ================================================================
-    __device__ bn254_g1_t& operator+=(const bn254_g1_t& other) {
+    __device__ __forceinline__ bn254_g1_t& operator+=(const bn254_g1_t& other) {
         if (other.is_infinity()) return *this;
         if (is_infinity()) {
             *this = other;
@@ -212,18 +212,37 @@ struct bn254_g1_t {
         // Total: 12M + 4S
     }
 
-    __device__ bn254_g1_t operator+(const bn254_g1_t& other) const {
+    __device__ __forceinline__ bn254_g1_t operator+(const bn254_g1_t& other) const {
         bn254_g1_t r = *this;
         r += other;
         return r;
     }
 
     // Negate: (X, Y, Z) -> (X, -Y, Z)
-    __device__ bn254_g1_t operator-() const {
+    __device__ __forceinline__ bn254_g1_t operator-() const {
         bn254_g1_t r;
         r.X = X;
         r.Y = -Y;
         r.Z = Z;
+        return r;
+    }
+
+    // Convert Jacobian (X, Y, Z) to affine (x, y)
+    // x = X / Z^2, y = Y / Z^3
+    // Requires one field inversion (expensive: ~380 field muls via Fermat)
+    // For batch conversion, use Montgomery's trick instead.
+    __device__ __forceinline__ bn254_g1_affine_t to_affine() const {
+        bn254_g1_affine_t r;
+        if (is_infinity()) {
+            r.x.set_to_zero();
+            r.y.set_to_zero();
+            return r;
+        }
+        bn254_fq_t z_inv = Z.inv();        // Z^{-1}
+        bn254_fq_t z_inv2 = z_inv.sqr();   // Z^{-2}
+        bn254_fq_t z_inv3 = z_inv2 * z_inv; // Z^{-3}
+        r.x = X * z_inv2;                   // x = X * Z^{-2}
+        r.y = Y * z_inv3;                   // y = Y * Z^{-3}
         return r;
     }
 };

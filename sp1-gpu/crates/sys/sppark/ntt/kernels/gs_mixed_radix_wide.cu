@@ -135,13 +135,17 @@ class GS_launcher {
     bool is_intt;
     int stage;
     const NTTParameters& ntt_parameters;
-    const stream_t& stream;
+    const cudaStream_t stream;
+    unsigned int batch_count;
+    unsigned int col_stride;
 
 public:
     GS_launcher(fr_t* d_ptr, int lg_dsz, bool innt,
-                const NTTParameters& params, const stream_t& s)
+                const NTTParameters& params, const cudaStream_t& s,
+                unsigned int batch = 1, unsigned int stride = 0)
       : d_inout(d_ptr), lg_domain_size(lg_dsz), is_intt(innt), stage(lg_dsz),
-        ntt_parameters(params), stream(s)
+        ntt_parameters(params), stream(s),
+        batch_count(batch), col_stride(stride)
     {}
 
     void step(int iterations)

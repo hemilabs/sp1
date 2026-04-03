@@ -3,8 +3,24 @@
 #ifdef __HIPCC__
 #include <hip/hip_runtime.h>
 using cudaError_t = hipError_t;
+using cudaStream_t = hipStream_t;
 #define cudaSuccess hipSuccess
 #define cudaGetErrorString hipGetErrorString
+#define cudaMalloc hipMalloc
+#define cudaFree hipFree
+#define cudaMemcpy hipMemcpy
+#define cudaMemcpyAsync hipMemcpyAsync
+#define cudaMemcpyHostToDevice hipMemcpyHostToDevice
+#define cudaMemcpyDeviceToHost hipMemcpyDeviceToHost
+#define cudaMemset hipMemset
+#define cudaMemGetInfo hipMemGetInfo
+#define cudaGetLastError hipGetLastError
+#define cudaDeviceSynchronize hipDeviceSynchronize
+#define cudaStreamCreate hipStreamCreate
+#define cudaStreamCreateWithFlags hipStreamCreateWithFlags
+#define cudaStreamNonBlocking hipStreamNonBlocking
+#define cudaStreamDestroy hipStreamDestroy
+#define cudaStreamSynchronize hipStreamSynchronize
 #else
 #include <cuda_runtime.h>
 #include <thrust/system/cuda/error.h>

@@ -171,10 +171,7 @@ fn detect_hip() -> bool {
     }
 
     // 5. Check common ROCm installation paths
-    for path in &[
-        "/opt/rocm/bin/hipcc",
-        "/opt/rocm-7.2.0/bin/hipcc",
-    ] {
+    for path in &["/opt/rocm/bin/hipcc", "/opt/rocm-7.2.0/bin/hipcc"] {
         if std::path::Path::new(path).exists() {
             return true;
         }
@@ -276,7 +273,9 @@ fn main() {
     let backend = match select_gpu_backend() {
         Some(b) => b,
         None => {
-            println!("cargo:warning=No GPU backend detected (neither CUDA nor HIP), skipping GPU build");
+            println!(
+                "cargo:warning=No GPU backend detected (neither CUDA nor HIP), skipping GPU build"
+            );
             return;
         }
     };
@@ -295,14 +294,14 @@ fn main() {
     match backend {
         GpuBackend::Hip => {
             println!("cargo:warning=Building with HIP/ROCm backend for AMD GPUs");
+            println!("cargo:rustc-cfg=hip_backend");
 
             // Tell CMakeLists.txt to use the HIP path
             cmake_config.define("USE_HIP", "ON");
 
             // Determine ROCm path
-            let rocm_path = env::var("ROCM_PATH")
-                .or_else(|_| env::var("HIP_PATH"))
-                .unwrap_or_else(|_| {
+            let rocm_path =
+                env::var("ROCM_PATH").or_else(|_| env::var("HIP_PATH")).unwrap_or_else(|_| {
                     // Auto-detect: check versioned paths first, then generic
                     for candidate in &["/opt/rocm-7.2.0", "/opt/rocm"] {
                         if std::path::Path::new(candidate).join("bin/hipcc").exists() {
@@ -372,9 +371,8 @@ fn main() {
     match backend {
         GpuBackend::Hip => {
             // ROCm / HIP library search paths
-            let rocm_path = env::var("ROCM_PATH")
-                .or_else(|_| env::var("HIP_PATH"))
-                .unwrap_or_else(|_| {
+            let rocm_path =
+                env::var("ROCM_PATH").or_else(|_| env::var("HIP_PATH")).unwrap_or_else(|_| {
                     for candidate in &["/opt/rocm-7.2.0", "/opt/rocm"] {
                         if std::path::Path::new(candidate).exists() {
                             return candidate.to_string();
@@ -407,10 +405,22 @@ fn main() {
         }
     }
 
-    // Link system libraries (same for both backends)
+    // Link system libraries
     println!("cargo:rustc-link-lib=stdc++");
-    println!("cargo:rustc-link-lib=gomp");
     println!("cargo:rustc-link-lib=dl");
+    match backend {
+        GpuBackend::Hip => {
+            // HIP uses LLVM's OpenMP runtime (libomp), not GNU's (libgomp)
+            let rocm_link = env::var("ROCM_PATH")
+                .or_else(|_| env::var("HIP_PATH"))
+                .unwrap_or_else(|_| "/opt/rocm-7.2.0".to_string());
+            println!("cargo:rustc-link-search=native={}/lib/llvm/lib", rocm_link);
+            println!("cargo:rustc-link-lib=omp");
+        }
+        GpuBackend::Cuda => {
+            println!("cargo:rustc-link-lib=gomp");
+        }
+    }
 
     // Add include directories for compilation if needed
     println!("cargo:include={}", out_include_dir.display());
