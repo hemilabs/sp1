@@ -364,8 +364,8 @@ pub(crate) mod gpu_ntt {
     /// Used to hold coset FFT results on GPU for the fused quotient pipeline.
     pub struct DeviceBuffer {
         pub ptr: *mut c_void,
-        _len: usize,
-        _bytes: usize,
+        pub _len: usize,
+        pub _bytes: usize,
     }
 
     unsafe impl Send for DeviceBuffer {}

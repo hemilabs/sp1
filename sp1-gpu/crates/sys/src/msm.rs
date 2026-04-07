@@ -55,6 +55,17 @@ extern "C" {
         mont: bool,
     ) -> CudaRustError;
 
+    /// Run MSM with scalars already in GPU device memory.
+    /// Skips the H2D scalar upload. d_scalars must be a valid device pointer.
+    /// mont: if true, device scalars are in Montgomery form (GPU converts).
+    pub fn sp1_bn254_msm_invoke_device(
+        ctx: *mut c_void,
+        result: *mut c_void,
+        npoints: usize,
+        d_scalars: *const c_void,
+        mont: bool,
+    ) -> CudaRustError;
+
     /// Destroy a persistent MSM context, freeing GPU resources.
     pub fn sp1_bn254_msm_destroy(ctx: *mut c_void);
 }

@@ -197,8 +197,8 @@ rustCudaError_t sp1_plonk_quotient_eval_fused(
     // NUM_STATIC=10 arrays per chunk (9 used + 1 reserved).
     size_t free_mem = 0, total_mem = 0;
     CUDA_OK(cudaMemGetInfo(&free_mem, &total_mem));
-    // Use 80% of free memory for chunk buffer (divided among NUM_STATIC arrays)
-    size_t chunk_size = (free_mem * 8 / 10) / (NUM_STATIC * elem_sz);
+    // Use 90% of free memory for chunk buffer (divided among NUM_STATIC arrays)
+    size_t chunk_size = (free_mem * 9 / 10) / (NUM_STATIC * elem_sz);
     if (chunk_size > big_n) chunk_size = big_n;
     chunk_size = (chunk_size / 256) * 256;
     if (chunk_size == 0) return rustCudaError_t{.message = "Not enough GPU memory for fused quotient"};
@@ -482,7 +482,7 @@ rustCudaError_t sp1_plonk_quotient_eval_streamed(
     size_t free_mem = 0, total_mem = 0;
     CUDA_OK(cudaMemGetInfo(&free_mem, &total_mem));
     // Use 80% of free memory for chunk buffers (divided among NUM_STREAMED arrays)
-    size_t chunk_size = (free_mem * 8 / 10) / (NUM_STREAMED * elem_sz);
+    size_t chunk_size = (free_mem * 9 / 10) / (NUM_STREAMED * elem_sz);
     if (chunk_size > big_n) chunk_size = big_n;
     chunk_size = (chunk_size / 256) * 256;
     if (chunk_size == 0) return rustCudaError_t{.message = "Not enough GPU memory for streamed quotient"};

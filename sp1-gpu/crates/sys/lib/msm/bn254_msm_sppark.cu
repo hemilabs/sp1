@@ -140,6 +140,39 @@ rustCudaError_t sp1_bn254_msm_invoke(void* ctx,
     }
 }
 
+/// Run MSM with scalars already on GPU device memory.
+/// Skips the H2D scalar upload — d_scalars must be a valid device pointer.
+/// mont: if true, device scalars are in Montgomery form (sppark converts on GPU).
+extern "C"
+rustCudaError_t sp1_bn254_msm_invoke_device(void* ctx,
+                                              void* result,
+                                              size_t npoints,
+                                              const void* d_scalars,
+                                              bool mont)
+{
+    auto* msm = reinterpret_cast<msm_context_t*>(ctx);
+    try {
+        // Set the device scalar pointer, then invoke with nullptr host scalars.
+        // This tells sppark's invoke to skip H2D and use pre-loaded device scalars.
+        msm->set_d_scalars_ptr(const_cast<scalar_t*>(
+            reinterpret_cast<const scalar_t*>(d_scalars)));
+        RustError err = msm->invoke(
+            *reinterpret_cast<point_t*>(result),
+            (const affine_t*)nullptr, npoints,
+            (const scalar_t*)nullptr,
+            mont);
+        if (err.code != 0) {
+            if (err.message) free(err.message);
+            return rustCudaError_t{.message = "BN254 MSM invoke (device scalars) failed"};
+        }
+        return CUDA_SUCCESS_CSL;
+    } catch (const cuda_error& e) {
+        return rustCudaError_t{.message = "BN254 MSM invoke (device scalars) failed"};
+    } catch (...) {
+        return rustCudaError_t{.message = "BN254 MSM invoke (device scalars) failed (unknown)"};
+    }
+}
+
 /// Destroy a persistent MSM context, freeing GPU resources.
 extern "C"
 void sp1_bn254_msm_destroy(void* ctx)

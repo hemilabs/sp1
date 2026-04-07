@@ -390,6 +390,42 @@ impl PersistentMsm {
         G1Jacobian::from_bn254(&result)
     }
 
+    /// MSM with scalars already on GPU device memory.
+    /// Skips the H2D scalar upload entirely — d_scalars must be a valid device pointer.
+    /// Scalars are in Montgomery form; the GPU converts via mont_to_canonical_kernel.
+    pub fn msm_device(&self, d_scalars: *const std::ffi::c_void, n: usize) -> G1Jacobian {
+        use crate::{BN254Fq, BN254G1Jacobian};
+        use std::ffi::c_void;
+
+        assert!(n <= self.npoints);
+
+        let mut result = BN254G1Jacobian {
+            x: BN254Fq { limbs: [0; 8] },
+            y: BN254Fq { limbs: [0; 8] },
+            z: BN254Fq { limbs: [0; 8] },
+        };
+
+        let err = unsafe {
+            sp1_gpu_sys::msm::sp1_bn254_msm_invoke_device(
+                self.ctx,
+                &mut result as *mut BN254G1Jacobian as *mut c_void,
+                n,
+                d_scalars,
+                true, // mont=true: scalars are in Montgomery form
+            )
+        };
+        if err != unsafe { sp1_gpu_sys::runtime::CUDA_SUCCESS_CSL } {
+            let msg = if err.message.is_null() {
+                "unknown error".to_string()
+            } else {
+                unsafe { std::ffi::CStr::from_ptr(err.message) }.to_string_lossy().into_owned()
+            };
+            panic!("Persistent MSM invoke (device scalars) failed: {}", msg);
+        }
+
+        G1Jacobian::from_bn254(&result)
+    }
+
     /// MSM with pre-converted canonical BN254Fr scalars (skips to_bn254fr conversion).
     /// Used for binary mask MSMs where scalars are known constants.
     pub fn msm_raw(&self, canonical_scalars: &[crate::BN254Fr]) -> G1Jacobian {

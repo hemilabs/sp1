@@ -588,6 +588,65 @@ rustCudaError_t sp1_bn254_msm_invoke(void* ctx_ptr, void* result,
     return CUDA_SUCCESS_CSL;
 }
 
+/// Run MSM with scalars already on GPU device memory.
+/// Skips the H2D scalar upload — d_scalars must be a valid device pointer.
+extern "C"
+rustCudaError_t sp1_bn254_msm_invoke_device(void* ctx_ptr, void* result,
+                                              size_t npoints, const void* d_scalars, bool mont)
+{
+    auto* ctx = reinterpret_cast<hip_msm_context*>(ctx_ptr);
+    int n = (int)npoints;
+    size_t elem32 = sizeof(uint32_t);
+
+    // D2D copy: caller's device scalars → pre-allocated ctx->d_scalars
+    CUDA_OK(hipMemcpy(ctx->d_scalars, d_scalars, n * SCALAR_LIMBS * elem32, hipMemcpyDeviceToDevice));
+
+    // Montgomery conversion on GPU if needed
+    if (mont) {
+        int threads = 256;
+        int blocks = (n + threads - 1) / threads;
+        hipLaunchKernelGGL(mont_to_canonical_kernel,
+            dim3(blocks), dim3(threads), 0, 0, ctx->d_scalars, n);
+        CUDA_OK(hipGetLastError());
+    }
+
+    // Initialize carries
+    CUDA_OK(hipMemset(ctx->d_carries, 0, n * sizeof(uint8_t)));
+
+    // Process windows
+    for (int w = 0; w < NUM_WINDOWS; w++) {
+        {
+            int threads = 256;
+            int blocks = (n + threads - 1) / threads;
+            hipLaunchKernelGGL(scalar_decompose_packed_kernel,
+                dim3(blocks), dim3(threads), 0, 0,
+                ctx->d_scalars, ctx->d_digits, ctx->d_packed, ctx->d_carries, n, w);
+            CUDA_OK(hipGetLastError());
+        }
+        msm_one_window(
+            ctx->d_points, ctx->d_digits, ctx->d_packed,
+            ctx->d_window_results + w, ctx->d_buckets,
+            ctx->d_bucket_offsets, ctx->d_bucket_counts,
+            ctx->d_sorted_digits, ctx->d_sorted_packed,
+            ctx->d_sort_temp, ctx->sort_temp_bytes,
+            ctx->d_partial_sums,
+            ctx->d_reduce_partials, ctx->d_reduce_suffixes,
+            n
+        );
+    }
+
+    // Combine windows
+    hipLaunchKernelGGL(window_combine_kernel,
+        dim3(1), dim3(1), 0, 0,
+        ctx->d_window_results, ctx->d_final_result, NUM_WINDOWS, WINDOW_BITS);
+    CUDA_OK(hipGetLastError());
+
+    // Download result
+    CUDA_OK(hipMemcpy(result, ctx->d_final_result, sizeof(bn254_g1_t), hipMemcpyDeviceToHost));
+
+    return CUDA_SUCCESS_CSL;
+}
+
 extern "C"
 void sp1_bn254_msm_destroy(void* ctx_ptr)
 {

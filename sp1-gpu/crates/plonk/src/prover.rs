@@ -1061,8 +1061,8 @@ impl PlonkProver {
 
         // Compute quotient polynomial on coset domain (size 4N)
         #[cfg(feature = "cuda")]
-        let h_coeffs = if use_gpu_quotient {
-            self.compute_quotient_with_device_bufs(
+        let (h_coeffs, d_h_coeffs) = if use_gpu_quotient {
+            let (h, d_h) = self.compute_quotient_with_device_bufs(
                 n,
                 domain,
                 &alpha,
@@ -1074,13 +1074,14 @@ impl PlonkProver {
                 d_r.unwrap(),
                 d_o.unwrap(),
                 d_z.unwrap(),
-            )
+            );
+            (h, Some(d_h))
         } else {
             // CPU quotient path for GPUs with <20 GiB VRAM.
             // Uses rayon parallel evaluation — faster than GPU-streamed on slow PCIe.
             // A GPU-streamed variant (compute_quotient_streamed) is also available for
             // bare-metal systems with fast PCIe where GPU compute beats CPU rayon.
-            self.compute_quotient_streamed(
+            (self.compute_quotient_streamed(
                 n,
                 domain,
                 &alpha,
@@ -1092,7 +1093,7 @@ impl PlonkProver {
                 r_coset_cpu,
                 o_coset_cpu,
                 z_coset_cpu,
-            )
+            ), None)
         };
         #[cfg(not(feature = "cuda"))]
         let h_coeffs = self.compute_quotient(
@@ -1146,13 +1147,27 @@ impl PlonkProver {
         #[cfg(feature = "cuda")]
         let persistent_can_msm = srs_can_handle.join().expect("SRS canonical upload panicked");
 
-        // Commit h0, h1, h2 using canonical SRS
+        // Commit h0, h1, h2 using canonical SRS.
+        // When d_h_coeffs is available, use device MSM to skip h0/h1 scalar H2D upload.
         #[cfg(feature = "cuda")]
         let (commit_h0, commit_h1, commit_h2) = {
             use crate::g1::G1Jacobian;
 
-            let h0 = persistent_can_msm.msm(h0_coeffs).to_affine();
-            let h1 = persistent_can_msm.msm(h1_coeffs).to_affine();
+            let stride = n + 2;
+            let elem_sz = std::mem::size_of::<Fr>();
+            let (h0, h1) = if let Some(ref d_h) = d_h_coeffs {
+                // Device MSM: h0/h1 scalars are already on GPU at known offsets
+                let d_h0_ptr = d_h.ptr; // offset 0
+                let d_h1_ptr = unsafe { (d_h.ptr as *mut u8).add(stride * elem_sz) as *const std::ffi::c_void };
+                let h0 = persistent_can_msm.msm_device(d_h0_ptr as *const std::ffi::c_void, stride).to_affine();
+                let h1 = persistent_can_msm.msm_device(d_h1_ptr, stride).to_affine();
+                (h0, h1)
+            } else {
+                // Host MSM fallback (streamed path)
+                let h0 = persistent_can_msm.msm(h0_coeffs).to_affine();
+                let h1 = persistent_can_msm.msm(h1_coeffs).to_affine();
+                (h0, h1)
+            };
             let h2 = if h2_is_zero {
                 G1Affine::INFINITY
             } else if h2_nnz <= 1000 {
@@ -1176,6 +1191,9 @@ impl PlonkProver {
             };
             (h0, h1, h2)
         };
+        // Free device h_coeffs buffer (no longer needed after h MSMs)
+        #[cfg(feature = "cuda")]
+        drop(d_h_coeffs);
         #[cfg(not(feature = "cuda"))]
         let (commit_h0, commit_h1, commit_h2) = {
             use crate::g1::G1Jacobian;
@@ -2162,7 +2180,7 @@ impl PlonkProver {
         d_r: crate::domain::gpu_ntt::DeviceBuffer,
         d_o: crate::domain::gpu_ntt::DeviceBuffer,
         d_z: crate::domain::gpu_ntt::DeviceBuffer,
-    ) -> Vec<Fr> {
+    ) -> (Vec<Fr>, crate::domain::gpu_ntt::DeviceBuffer) {
         use std::ffi::c_void;
 
         let big_n = 4 * n;
@@ -2292,7 +2310,7 @@ impl PlonkProver {
         }
         eprintln!("[T] 7b. Coset iFFT: {:?}", _t_ifft.elapsed());
 
-        // Download h_coeffs (pre-fault pages to avoid DMA page faults)
+        // Download h_coeffs to CPU (for Round 4/5) while keeping device copy for h MSMs.
         let _t_d2h = std::time::Instant::now();
         let mut h_coeffs = Vec::with_capacity(big_n);
         unsafe { h_coeffs.set_len(big_n); }
@@ -2310,9 +2328,15 @@ impl PlonkProver {
             panic!("D2H failed for quotient h_coeffs");
         }
         eprintln!("[T] 7c. D2H download: {:?}", _t_d2h.elapsed());
-        unsafe { sp1_gpu_sys::runtime::cuda_free(d_output_ptr as *const c_void) };
 
-        h_coeffs
+        // Return both CPU coefficients and the device pointer (for h0/h1 device MSM).
+        // d_output_ptr stays allocated — caller frees via DeviceBuffer drop.
+        let d_h = crate::domain::gpu_ntt::DeviceBuffer {
+            ptr: d_output_ptr,
+            _len: big_n,
+            _bytes: output_bytes,
+        };
+        (h_coeffs, d_h)
     }
 
     #[allow(clippy::too_many_arguments)]
