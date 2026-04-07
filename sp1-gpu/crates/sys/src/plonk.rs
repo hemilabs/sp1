@@ -88,4 +88,15 @@ extern "C" {
         h_zh_inv_4: *const c_void,
         h_zh_val_4: *const c_void,
     ) -> CudaRustError;
+
+    /// BN254 element-wise add: d_a[i] += d_b[i] for i in 0..n
+    pub fn bn254_elementwise_add(d_a: *mut c_void, d_b: *const c_void, n: usize);
+
+    /// BN254 element-wise fused multiply-add: d_a[i] += d_b[i] * d_c[i] for i in 0..n
+    pub fn bn254_elementwise_fma(
+        d_a: *mut c_void,
+        d_b: *const c_void,
+        d_c: *const c_void,
+        n: usize,
+    );
 }

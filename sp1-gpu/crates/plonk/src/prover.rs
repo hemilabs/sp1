@@ -776,37 +776,110 @@ impl PlonkProver {
 
         // On main thread: run PI+BSB22 fused iFFT+cosetFFT while grand product runs
         #[cfg(feature = "cuda")]
-        let pi_bsb22_precomputed = {
+        let (pi_bsb22_precomputed, bsb22_coeffs_from_aux) = {
             let big_log = self.cached.big_domain.log_size;
             let lg_n = domain.log_size;
+            use crate::domain::gpu_ntt::gpu_ifft_then_coset_fft_to_device;
 
-            // Fused iFFT + coset FFT for PI polynomial
-            let (_pi_coeffs, pi_coset_evals) =
-                crate::domain::gpu_ntt::gpu_ifft_then_coset_fft_to_host(
-                    &pi_poly_evals,
-                    lg_n,
-                    big_log,
-                );
+            // PI: iFFT + coset FFT, keep coset evals on GPU as DeviceBuffer
+            let (pi_coeffs, d_pi_coset) =
+                gpu_ifft_then_coset_fft_to_device(&pi_poly_evals, lg_n, big_log);
+            let _ = pi_coeffs; // PI coefficients not needed for Round 4/5
 
-            // Fused iFFT + coset FFT for BSB22 polynomials
-            let bsb22_coset_evals: Vec<Vec<Fr>> = bsb22_polys_fr
-                .iter()
-                .map(|p| {
-                    let (_coeffs, evals) =
-                        crate::domain::gpu_ntt::gpu_ifft_then_coset_fft_to_host(p, lg_n, big_log);
-                    evals
-                })
-                .collect();
+            // BSB22: iFFT + coset FFT, keep coset evals on GPU
+            let mut bsb22_coeffs_list = Vec::with_capacity(bsb22_polys_fr.len());
+            let mut d_bsb22_cosets = Vec::with_capacity(bsb22_polys_fr.len());
+            for p in bsb22_polys_fr.iter() {
+                let (coeffs, d_coset) =
+                    gpu_ifft_then_coset_fft_to_device(p, lg_n, big_log);
+                bsb22_coeffs_list.push(coeffs);
+                d_bsb22_cosets.push(d_coset);
+            }
+            crate::domain::gpu_ntt::free_ntt_buffer();
 
-            // Fuse pi + qcp*bsb22
-            let qcp_evals = &self.cached.qcp_coset_evals;
-            let mut pi_bsb22 = pi_coset_evals;
-            pi_bsb22.par_iter_mut().enumerate().for_each(|(i, v)| {
-                for (qcp_ev, bsb22_ev) in qcp_evals.iter().zip(bsb22_coset_evals.iter()) {
-                    *v += qcp_ev[i] * bsb22_ev[i];
+            // Fuse qk + pi + qcp*bsb22 on GPU:
+            // 1. Allocate result on GPU, copy qk_coset_evals into it
+            // 2. Add pi_coset_evals (device → device add)
+            // 3. For each (qcp, bsb22): upload qcp, run FMA kernel, free qcp
+            // 4. Download fused result to CPU, free GPU buffers
+            let big_n = 1usize << big_log;
+            let elem_sz = std::mem::size_of::<Fr>();
+            let byte_sz = big_n * elem_sz;
+
+            let mut d_fused: *mut std::ffi::c_void = std::ptr::null_mut();
+            let err = unsafe { sp1_gpu_sys::runtime::cuda_malloc(&mut d_fused as *mut _, byte_sz) };
+            if err != unsafe { sp1_gpu_sys::runtime::CUDA_SUCCESS_CSL } {
+                panic!("cuda_malloc failed for qk+pi fusion buffer");
+            }
+            // Copy qk_coset_evals → d_fused
+            let err = unsafe {
+                sp1_gpu_sys::runtime::cuda_mem_copy_host_to_device(
+                    d_fused,
+                    self.cached.qk_coset_evals.as_ptr() as *const std::ffi::c_void,
+                    byte_sz,
+                )
+            };
+            if err != unsafe { sp1_gpu_sys::runtime::CUDA_SUCCESS_CSL } {
+                panic!("H2D failed for qk_coset_evals fusion");
+            }
+
+            // Add pi: d_fused[i] += d_pi_coset[i]
+            unsafe {
+                sp1_gpu_sys::plonk::bn254_elementwise_add(d_fused, d_pi_coset.ptr, big_n);
+            }
+            drop(d_pi_coset);
+
+            // FMA each qcp*bsb22
+            for (j, d_bsb22) in d_bsb22_cosets.iter().enumerate() {
+                if j < self.cached.qcp_coset_evals.len() {
+                    let mut d_qcp: *mut std::ffi::c_void = std::ptr::null_mut();
+                    let err = unsafe { sp1_gpu_sys::runtime::cuda_malloc(&mut d_qcp as *mut _, byte_sz) };
+                    if err != unsafe { sp1_gpu_sys::runtime::CUDA_SUCCESS_CSL } {
+                        panic!("cuda_malloc failed for qcp upload");
+                    }
+                    let err = unsafe {
+                        sp1_gpu_sys::runtime::cuda_mem_copy_host_to_device(
+                            d_qcp,
+                            self.cached.qcp_coset_evals[j].as_ptr() as *const std::ffi::c_void,
+                            byte_sz,
+                        )
+                    };
+                    if err != unsafe { sp1_gpu_sys::runtime::CUDA_SUCCESS_CSL } {
+                        panic!("H2D failed for qcp_coset_evals");
+                    }
+                    // d_fused[i] += d_qcp[i] * d_bsb22[i]
+                    unsafe {
+                        sp1_gpu_sys::plonk::bn254_elementwise_fma(
+                            d_fused,
+                            d_qcp as *const std::ffi::c_void,
+                            d_bsb22.ptr,
+                            big_n,
+                        );
+                    }
+                    unsafe { sp1_gpu_sys::runtime::cuda_free(d_qcp as *const std::ffi::c_void) };
                 }
+            }
+            drop(d_bsb22_cosets);
+
+            // Download fused result to CPU (pre-faulted)
+            let mut pi_bsb22 = Vec::with_capacity(big_n);
+            unsafe { pi_bsb22.set_len(big_n); }
+            pi_bsb22.par_chunks_mut(128).for_each(|chunk| {
+                unsafe { std::ptr::write_volatile(&mut chunk[0] as *mut Fr, Fr::ZERO); }
             });
-            pi_bsb22
+            let err = unsafe {
+                sp1_gpu_sys::runtime::cuda_mem_copy_device_to_host(
+                    pi_bsb22.as_mut_ptr() as *mut std::ffi::c_void,
+                    d_fused,
+                    byte_sz,
+                )
+            };
+            if err != unsafe { sp1_gpu_sys::runtime::CUDA_SUCCESS_CSL } {
+                panic!("D2H failed for fused pi_bsb22");
+            }
+            unsafe { sp1_gpu_sys::runtime::cuda_free(d_fused as *const std::ffi::c_void) };
+
+            (pi_bsb22, bsb22_coeffs_list)
         };
 
         // Join grand product thread
@@ -902,15 +975,8 @@ impl PlonkProver {
         ) = {
             let big_log = self.cached.big_domain.log_size;
 
-            // BSB22 coefficients only (PI already done during Round 2 overlap)
-            let bsb22_refs: Vec<&[Fr]> = bsb22_polys_fr.iter().map(|v| v.as_slice()).collect();
-            let bsb22: Vec<Vec<Fr>> = if bsb22_refs.is_empty() {
-                Vec::new()
-            } else {
-                let ifft_results = crate::domain::gpu_ntt::gpu_batch_ifft(&bsb22_refs, domain.log_size);
-                crate::domain::gpu_ntt::free_ntt_buffer();
-                ifft_results
-            };
+            // BSB22 coefficients already computed during Round 2 aux NTT overlap
+            let bsb22 = bsb22_coeffs_from_aux;
 
             // Start precomputing INVERSE twiddle VALUES on a background CPU thread.
             // CPU-only computation (~2s with OpenMP) overlaps with GPU coset FFTs.

@@ -366,27 +366,9 @@ impl PersistentMsm {
             z: BN254Fq { limbs: [0; 8] },
         };
 
-        // GPU Montgomery conversion: pass scalars in Montgomery form, let the GPU convert.
-        // On CUDA (sppark MSM): always works, saves ~60ms CPU conversion.
-        // On HIP (custom MSM): has a driver issue that causes MSM failure, so fall back
-        // to CPU conversion. Detected at compile time via cfg target env.
-        #[cfg(not(target_env = ""))] // This cfg is always true — we detect HIP at runtime below
-        let canonical_holder: Option<Vec<crate::BN254Fr>>;
-        let (scalar_ptr, mont_flag) = if std::env::var("SP1_HIP_ENABLED").is_ok() {
-            // HIP: CPU conversion (GPU mont kernel has driver issues)
-            use rayon::prelude::*;
-            let zero_canonical = crate::BN254Fr { limbs: [0; 8] };
-            let cs: Vec<crate::BN254Fr> = scalars
-                .par_iter()
-                .map(|s| if s.is_zero() { zero_canonical } else { s.to_bn254fr() })
-                .collect();
-            let ptr = cs.as_ptr() as *const c_void;
-            canonical_holder = Some(cs);
-            (ptr, false)
-        } else {
-            canonical_holder = None;
-            (scalars.as_ptr() as *const c_void, true)
-        };
+        // GPU Montgomery conversion: pass scalars in Montgomery form, GPU converts.
+        // mont=true tells the MSM to run a GPU kernel for Montgomery→canonical conversion.
+        let (scalar_ptr, mont_flag) = (scalars.as_ptr() as *const c_void, true);
         let err = unsafe {
             sp1_gpu_sys::msm::sp1_bn254_msm_invoke(
                 self.ctx,
@@ -396,7 +378,6 @@ impl PersistentMsm {
                 mont_flag,
             )
         };
-        drop(canonical_holder); // Keep alive until after FFI call
         if err != unsafe { sp1_gpu_sys::runtime::CUDA_SUCCESS_CSL } {
             let msg = if err.message.is_null() {
                 "unknown error".to_string()

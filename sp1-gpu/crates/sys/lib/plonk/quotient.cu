@@ -598,3 +598,35 @@ rustCudaError_t sp1_plonk_quotient_eval_streamed(
     cudaFree(d_hi_table);
     return CUDA_SUCCESS_CSL;
 }
+
+// ============================================================
+// BN254 element-wise GPU kernels for on-device pi+qk+bsb22 fusion
+// ============================================================
+
+__global__ void bn254_add_assign_kernel(fr_t* d_a, const fr_t* d_b, uint32_t n) {
+    uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) d_a[i] = d_a[i] + d_b[i];
+}
+
+__global__ void bn254_fma_assign_kernel(fr_t* d_a, const fr_t* d_b, const fr_t* d_c, uint32_t n) {
+    uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) d_a[i] = d_a[i] + d_b[i] * d_c[i];
+}
+
+extern "C"
+void bn254_elementwise_add(void* d_a, const void* d_b, size_t n) {
+    uint32_t threads = 256;
+    uint32_t blocks = ((uint32_t)n + threads - 1) / threads;
+    bn254_add_assign_kernel<<<blocks, threads>>>(
+        (fr_t*)d_a, (const fr_t*)d_b, (uint32_t)n);
+    cudaDeviceSynchronize();
+}
+
+extern "C"
+void bn254_elementwise_fma(void* d_a, const void* d_b, const void* d_c, size_t n) {
+    uint32_t threads = 256;
+    uint32_t blocks = ((uint32_t)n + threads - 1) / threads;
+    bn254_fma_assign_kernel<<<blocks, threads>>>(
+        (fr_t*)d_a, (const fr_t*)d_b, (const fr_t*)d_c, (uint32_t)n);
+    cudaDeviceSynchronize();
+}
