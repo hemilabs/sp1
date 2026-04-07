@@ -11,6 +11,8 @@
 //! - **GPU** (when available): MSM for KZG commitments, NTT for domain transforms
 
 use crate::domain::Domain;
+#[cfg(feature = "cuda")]
+use crate::fields::batch_inv_fr_inplace;
 use crate::fields::{batch_inv_fr, Fr};
 use crate::g1::{msm, G1Affine};
 use crate::kzg::{BatchOpeningProof, OpeningProof};
@@ -97,6 +99,12 @@ pub(crate) struct CachedFrData {
     /// 4 cyclic zh_inv constants: 1/zh_values[i % 4].
     #[allow(dead_code)]
     zh_invs_4: [Fr; 4],
+    /// Two-level omega lookup tables for on-the-fly coset point computation in GPU kernel.
+    /// lo_table[k] = omega_4N^k for k = 0..2^14-1
+    /// hi_table[k] = omega_4N^(k*2^14) for k = 0..big_n/2^14-1
+    /// Total ~768 KB pinned memory, replaces 4.3 GiB coset_points PCIe transfer.
+    omega_lo_table: Vec<Fr>,
+    omega_hi_table: Vec<Fr>,
 }
 
 impl PlonkProver {
@@ -392,6 +400,26 @@ impl PlonkProver {
             unsafe { sp1_gpu_sys::dft_bn254::bn254_ntt_clear_twiddle_cache() };
         }
 
+        // Two-level omega lookup tables for on-the-fly coset point computation.
+        // lo_table[k] = omega_4N^k for k = 0..2^14-1
+        // hi_table[k] = omega_4N^(k*2^14) for k = 0..big_n/2^14-1
+        let omega_lo_table: Vec<Fr> = {
+            let mut t = vec![Fr::ONE; 1 << 14];
+            for i in 1..t.len() {
+                t[i] = t[i - 1] * omega_4n;
+            }
+            t
+        };
+        let omega_hi_table: Vec<Fr> = {
+            let omega_step = omega_4n.pow(&[1u64 << 14, 0, 0, 0]);
+            let hi_len = big_n >> 14;
+            let mut t = vec![Fr::ONE; hi_len];
+            for i in 1..t.len() {
+                t[i] = t[i - 1] * omega_step;
+            }
+            t
+        };
+
         let mut cached = CachedFrData {
             domain,
             coset_shift,
@@ -430,6 +458,8 @@ impl PlonkProver {
             zh_vals_4: [zh_values[0], zh_values[1], zh_values[2], zh_values[3]],
             zh_invs_4: [Fr::ZERO; 4], // filled below after struct init
             zh_values,
+            omega_lo_table,
+            omega_hi_table,
         };
         // Fill zh_invs_4 from the already-computed zh_inv
         cached.zh_invs_4 = [cached.zh_inv[0], cached.zh_inv[1], cached.zh_inv[2], cached.zh_inv[3]];
@@ -473,6 +503,9 @@ impl PlonkProver {
             // coset_points, zh_inv, zh_values no longer transferred to GPU
             // (computed on-the-fly in kernel from lookup tables + 4 cyclic constants)
             pin(&cached.x_minus_one_n_inv);
+            // Pin omega lookup tables for DMA upload (~768 KB total)
+            pin(&cached.omega_lo_table);
+            pin(&cached.omega_hi_table);
         }
 
         tracing::info!("VK commitments and cached Fr data computed");
@@ -505,6 +538,22 @@ impl PlonkProver {
 
         tracing::info!(n, public_inputs = public_inputs.len(), "Starting PLONK proof generation");
 
+        // Use cached circuit-static data (converted once in new())
+        let domain = &self.cached.domain;
+        let srs_lagrange = &self.cached.srs_lagrange;
+
+        // Start SRS Lagrange upload BEFORE wire conversion to overlap GPU upload with CPU work
+        #[cfg(feature = "cuda")]
+        let srs_upload_handle = {
+            let srs_ptr = srs_lagrange.as_ptr() as usize;
+            let srs_len = srs_lagrange.len();
+            std::thread::spawn(move || {
+                let srs =
+                    unsafe { std::slice::from_raw_parts(srs_ptr as *const G1Affine, srs_len) };
+                crate::g1::PersistentMsm::new(srs)
+            })
+        };
+
         // Convert per-proof wire values to Montgomery Fr for arithmetic (parallel)
         let t = std::time::Instant::now();
         let l_fr: Vec<Fr> = l.par_iter().map(Fr::from_bn254fr).collect();
@@ -516,10 +565,6 @@ impl PlonkProver {
         let bsb22_polys_fr: Vec<Vec<Fr>> =
             bsb22_polys.iter().map(|p| p.par_iter().map(Fr::from_bn254fr).collect()).collect();
         eprintln!("[T] 1. Wire BN254Fr→Fr conversion: {:?}", t.elapsed());
-
-        // Use cached circuit-static data (converted once in new())
-        let domain = &self.cached.domain;
-        let srs_lagrange = &self.cached.srs_lagrange;
         let srs_canonical = &self.cached.srs_canonical;
         let s1 = &self.cached.s1;
         let s2 = &self.cached.s2;
@@ -545,12 +590,11 @@ impl PlonkProver {
         // Bind VK public data to transcript (uses cached VK commitments)
         self.bind_public_data(&mut transcript, &pi_fr)?;
 
-        // Create persistent GPU MSM context: uploads SRS Lagrange points to GPU once,
-        // reused for all Lagrange-basis commitments (L, R, O, Z) in this proof.
+        // Join SRS upload thread (was spawned before wire conversion to overlap)
         let t = std::time::Instant::now();
         #[cfg(feature = "cuda")]
-        let persistent_lag_msm = crate::g1::PersistentMsm::new(srs_lagrange);
-        eprintln!("[T] 2. PersistentMsm::new for Lagrange SRS: {:?}", t.elapsed());
+        let persistent_lag_msm = srs_upload_handle.join().expect("SRS upload thread panicked");
+        eprintln!("[T] 2. PersistentMsm::new for Lagrange SRS (overlapped): {:?}", t.elapsed());
 
         // Commit wire polynomials using persistent MSM with depadding.
         // Depadding removes hot scalar values that cause Pippenger bucket serialization,
@@ -598,8 +642,186 @@ impl PlonkProver {
         // ================================================================
         tracing::info!("Round 2: Grand product Z(X)");
 
-        // Compute Z polynomial in Lagrange basis (parallel prefix product)
+        // Prepare BSB22 data BEFORE grand product so we can overlap PI computation
+        let bsb22_commitments_bn: Vec<BN254G1Affine> = if bsb22_commitments.is_empty() {
+            vec![BN254G1Affine::ZERO; self.cached.num_qcp]
+        } else {
+            bsb22_commitments.to_vec()
+        };
+        let bsb22_polys_fr: Vec<Vec<Fr>> = if bsb22_polys.is_empty() && self.cached.num_qcp > 0 {
+            vec![vec![Fr::ZERO; n]; self.cached.num_qcp]
+        } else {
+            bsb22_polys_fr
+        };
+
+        // Compute PI polynomial evals (needed for fused iFFT+cosetFFT on main thread)
+        #[allow(unused_variables)]
+        let pi_poly_evals = {
+            let nb_pub = self.data.nb_public_variables;
+            let mut pi_ev = vec![Fr::ZERO; n];
+            let copy_len = pi_fr.len().min(nb_pub);
+            pi_ev[..copy_len].copy_from_slice(&pi_fr[..copy_len]);
+            for (i, commit) in bsb22_commitments_bn.iter().enumerate() {
+                if i < self.data.commitment_constraint_indexes.len() {
+                    let hashed =
+                        crate::hash_to_field::hash_to_field_bsb22(&commit.to_transcript_bytes());
+                    let pos = nb_pub + self.data.commitment_constraint_indexes[i];
+                    if pos < n {
+                        pi_ev[pos] = hashed;
+                    }
+                }
+            }
+            pi_ev
+        };
+
+        // Spawn grand product on background thread using batch_inv_fr_inplace.
+        // Raw pointers (as usize for Send) to avoid borrow conflicts.
         let t = std::time::Instant::now();
+        #[cfg(feature = "cuda")]
+        let grand_product_handle = {
+            let omega_ptr = self.cached.omega_powers.as_ptr() as usize;
+            let l_ptr = l_fr.as_ptr() as usize;
+            let r_ptr = r_fr.as_ptr() as usize;
+            let o_ptr = o_fr.as_ptr() as usize;
+            let s1_ptr = s1.as_ptr() as usize;
+            let s2_ptr = s2.as_ptr() as usize;
+            let s3_ptr = s3.as_ptr() as usize;
+            let gp_n = n;
+            let gp_beta = beta;
+            let gp_gamma = gamma;
+            let gp_coset_shift = coset_shift;
+            std::thread::spawn(move || {
+                let omega_powers =
+                    unsafe { std::slice::from_raw_parts(omega_ptr as *const Fr, gp_n) };
+                let l = unsafe { std::slice::from_raw_parts(l_ptr as *const Fr, gp_n) };
+                let r = unsafe { std::slice::from_raw_parts(r_ptr as *const Fr, gp_n) };
+                let o = unsafe { std::slice::from_raw_parts(o_ptr as *const Fr, gp_n) };
+                let s1 = unsafe { std::slice::from_raw_parts(s1_ptr as *const Fr, gp_n) };
+                let s2 = unsafe { std::slice::from_raw_parts(s2_ptr as *const Fr, gp_n) };
+                let s3 = unsafe { std::slice::from_raw_parts(s3_ptr as *const Fr, gp_n) };
+
+                let k1 = gp_coset_shift;
+                let k2 = k1 * k1;
+
+                // Compute element-wise numerators and denominators (parallel)
+                let (numerators, mut denominators): (Vec<Fr>, Vec<Fr>) = (0..gp_n)
+                    .into_par_iter()
+                    .map(|i| {
+                        let w = omega_powers[i];
+                        let beta_w = gp_beta * w;
+                        let n1 = l[i] + beta_w + gp_gamma;
+                        let n2 = r[i] + beta_w * k1 + gp_gamma;
+                        let n3 = o[i] + beta_w * k2 + gp_gamma;
+                        let num = n1 * n2 * n3;
+
+                        let d1 = l[i] + gp_beta * s1[i] + gp_gamma;
+                        let d2 = r[i] + gp_beta * s2[i] + gp_gamma;
+                        let d3 = o[i] + gp_beta * s3[i] + gp_gamma;
+                        let den = d1 * d2 * d3;
+
+                        (num, den)
+                    })
+                    .unzip();
+
+                // Batch invert denominators IN-PLACE
+                batch_inv_fr_inplace(&mut denominators);
+
+                // Compute ratios: num[i] * inv_den[i] (parallel)
+                let ratios: Vec<Fr> = numerators
+                    .par_iter()
+                    .zip(denominators.par_iter())
+                    .map(|(n, d)| *n * *d)
+                    .collect();
+
+                // Parallel prefix product: Z[0] = 1, Z[i] = Z[i-1] * ratio[i-1]
+                let z = {
+                    let num_chunks = rayon::current_num_threads().max(1);
+                    let chunk_size = gp_n.div_ceil(num_chunks);
+
+                    let chunk_prefixes: Vec<Vec<Fr>> = ratios
+                        .par_chunks(chunk_size)
+                        .map(|chunk| {
+                            let mut prefix = Vec::with_capacity(chunk.len());
+                            let mut acc = Fr::ONE;
+                            for &r in chunk {
+                                prefix.push(acc);
+                                acc *= r;
+                            }
+                            prefix.push(acc);
+                            prefix
+                        })
+                        .collect();
+
+                    let mut chunk_cumulative = vec![Fr::ONE; chunk_prefixes.len()];
+                    for i in 1..chunk_prefixes.len() {
+                        chunk_cumulative[i] = chunk_cumulative[i - 1]
+                            * chunk_prefixes[i - 1][chunk_prefixes[i - 1].len() - 1];
+                    }
+
+                    let mut z = vec![Fr::ZERO; gp_n];
+                    z.par_chunks_mut(chunk_size).enumerate().for_each(|(ci, z_chunk)| {
+                        let cumul = chunk_cumulative[ci];
+                        let prefix = &chunk_prefixes[ci];
+                        for (j, z_val) in z_chunk.iter_mut().enumerate() {
+                            *z_val = cumul * prefix[j];
+                        }
+                    });
+                    z
+                };
+
+                let final_product = z[gp_n - 1] * ratios[gp_n - 1];
+                (z, final_product)
+            })
+        };
+
+        // On main thread: run PI+BSB22 fused iFFT+cosetFFT while grand product runs
+        #[cfg(feature = "cuda")]
+        let pi_bsb22_precomputed = {
+            let big_log = self.cached.big_domain.log_size;
+            let lg_n = domain.log_size;
+
+            // Fused iFFT + coset FFT for PI polynomial
+            let (_pi_coeffs, pi_coset_evals) =
+                crate::domain::gpu_ntt::gpu_ifft_then_coset_fft_to_host(
+                    &pi_poly_evals,
+                    lg_n,
+                    big_log,
+                );
+
+            // Fused iFFT + coset FFT for BSB22 polynomials
+            let bsb22_coset_evals: Vec<Vec<Fr>> = bsb22_polys_fr
+                .iter()
+                .map(|p| {
+                    let (_coeffs, evals) =
+                        crate::domain::gpu_ntt::gpu_ifft_then_coset_fft_to_host(p, lg_n, big_log);
+                    evals
+                })
+                .collect();
+
+            // Fuse pi + qcp*bsb22
+            let qcp_evals = &self.cached.qcp_coset_evals;
+            let mut pi_bsb22 = pi_coset_evals;
+            pi_bsb22.par_iter_mut().enumerate().for_each(|(i, v)| {
+                for (qcp_ev, bsb22_ev) in qcp_evals.iter().zip(bsb22_coset_evals.iter()) {
+                    *v += qcp_ev[i] * bsb22_ev[i];
+                }
+            });
+            pi_bsb22
+        };
+
+        // Join grand product thread
+        #[cfg(feature = "cuda")]
+        let (z_lagrange, final_product) =
+            grand_product_handle.join().expect("Grand product thread panicked");
+        #[cfg(feature = "cuda")]
+        {
+            anyhow::ensure!(
+                final_product == Fr::ONE,
+                "Grand product check failed: Z[N] != 1. Wire assignments violate copy constraints."
+            );
+        }
+
+        #[cfg(not(feature = "cuda"))]
         let z_lagrange = self.compute_grand_product(
             &l_fr,
             &r_fr,
@@ -612,9 +834,9 @@ impl PlonkProver {
             domain,
             &coset_shift,
         )?;
-        eprintln!("[T] 4. Grand product computation: {:?}", t.elapsed());
+        eprintln!("[T] 4. Grand product (overlapped with PI NTTs): {:?}", t.elapsed());
 
-        // Commit Z (reuses persistent Lagrange MSM context — no SRS re-upload)
+        // Commit Z (reuses persistent Lagrange MSM context -- no SRS re-upload)
         let t = std::time::Instant::now();
         #[cfg(feature = "cuda")]
         let commit_z = persistent_lag_msm.msm(&z_lagrange).to_affine();
@@ -625,20 +847,8 @@ impl PlonkProver {
         eprintln!("[T] 5. Z commit: {:?}", t.elapsed());
         let commit_z_bn = commit_z.to_bn254();
 
-        // BSB22 commitments
-        let t = std::time::Instant::now();
-        let bsb22_commitments_bn: Vec<BN254G1Affine> = if bsb22_commitments.is_empty() {
-            vec![BN254G1Affine::ZERO; self.cached.num_qcp]
-        } else {
-            bsb22_commitments.to_vec()
-        };
-        let bsb22_polys_fr: Vec<Vec<Fr>> = if bsb22_polys.is_empty() && self.cached.num_qcp > 0 {
-            vec![vec![Fr::ZERO; n]; self.cached.num_qcp]
-        } else {
-            bsb22_polys_fr
-        };
-
         // Bind BSB22 + Z, derive alpha
+        let t = std::time::Instant::now();
         for bsb22 in &bsb22_commitments_bn {
             transcript.bind("alpha", &bsb22.to_transcript_bytes());
         }
@@ -670,6 +880,10 @@ impl PlonkProver {
         #[cfg(feature = "cuda")]
         let use_gpu_quotient = gpu_vram_bytes >= 20 * 1024 * 1024 * 1024; // 20 GiB threshold
 
+        // pi_bsb22_evals already computed during Round 2 overlap (cuda path)
+        #[cfg(feature = "cuda")]
+        let pi_bsb22_evals = pi_bsb22_precomputed;
+
         #[cfg(feature = "cuda")]
         let (
             l_coeffs,
@@ -677,7 +891,6 @@ impl PlonkProver {
             o_coeffs,
             z_coeffs,
             bsb22_coeffs,
-            pi_bsb22_evals,
             d_l,
             d_r,
             d_o,
@@ -689,45 +902,19 @@ impl PlonkProver {
         ) = {
             let big_log = self.cached.big_domain.log_size;
 
-            // Compute PI polynomial in evaluation form (needed for iFFT batch)
-            let pi_poly_evals = {
-                let nb_pub = self.data.nb_public_variables;
-                let mut pi_ev = vec![Fr::ZERO; n];
-                let copy_len = pi_fr.len().min(nb_pub);
-                pi_ev[..copy_len].copy_from_slice(&pi_fr[..copy_len]);
-                for (i, commit) in bsb22_commitments_bn.iter().enumerate() {
-                    if i < self.data.commitment_constraint_indexes.len() {
-                        let hashed = crate::hash_to_field::hash_to_field_bsb22(
-                            &commit.to_transcript_bytes(),
-                        );
-                        let pos = nb_pub + self.data.commitment_constraint_indexes[i];
-                        if pos < n {
-                            pi_ev[pos] = hashed;
-                        }
-                    }
-                }
-                pi_ev
-            };
-
-            // iFFTs: batch all 6 (L,R,O,Z,bsb22,pi) into single GPU call
+            // BSB22 coefficients only (PI already done during Round 2 overlap)
             let bsb22_refs: Vec<&[Fr]> = bsb22_polys_fr.iter().map(|v| v.as_slice()).collect();
-            let mut ifft_polys: Vec<&[Fr]> = vec![&l_fr, &r_fr, &o_fr, &z_lagrange];
-            ifft_polys.extend(bsb22_refs.iter());
-            ifft_polys.push(&pi_poly_evals);
-            let ifft_results = crate::domain::gpu_ntt::gpu_batch_ifft(&ifft_polys, domain.log_size);
-            let mut ifft_iter = ifft_results.into_iter();
-            let l_c = ifft_iter.next().unwrap();
-            let r_c = ifft_iter.next().unwrap();
-            let o_c = ifft_iter.next().unwrap();
-            let z_c = ifft_iter.next().unwrap();
-            let bsb22: Vec<Vec<Fr>> = (&mut ifft_iter).take(bsb22_refs.len()).collect();
-            let pi_poly_coeffs = ifft_iter.next().unwrap();
-            crate::domain::gpu_ntt::free_ntt_buffer();
-            unsafe { sp1_gpu_sys::dft_bn254::bn254_ntt_clear_twiddle_cache() };
+            let bsb22: Vec<Vec<Fr>> = if bsb22_refs.is_empty() {
+                Vec::new()
+            } else {
+                let ifft_results = crate::domain::gpu_ntt::gpu_batch_ifft(&bsb22_refs, domain.log_size);
+                crate::domain::gpu_ntt::free_ntt_buffer();
+                ifft_results
+            };
 
             // Start precomputing INVERSE twiddle VALUES on a background CPU thread.
             // CPU-only computation (~2s with OpenMP) overlaps with GPU coset FFTs.
-            // No GPU upload — that happens later when the coset iFFT calls ensure(),
+            // No GPU upload -- that happens later when the coset iFFT calls ensure(),
             // which finds host_valid=true and does a fast re-upload (~300ms).
             let inv_precompute = {
                 let lg = big_log;
@@ -736,28 +923,22 @@ impl PlonkProver {
                 })
             };
 
-            // Coset FFTs: two paths based on VRAM
+            // Coset FFTs: two paths based on VRAM (only L/R/O/Z -- PI+BSB22 already done)
             let cfft_padded = |c: &[Fr]| crate::domain::gpu_ntt::gpu_coset_fft_padded(c, big_log);
 
             if use_gpu_quotient {
-                // ≥20 GiB path: keep L/R/O/Z coset evals on GPU as DeviceBuffers
-                use crate::domain::gpu_ntt::gpu_coset_fft_to_device;
-                let d_l = gpu_coset_fft_to_device(&l_c, big_log);
-                let d_r = gpu_coset_fft_to_device(&r_c, big_log);
-                let d_o = gpu_coset_fft_to_device(&o_c, big_log);
-
-                let pi_evals = cfft_padded(&pi_poly_coeffs);
-                let bsb22_evals: Vec<Vec<Fr>> = bsb22.iter().map(|p| cfft_padded(p)).collect();
-                let qcp_evals = &self.cached.qcp_coset_evals;
-                let mut pi_bsb22 = pi_evals;
-                pi_bsb22.par_iter_mut().enumerate().for_each(|(i, v)| {
-                    for (qcp_ev, bsb22_ev) in qcp_evals.iter().zip(bsb22_evals.iter()) {
-                        *v += qcp_ev[i] * bsb22_ev[i];
-                    }
-                });
-
-                let d_z = gpu_coset_fft_to_device(&z_c, big_log);
+                // >=20 GiB path: fused iFFT+cosetFFT keeps L/R/O/Z on GPU as DeviceBuffers
+                use crate::domain::gpu_ntt::gpu_ifft_then_coset_fft_to_device;
+                let lg = domain.log_size;
+                let _t_ntt = std::time::Instant::now();
+                let (l_c, d_l) = gpu_ifft_then_coset_fft_to_device(&l_fr, lg, big_log);
+                let (r_c, d_r) = gpu_ifft_then_coset_fft_to_device(&r_fr, lg, big_log);
+                let (o_c, d_o) = gpu_ifft_then_coset_fft_to_device(&o_fr, lg, big_log);
+                let (z_c, d_z) = gpu_ifft_then_coset_fft_to_device(&z_lagrange, lg, big_log);
+                crate::domain::gpu_ntt::free_ntt_buffer();
+                unsafe { sp1_gpu_sys::dft_bn254::bn254_ntt_clear_twiddle_cache() };
                 inv_precompute.join().expect("inverse twiddle precompute failed");
+                eprintln!("[T] 7-ntt. L/R/O/Z iFFT+cosetFFT (aux done earlier): {:?}", _t_ntt.elapsed());
 
                 (
                     l_c,
@@ -765,7 +946,6 @@ impl PlonkProver {
                     o_c,
                     z_c,
                     bsb22,
-                    pi_bsb22,
                     Some(d_l),
                     Some(d_r),
                     Some(d_o),
@@ -776,30 +956,19 @@ impl PlonkProver {
                     Vec::new(),
                 )
             } else {
-                // <20 GiB path: all coset FFTs return to CPU (no DeviceBuffers)
-                // Each coset FFT uses ~8.5 GiB peak (NTT buf + twiddles), fits in 16 GiB
-                let l_coset = cfft_padded(&l_c);
-                let r_coset = cfft_padded(&r_c);
-                let o_coset = cfft_padded(&o_c);
-
-                let pi_evals = cfft_padded(&pi_poly_coeffs);
-                let bsb22_evals: Vec<Vec<Fr>> = bsb22.iter().map(|p| cfft_padded(p)).collect();
-                let qcp_evals = &self.cached.qcp_coset_evals;
-                let mut pi_bsb22 = pi_evals;
-                pi_bsb22.par_iter_mut().enumerate().for_each(|(i, v)| {
-                    for (qcp_ev, bsb22_ev) in qcp_evals.iter().zip(bsb22_evals.iter()) {
-                        *v += qcp_ev[i] * bsb22_ev[i];
-                    }
-                });
-
-                let z_coset = cfft_padded(&z_c);
+                // <20 GiB path: iFFT + coset FFTs return to CPU (no DeviceBuffers)
+                let lg = domain.log_size;
+                let (l_c, l_coset) = crate::domain::gpu_ntt::gpu_ifft_then_coset_fft_to_host(&l_fr, lg, big_log);
+                let (r_c, r_coset) = crate::domain::gpu_ntt::gpu_ifft_then_coset_fft_to_host(&r_fr, lg, big_log);
+                let (o_c, o_coset) = crate::domain::gpu_ntt::gpu_ifft_then_coset_fft_to_host(&o_fr, lg, big_log);
+                let (z_c, z_coset) = crate::domain::gpu_ntt::gpu_ifft_then_coset_fft_to_host(&z_lagrange, lg, big_log);
                 crate::domain::gpu_ntt::free_ntt_buffer();
                 unsafe { sp1_gpu_sys::dft_bn254::bn254_ntt_clear_twiddle_cache() };
                 inv_precompute.join().expect("inverse twiddle precompute failed");
 
                 (
-                    l_c, r_c, o_c, z_c, bsb22, pi_bsb22, None, None, None, None, l_coset, r_coset,
-                    o_coset, z_coset,
+                    l_c, r_c, o_c, z_c, bsb22, None, None, None, None, l_coset, r_coset, o_coset,
+                    z_coset,
                 )
             }
         };
@@ -887,24 +1056,29 @@ impl PlonkProver {
 
         eprintln!("[T] 7. Round 3 (iFFT + coset FFT + quotient): {:?}", t.elapsed());
 
-        // Split h into h0, h1, h2 at degree boundaries
-        // h(X) = h0(X) + X^{n+2} h1(X) + X^{2(n+2)} h2(X)
+        // Start SRS canonical upload while CPU does split + h2_nnz (overlaps ~600ms upload
+        // with ~100ms CPU work). On HIP this works because the GPU is idle after the quotient.
         let t = std::time::Instant::now();
-        let (h0_coeffs, h1_coeffs, h2_coeffs) = split_quotient(&h_coeffs, n);
+        #[cfg(feature = "cuda")]
+        let srs_can_handle = {
+            let ptr_val = srs_canonical.as_ptr() as usize;
+            let len = srs_canonical.len();
+            std::thread::spawn(move || {
+                let srs = unsafe {
+                    std::slice::from_raw_parts(ptr_val as *const G1Affine, len)
+                };
+                crate::g1::PersistentMsm::new(srs)
+            })
+        };
 
-        // Detect h2 sparsity: count non-zero coefficients to choose the best commit path.
-        // For SP1's circuit, h2 typically has only 2-3 non-zero coefficients out of ~33M,
-        // so a full GPU MSM is extremely wasteful. We use three tiers:
-        //   - all zero:    point at infinity (free)
-        //   - <= 1000 nz:  sparse CPU scalar_mul + accumulate (microseconds)
-        //   - > 1000 nz:   full MSM (GPU or CPU fallback)
+        // Split h into h0, h1, h2 at degree boundaries (CPU, overlapped with SRS upload)
+        let (h0_coeffs, h1_coeffs, h2_coeffs) = split_quotient(&h_coeffs, n);
         let h2_nnz: usize = h2_coeffs.par_iter().filter(|c| !c.is_zero()).count();
         let h2_is_zero = h2_nnz == 0;
 
-        // Create persistent canonical MSM context (SRS uploaded once, reused for
-        // h0/h1/h2 commits + batch_h + z_shifted_h in Round 5).
+        // Wait for SRS canonical upload
         #[cfg(feature = "cuda")]
-        let persistent_can_msm = crate::g1::PersistentMsm::new(srs_canonical);
+        let persistent_can_msm = srs_can_handle.join().expect("SRS canonical upload panicked");
 
         // Commit h0, h1, h2 using canonical SRS
         #[cfg(feature = "cuda")]
@@ -1013,6 +1187,15 @@ impl PlonkProver {
         if !h2_is_zero {
             eval_tasks.push((h2_coeffs, zeta)); // 15: h2_zeta (only if non-zero)
         }
+        // Add qcp + bsb22 polynomials to the same parallel batch
+        let base_count = eval_tasks.len(); // 15 or 16
+        for q in qcp_coeffs.iter() {
+            eval_tasks.push((q.as_slice(), zeta));
+        }
+        for b in bsb22_coeffs.iter() {
+            eval_tasks.push((b.as_slice(), zeta));
+        }
+
         let evals: Vec<Fr> =
             eval_tasks.par_iter().map(|(poly, point)| eval_poly_at(poly, point)).collect();
 
@@ -1033,9 +1216,10 @@ impl PlonkProver {
         let h1_zeta = evals[14];
         let h2_zeta = if h2_is_zero { Fr::ZERO } else { evals[15] };
 
-        // Evaluate Qcp + BSB22 polynomials at ζ (parallel)
-        let qcp_zeta: Vec<Fr> = qcp_coeffs.par_iter().map(|q| eval_poly_at(q, &zeta)).collect();
-        let bsb22_zeta: Vec<Fr> = bsb22_coeffs.par_iter().map(|p| eval_poly_at(p, &zeta)).collect();
+        // Extract qcp and bsb22 evaluations from the same batch
+        let mut idx = if h2_is_zero { 15 } else { 16 };
+        let qcp_zeta: Vec<Fr> = (0..qcp_coeffs.len()).map(|_| { let v = evals[idx]; idx += 1; v }).collect();
+        let bsb22_zeta: Vec<Fr> = (0..bsb22_coeffs.len()).map(|_| { let v = evals[idx]; idx += 1; v }).collect();
 
         // Compute const_lin as scalar dot product (O(1) instead of O(N) Horner eval).
         // const_lin = Σ scalar_i * component_i(ζ)
@@ -1297,8 +1481,20 @@ impl PlonkProver {
         // Fused linear combination: result = Σ scalar_i * poly_i - eval_correction
         // This replaces compute_linearization (10 O(N) passes) + fold_and_subtract (7 O(N) passes)
         // with a single set of ~17 O(N) passes but eliminates the intermediate 1 GiB lin_poly allocation.
+        // Pre-fault result vector; linear_combination_into does write-first so no zeroing needed.
         let max_len = fused_polys.iter().map(|p| p.len()).max().unwrap_or(0);
-        let mut result = vec![Fr::ZERO; max_len];
+        let mut result = {
+            let mut v = Vec::with_capacity(max_len);
+            unsafe { v.set_len(max_len) };
+            v.par_chunks_mut((max_len / rayon::current_num_threads().max(1)).max(4096)).for_each(
+                |c| {
+                    for slot in c.iter_mut() {
+                        unsafe { std::ptr::write_volatile(slot as *mut Fr, Fr::ZERO) };
+                    }
+                },
+            );
+            v
+        };
         crate::polynomial::linear_combination_into(&mut result, &fused_polys, &fused_scalars);
         result[0] -= eval_correction;
         let folded = Polynomial::new(result);
@@ -1512,48 +1708,52 @@ impl PlonkProver {
         let zeroed: Vec<Fr> =
             evals.par_iter().map(|s| if hot_set.contains(s) { Fr::ZERO } else { *s }).collect();
 
-        // Main MSM on zeroed scalars (fast — no hot buckets)
+        // Overlap: start CPU correction tree-reduction WHILE the GPU runs the main MSM.
+        use crate::g1::G1Jacobian;
+
+        let hot_values_clone = hot_values.clone();
+        let srs_ptr = srs.as_ptr() as usize;
+        let srs_len = srs.len();
+        let evals_ptr = evals.as_ptr() as usize;
+        let evals_len = evals.len();
+
+        let correction_handle = std::thread::spawn(move || {
+            let srs = unsafe { std::slice::from_raw_parts(srs_ptr as *const G1Affine, srs_len) };
+            let evals = unsafe { std::slice::from_raw_parts(evals_ptr as *const Fr, evals_len) };
+            let hot_srs_sums: Vec<G1Jacobian> = hot_values_clone
+                .par_iter()
+                .map(|(hot_val, _count)| {
+                    let partial_sums: Vec<G1Jacobian> = evals
+                        .par_chunks(8192)
+                        .enumerate()
+                        .map(|(chunk_idx, chunk)| {
+                            let base = chunk_idx * 8192;
+                            let mut acc = G1Jacobian::INFINITY;
+                            for (j, v) in chunk.iter().enumerate() {
+                                if *v == *hot_val {
+                                    acc = acc.add_affine(&srs[base + j]);
+                                }
+                            }
+                            acc
+                        })
+                        .collect();
+                    let mut sum = G1Jacobian::INFINITY;
+                    for ps in &partial_sums {
+                        sum = sum.add(ps);
+                    }
+                    sum
+                })
+                .collect();
+            (hot_srs_sums, hot_values_clone)
+        });
+
+        // Main MSM on zeroed scalars (GPU — runs concurrently with CPU correction)
         let mut result = persistent.msm(&zeroed);
 
-        // Correction via compact mask MSMs: for each hot value, gather the SRS
-        // points at matching indices and sum them, then multiply by hot_val.
-        // This avoids uploading a full-size (1 GiB) mask vector to the GPU.
-        // For small point sets (<50K), use parallel CPU tree-reduction.
-        // For larger sets, use GPU MSM with all-ones scalars.
-        use crate::g1::G1Jacobian;
-        const COMPACT_GPU_THRESHOLD: usize = 50_000;
-        for (hot_val, count) in &hot_values {
-            // Collect matching indices and gather the corresponding SRS points.
-            let indices: Vec<usize> = evals
-                .par_iter()
-                .enumerate()
-                .filter_map(|(j, v)| if *v == *hot_val { Some(j) } else { None })
-                .collect();
-            let gathered_points: Vec<G1Affine> = indices.par_iter().map(|&idx| srs[idx]).collect();
+        // Wait for CPU correction and apply
+        let (hot_srs_sums, _) = correction_handle.join().unwrap();
 
-            let srs_sum = if *count < COMPACT_GPU_THRESHOLD {
-                // CPU path: parallel chunked affine summation (tree-reduction).
-                let partial_sums: Vec<G1Jacobian> = gathered_points
-                    .par_chunks(1024)
-                    .map(|chunk| {
-                        let mut acc = G1Jacobian::INFINITY;
-                        for p in chunk {
-                            acc = acc.add_affine(p);
-                        }
-                        acc
-                    })
-                    .collect();
-                let mut sum = G1Jacobian::INFINITY;
-                for ps in &partial_sums {
-                    sum = sum.add(ps);
-                }
-                sum
-            } else {
-                // GPU path: MSM with all-ones scalars on gathered points.
-                let ones: Vec<Fr> = vec![Fr::ONE; gathered_points.len()];
-                crate::g1::msm(&gathered_points, &ones)
-            };
-
+        for ((hot_val, _), srs_sum) in hot_values.iter().zip(hot_srs_sums.iter()) {
             let contribution = srs_sum.scalar_mul(&hot_val.to_canonical());
             result = result.add(&contribution);
         }
@@ -1718,15 +1918,11 @@ impl PlonkProver {
     /// Compute the quotient polynomial h(X).
     ///
     /// h(X) = [gate_constraint + α·permutation_constraint + α²·boundary_constraint] / Z_H(X)
-    /// Compute quotient with pre-computed device buffers for l,r,o,z coset evals.
-    /// The device buffers were computed via fused iFFT+coset_fft, avoiding PCIe round-trips.
-    #[cfg(feature = "cuda")]
-    #[allow(clippy::too_many_arguments)]
-    #[cfg(feature = "cuda")]
-    #[allow(clippy::too_many_arguments)]
-    /// CPU quotient computation for GPUs with <20 GiB VRAM.
-    /// All coset evaluations are in host memory. The quotient is computed with rayon,
-    /// then uploaded to GPU for the coset iFFT.
+
+    /// GPU-streamed quotient computation for GPUs with <20 GiB VRAM.
+    /// All coset evaluations are in host memory, streamed to GPU in chunks.
+    /// Uses fused qk+pi_bsb22, omega lookup tables, and cyclic zh constants to reduce
+    /// PCIe-streamed arrays from 18 to 14 (saves ~16 GiB of host->device transfers).
     #[cfg(feature = "cuda")]
     #[allow(clippy::too_many_arguments)]
     fn compute_quotient_streamed(
@@ -1752,6 +1948,24 @@ impl PlonkProver {
         let k2 = k1 * k1;
         let alpha_sq = alpha.square();
 
+        // Precompute beta*k1 and beta*k2 on host (saves 2 GPU multiplies per thread)
+        let beta_k1 = *beta * k1;
+        let beta_k2 = *beta * k2;
+
+        // Fuse qk + pi_bsb22 on CPU (replaces separate qk and pi_bsb22 arrays)
+        let mut qk_plus_pi = pi_bsb22;
+        qk_plus_pi.par_iter_mut().enumerate().for_each(|(i, v)| {
+            *v += self.cached.qk_coset_evals[i];
+        });
+
+        // Pin qk_plus_pi for DMA upload
+        unsafe {
+            let _ = sp1_gpu_sys::runtime::cuda_host_register(
+                qk_plus_pi.as_ptr() as *const c_void,
+                std::mem::size_of_val(qk_plus_pi.as_slice()),
+            );
+        }
+
         // Precompute z_shifted on CPU: z_shifted[i] = z_coset[(i+4) % big_n]
         let mut z_shifted = vec![Fr::ZERO; big_n];
         z_shifted[..big_n - 4].copy_from_slice(&z_coset[4..]);
@@ -1770,23 +1984,19 @@ impl PlonkProver {
             panic!("cuda_malloc failed for streamed quotient output ({output_bytes} bytes)");
         }
 
-        // Run fully-streamed quotient kernel (all 18 arrays from host)
+        // Run fully-streamed quotient kernel (14 arrays from host)
         let err = unsafe {
             sp1_gpu_sys::plonk::sp1_plonk_quotient_eval_streamed(
                 d_output_ptr,
-                // 13 static arrays
+                // 9 static arrays
                 self.cached.ql_coset_evals.as_ptr() as *const c_void,
                 self.cached.qr_coset_evals.as_ptr() as *const c_void,
                 self.cached.qm_coset_evals.as_ptr() as *const c_void,
                 self.cached.qo_coset_evals.as_ptr() as *const c_void,
-                self.cached.qk_coset_evals.as_ptr() as *const c_void,
+                qk_plus_pi.as_ptr() as *const c_void,
                 self.cached.s1_coset_evals.as_ptr() as *const c_void,
                 self.cached.s2_coset_evals.as_ptr() as *const c_void,
                 self.cached.s3_coset_evals.as_ptr() as *const c_void,
-                pi_bsb22.as_ptr() as *const c_void,
-                self.cached.coset_points.as_ptr() as *const c_void,
-                self.cached.zh_inv.as_ptr() as *const c_void,
-                self.cached.zh_values.as_ptr() as *const c_void,
                 self.cached.x_minus_one_n_inv.as_ptr() as *const c_void,
                 // 5 per-proof arrays
                 l_coset.as_ptr() as *const c_void,
@@ -1794,15 +2004,24 @@ impl PlonkProver {
                 o_coset.as_ptr() as *const c_void,
                 z_coset.as_ptr() as *const c_void,
                 z_shifted.as_ptr() as *const c_void,
+                // Omega lookup tables
+                self.cached.omega_lo_table.as_ptr() as *const c_void,
+                self.cached.omega_hi_table.as_ptr() as *const c_void,
+                self.cached.omega_lo_table.len(),
+                self.cached.omega_hi_table.len(),
                 big_n,
                 // Scalar constants
                 alpha as *const Fr as *const c_void,
                 beta as *const Fr as *const c_void,
                 gamma as *const Fr as *const c_void,
-                &k1 as *const Fr as *const c_void,
-                &k2 as *const Fr as *const c_void,
+                &beta_k1 as *const Fr as *const c_void,
+                &beta_k2 as *const Fr as *const c_void,
                 &alpha_sq as *const Fr as *const c_void,
                 &Fr::ONE as *const Fr as *const c_void,
+                coset_shift as *const Fr as *const c_void,
+                // Cyclic constants (period 4)
+                self.cached.zh_invs_4.as_ptr() as *const c_void,
+                self.cached.zh_vals_4.as_ptr() as *const c_void,
             )
         };
         if err != unsafe { sp1_gpu_sys::runtime::CUDA_SUCCESS_CSL } {
@@ -1810,6 +2029,13 @@ impl PlonkProver {
         }
 
         // Free per-proof host vectors now that the kernel is done
+        // Unpin qk_plus_pi first
+        unsafe {
+            let _ = sp1_gpu_sys::runtime::cuda_host_unregister(
+                qk_plus_pi.as_ptr() as *const c_void,
+            );
+        }
+        drop(qk_plus_pi);
         drop(l_coset);
         drop(r_coset);
         drop(o_coset);
@@ -1830,8 +2056,12 @@ impl PlonkProver {
             panic!("GPU coset iNTT failed");
         }
 
-        // Download h_coeffs
-        let mut h_coeffs = vec![Fr::ZERO; big_n];
+        // Download h_coeffs (pre-fault pages to avoid DMA page faults)
+        let mut h_coeffs = Vec::with_capacity(big_n);
+        unsafe { h_coeffs.set_len(big_n); }
+        h_coeffs.par_chunks_mut(128).for_each(|chunk| {
+            unsafe { std::ptr::write_volatile(&mut chunk[0] as *mut Fr, Fr::ZERO); }
+        });
         let err = unsafe {
             sp1_gpu_sys::runtime::cuda_mem_copy_device_to_host(
                 h_coeffs.as_mut_ptr() as *mut c_void,
@@ -1847,6 +2077,12 @@ impl PlonkProver {
         h_coeffs
     }
 
+    /// Compute quotient with pre-computed device buffers for l,r,o,z coset evals.
+    /// The device buffers were computed via fused iFFT+coset_fft, avoiding PCIe round-trips.
+    /// Uses fused qk+pi_bsb22, omega lookup tables, and cyclic zh constants to reduce
+    /// PCIe-streamed arrays from 13 to 9 (saves ~16 GiB of host->device transfers per proof).
+    #[cfg(feature = "cuda")]
+    #[allow(clippy::too_many_arguments)]
     fn compute_quotient_with_device_bufs(
         &self,
         n: usize,
@@ -1870,6 +2106,24 @@ impl PlonkProver {
         let k2 = k1 * k1;
         let alpha_sq = alpha.square();
 
+        // Precompute beta*k1 and beta*k2 on host (saves 2 GPU multiplies per thread)
+        let beta_k1 = *beta * k1;
+        let beta_k2 = *beta * k2;
+
+        // Fuse qk + pi_bsb22 on CPU (replaces separate qk and pi_bsb22 arrays)
+        let mut qk_plus_pi = pi_bsb22;
+        qk_plus_pi.par_iter_mut().enumerate().for_each(|(i, v)| {
+            *v += self.cached.qk_coset_evals[i];
+        });
+
+        // Pin qk_plus_pi for DMA upload
+        unsafe {
+            let _ = sp1_gpu_sys::runtime::cuda_host_register(
+                qk_plus_pi.as_ptr() as *const c_void,
+                std::mem::size_of_val(qk_plus_pi.as_slice()),
+            );
+        }
+
         // Free NTT scratch buffer and twiddle caches to make room for quotient output.
         crate::domain::gpu_ntt::free_ntt_buffer();
         unsafe { sp1_gpu_sys::dft_bn254::bn254_ntt_clear_twiddle_cache() };
@@ -1884,6 +2138,7 @@ impl PlonkProver {
         }
 
         // Run fused quotient kernel
+        let _t_kernel = std::time::Instant::now();
         let err = unsafe {
             sp1_gpu_sys::plonk::sp1_plonk_quotient_eval_fused(
                 d_output_ptr,
@@ -1891,40 +2146,67 @@ impl PlonkProver {
                 d_r.ptr,
                 d_o.ptr,
                 d_z.ptr,
+                // 9 static arrays
                 self.cached.ql_coset_evals.as_ptr() as *const c_void,
                 self.cached.qr_coset_evals.as_ptr() as *const c_void,
                 self.cached.qm_coset_evals.as_ptr() as *const c_void,
                 self.cached.qo_coset_evals.as_ptr() as *const c_void,
-                self.cached.qk_coset_evals.as_ptr() as *const c_void,
+                qk_plus_pi.as_ptr() as *const c_void,
                 self.cached.s1_coset_evals.as_ptr() as *const c_void,
                 self.cached.s2_coset_evals.as_ptr() as *const c_void,
                 self.cached.s3_coset_evals.as_ptr() as *const c_void,
-                pi_bsb22.as_ptr() as *const c_void,
-                self.cached.coset_points.as_ptr() as *const c_void,
-                self.cached.zh_inv.as_ptr() as *const c_void,
-                self.cached.zh_values.as_ptr() as *const c_void,
                 self.cached.x_minus_one_n_inv.as_ptr() as *const c_void,
+                // Omega lookup tables
+                self.cached.omega_lo_table.as_ptr() as *const c_void,
+                self.cached.omega_hi_table.as_ptr() as *const c_void,
+                self.cached.omega_lo_table.len(),
+                self.cached.omega_hi_table.len(),
                 big_n,
+                // Scalar constants
                 alpha as *const Fr as *const c_void,
                 beta as *const Fr as *const c_void,
                 gamma as *const Fr as *const c_void,
-                &k1 as *const Fr as *const c_void,
-                &k2 as *const Fr as *const c_void,
+                &beta_k1 as *const Fr as *const c_void,
+                &beta_k2 as *const Fr as *const c_void,
                 &alpha_sq as *const Fr as *const c_void,
                 &Fr::ONE as *const Fr as *const c_void,
+                coset_shift as *const Fr as *const c_void,
+                // Cyclic constants (period 4)
+                self.cached.zh_invs_4.as_ptr() as *const c_void,
+                self.cached.zh_vals_4.as_ptr() as *const c_void,
             )
         };
         if err != unsafe { sp1_gpu_sys::runtime::CUDA_SUCCESS_CSL } {
             panic!("GPU fused quotient eval failed");
         }
 
-        // Free per-proof device buffers
+        eprintln!("[T] 7a. Quotient kernel: {:?}", _t_kernel.elapsed());
+
+        // Free per-proof device buffers and NTT twiddle caches
         drop(d_l);
         drop(d_r);
         drop(d_o);
         drop(d_z);
+        // Unpin and free qk_plus_pi
+        unsafe {
+            let _ = sp1_gpu_sys::runtime::cuda_host_unregister(
+                qk_plus_pi.as_ptr() as *const c_void,
+            );
+        }
+        drop(qk_plus_pi);
+        // Sync + clear caches + free NTT buffer to ensure memory is freed
+        unsafe { sp1_gpu_sys::runtime::cuda_device_synchronize() };
+        unsafe { sp1_gpu_sys::dft_bn254::bn254_ntt_clear_twiddle_cache() };
+        crate::domain::gpu_ntt::free_ntt_buffer();
+        {
+            let mut free: usize = 0;
+            let mut total: usize = 0;
+            unsafe { sp1_gpu_sys::runtime::cuda_mem_get_info(&mut free as *mut _, &mut total as *mut _) };
+            eprintln!("  [VRAM] before coset iFFT: free={} MiB, total={} MiB", free / (1024*1024), total / (1024*1024));
+        }
 
         // Coset iFFT on GPU
+        let _t_ifft = std::time::Instant::now();
         let stream = unsafe { sp1_gpu_sys::runtime::DEFAULT_STREAM };
         let err = unsafe {
             sp1_gpu_sys::dft_bn254::batch_coset_iNTT_bn254(
@@ -1935,11 +2217,22 @@ impl PlonkProver {
             )
         };
         if err != unsafe { sp1_gpu_sys::runtime::CUDA_SUCCESS_CSL } {
-            panic!("GPU coset iNTT failed");
+            let msg = if err.message.is_null() {
+                "null".to_string()
+            } else {
+                unsafe { std::ffi::CStr::from_ptr(err.message) }.to_string_lossy().into_owned()
+            };
+            panic!("GPU coset iNTT failed: {msg}");
         }
+        eprintln!("[T] 7b. Coset iFFT: {:?}", _t_ifft.elapsed());
 
-        // Download h_coeffs
-        let mut h_coeffs = vec![Fr::ZERO; big_n];
+        // Download h_coeffs (pre-fault pages to avoid DMA page faults)
+        let _t_d2h = std::time::Instant::now();
+        let mut h_coeffs = Vec::with_capacity(big_n);
+        unsafe { h_coeffs.set_len(big_n); }
+        h_coeffs.par_chunks_mut(128).for_each(|chunk| {
+            unsafe { std::ptr::write_volatile(&mut chunk[0] as *mut Fr, Fr::ZERO); }
+        });
         let err = unsafe {
             sp1_gpu_sys::runtime::cuda_mem_copy_device_to_host(
                 h_coeffs.as_mut_ptr() as *mut c_void,
@@ -1950,6 +2243,7 @@ impl PlonkProver {
         if err != unsafe { sp1_gpu_sys::runtime::CUDA_SUCCESS_CSL } {
             panic!("D2H failed for quotient h_coeffs");
         }
+        eprintln!("[T] 7c. D2H download: {:?}", _t_d2h.elapsed());
         unsafe { sp1_gpu_sys::runtime::cuda_free(d_output_ptr as *const c_void) };
 
         h_coeffs
@@ -2020,6 +2314,24 @@ impl PlonkProver {
                 }
             });
 
+            // Fuse qk + pi_bsb22 on CPU
+            let mut qk_plus_pi = pi_bsb22;
+            qk_plus_pi.par_iter_mut().enumerate().for_each(|(i, v)| {
+                *v += self.cached.qk_coset_evals[i];
+            });
+
+            // Precompute beta*k1 and beta*k2
+            let beta_k1 = *beta * k1;
+            let beta_k2 = *beta * k2;
+
+            // Pin qk_plus_pi for DMA upload
+            unsafe {
+                let _ = sp1_gpu_sys::runtime::cuda_host_register(
+                    qk_plus_pi.as_ptr() as *const c_void,
+                    std::mem::size_of_val(qk_plus_pi.as_slice()),
+                );
+            }
+
             // Free the NTT scratch buffer to maximize VRAM for chunk processing
             crate::domain::gpu_ntt::free_ntt_buffer();
 
@@ -2041,27 +2353,34 @@ impl PlonkProver {
                     d_r.ptr,
                     d_o.ptr,
                     d_z.ptr,
+                    // 9 static arrays
                     self.cached.ql_coset_evals.as_ptr() as *const c_void,
                     self.cached.qr_coset_evals.as_ptr() as *const c_void,
                     self.cached.qm_coset_evals.as_ptr() as *const c_void,
                     self.cached.qo_coset_evals.as_ptr() as *const c_void,
-                    self.cached.qk_coset_evals.as_ptr() as *const c_void,
+                    qk_plus_pi.as_ptr() as *const c_void,
                     self.cached.s1_coset_evals.as_ptr() as *const c_void,
                     self.cached.s2_coset_evals.as_ptr() as *const c_void,
                     self.cached.s3_coset_evals.as_ptr() as *const c_void,
-                    pi_bsb22.as_ptr() as *const c_void,
-                    self.cached.coset_points.as_ptr() as *const c_void,
-                    self.cached.zh_inv.as_ptr() as *const c_void,
-                    self.cached.zh_values.as_ptr() as *const c_void,
                     self.cached.x_minus_one_n_inv.as_ptr() as *const c_void,
+                    // Omega lookup tables
+                    self.cached.omega_lo_table.as_ptr() as *const c_void,
+                    self.cached.omega_hi_table.as_ptr() as *const c_void,
+                    self.cached.omega_lo_table.len(),
+                    self.cached.omega_hi_table.len(),
                     big_n,
+                    // Scalar constants
                     alpha as *const Fr as *const c_void,
                     beta as *const Fr as *const c_void,
                     gamma as *const Fr as *const c_void,
-                    &k1 as *const Fr as *const c_void,
-                    &k2 as *const Fr as *const c_void,
+                    &beta_k1 as *const Fr as *const c_void,
+                    &beta_k2 as *const Fr as *const c_void,
                     &alpha_sq as *const Fr as *const c_void,
                     &Fr::ONE as *const Fr as *const c_void,
+                    coset_shift as *const Fr as *const c_void,
+                    // Cyclic constants (period 4)
+                    self.cached.zh_invs_4.as_ptr() as *const c_void,
+                    self.cached.zh_vals_4.as_ptr() as *const c_void,
                 )
             };
             if err != unsafe { sp1_gpu_sys::runtime::CUDA_SUCCESS_CSL } {
@@ -2072,6 +2391,14 @@ impl PlonkProver {
                 };
                 panic!("GPU fused quotient eval failed: {}", msg);
             }
+
+            // Unpin qk_plus_pi
+            unsafe {
+                let _ = sp1_gpu_sys::runtime::cuda_host_unregister(
+                    qk_plus_pi.as_ptr() as *const c_void,
+                );
+            }
+            drop(qk_plus_pi);
 
             // Free per-proof device buffers
             drop(d_l);

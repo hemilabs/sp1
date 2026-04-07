@@ -46,10 +46,10 @@ namespace device {
     };
     static __device__ __constant__ const uint32_t ALT_BN128_m0 = 0xefffffff;
 }
-# if defined(__CUDA_ARCH__) || defined(__HIP_DEVICE_COMPILE__)   // device-side field types
+# if defined(__CUDA_ARCH__) || defined(__HIPCC__)   // device/host field types for GPU builds
 #  if defined(__CUDA_ARCH__)
 #   include "mont_t.cuh"
-#  elif defined(__HIP_DEVICE_COMPILE__)
+#  elif defined(__HIPCC__)
 #   include "mont_t.hip"
 typedef uint64_t vec256[4];
 #  endif
@@ -61,21 +61,20 @@ typedef mont_t<254, device::ALT_BN128_P, device::ALT_BN128_M0,
                     device::ALT_BN128_Px4> fp_mont;
 struct fp_t : public fp_mont {
     using mem_t = fp_t;
-    __device__ __forceinline__ fp_t() {}
-    __device__ __forceinline__ fp_t(const fp_mont& a) : fp_mont(a) {}
+    __host__ __device__ __forceinline__ fp_t() {}
+    __host__ __device__ __forceinline__ fp_t(const fp_mont& a) : fp_mont(a) {}
     template<typename... Ts> constexpr fp_t(Ts... a)  : fp_mont{a...} {}
-    __device__ __forceinline__ void set_to_zero() { this->zero(); }
+    __host__ __device__ __forceinline__ void set_to_zero() { this->zero(); }
 };
 typedef mont_t<254, device::ALT_BN128_r, device::ALT_BN128_m0,
                     device::ALT_BN128_rRR, device::ALT_BN128_rone,
                     device::ALT_BN128_rx4> fr_mont;
 struct fr_t : public fr_mont {
     using mem_t = fr_t;
-    __device__ __forceinline__ fr_t() {}
-    __device__ __forceinline__ fr_t(const fr_mont& a) : fr_mont(a) {}
+    __host__ __device__ __forceinline__ fr_t() {}
+    __host__ __device__ __forceinline__ fr_t(const fr_mont& a) : fr_mont(a) {}
     template<typename... Ts> constexpr fr_t(Ts... a)  : fr_mont{a...} {}
-    // SP1 NTT kernels call set_to_zero() instead of zero()
-    __device__ __forceinline__ void set_to_zero() { this->zero(); }
+    __host__ __device__ __forceinline__ void set_to_zero() { this->zero(); }
 };
 
 } // namespace alt_bn128
@@ -83,7 +82,9 @@ struct fr_t : public fr_mont {
 # endif
 #endif
 
-#if !defined(__CUDA_ARCH__) && !defined(__HIP_DEVICE_COMPILE__)  // host-side field types
+// Host-side field types using blst_256_t (CUDA only — HIP uses mont_t.hip
+// which is __host__ __device__ and serves both host and device code).
+#if !defined(__CUDA_ARCH__) && !defined(__HIPCC__)
 # include <blst_t.hpp>
 
 # if defined(__GNUC__) && !defined(__clang__)

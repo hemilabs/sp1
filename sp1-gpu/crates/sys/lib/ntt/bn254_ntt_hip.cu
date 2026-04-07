@@ -59,6 +59,103 @@ __global__ void bn254_scale_kernel(fr_t* data, fr_t scale, uint32_t n) {
     if (tid < n) data[tid] = data[tid] * scale;
 }
 
+// XOR-swizzled LDS layout for zero bank conflicts on RDNA3's 32-bank LDS.
+// Each BN254 element is 8 × uint32_t. The XOR swizzle maps element i, limb k
+// to word offset: 8*i + (k ^ ((i >> 2) & 7)).
+__device__ __forceinline__
+fr_t lds_load(const uint32_t* base, uint32_t i) {
+    fr_t r;
+    uint32_t swiz = (i >> 2) & 7;
+    #pragma unroll
+    for (int k = 0; k < 8; k++)
+        r.data[k] = base[8 * i + (k ^ swiz)];
+    return r;
+}
+
+__device__ __forceinline__
+void lds_store(uint32_t* base, uint32_t i, const fr_t& v) {
+    uint32_t swiz = (i >> 2) & 7;
+    #pragma unroll
+    for (int k = 0; k < 8; k++)
+        base[8 * i + (k ^ swiz)] = v.data[k];
+}
+
+__device__ __forceinline__
+uint32_t bit_rev_10(uint32_t val) {
+    uint32_t r = 0;
+    for (int i = 0; i < 10; i++) {
+        r = (r << 1) | (val & 1);
+        val >>= 1;
+    }
+    return r;
+}
+
+// LDS butterfly stages 0-9: processes 10 DIT butterfly stages on 1024-element blocks.
+// Assumes data is already globally bit-reversed. Each block handles one 1024-element
+// sub-NTT entirely in LDS. 256 threads per block, 32 KB LDS per block.
+// Replaces 10 global-memory butterfly kernel launches with 1 LDS kernel.
+__launch_bounds__(256, 2)
+__global__ void bn254_lds_butterfly_10_kernel(
+    fr_t* __restrict__ d_data,
+    const fr_t* __restrict__ tw0, const fr_t* __restrict__ tw1,
+    const fr_t* __restrict__ tw2, const fr_t* __restrict__ tw3,
+    const fr_t* __restrict__ tw4, const fr_t* __restrict__ tw5,
+    const fr_t* __restrict__ tw6, const fr_t* __restrict__ tw7,
+    const fr_t* __restrict__ tw8, const fr_t* __restrict__ tw9,
+    uint32_t num_blocks
+) {
+    if (blockIdx.x >= num_blocks) return;
+
+    __shared__ uint32_t lds[8192]; // 1024 × 8 words = 32 KB
+
+    const uint32_t tid = threadIdx.x;
+    const uint32_t base_offset = blockIdx.x * 1024;
+
+    // Load 1024 elements from global to LDS (coalesced read)
+    #pragma unroll
+    for (int i = 0; i < 4; i++) {
+        uint32_t idx = tid + i * 256;
+        lds_store(lds, idx, d_data[base_offset + idx]);
+    }
+    __syncthreads();
+
+    // Pointer array for twiddle stages
+    const fr_t* tw_ptrs[10] = {tw0, tw1, tw2, tw3, tw4, tw5, tw6, tw7, tw8, tw9};
+
+    // 10 DIT butterfly stages
+    for (uint32_t s = 0; s < 10; s++) {
+        uint32_t m = 1u << s;
+        uint32_t two_m = 2u * m;
+
+        #pragma unroll 1
+        for (int b = 0; b < 2; b++) {
+            uint32_t bid = tid + b * 256; // butterfly index 0..511
+            uint32_t group = bid / m;
+            uint32_t pos = bid % m;
+            uint32_t idx_a = group * two_m + pos;
+            uint32_t idx_b = idx_a + m;
+
+            fr_t a = lds_load(lds, idx_a);
+            fr_t bv = lds_load(lds, idx_b);
+
+            fr_t tw = tw_ptrs[s][pos]; // twiddle for this position
+            bv = bv * tw;
+
+            lds_store(lds, idx_a, a + bv);
+            lds_store(lds, idx_b, a - bv);
+        }
+        __syncthreads();
+    }
+
+    // Store back to global (coalesced write)
+    #pragma unroll
+    for (int i = 0; i < 4; i++) {
+        uint32_t idx = tid + i * 256;
+        d_data[base_offset + idx] = lds_load(lds, idx);
+    }
+}
+
+
 // Coset multiplication: multiply element i by coset_gen^i via binary exponentiation.
 // Kept as fallback when CosetCache is not valid.
 __global__ void bn254_coset_mul_inplace_kernel(
@@ -477,8 +574,28 @@ static rustCudaError_t run_ntt(void* d_inout, uint32_t lg_n, bool inverse) {
         CUDA_OK(hipGetLastError());
     }
 
-    // Butterfly stages using cached twiddles
-    for (uint32_t s = 0; s < lg_n; s++) {
+    // Butterfly stages using cached twiddles.
+    // For lg_n >= 10: fuse first 10 stages into a single LDS kernel (32 KB per block).
+    // This replaces 10 global-memory kernel launches with 1 LDS kernel, saving
+    // ~9 kernel launches of overhead and improving data locality.
+    uint32_t start_stage = 0;
+    if (lg_n >= 10) {
+        uint32_t num_blocks = n / 1024;
+        hipLaunchKernelGGL(bn254_lds_butterfly_10_kernel,
+            dim3(num_blocks), dim3(256), 0, 0,
+            d_data,
+            cache.d_twiddles[0], cache.d_twiddles[1],
+            cache.d_twiddles[2], cache.d_twiddles[3],
+            cache.d_twiddles[4], cache.d_twiddles[5],
+            cache.d_twiddles[6], cache.d_twiddles[7],
+            cache.d_twiddles[8], cache.d_twiddles[9],
+            num_blocks);
+        CUDA_OK(hipGetLastError());
+        start_stage = 10;
+    }
+
+    // Remaining stages using global-memory butterfly kernel
+    for (uint32_t s = start_stage; s < lg_n; s++) {
         uint32_t half = 1u << s;
         uint32_t stage = 1u << (s + 1);
         uint32_t num_bf = n / 2;
@@ -499,7 +616,8 @@ static rustCudaError_t run_ntt(void* d_inout, uint32_t lg_n, bool inverse) {
         CUDA_OK(hipGetLastError());
     }
 
-    CUDA_OK(hipDeviceSynchronize());
+    // No device sync here — callers (batch functions) sync once after all polynomials.
+    // All kernels on the default stream are ordered, so no sync needed between iterations.
 
     // Twiddle cache is now managed explicitly from Rust via bn254_ntt_clear_twiddle_cache().
     // No automatic eviction — the Rust prover clears when it knows it needs the memory.
@@ -593,7 +711,7 @@ static rustCudaError_t run_coset_ntt(void* d_inout, uint32_t lg_n, bool inverse)
                     d_data, g_inv_coset_cache.d_lo_table,
                     g_inv_coset_cache.d_hi_table, n);
                 CUDA_OK(hipGetLastError());
-                CUDA_OK(hipDeviceSynchronize());
+                // No device sync here — batch callers sync once after all polynomials.
                 return CUDA_SUCCESS_CSL;
             }
         }
@@ -608,7 +726,7 @@ static rustCudaError_t run_coset_ntt(void* d_inout, uint32_t lg_n, bool inverse)
             CUDA_OK(hipGetLastError());
         }
 
-        CUDA_OK(hipDeviceSynchronize());
+        // No device sync here — batch callers sync once after all polynomials.
         return CUDA_SUCCESS_CSL;
     }
 }
@@ -718,6 +836,7 @@ rustCudaError_t batch_NTT_bn254(void* d_inout, uint32_t lg_domain_size,
         rustCudaError_t err = run_ntt(data + p * n, lg_domain_size, false);
         if (err.message != CUDA_SUCCESS_CSL.message) return err;
     }
+    CUDA_OK(hipDeviceSynchronize());
     return CUDA_SUCCESS_CSL;
 }
 
@@ -730,6 +849,7 @@ rustCudaError_t batch_iNTT_bn254(void* d_inout, uint32_t lg_domain_size,
         rustCudaError_t err = run_ntt(data + p * n, lg_domain_size, true);
         if (err.message != CUDA_SUCCESS_CSL.message) return err;
     }
+    CUDA_OK(hipDeviceSynchronize());
     return CUDA_SUCCESS_CSL;
 }
 
@@ -742,6 +862,7 @@ rustCudaError_t batch_coset_NTT_bn254(void* d_inout, uint32_t lg_domain_size,
         rustCudaError_t err = run_coset_ntt(data + p * n, lg_domain_size, false);
         if (err.message != CUDA_SUCCESS_CSL.message) return err;
     }
+    CUDA_OK(hipDeviceSynchronize());
     return CUDA_SUCCESS_CSL;
 }
 
@@ -754,6 +875,7 @@ rustCudaError_t batch_coset_iNTT_bn254(void* d_inout, uint32_t lg_domain_size,
         rustCudaError_t err = run_coset_ntt(data + p * n, lg_domain_size, true);
         if (err.message != CUDA_SUCCESS_CSL.message) return err;
     }
+    CUDA_OK(hipDeviceSynchronize());
     return CUDA_SUCCESS_CSL;
 }
 

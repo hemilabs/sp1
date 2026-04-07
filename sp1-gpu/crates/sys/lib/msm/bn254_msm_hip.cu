@@ -79,108 +79,87 @@ __global__ void compute_bucket_counts_kernel(
     }
 }
 
-// Run MSM for one window: sort digits, accumulate buckets, reduce
+// Run MSM for one window: sort digits, accumulate buckets, reduce.
+// Uses packed indices (sign in high bit) to eliminate sign arrays + rearrange kernel.
+// Uses neighbor-comparison boundary detection (no atomics).
+// Sorts only WINDOW_BITS bits (up to 13-16) instead of all 16.
 static rustCudaError_t msm_one_window(
     const bn254_g1_affine_t* d_points,
-    const uint16_t* d_digits_win,   // digits for this window [n]
-    const uint8_t* d_signs_win,     // signs for this window [n]
-    bn254_g1_t* d_window_result,    // output: 1 point
-    bn254_g1_t* d_buckets,          // scratch: [NUM_BUCKETS]
-    uint32_t* d_bucket_offsets,     // scratch: [NUM_BUCKETS]
-    uint32_t* d_bucket_ends,        // scratch: [NUM_BUCKETS]
-    uint32_t* d_bucket_counts,      // scratch: [NUM_BUCKETS]
-    uint16_t* d_sorted_digits,      // scratch: [n]
-    uint32_t* d_sorted_indices,     // scratch: [n]
-    uint8_t* d_sorted_signs,        // scratch: [n]
-    uint32_t* d_indices,            // scratch: [n] (original indices)
-    void* d_sort_temp,              // scratch: hipCUB temp
+    const uint16_t* d_digits_win,    // digits for this window [n]
+    const uint32_t* d_packed_win,    // [n] packed point indices with sign in high bit
+    bn254_g1_t* d_window_result,     // output: 1 point
+    bn254_g1_t* d_buckets,           // scratch: [NUM_BUCKETS]
+    uint32_t* d_bucket_offsets,      // scratch: [NUM_BUCKETS]
+    uint32_t* d_bucket_counts,       // scratch: [NUM_BUCKETS]
+    uint16_t* d_sorted_digits,       // scratch: [n]
+    uint32_t* d_sorted_packed,       // scratch: [n] sorted packed indices
+    void* d_sort_temp,               // scratch: hipCUB temp
     size_t sort_temp_bytes,
-    bn254_g1_t* d_partial_sums,     // scratch: [NUM_BUCKETS * BUCKET_PAR] (or nullptr for serial)
-    bn254_g1_t* d_reduce_partials, // scratch: [REDUCE_THREADS] for block-parallel reduction
-    bn254_g1_t* d_reduce_suffixes, // scratch: [REDUCE_THREADS] for block-parallel reduction
+    bn254_g1_xyzz_t* d_partial_sums,  // scratch: [NUM_BUCKETS * BUCKET_PAR] (XYZZ coords)
+    bn254_g1_t* d_reduce_partials,   // scratch: [REDUCE_THREADS]
+    bn254_g1_t* d_reduce_suffixes,   // scratch: [REDUCE_THREADS]
     int n
 ) {
     static constexpr int REDUCE_THREADS = (NUM_BUCKETS - 1 + REDUCE_BLOCK_SIZE - 1) / REDUCE_BLOCK_SIZE;
-    // Initialize original indices: 0, 1, 2, ..., n-1
-    {
-        int threads = 256;
-        int blocks = (n + threads - 1) / threads;
-        hipLaunchKernelGGL(init_indices_kernel,
-            dim3(blocks), dim3(threads), 0, 0, d_indices, n);
-    }
 
-    // Sort (digit, index, sign) triples by digit using hipCUB
-    // SortPairs: sorts keys (digits) and rearranges values (indices) to match
+    // Sort (digit, packed_index) pairs by digit using hipCUB.
+    // Sort only WINDOW_BITS bits (digits are in range [0, 2^(WINDOW_BITS-1)]).
+    // The packed index already contains the sign bit, so no separate sign sort needed.
     hipcub::DeviceRadixSort::SortPairs(
         d_sort_temp, sort_temp_bytes,
         d_digits_win, d_sorted_digits,
-        d_indices, d_sorted_indices,
-        n, 0, 16  // sort all 16 bits of uint16_t
+        d_packed_win, d_sorted_packed,
+        n, 0, WINDOW_BITS  // sort only the meaningful bits
     );
     CUDA_OK(hipGetLastError());
 
-    // Also rearrange signs to match sorted order
-    {
-        int threads = 256;
-        int blocks = (n + threads - 1) / threads;
-        hipLaunchKernelGGL(rearrange_signs_kernel,
-            dim3(blocks), dim3(threads), 0, 0,
-            d_signs_win, d_sorted_indices, d_sorted_signs, n);
-    }
-
     // Initialize bucket boundaries
     CUDA_OK(hipMemset(d_bucket_offsets, 0xFF, NUM_BUCKETS * sizeof(uint32_t))); // UINT32_MAX
-    CUDA_OK(hipMemset(d_bucket_ends, 0, NUM_BUCKETS * sizeof(uint32_t)));
+    CUDA_OK(hipMemset(d_bucket_counts, 0, NUM_BUCKETS * sizeof(uint32_t)));
 
-    // Pass 1: find segment starts/ends with atomicMin/Max
+    // Single-pass boundary detection: neighbor comparison, no atomics.
+    // Each thread writes offset (if it's a boundary start) and end+1
+    // (if it's a boundary end). No atomic conflicts since only one thread
+    // writes to each bucket slot.
     {
         int threads = 256;
         int blocks = (n + threads - 1) / threads;
-        hipLaunchKernelGGL(compute_bucket_starts_kernel,
+        hipLaunchKernelGGL(detect_boundaries_and_counts_kernel,
             dim3(blocks), dim3(threads), 0, 0,
-            d_sorted_digits, d_bucket_offsets, d_bucket_ends, n, NUM_BUCKETS);
+            d_sorted_digits, d_bucket_offsets, d_bucket_counts, n, NUM_BUCKETS);
         CUDA_OK(hipGetLastError());
     }
 
-    // Pass 2: compute counts
+    // Finalize counts: subtract offset from end+1 to get actual count.
     {
         int threads = 256;
         int blocks = (NUM_BUCKETS + threads - 1) / threads;
-        hipLaunchKernelGGL(compute_bucket_counts_kernel,
+        hipLaunchKernelGGL(finalize_counts_kernel,
             dim3(blocks), dim3(threads), 0, 0,
-            d_bucket_offsets, d_bucket_ends, d_bucket_counts, NUM_BUCKETS);
+            d_bucket_counts, d_bucket_offsets, NUM_BUCKETS);
         CUDA_OK(hipGetLastError());
     }
 
-    // Bucket accumulation: use parallel version if partial_sums buffer is available
-    if (d_partial_sums) {
-        // Parallel accumulation: BUCKET_PAR threads per bucket (32× more parallelism)
+    // Parallel bucket accumulation with packed sign.
+    {
         int total_threads = NUM_BUCKETS * BUCKET_PAR;
         int threads = 256;
         int blocks = (total_threads + threads - 1) / threads;
-        hipLaunchKernelGGL(bucket_accumulate_parallel_kernel,
+        hipLaunchKernelGGL(bucket_accumulate_parallel_packed_kernel,
             dim3(blocks), dim3(threads), 0, 0,
-            d_points, d_sorted_indices, d_sorted_signs,
+            d_points, d_sorted_packed,
             d_bucket_offsets, d_bucket_counts,
             d_partial_sums, NUM_BUCKETS);
         CUDA_OK(hipGetLastError());
+    }
 
-        // Merge partial sums into bucket results
-        threads = 256;
-        blocks = (NUM_BUCKETS + threads - 1) / threads;
+    // Merge partial sums into bucket results
+    {
+        int threads = 256;
+        int blocks = (NUM_BUCKETS + threads - 1) / threads;
         hipLaunchKernelGGL(bucket_merge_kernel,
             dim3(blocks), dim3(threads), 0, 0,
             d_partial_sums, d_buckets, NUM_BUCKETS);
-        CUDA_OK(hipGetLastError());
-    } else {
-        // Fallback: single thread per bucket (low occupancy)
-        int threads = 256;
-        int blocks = (NUM_BUCKETS + threads - 1) / threads;
-        hipLaunchKernelGGL(bucket_accumulate_kernel,
-            dim3(blocks), dim3(threads), 0, 0,
-            d_points, d_sorted_indices, d_sorted_signs,
-            d_bucket_offsets, d_bucket_counts,
-            d_buckets, NUM_BUCKETS);
         CUDA_OK(hipGetLastError());
     }
 
@@ -243,69 +222,56 @@ rustCudaError_t sp1_bn254_msm(void* result, const void* points, size_t npoints,
         hipEventRecord(ev_start);
     }
 
-    // Allocate device memory
+    // Allocate device memory (per-window buffers with packed sign in index)
     bn254_g1_affine_t* d_points = nullptr;
     uint32_t* d_scalars = nullptr;
-    uint16_t* d_digits = nullptr;
-    uint8_t* d_signs = nullptr;
+    uint16_t* d_digits = nullptr;              // single window
+    uint32_t* d_packed = nullptr;              // single window, sign in bit 31
+    uint8_t* d_carries = nullptr;              // inter-window carry bits
     bn254_g1_t* d_buckets = nullptr;
     bn254_g1_t* d_window_results = nullptr;
     bn254_g1_t* d_final_result = nullptr;
     uint32_t* d_bucket_offsets = nullptr;
     uint32_t* d_bucket_counts = nullptr;
-    uint32_t* d_bucket_ends = nullptr;
     uint16_t* d_sorted_digits = nullptr;
-    uint32_t* d_sorted_indices = nullptr;
-    uint8_t* d_sorted_signs = nullptr;
-    uint32_t* d_indices = nullptr;
+    uint32_t* d_sorted_packed = nullptr;
 
     CUDA_OK(hipMalloc(&d_points, n * sizeof(bn254_g1_affine_t)));
     CUDA_OK(hipMalloc(&d_scalars, n * SCALAR_LIMBS * elem32));
-    CUDA_OK(hipMalloc(&d_digits, NUM_WINDOWS * n * sizeof(uint16_t)));
-    CUDA_OK(hipMalloc(&d_signs, NUM_WINDOWS * n * sizeof(uint8_t)));
+    CUDA_OK(hipMalloc(&d_digits, n * sizeof(uint16_t)));         // single window
+    CUDA_OK(hipMalloc(&d_packed, n * sizeof(uint32_t)));         // single window
+    CUDA_OK(hipMalloc(&d_carries, n * sizeof(uint8_t)));         // carry bits
     CUDA_OK(hipMalloc(&d_buckets, NUM_BUCKETS * sizeof(bn254_g1_t)));
     CUDA_OK(hipMalloc(&d_window_results, NUM_WINDOWS * sizeof(bn254_g1_t)));
     CUDA_OK(hipMalloc(&d_final_result, sizeof(bn254_g1_t)));
     CUDA_OK(hipMalloc(&d_bucket_offsets, NUM_BUCKETS * sizeof(uint32_t)));
     CUDA_OK(hipMalloc(&d_bucket_counts, NUM_BUCKETS * sizeof(uint32_t)));
-    CUDA_OK(hipMalloc(&d_bucket_ends, NUM_BUCKETS * sizeof(uint32_t)));
     CUDA_OK(hipMalloc(&d_sorted_digits, n * sizeof(uint16_t)));
-    CUDA_OK(hipMalloc(&d_sorted_indices, n * sizeof(uint32_t)));
-    CUDA_OK(hipMalloc(&d_sorted_signs, n * sizeof(uint8_t)));
-    CUDA_OK(hipMalloc(&d_indices, n * sizeof(uint32_t)));
+    CUDA_OK(hipMalloc(&d_sorted_packed, n * sizeof(uint32_t)));
 
     if (do_timing) hipEventRecord(ev_alloc);
 
-    // Upload points and scalars
+    // Upload points and scalars, initialize carries
     CUDA_OK(hipMemcpy(d_points, points, n * sizeof(bn254_g1_affine_t), hipMemcpyHostToDevice));
     CUDA_OK(hipMemcpy(d_scalars, scalars, n * SCALAR_LIMBS * elem32, hipMemcpyHostToDevice));
+    CUDA_OK(hipMemset(d_carries, 0, n * sizeof(uint8_t)));
 
     if (do_timing) hipEventRecord(ev_upload);
 
-    // Step 1: Scalar decomposition (all windows)
-    {
-        int threads = 256;
-        int blocks = (n + threads - 1) / threads;
-        hipLaunchKernelGGL(scalar_decompose_kernel,
-            dim3(blocks), dim3(threads), 0, 0,
-            d_scalars, d_digits, d_signs, n);
-        CUDA_OK(hipGetLastError());
-    }
-
-    // Determine hipCUB sort temp storage
+    // Determine hipCUB sort temp storage (sort only WINDOW_BITS bits)
     void* d_sort_temp = nullptr;
     size_t sort_temp_bytes = 0;
     hipcub::DeviceRadixSort::SortPairs(
         nullptr, sort_temp_bytes,
         d_digits, d_sorted_digits,
-        d_indices, d_sorted_indices,
-        n, 0, 16);
+        d_packed, d_sorted_packed,
+        n, 0, WINDOW_BITS);
     CUDA_OK(hipMalloc(&d_sort_temp, sort_temp_bytes));
 
-    // Parallel accumulation scratch buffer (32× more GPU threads for bucket accumulation)
-    bn254_g1_t* d_partial_sums = nullptr;
+    // Parallel accumulation scratch buffer
+    bn254_g1_xyzz_t* d_partial_sums = nullptr;
     CUDA_OK(hipMalloc(&d_partial_sums,
-                       (size_t)NUM_BUCKETS * BUCKET_PAR * sizeof(bn254_g1_t)));
+                       (size_t)NUM_BUCKETS * BUCKET_PAR * sizeof(bn254_g1_xyzz_t)));
 
     // Block-parallel reduction scratch buffers
     int reduce_threads = (NUM_BUCKETS - 1 + REDUCE_BLOCK_SIZE - 1) / REDUCE_BLOCK_SIZE;
@@ -314,21 +280,28 @@ rustCudaError_t sp1_bn254_msm(void* result, const void* points, size_t npoints,
     CUDA_OK(hipMalloc(&d_reduce_partials, reduce_threads * sizeof(bn254_g1_t)));
     CUDA_OK(hipMalloc(&d_reduce_suffixes, reduce_threads * sizeof(bn254_g1_t)));
 
-    // Step 2-4: Process each window
+    // Process each window: decompose + sort + accumulate + reduce
     for (int w = 0; w < NUM_WINDOWS; w++) {
+        // Per-window scalar decomposition with packed sign
+        {
+            int threads = 256;
+            int blocks = (n + threads - 1) / threads;
+            hipLaunchKernelGGL(scalar_decompose_packed_kernel,
+                dim3(blocks), dim3(threads), 0, 0,
+                d_scalars, d_digits, d_packed, d_carries, n, w);
+            CUDA_OK(hipGetLastError());
+        }
+
         rustCudaError_t err = msm_one_window(
             d_points,
-            d_digits + (size_t)w * n,
-            d_signs + (size_t)w * n,
+            d_digits,
+            d_packed,
             d_window_results + w,
             d_buckets,
             d_bucket_offsets,
-            d_bucket_ends,
             d_bucket_counts,
             d_sorted_digits,
-            d_sorted_indices,
-            d_sorted_signs,
-            d_indices,
+            d_sorted_packed,
             d_sort_temp,
             sort_temp_bytes,
             d_partial_sums,
@@ -339,12 +312,11 @@ rustCudaError_t sp1_bn254_msm(void* result, const void* points, size_t npoints,
         if (err.message != CUDA_SUCCESS_CSL.message) {
             // Cleanup on error
             hipFree(d_points); hipFree(d_scalars);
-            hipFree(d_digits); hipFree(d_signs);
+            hipFree(d_digits); hipFree(d_packed); hipFree(d_carries);
             hipFree(d_buckets); hipFree(d_window_results);
             hipFree(d_final_result);
-            hipFree(d_bucket_offsets); hipFree(d_bucket_ends); hipFree(d_bucket_counts);
-            hipFree(d_sorted_digits); hipFree(d_sorted_indices);
-            hipFree(d_sorted_signs); hipFree(d_indices);
+            hipFree(d_bucket_offsets); hipFree(d_bucket_counts);
+            hipFree(d_sorted_digits); hipFree(d_sorted_packed);
             hipFree(d_sort_temp); hipFree(d_partial_sums);
             hipFree(d_reduce_partials); hipFree(d_reduce_suffixes);
             return err;
@@ -384,12 +356,11 @@ rustCudaError_t sp1_bn254_msm(void* result, const void* points, size_t npoints,
 
     // Cleanup
     hipFree(d_points); hipFree(d_scalars);
-    hipFree(d_digits); hipFree(d_signs);
+    hipFree(d_digits); hipFree(d_packed); hipFree(d_carries);
     hipFree(d_buckets); hipFree(d_window_results);
     hipFree(d_final_result);
-    hipFree(d_bucket_offsets); hipFree(d_bucket_ends); hipFree(d_bucket_counts);
-    hipFree(d_sorted_digits); hipFree(d_sorted_indices);
-    hipFree(d_sorted_signs); hipFree(d_indices);
+    hipFree(d_bucket_offsets); hipFree(d_bucket_counts);
+    hipFree(d_sorted_digits); hipFree(d_sorted_packed);
     hipFree(d_sort_temp); hipFree(d_partial_sums);
     hipFree(d_reduce_partials); hipFree(d_reduce_suffixes);
 
@@ -404,23 +375,22 @@ struct hip_msm_context {
     int npoints;
     int alloc_n;            // allocated capacity for working buffers
 
-    // Pre-allocated working buffers (sized for alloc_n points)
+    // Pre-allocated working buffers (sized for alloc_n points).
+    // Per-window packed design: digits + packed_indices (sign in bit 31) + carries.
     uint32_t* d_scalars;
-    uint16_t* d_digits;
-    uint8_t* d_signs;
+    uint16_t* d_digits;             // single window
+    uint32_t* d_packed;             // single window, sign in bit 31
+    uint8_t* d_carries;             // inter-window carry bits
     bn254_g1_t* d_buckets;
     bn254_g1_t* d_window_results;
     bn254_g1_t* d_final_result;
     uint32_t* d_bucket_offsets;
     uint32_t* d_bucket_counts;
-    uint32_t* d_bucket_ends;
     uint16_t* d_sorted_digits;
-    uint32_t* d_sorted_indices;
-    uint8_t* d_sorted_signs;
-    uint32_t* d_indices;
+    uint32_t* d_sorted_packed;
     void* d_sort_temp;
     size_t sort_temp_bytes;
-    bn254_g1_t* d_partial_sums;     // [NUM_BUCKETS * BUCKET_PAR] for parallel accumulation
+    bn254_g1_xyzz_t* d_partial_sums; // [NUM_BUCKETS * BUCKET_PAR] XYZZ accumulators
     bn254_g1_t* d_reduce_partials; // [REDUCE_THREADS] for block-parallel reduction
     bn254_g1_t* d_reduce_suffixes; // [REDUCE_THREADS] for block-parallel reduction
 };
@@ -430,32 +400,29 @@ static rustCudaError_t alloc_working_buffers(hip_msm_context* ctx, int n) {
     ctx->alloc_n = n;
 
     CUDA_OK(hipMalloc(&ctx->d_scalars, n * SCALAR_LIMBS * elem32));
-    CUDA_OK(hipMalloc(&ctx->d_digits, NUM_WINDOWS * n * sizeof(uint16_t)));
-    CUDA_OK(hipMalloc(&ctx->d_signs, NUM_WINDOWS * n * sizeof(uint8_t)));
+    CUDA_OK(hipMalloc(&ctx->d_digits, n * sizeof(uint16_t)));     // single window
+    CUDA_OK(hipMalloc(&ctx->d_packed, n * sizeof(uint32_t)));     // single window, sign in bit 31
+    CUDA_OK(hipMalloc(&ctx->d_carries, n * sizeof(uint8_t)));     // carry bits
     CUDA_OK(hipMalloc(&ctx->d_buckets, NUM_BUCKETS * sizeof(bn254_g1_t)));
     CUDA_OK(hipMalloc(&ctx->d_window_results, NUM_WINDOWS * sizeof(bn254_g1_t)));
     CUDA_OK(hipMalloc(&ctx->d_final_result, sizeof(bn254_g1_t)));
     CUDA_OK(hipMalloc(&ctx->d_bucket_offsets, NUM_BUCKETS * sizeof(uint32_t)));
     CUDA_OK(hipMalloc(&ctx->d_bucket_counts, NUM_BUCKETS * sizeof(uint32_t)));
-    CUDA_OK(hipMalloc(&ctx->d_bucket_ends, NUM_BUCKETS * sizeof(uint32_t)));
     CUDA_OK(hipMalloc(&ctx->d_sorted_digits, n * sizeof(uint16_t)));
-    CUDA_OK(hipMalloc(&ctx->d_sorted_indices, n * sizeof(uint32_t)));
-    CUDA_OK(hipMalloc(&ctx->d_sorted_signs, n * sizeof(uint8_t)));
-    CUDA_OK(hipMalloc(&ctx->d_indices, n * sizeof(uint32_t)));
+    CUDA_OK(hipMalloc(&ctx->d_sorted_packed, n * sizeof(uint32_t)));
 
-    // Determine hipCUB sort temp storage size
+    // Determine hipCUB sort temp storage size (sort only WINDOW_BITS bits)
     ctx->sort_temp_bytes = 0;
     hipcub::DeviceRadixSort::SortPairs(
         nullptr, ctx->sort_temp_bytes,
         ctx->d_digits, ctx->d_sorted_digits,
-        ctx->d_indices, ctx->d_sorted_indices,
-        n, 0, 16);
+        ctx->d_packed, ctx->d_sorted_packed,
+        n, 0, WINDOW_BITS);
     CUDA_OK(hipMalloc(&ctx->d_sort_temp, ctx->sort_temp_bytes));
 
-    // Parallel bucket accumulation scratch: NUM_BUCKETS * BUCKET_PAR Jacobian points
-    // ~50 MiB for BUCKET_PAR=32, NUM_BUCKETS=16385
+    // Parallel bucket accumulation scratch (XYZZ: 4 fields per point, 128 bytes)
     CUDA_OK(hipMalloc(&ctx->d_partial_sums,
-                       (size_t)NUM_BUCKETS * BUCKET_PAR * sizeof(bn254_g1_t)));
+                       (size_t)NUM_BUCKETS * BUCKET_PAR * sizeof(bn254_g1_xyzz_t)));
 
     // Block-parallel reduction scratch
     int reduce_threads = (NUM_BUCKETS - 1 + REDUCE_BLOCK_SIZE - 1) / REDUCE_BLOCK_SIZE;
@@ -469,17 +436,15 @@ static void free_working_buffers(hip_msm_context* ctx) {
     if (ctx->alloc_n <= 0) return;
     hipFree(ctx->d_scalars);
     hipFree(ctx->d_digits);
-    hipFree(ctx->d_signs);
+    hipFree(ctx->d_packed);
+    hipFree(ctx->d_carries);
     hipFree(ctx->d_buckets);
     hipFree(ctx->d_window_results);
     hipFree(ctx->d_final_result);
     hipFree(ctx->d_bucket_offsets);
     hipFree(ctx->d_bucket_counts);
-    hipFree(ctx->d_bucket_ends);
     hipFree(ctx->d_sorted_digits);
-    hipFree(ctx->d_sorted_indices);
-    hipFree(ctx->d_sorted_signs);
-    hipFree(ctx->d_indices);
+    hipFree(ctx->d_sorted_packed);
     hipFree(ctx->d_sort_temp);
     hipFree(ctx->d_partial_sums);
     hipFree(ctx->d_reduce_partials);
@@ -551,29 +516,31 @@ rustCudaError_t sp1_bn254_msm_invoke(void* ctx_ptr, void* result,
         CUDA_OK(hipGetLastError());
     }
 
-    // Decompose scalars
-    {
-        int threads = 256;
-        int blocks = (n + threads - 1) / threads;
-        hipLaunchKernelGGL(scalar_decompose_kernel,
-            dim3(blocks), dim3(threads), 0, 0,
-            ctx->d_scalars, ctx->d_digits, ctx->d_signs, n);
-        CUDA_OK(hipGetLastError());
-    }
+    // Initialize carries to zero for per-window decomposition
+    CUDA_OK(hipMemset(ctx->d_carries, 0, n * sizeof(uint8_t)));
 
     if (do_timing) hipEventRecord(ev_decompose);
 
-    // Process each window using pre-allocated buffers
+    // Process each window: per-window decompose (packed sign) + sort + accumulate + reduce
     for (int w = 0; w < NUM_WINDOWS; w++) {
+        // Per-window scalar decomposition with packed sign into index bit 31
+        {
+            int threads = 256;
+            int blocks = (n + threads - 1) / threads;
+            hipLaunchKernelGGL(scalar_decompose_packed_kernel,
+                dim3(blocks), dim3(threads), 0, 0,
+                ctx->d_scalars, ctx->d_digits, ctx->d_packed, ctx->d_carries, n, w);
+            CUDA_OK(hipGetLastError());
+        }
+
         msm_one_window(
             ctx->d_points,
-            ctx->d_digits + (size_t)w * n,
-            ctx->d_signs + (size_t)w * n,
+            ctx->d_digits,
+            ctx->d_packed,
             ctx->d_window_results + w,
             ctx->d_buckets,
-            ctx->d_bucket_offsets, ctx->d_bucket_ends, ctx->d_bucket_counts,
-            ctx->d_sorted_digits, ctx->d_sorted_indices,
-            ctx->d_sorted_signs, ctx->d_indices,
+            ctx->d_bucket_offsets, ctx->d_bucket_counts,
+            ctx->d_sorted_digits, ctx->d_sorted_packed,
             ctx->d_sort_temp, ctx->sort_temp_bytes,
             ctx->d_partial_sums,
             ctx->d_reduce_partials, ctx->d_reduce_suffixes,

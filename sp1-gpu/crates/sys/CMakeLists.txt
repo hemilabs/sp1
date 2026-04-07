@@ -54,9 +54,9 @@ if(USE_HIP)
     # HIP's compiler handles CUDA API mapping natively in ROCm 7.2+.
     # No need for cuda2hip.hpp global include.
 
-    # Release optimization
-    set(CMAKE_HIP_FLAGS_RELEASE "-O3")
-    set(CMAKE_HIP_FLAGS_DEBUG "-O3")
+    # Release optimization. -Wno-c++11-narrowing for sppark's variadic constructors.
+    set(CMAKE_HIP_FLAGS_RELEASE "-O3 -Wno-c++11-narrowing")
+    set(CMAKE_HIP_FLAGS_DEBUG "-O3 -Wno-c++11-narrowing")
 
     # Get the actual source directory
     set(CSL_SOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR})
@@ -106,6 +106,7 @@ if(USE_HIP)
     add_subdirectory(lib/merkle_tree)
     add_subdirectory(lib/mle)
     add_subdirectory(lib/ntt)
+    # add_subdirectory(lib/ntt_bn254_rdna3)  # Custom NTT: correct proofs, slower than sppark (needs optimization)
     add_subdirectory(lib/runtime)
     add_subdirectory(lib/scan)
     add_subdirectory(lib/sum_and_reduce)

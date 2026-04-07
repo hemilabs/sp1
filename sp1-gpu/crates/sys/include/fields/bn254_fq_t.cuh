@@ -46,12 +46,14 @@ struct bn254_fq_t {
     __device__ __forceinline__ const uint32_t& operator[](size_t i) const { return data[i]; }
 
     // Comparison: is this >= P (base field modulus)?
+    // Branchless: computes data - P and checks carry. No warp divergence.
     __device__ __forceinline__ bool gte_p() const {
-        for (int i = N - 1; i >= 0; i--) {
-            if (data[i] > device::ALT_BN128_P[i]) return true;
-            if (data[i] < device::ALT_BN128_P[i]) return false;
+        uint64_t borrow = 0;
+        for (int i = 0; i < N; i++) {
+            uint64_t diff = (uint64_t)data[i] - device::ALT_BN128_P[i] - borrow;
+            borrow = (diff >> 63) & 1;
         }
-        return true; // equal
+        return borrow == 0; // no borrow means data >= P
     }
 
     // Subtract P
@@ -111,46 +113,58 @@ struct bn254_fq_t {
     }
 
     // Montgomery multiplication: computes (a * b * R^{-1}) mod P
-    // Using CIOS (Coarsely Integrated Operand Scanning) method
+    // Fully-unrolled CIOS with fused shift: the reduction step writes to t[j-1]
+    // instead of t[j], eliminating the separate shift loop (saves ~120 instructions).
     // M0 = ALT_BN128_M0 = -P^{-1} mod 2^32 = 0xe4866389
     __device__ __forceinline__ bn254_fq_t operator*(const bn254_fq_t& b) const {
         const uint32_t m0 = device::ALT_BN128_M0;
-        uint32_t t[N + 2] = {0};
+        const uint32_t* p = device::ALT_BN128_P;
 
-        for (int i = 0; i < N; i++) {
-            // Step 1: t += a[i] * b
-            uint64_t carry = 0;
-            for (int j = 0; j < N; j++) {
-                uint64_t prod = (uint64_t)data[i] * b.data[j] + t[j] + carry;
-                t[j] = (uint32_t)prod;
-                carry = prod >> 32;
-            }
-            uint64_t sum = (uint64_t)t[N] + carry;
-            t[N] = (uint32_t)sum;
-            t[N + 1] = (uint32_t)(sum >> 32);
+        // Named scalar accumulators. NO_CARRY: t9 provably always zero for BN254
+        // because P[7]=0x30644e72 < 2^31-2 (same top limb as Fr).
+        uint32_t t0 = 0, t1 = 0, t2 = 0, t3 = 0;
+        uint32_t t4 = 0, t5 = 0, t6 = 0, t7 = 0;
+        uint32_t t8 = 0;
 
-            // Step 2: Montgomery reduction with base field modulus P
-            uint32_t m = t[0] * m0;
-            carry = 0;
-            for (int j = 0; j < N; j++) {
-                uint64_t prod = (uint64_t)m * device::ALT_BN128_P[j] + t[j] + carry;
-                t[j] = (uint32_t)prod;
-                carry = prod >> 32;
-            }
-            sum = (uint64_t)t[N] + carry;
-            t[N] = (uint32_t)sum;
-            t[N + 1] += (uint32_t)(sum >> 32);
+        #define FQ_CIOS_ROUND(a_i) do { \
+            uint64_t acc; uint32_t c; \
+            acc = (uint64_t)(a_i) * b.data[0] + t0;       t0 = (uint32_t)acc; c = (uint32_t)(acc >> 32); \
+            acc = (uint64_t)(a_i) * b.data[1] + t1 + c;   t1 = (uint32_t)acc; c = (uint32_t)(acc >> 32); \
+            acc = (uint64_t)(a_i) * b.data[2] + t2 + c;   t2 = (uint32_t)acc; c = (uint32_t)(acc >> 32); \
+            acc = (uint64_t)(a_i) * b.data[3] + t3 + c;   t3 = (uint32_t)acc; c = (uint32_t)(acc >> 32); \
+            acc = (uint64_t)(a_i) * b.data[4] + t4 + c;   t4 = (uint32_t)acc; c = (uint32_t)(acc >> 32); \
+            acc = (uint64_t)(a_i) * b.data[5] + t5 + c;   t5 = (uint32_t)acc; c = (uint32_t)(acc >> 32); \
+            acc = (uint64_t)(a_i) * b.data[6] + t6 + c;   t6 = (uint32_t)acc; c = (uint32_t)(acc >> 32); \
+            acc = (uint64_t)(a_i) * b.data[7] + t7 + c;   t7 = (uint32_t)acc; c = (uint32_t)(acc >> 32); \
+            t8 += c; \
+            uint32_t m = t0 * m0; \
+            acc = (uint64_t)m * p[0] + t0;                 c = (uint32_t)(acc >> 32); \
+            acc = (uint64_t)m * p[1] + t1 + c;             t0 = (uint32_t)acc; c = (uint32_t)(acc >> 32); \
+            acc = (uint64_t)m * p[2] + t2 + c;             t1 = (uint32_t)acc; c = (uint32_t)(acc >> 32); \
+            acc = (uint64_t)m * p[3] + t3 + c;             t2 = (uint32_t)acc; c = (uint32_t)(acc >> 32); \
+            acc = (uint64_t)m * p[4] + t4 + c;             t3 = (uint32_t)acc; c = (uint32_t)(acc >> 32); \
+            acc = (uint64_t)m * p[5] + t5 + c;             t4 = (uint32_t)acc; c = (uint32_t)(acc >> 32); \
+            acc = (uint64_t)m * p[6] + t6 + c;             t5 = (uint32_t)acc; c = (uint32_t)(acc >> 32); \
+            acc = (uint64_t)m * p[7] + t7 + c;             t6 = (uint32_t)acc; c = (uint32_t)(acc >> 32); \
+            t7 = t8 + c; \
+            t8 = 0; \
+        } while(0)
 
-            // Shift right by one limb
-            for (int j = 0; j < N + 1; j++) {
-                t[j] = t[j + 1];
-            }
-            t[N + 1] = 0;
-        }
+        FQ_CIOS_ROUND(data[0]);
+        FQ_CIOS_ROUND(data[1]);
+        FQ_CIOS_ROUND(data[2]);
+        FQ_CIOS_ROUND(data[3]);
+        FQ_CIOS_ROUND(data[4]);
+        FQ_CIOS_ROUND(data[5]);
+        FQ_CIOS_ROUND(data[6]);
+        FQ_CIOS_ROUND(data[7]);
+
+        #undef FQ_CIOS_ROUND
 
         bn254_fq_t r;
-        for (int i = 0; i < N; i++) r.data[i] = t[i];
-        if (t[N] || r.gte_p()) r.sub_p();
+        r.data[0] = t0; r.data[1] = t1; r.data[2] = t2; r.data[3] = t3;
+        r.data[4] = t4; r.data[5] = t5; r.data[6] = t6; r.data[7] = t7;
+        if (t8 || r.gte_p()) r.sub_p();
         return r;
     }
 
@@ -210,11 +224,11 @@ struct bn254_fq_t {
                 w[i + j] = (uint32_t)prod;
                 rc = prod >> 32;
             }
+            // Branchless carry propagation: no early-exit break to avoid warp divergence.
             for (int k = i + N; k <= 2 * N; k++) {
                 uint64_t sum = (uint64_t)w[k] + rc;
                 w[k] = (uint32_t)sum;
                 rc = sum >> 32;
-                if (rc == 0) break;
             }
         }
 

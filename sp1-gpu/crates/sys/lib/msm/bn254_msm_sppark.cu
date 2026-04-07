@@ -1,11 +1,12 @@
-// BN254 MSM using sppark's Pippenger implementation (CUDA primary path).
+// BN254 MSM using sppark's Pippenger implementation.
+// Works on both CUDA (nvcc) and HIP (hipcc) — sppark's kernels have
+// HIP fallbacks for all PTX instructions, and mont_t.hip provides
+// device-side Montgomery arithmetic in pure C++.
 //
 // Uses risc0-sppark's alt_bn128.hpp (vendored in sppark/ff/) for proper
 // fp_t/fr_t types with mem_t and degree members required by sppark EC types.
 // The msm_compat.cuh header provides CUDA_OK and is_device_ptr that
 // pippenger.cuh expects but SP1's vendored sppark doesn't define.
-
-#ifndef __HIPCC__
 
 // MSM compatibility shim: defines CUDA_OK and is_device_ptr
 #include "msm_compat.cuh"
@@ -147,35 +148,3 @@ void sp1_bn254_msm_destroy(void* ctx)
         delete reinterpret_cast<msm_context_t*>(ctx);
     }
 }
-
-#else
-// HIP path: sppark MSM uses PTX in sort/batch kernels which don't compile on HIP.
-// Provide stub implementations that return errors — the Rust prover falls back to CPU MSM.
-#include "runtime/exception.cuh"
-
-extern "C"
-rustCudaError_t sp1_bn254_msm(void* result, const void* points, size_t npoints,
-                               const void* scalars, size_t ffi_affine_sz)
-{
-    return rustCudaError_t{.message = "BN254 MSM not implemented for HIP"};
-}
-
-extern "C"
-rustCudaError_t sp1_bn254_msm_create(void** ctx_out, const void* points,
-                                      size_t npoints, size_t ffi_affine_sz)
-{
-    *ctx_out = nullptr;
-    return rustCudaError_t{.message = "BN254 MSM not implemented for HIP"};
-}
-
-extern "C"
-rustCudaError_t sp1_bn254_msm_invoke(void* ctx, void* result,
-                                      size_t npoints, const void* scalars, bool mont)
-{
-    return rustCudaError_t{.message = "BN254 MSM not implemented for HIP"};
-}
-
-extern "C"
-void sp1_bn254_msm_destroy(void* ctx) {}
-
-#endif

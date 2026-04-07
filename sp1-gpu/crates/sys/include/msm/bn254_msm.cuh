@@ -34,9 +34,14 @@
 namespace bn254_msm {
 
 // MSM configuration
-static constexpr int WINDOW_BITS = 15;
-static constexpr int NUM_WINDOWS = (254 + WINDOW_BITS - 1) / WINDOW_BITS; // = 17
-static constexpr int NUM_BUCKETS = (1 << (WINDOW_BITS - 1)) + 1; // = 16385 (signed, includes half-point)
+// WINDOW_BITS=13: 4097 signed buckets per window × 20 windows.
+// With BUCKET_PAR=128 parallel accumulation, gives 4097×128=524K threads for
+// good GPU occupancy. Each bucket has ~410 points at N=33M.
+// Benchmarked WBITS=15: 68.77s (slower — merge cost scales with NUM_BUCKETS).
+// WBITS=13 is the sweet spot for this architecture.
+static constexpr int WINDOW_BITS = 13;
+static constexpr int NUM_WINDOWS = (254 + WINDOW_BITS - 1) / WINDOW_BITS; // = 20
+static constexpr int NUM_BUCKETS = (1 << (WINDOW_BITS - 1)) + 1; // = 4097 (signed)
 static constexpr int SCALAR_LIMBS = 8; // 256-bit scalar = 8 x 32-bit
 
 // ================================================================
@@ -105,6 +110,86 @@ __global__ void scalar_decompose_kernel(
             signs[w * n + idx] = 0;
         }
     }
+}
+
+// ================================================================
+// Kernel 1b: Decomposition with sign packed into index (sppark-style).
+// Produces digits[n] and packed_indices[n] where the high bit of each
+// index encodes the sign: idx_with_sign = point_index | (sign << 31).
+// Also produces bucket_counts[NUM_BUCKETS] directly via atomics — no
+// separate boundary-detection kernels needed.
+//
+// Benefits vs scalar_decompose_single_window_kernel:
+//   - Eliminates separate signs array (saves N bytes)
+//   - Eliminates rearrange_signs_kernel (saves 1 kernel launch/window)
+//   - Fuses bucket counting into decomposition (saves 2 kernel launches/window)
+//
+// Output layout:
+//   digits[i]         = bucket index for point i (0..2^(c-1))
+//   packed_idx[i]     = (i & 0x7FFFFFFF) | ((sign) << 31)
+//   bucket_counts[b]  = number of points mapping to bucket b
+// ================================================================
+__global__ void scalar_decompose_packed_kernel(
+    const uint32_t* __restrict__ scalars,     // n * 8 limbs
+    uint16_t* __restrict__ digits,             // [n]
+    uint32_t* __restrict__ packed_indices,     // [n] with sign in bit 31
+    uint8_t* __restrict__ carries,             // [n] in/out carry bits
+    int n,
+    int window_idx
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+
+    // Load the scalar (8 limbs)
+    const uint32_t* s = &scalars[idx * SCALAR_LIMBS];
+
+    uint32_t carry = carries[idx];
+    int bit_start = window_idx * WINDOW_BITS;
+
+    // Extract window value using efficient 64-bit load+mask
+    int limb_lo = bit_start / 32;
+    int shift = bit_start % 32;
+
+    uint64_t combined = 0;
+    if (limb_lo < SCALAR_LIMBS) {
+        combined = (uint64_t)s[limb_lo];
+        if (limb_lo + 1 < SCALAR_LIMBS) {
+            combined |= ((uint64_t)s[limb_lo + 1]) << 32;
+        }
+    }
+    uint32_t raw = (uint32_t)(combined >> shift);
+
+    // For the last window, mask to available bits
+    int bits_avail = 254 - bit_start;
+    if (bits_avail < WINDOW_BITS) {
+        raw &= (1u << bits_avail) - 1;
+    } else {
+        raw &= (1u << WINDOW_BITS) - 1;
+    }
+
+    // Add carry from previous window's signed decomposition
+    raw += carry;
+
+    // Signed decomposition: if digit > 2^(c-1), negate and carry
+    uint32_t half = 1u << (WINDOW_BITS - 1);
+    uint16_t digit;
+    uint32_t sign_bit;
+    uint32_t next_carry;
+    if (raw > half) {
+        digit = (uint16_t)((1u << WINDOW_BITS) - raw);
+        sign_bit = 1u;
+        next_carry = 1u;
+    } else {
+        digit = (uint16_t)raw;
+        sign_bit = 0u;
+        next_carry = 0u;
+    }
+
+    digits[idx] = digit;
+    // Pack: low 31 bits = point index, high bit = sign.
+    // Safe because N < 2^31 (max supported: 2.1 billion points).
+    packed_indices[idx] = ((uint32_t)idx & 0x7FFFFFFFu) | (sign_bit << 31);
+    carries[idx] = (uint8_t)next_carry;
 }
 
 // ================================================================
@@ -184,7 +269,7 @@ __global__ void bucket_accumulate_parallel_kernel(
     const uint8_t* __restrict__ sorted_signs,
     const uint32_t* __restrict__ bucket_offsets,
     const uint32_t* __restrict__ bucket_counts,
-    bn254_g1_t* __restrict__ partial_sums,
+    bn254_g1_xyzz_t* __restrict__ partial_sums,
     int num_buckets
 ) {
     int flat_id = blockIdx.x * blockDim.x + threadIdx.x;
@@ -193,10 +278,6 @@ __global__ void bucket_accumulate_parallel_kernel(
 
     if (bucket_id >= num_buckets) return;
 
-    // Skip bucket 0: digit=0 means the scalar's contribution to this window is zero.
-    // These points don't affect the MSM result. Skipping avoids massive workload
-    // imbalance when many scalars are zero (e.g., depadded wire polynomials with
-    // 19% zero entries → 6.5M points in bucket 0 vs ~2K average).
     if (bucket_id == 0) {
         partial_sums[(size_t)bucket_id * BUCKET_PAR + par_id].set_infinity();
         return;
@@ -205,17 +286,165 @@ __global__ void bucket_accumulate_parallel_kernel(
     uint32_t offset = bucket_offsets[bucket_id];
     uint32_t count = bucket_counts[bucket_id];
 
-    bn254_g1_t accum;
+    bn254_g1_xyzz_t accum;
     accum.set_infinity();
 
-    // Each thread processes every BUCKET_PAR-th point, starting at par_id
-    for (uint32_t i = par_id; i < count; i += BUCKET_PAR) {
+    uint32_t i = par_id;
+    if (i < count) {
         uint32_t pt_idx = sorted_indices[offset + i];
         bn254_g1_affine_t p = points[pt_idx];
-        if (sorted_signs[offset + i]) {
-            p.y = -p.y;
-        }
-        accum.add_affine(p);
+        if (sorted_signs[offset + i]) p.y = -p.y;
+        accum.from_affine(p);
+        i += BUCKET_PAR;
+    }
+
+    for (; i < count; i += BUCKET_PAR) {
+        uint32_t pt_idx = sorted_indices[offset + i];
+        bn254_g1_affine_t p = points[pt_idx];
+        if (sorted_signs[offset + i]) p.y = -p.y;
+        accum.add_affine_unsafe(p);
+    }
+
+    partial_sums[(size_t)bucket_id * BUCKET_PAR + par_id] = accum;
+}
+
+// ================================================================
+// Boundary detection via neighbor comparison (no atomics).
+// After sorting, sorted_digits is monotonically non-decreasing.
+// For each position i, check if sorted_digits[i] != sorted_digits[i-1]
+// to detect bucket boundaries. This avoids atomicMin/Max entirely.
+//
+// Output: bucket_offsets[b] = first position where digit = b
+//         bucket_counts[b]  = count computed from offset differences
+// ================================================================
+__global__ void detect_boundaries_kernel(
+    const uint16_t* __restrict__ sorted_digits,
+    uint32_t* __restrict__ bucket_offsets,  // pre-initialized to UINT32_MAX
+    int n,
+    int num_buckets
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+
+    uint16_t d = sorted_digits[i];
+    if (d >= (uint16_t)num_buckets) return;
+
+    // A position is a boundary if it's the first position or if the previous
+    // position had a different digit. Only the boundary thread writes to
+    // bucket_offsets — no atomic needed (only one writer per bucket).
+    bool is_boundary = (i == 0) || (sorted_digits[i - 1] != d);
+    if (is_boundary) {
+        bucket_offsets[d] = (uint32_t)i;
+    }
+}
+
+// Compute counts from sorted_digits in one pass.
+// For each position i, if digit[i] != digit[i+1] (or i==n-1), write
+// (i+1 - bucket_offsets[digit[i]]) to bucket_counts[digit[i]].
+// This is a "find last position" pattern — the last position in each
+// segment writes the segment length (computed from offset).
+__global__ void detect_boundaries_and_counts_kernel(
+    const uint16_t* __restrict__ sorted_digits,
+    uint32_t* __restrict__ bucket_offsets,  // pre-initialized to UINT32_MAX
+    uint32_t* __restrict__ bucket_counts,   // pre-initialized to 0
+    int n,
+    int num_buckets
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+
+    uint16_t d = sorted_digits[i];
+    if (d >= (uint16_t)num_buckets) return;
+
+    // First position of a segment: write offset
+    bool is_start = (i == 0) || (sorted_digits[i - 1] != d);
+    if (is_start) {
+        bucket_offsets[d] = (uint32_t)i;
+    }
+
+    // Last position of a segment: write count (requires offset to be set)
+    bool is_end = (i == n - 1) || (sorted_digits[i + 1] != d);
+    if (is_end) {
+        // Read offset that was just written by the segment's first thread.
+        // Safe: same warp usually, __threadfence not needed since grid-wide
+        // memory consistency is guaranteed after kernel completion, but we
+        // need it within this kernel. Use a simpler approach: compute count
+        // from (i+1 - i_start). We need to find i_start by scanning back,
+        // which is bad. Better: just write (i+1) to bucket_counts, then
+        // subtract offset in a second pass.
+        bucket_counts[d] = (uint32_t)(i + 1);
+    }
+}
+
+// Finalize counts: subtract offset from the "end+1" position stored in bucket_counts.
+__global__ void finalize_counts_kernel(
+    uint32_t* __restrict__ bucket_counts,
+    const uint32_t* __restrict__ bucket_offsets,
+    int num_buckets
+) {
+    int b = blockIdx.x * blockDim.x + threadIdx.x;
+    if (b >= num_buckets) return;
+
+    uint32_t offset = bucket_offsets[b];
+    uint32_t end = bucket_counts[b];
+    if (offset == UINT32_MAX || end == 0) {
+        bucket_counts[b] = 0;
+    } else {
+        bucket_counts[b] = end - offset;
+    }
+}
+
+// ================================================================
+// Kernel 2b-packed: Parallel Bucket Accumulation with packed sign.
+// Same as bucket_accumulate_parallel_kernel but reads sign from high
+// bit of sorted_packed_indices (eliminating separate sorted_signs array).
+// Saves memory bandwidth: 4 bytes/point instead of 4+1 bytes/point.
+// ================================================================
+__global__ void bucket_accumulate_parallel_packed_kernel(
+    const bn254_g1_affine_t* __restrict__ points,
+    const uint32_t* __restrict__ sorted_packed_indices,  // sign in high bit
+    const uint32_t* __restrict__ bucket_offsets,
+    const uint32_t* __restrict__ bucket_counts,
+    bn254_g1_xyzz_t* __restrict__ partial_sums,
+    int num_buckets
+) {
+    int flat_id = blockIdx.x * blockDim.x + threadIdx.x;
+    int bucket_id = flat_id / BUCKET_PAR;
+    int par_id = flat_id % BUCKET_PAR;
+
+    if (bucket_id >= num_buckets) return;
+
+    if (bucket_id == 0) {
+        partial_sums[(size_t)bucket_id * BUCKET_PAR + par_id].set_infinity();
+        return;
+    }
+
+    uint32_t offset = bucket_offsets[bucket_id];
+    uint32_t count = bucket_counts[bucket_id];
+
+    // XYZZ accumulator: first point initializes directly (avoids infinity check),
+    // subsequent points use add_affine_unsafe (7M+2S vs Jacobian's 8M+3S).
+    bn254_g1_xyzz_t accum;
+    accum.set_infinity();
+
+    uint32_t i = par_id;
+    // First point: initialize accumulator from affine
+    if (i < count) {
+        uint32_t packed = sorted_packed_indices[offset + i];
+        uint32_t pt_idx = packed & 0x7FFFFFFFu;
+        bn254_g1_affine_t p = points[pt_idx];
+        if (packed >> 31) p.y = -p.y;
+        accum.from_affine(p);
+        i += BUCKET_PAR;
+    }
+
+    // Remaining points: unsafe add (no infinity/P==Q checks, 7M+2S)
+    for (; i < count; i += BUCKET_PAR) {
+        uint32_t packed = sorted_packed_indices[offset + i];
+        uint32_t pt_idx = packed & 0x7FFFFFFFu;
+        bn254_g1_affine_t p = points[pt_idx];
+        if (packed >> 31) p.y = -p.y;
+        accum.add_affine_unsafe(p);
     }
 
     partial_sums[(size_t)bucket_id * BUCKET_PAR + par_id] = accum;
@@ -227,24 +456,27 @@ __global__ void bucket_accumulate_parallel_kernel(
 // One thread per bucket, each merging 32 partial Jacobian points.
 // ================================================================
 __global__ void bucket_merge_kernel(
-    const bn254_g1_t* __restrict__ partial_sums,
+    const bn254_g1_xyzz_t* __restrict__ partial_sums,
     bn254_g1_t* __restrict__ buckets,
     int num_buckets
 ) {
     int bucket_id = blockIdx.x * blockDim.x + threadIdx.x;
     if (bucket_id >= num_buckets) return;
 
-    bn254_g1_t accum;
+    // Merge XYZZ partial sums using XYZZ addition (11M+2S vs Jacobian's 12M+4S),
+    // then convert the final result to Jacobian for the reduce kernel.
+    bn254_g1_xyzz_t accum;
     accum.set_infinity();
 
     for (int i = 0; i < BUCKET_PAR; i++) {
-        const bn254_g1_t& partial = partial_sums[(size_t)bucket_id * BUCKET_PAR + i];
+        const bn254_g1_xyzz_t& partial = partial_sums[(size_t)bucket_id * BUCKET_PAR + i];
         if (!partial.is_infinity()) {
             accum += partial;
         }
     }
 
-    buckets[bucket_id] = accum;
+    // Convert XYZZ → Jacobian for the reduce kernel (1 inversion per bucket, ~4097 total)
+    buckets[bucket_id] = accum.to_jacobian();
 }
 
 // ================================================================

@@ -8,8 +8,13 @@
 #include "exception.hpp"
 
 #ifdef __HIPCC__
-#include <hip/hip_runtime.h>
-// CUDA→HIP type compatibility for AMD platform
+// Use sppark's cuda2hip.hpp for comprehensive CUDA→HIP mapping.
+// This defines HIP_DISABLE_WARP_SYNC_BUILTINS (disabling ROCm 7.2+ native
+// __shfl_sync builtins that require 64-bit masks), then provides polyfill
+// implementations of __shfl_sync, __shfl_up_sync, __shfl_down_sync, etc.
+// that work with uint32_t masks and correctly handle wave32/wave64 partitioning.
+#include "cuda2hip.hpp"
+// Additional CUDA→HIP type compatibility not in cuda2hip.hpp
 using cudaError_t = hipError_t;
 using cudaStream_t = hipStream_t;
 using cudaEvent_t = hipEvent_t;
@@ -60,7 +65,7 @@ static inline hipError_t cachedHipFreeSppark(void* p, hipStream_t) {
     auto it = g_sppark_alloc_sizes.find(p);
     if (it != g_sppark_alloc_sizes.end()) {
         size_t s = it->second;
-        if (g_sppark_cached_bytes + s <= 4ULL * 1024 * 1024 * 1024) {
+        if (g_sppark_cached_bytes + s <= 1ULL * 1024 * 1024 * 1024) {
             g_sppark_free_pool[s].push_back(p);
             g_sppark_cached_bytes += s;
             return hipSuccess;
@@ -88,6 +93,8 @@ static inline hipError_t cachedHipFreeSppark(void* p, hipStream_t) {
 #define cudaMalloc hipMalloc
 #define cudaFree hipFree
 #define cudaMemcpy hipMemcpy
+#define cudaMemcpy2D hipMemcpy2D
+#define cudaMemcpy2DAsync hipMemcpy2DAsync
 #define cudaMallocHost hipHostMalloc
 #define cudaFreeHost hipHostFree
 #define cudaStreamQuery hipStreamQuery

@@ -351,7 +351,8 @@ impl PersistentMsm {
 
     /// Run MSM with pre-uploaded SRS. Only uploads scalars to GPU.
     /// Uses the persistent invoke path with pre-allocated working buffers.
-    /// Scalars are converted to canonical form on CPU and passed with mont=false.
+    /// Scalars are passed in Montgomery form; the GPU converts to canonical
+    /// form via the mont_to_canonical_kernel (saves ~60ms CPU conversion per call).
     pub fn msm(&self, scalars: &[crate::fields::Fr]) -> G1Jacobian {
         use crate::{BN254Fq, BN254G1Jacobian};
         use std::ffi::c_void;
@@ -365,26 +366,37 @@ impl PersistentMsm {
             z: BN254Fq { limbs: [0; 8] },
         };
 
-        // Convert scalars to canonical form on CPU (fast with rayon, ~60ms).
-        // Skip conversion for zero scalars (common in depadded wire polynomials).
-        use rayon::prelude::*;
-        let zero_canonical = crate::BN254Fr { limbs: [0; 8] };
-        let canonical_scalars: Vec<crate::BN254Fr> = scalars
-            .par_iter()
-            .map(|s| if s.is_zero() { zero_canonical } else { s.to_bn254fr() })
-            .collect();
-
-        // Use persistent invoke: SRS stays on GPU, only scalars uploaded.
-        // Working buffers are pre-allocated (no per-call hipMalloc/hipFree).
+        // GPU Montgomery conversion: pass scalars in Montgomery form, let the GPU convert.
+        // On CUDA (sppark MSM): always works, saves ~60ms CPU conversion.
+        // On HIP (custom MSM): has a driver issue that causes MSM failure, so fall back
+        // to CPU conversion. Detected at compile time via cfg target env.
+        #[cfg(not(target_env = ""))] // This cfg is always true — we detect HIP at runtime below
+        let canonical_holder: Option<Vec<crate::BN254Fr>>;
+        let (scalar_ptr, mont_flag) = if std::env::var("SP1_HIP_ENABLED").is_ok() {
+            // HIP: CPU conversion (GPU mont kernel has driver issues)
+            use rayon::prelude::*;
+            let zero_canonical = crate::BN254Fr { limbs: [0; 8] };
+            let cs: Vec<crate::BN254Fr> = scalars
+                .par_iter()
+                .map(|s| if s.is_zero() { zero_canonical } else { s.to_bn254fr() })
+                .collect();
+            let ptr = cs.as_ptr() as *const c_void;
+            canonical_holder = Some(cs);
+            (ptr, false)
+        } else {
+            canonical_holder = None;
+            (scalars.as_ptr() as *const c_void, true)
+        };
         let err = unsafe {
             sp1_gpu_sys::msm::sp1_bn254_msm_invoke(
                 self.ctx,
                 &mut result as *mut BN254G1Jacobian as *mut c_void,
                 n,
-                canonical_scalars.as_ptr() as *const c_void,
-                false, // scalars already canonical
+                scalar_ptr,
+                mont_flag,
             )
         };
+        drop(canonical_holder); // Keep alive until after FFI call
         if err != unsafe { sp1_gpu_sys::runtime::CUDA_SUCCESS_CSL } {
             let msg = if err.message.is_null() {
                 "unknown error".to_string()

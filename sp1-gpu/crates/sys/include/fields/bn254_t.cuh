@@ -117,45 +117,64 @@ struct bn254_t {
     }
 
     // Montgomery multiplication: computes (a * b * R^{-1}) mod r
-    // Using CIOS (Coarsely Integrated Operand Scanning) method
+    // Fully-unrolled CIOS with fused shift: the reduction step writes to t[j-1]
+    // instead of t[j], eliminating the separate shift loop (saves ~120 instructions).
+    // All loops are unrolled by the compiler since N=8 is constexpr.
     __device__ __forceinline__ bn254_t operator*(const bn254_t& b) const {
-        const uint32_t m0 = device::ALT_BN128_m0;
-        uint32_t t[N + 2] = {0};
+        const uint32_t* p = device::ALT_BN128_r;
 
-        for (int i = 0; i < N; i++) {
-            // Step 1: t += a[i] * b
-            uint64_t carry = 0;
-            for (int j = 0; j < N; j++) {
-                uint64_t prod = (uint64_t)data[i] * b.data[j] + t[j] + carry;
-                t[j] = (uint32_t)prod;
-                carry = prod >> 32;
-            }
-            uint64_t sum = (uint64_t)t[N] + carry;
-            t[N] = (uint32_t)sum;
-            t[N + 1] = (uint32_t)(sum >> 32);
+        // Named scalar accumulators (forces VGPR allocation, avoids array spills)
+        // NO_CARRY optimization: t9 is provably always zero for BN254 because
+        // the top limb r[7]=0x30644e72 < 2^31-2, so overflow into t9 never occurs.
+        uint32_t t0 = 0, t1 = 0, t2 = 0, t3 = 0;
+        uint32_t t4 = 0, t5 = 0, t6 = 0, t7 = 0;
+        uint32_t t8 = 0;
 
-            // Step 2: Montgomery reduction
-            uint32_t m = t[0] * m0;
-            carry = 0;
-            for (int j = 0; j < N; j++) {
-                uint64_t prod = (uint64_t)m * device::ALT_BN128_r[j] + t[j] + carry;
-                t[j] = (uint32_t)prod;
-                carry = prod >> 32;
-            }
-            sum = (uint64_t)t[N] + carry;
-            t[N] = (uint32_t)sum;
-            t[N + 1] += (uint32_t)(sum >> 32);
+        // Macro for one CIOS round with fused shift and NO_CARRY.
+        // m0 decomposition: m0 = 0xefffffff = -(1 + 2^28), so
+        //   m = t0 * m0 = -(t0 + (t0 << 28)) mod 2^32
+        // This uses 3 full-rate ops instead of 1 quarter-rate multiply.
+        #define CIOS_ROUND(a_i) do { \
+            uint64_t acc; uint32_t c; \
+            /* Step 1: t += a_i * b[j] for j=0..7 */ \
+            acc = (uint64_t)(a_i) * b.data[0] + t0;       t0 = (uint32_t)acc; c = (uint32_t)(acc >> 32); \
+            acc = (uint64_t)(a_i) * b.data[1] + t1 + c;   t1 = (uint32_t)acc; c = (uint32_t)(acc >> 32); \
+            acc = (uint64_t)(a_i) * b.data[2] + t2 + c;   t2 = (uint32_t)acc; c = (uint32_t)(acc >> 32); \
+            acc = (uint64_t)(a_i) * b.data[3] + t3 + c;   t3 = (uint32_t)acc; c = (uint32_t)(acc >> 32); \
+            acc = (uint64_t)(a_i) * b.data[4] + t4 + c;   t4 = (uint32_t)acc; c = (uint32_t)(acc >> 32); \
+            acc = (uint64_t)(a_i) * b.data[5] + t5 + c;   t5 = (uint32_t)acc; c = (uint32_t)(acc >> 32); \
+            acc = (uint64_t)(a_i) * b.data[6] + t6 + c;   t6 = (uint32_t)acc; c = (uint32_t)(acc >> 32); \
+            acc = (uint64_t)(a_i) * b.data[7] + t7 + c;   t7 = (uint32_t)acc; c = (uint32_t)(acc >> 32); \
+            t8 += c; \
+            /* Step 2: m = -(t0 + (t0<<28)); t += m*p; fused shift */ \
+            uint32_t m = -(t0 + (t0 << 28)); \
+            acc = (uint64_t)m * p[0] + t0;                 c = (uint32_t)(acc >> 32); \
+            acc = (uint64_t)m * p[1] + t1 + c;             t0 = (uint32_t)acc; c = (uint32_t)(acc >> 32); \
+            acc = (uint64_t)m * p[2] + t2 + c;             t1 = (uint32_t)acc; c = (uint32_t)(acc >> 32); \
+            acc = (uint64_t)m * p[3] + t3 + c;             t2 = (uint32_t)acc; c = (uint32_t)(acc >> 32); \
+            acc = (uint64_t)m * p[4] + t4 + c;             t3 = (uint32_t)acc; c = (uint32_t)(acc >> 32); \
+            acc = (uint64_t)m * p[5] + t5 + c;             t4 = (uint32_t)acc; c = (uint32_t)(acc >> 32); \
+            acc = (uint64_t)m * p[6] + t6 + c;             t5 = (uint32_t)acc; c = (uint32_t)(acc >> 32); \
+            acc = (uint64_t)m * p[7] + t7 + c;             t6 = (uint32_t)acc; c = (uint32_t)(acc >> 32); \
+            t7 = t8 + c; \
+            t8 = 0; \
+        } while(0)
 
-            // Shift right by one limb
-            for (int j = 0; j < N + 1; j++) {
-                t[j] = t[j + 1];
-            }
-            t[N + 1] = 0;
-        }
+        CIOS_ROUND(data[0]);
+        CIOS_ROUND(data[1]);
+        CIOS_ROUND(data[2]);
+        CIOS_ROUND(data[3]);
+        CIOS_ROUND(data[4]);
+        CIOS_ROUND(data[5]);
+        CIOS_ROUND(data[6]);
+        CIOS_ROUND(data[7]);
+
+        #undef CIOS_ROUND
 
         bn254_t r;
-        for (int i = 0; i < N; i++) r.data[i] = t[i];
-        if (t[N] || r.gte_p()) r.sub_p();
+        r.data[0] = t0; r.data[1] = t1; r.data[2] = t2; r.data[3] = t3;
+        r.data[4] = t4; r.data[5] = t5; r.data[6] = t6; r.data[7] = t7;
+        if (t8 || r.gte_p()) r.sub_p();
         return r;
     }
 
@@ -210,11 +229,12 @@ struct bn254_t {
                 w[i + j] = (uint32_t)prod;
                 rc = prod >> 32;
             }
+            // Branchless carry propagation: avoid warp-divergent break
+            // that would serialize lanes with different carry chain lengths.
             for (int k = i + N; k <= 2 * N; k++) {
                 uint64_t sum = (uint64_t)w[k] + rc;
                 w[k] = (uint32_t)sum;
                 rc = sum >> 32;
-                if (rc == 0) break;
             }
         }
 
@@ -238,10 +258,11 @@ struct bn254_t {
     }
 
     // Power: x^exp (only used for small exponents like D=5 in Poseidon2 S-box)
+    // Uses dedicated sqr() for x² and x⁴ (36 muls vs 64 for generic mul).
     __device__ __forceinline__ bn254_t& operator^=(int exp) {
         if (exp == 5) {
-            bn254_t x2 = *this * *this;
-            bn254_t x4 = x2 * x2;
+            bn254_t x2 = this->sqr();
+            bn254_t x4 = x2.sqr();
             *this = x4 * *this;
         }
         return *this;
@@ -310,9 +331,10 @@ struct bn254_t {
     }
 
     // Warp shuffle XOR for NTT butterfly: exchange data between lanes.
+    // Width=32 for RDNA3 wave32 mode. CUDA warp size is also 32.
     __device__ __forceinline__ void shfl_bfly(uint32_t laneMask) {
         for (int i = 0; i < N; i++)
-            data[i] = __shfl_xor(data[i], laneMask, 64);
+            data[i] = __shfl_xor(data[i], laneMask, 32);
     }
 
     // Equality

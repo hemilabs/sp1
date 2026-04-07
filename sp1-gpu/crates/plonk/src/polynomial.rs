@@ -15,18 +15,32 @@ pub fn eval_poly_at(coeffs: &[Fr], x: &Fr) -> Fr {
     result
 }
 
-/// In-place linear combination: result[i] += Σ scalars[j] * polys[j][i].
-/// Accumulates into `result` without allocating intermediate vectors.
+/// In-place linear combination: result[i] = Σ scalars[j] * polys[j][i].
+/// The FIRST polynomial is WRITTEN with `=` (not `+=`), eliminating the need
+/// for pre-zeroing the result buffer. Subsequent polynomials accumulate with `+=`.
 /// Iterates polynomial-outer (one poly at a time) for cache-friendly sequential
 /// access over each 1 GiB polynomial, then parallelizes within each poly via rayon.
 pub fn linear_combination_into(result: &mut [Fr], polys: &[&[Fr]], scalars: &[Fr]) {
     use rayon::prelude::*;
     assert_eq!(polys.len(), scalars.len());
+    let mut first = true;
     for (poly, scalar) in polys.iter().zip(scalars.iter()) {
         let len = poly.len().min(result.len());
-        result[..len].par_iter_mut().zip(poly[..len].par_iter()).for_each(|(r, &p)| {
-            *r += p * *scalar;
-        });
+        if first {
+            // Write-first: initialize result from first polynomial (no pre-zeroing needed)
+            result[..len].par_iter_mut().zip(poly[..len].par_iter()).for_each(|(r, &p)| {
+                *r = p * *scalar;
+            });
+            // Zero any trailing elements beyond this poly's length
+            if len < result.len() {
+                result[len..].par_iter_mut().for_each(|r| *r = Fr::ZERO);
+            }
+            first = false;
+        } else {
+            result[..len].par_iter_mut().zip(poly[..len].par_iter()).for_each(|(r, &p)| {
+                *r += p * *scalar;
+            });
+        }
     }
 }
 
@@ -78,7 +92,16 @@ impl Polynomial {
         //   q[n-2] = coeffs[n-1]
         //   q[i-1] = coeffs[i] + z * q[i]  for i = n-2, ..., 1
         //   r = coeffs[0] + z * q[0]
-        let mut q = vec![Fr::ZERO; n - 1];
+        let mut q = {
+            let qlen = n - 1;
+            let mut v = Vec::with_capacity(qlen);
+            unsafe { v.set_len(qlen) };
+            use rayon::prelude::*;
+            v.par_chunks_mut(128).for_each(|chunk| {
+                unsafe { std::ptr::write_volatile(&mut chunk[0] as *mut Fr, Fr::ZERO); }
+            });
+            v
+        };
         q[n - 2] = self.coeffs[n - 1];
         for i in (1..n - 1).rev() {
             q[i - 1] = self.coeffs[i] + *z * q[i];

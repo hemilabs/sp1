@@ -16,7 +16,7 @@
 // accumulate with add_unsafe).
 //
 
-# define inline __device__ __forceinline__
+# define inline __host__ __device__ __forceinline__
 
 //
 // To instantiate declare modulus as __device__ __constant___ const and
@@ -30,7 +30,7 @@ template<const size_t N, const uint32_t MOD[(N+31)/32], const uint32_t& M0,
 class __align__(((N+63)/64)&1 ? 8 : 16) mont_t {
 public:
     static const size_t nbits = N;
-    static constexpr size_t __device__ bit_length() { return N; }
+    static constexpr size_t __host__ __device__ bit_length() { return N; }
     static const uint32_t degree = 1;
     using mem_t = mont_t;
 protected:
@@ -52,6 +52,14 @@ public:
     {
         for (size_t i=0; i<n; i++)
             val[i] = p[i];
+    }
+    // Constructor from uint64_t array (used by sppark's FR_T macro on host)
+    inline mont_t(const uint64_t p[n/2])
+    {
+        for (size_t i=0; i<n/2; i++) {
+            val[2*i]   = (uint32_t)p[i];
+            val[2*i+1] = (uint32_t)(p[i] >> 32);
+        }
     }
 
     template<typename... Ts>

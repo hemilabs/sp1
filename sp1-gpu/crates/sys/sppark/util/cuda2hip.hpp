@@ -194,17 +194,16 @@ cudaLaunchCooperativeKernel(const T* func, dim3 gridDim, dim3 blockDim,
                                       stream);
 }
 
+// __syncwarp and __activemask: ROCm 7.2+ provides these as built-in
+// functions regardless of HIP_DISABLE_WARP_SYNC_BUILTINS.
+// Only define polyfills for ROCm < 7.0 which didn't have them.
+#if HIP_VERSION_MAJOR < 7
 static inline __device__ void __syncwarp()
 {   __builtin_amdgcn_wave_barrier();
 }
-
-/*
- * Provide __activemask() that returns a 32-bit virtual-warp mask,
- * since the native ROCm 7.2 version is disabled by
- * HIP_DISABLE_WARP_SYNC_BUILTINS above.
- */
 __device__ __forceinline__
 static unsigned long long __activemask() { return __ballot(true); }
+#endif
 
 /*
  * To match CUDA, the 3-argument polyfills below are designed to produce

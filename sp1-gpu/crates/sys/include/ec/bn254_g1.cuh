@@ -159,6 +159,36 @@ struct bn254_g1_t {
     }
 
     // ================================================================
+    // Unsafe mixed addition: P + Q where Q is affine (Z2=1), NO edge-case checks.
+    // Skips infinity checks and P==±Q handling for maximum throughput.
+    // Only safe when:
+    //   - this is not infinity (caller ensures first point initializes accum)
+    //   - p is not infinity (bucket-0 already skipped)
+    //   - P != ±Q (guaranteed for distinct SRS points in MSM buckets)
+    // Cost: 7M + 3S (same formula, fewer branches → no warp divergence)
+    // ================================================================
+    __device__ __forceinline__ bn254_g1_t& add_affine_unsafe(const bn254_g1_affine_t& p) {
+        bn254_fq_t Z1_sq = Z.sqr();
+        bn254_fq_t U2 = p.x * Z1_sq;
+        bn254_fq_t Z1_cu = Z1_sq * Z;
+        bn254_fq_t S2 = p.y * Z1_cu;
+
+        bn254_fq_t H = U2 - X;
+        bn254_fq_t R = S2 - Y;
+
+        bn254_fq_t H_sq = H.sqr();
+        bn254_fq_t H_cu = H_sq * H;
+        bn254_fq_t V = X * H_sq;
+
+        bn254_fq_t R_sq = R.sqr();
+        X = R_sq - H_cu - V.dbl();
+        Y = R * (V - X) - Y * H_cu;
+        Z = H * Z;
+
+        return *this;
+    }
+
+    // ================================================================
     // Full Jacobian addition: P + Q
     // "add-2007-bl" formula (12M + 4S)
     //
@@ -244,5 +274,109 @@ struct bn254_g1_t {
         r.x = X * z_inv2;                   // x = X * Z^{-2}
         r.y = Y * z_inv3;                   // y = Y * Z^{-3}
         return r;
+    }
+};
+
+// ================================================================
+// XYZZ coordinates: (X, Y, ZZ, ZZZ) where x=X/ZZ, y=Y/ZZZ
+//
+// Caches Z^2 (ZZ) and Z^3 (ZZZ), saving 1 squaring and 1 multiply
+// per mixed affine addition vs Jacobian:
+//   Jacobian add_affine: 8M + 3S (needs Z^2 and Z^3 each time)
+//   XYZZ add_affine:     7M + 2S (ZZ and ZZZ already stored)
+//
+// Used for MSM bucket accumulation where additions dominate (~18% faster).
+// ================================================================
+struct bn254_g1_xyzz_t {
+    bn254_fq_t X, Y, ZZ, ZZZ;
+
+    __device__ __forceinline__ void set_infinity() {
+        ZZ.set_to_zero();
+        ZZZ.set_to_zero();
+    }
+
+    __device__ __forceinline__ bool is_infinity() const {
+        return ZZ.is_zero();
+    }
+
+    // Initialize from affine point (ZZ=1, ZZZ=1)
+    __device__ __forceinline__ void from_affine(const bn254_g1_affine_t& p) {
+        X = p.x;
+        Y = p.y;
+        ZZ = bn254_fq_t::one();
+        ZZZ = bn254_fq_t::one();
+    }
+
+    // Mixed XYZZ + affine addition (7M + 2S)
+    // Assumes: this is NOT infinity, p is NOT infinity, P != ±Q
+    // Safe for MSM bucket accumulation after first point.
+    __device__ __forceinline__ void add_affine_unsafe(const bn254_g1_affine_t& p) {
+        bn254_fq_t U2 = p.x * ZZ;              // x2 * ZZ    (1M)
+        bn254_fq_t S2 = p.y * ZZZ;             // y2 * ZZZ   (1M)
+
+        bn254_fq_t H = U2 - X;                 // U2 - X
+        bn254_fq_t R = S2 - Y;                 // S2 - Y
+
+        bn254_fq_t H_sq = H.sqr();             // H^2        (1S)
+        bn254_fq_t H_cu = H_sq * H;            // H^3        (1M)
+        bn254_fq_t V = X * H_sq;               // X * H^2    (1M)
+
+        bn254_fq_t R_sq = R.sqr();             // R^2        (1S)
+        X = R_sq - H_cu - V.dbl();             // R^2 - H^3 - 2V
+
+        Y = R * (V - X) - Y * H_cu;            // R(V-X3) - Y*H^3  (2M)
+
+        ZZZ = ZZZ * H_cu;                      // ZZZ * H^3  (1M) -- MUST update before ZZ!
+        ZZ = ZZ * H_sq;                         // ZZ * H^2   (1M) -- but H_sq already consumed
+        // Note: ZZ uses H_sq which is still valid (not overwritten).
+        // Total: 7M + 2S
+    }
+
+    // Convert XYZZ to Jacobian: Z = ZZZ / ZZ (1 inv + 1 mul)
+    __device__ __forceinline__ bn254_g1_t to_jacobian() const {
+        bn254_g1_t r;
+        if (is_infinity()) {
+            r.set_infinity();
+            return r;
+        }
+        r.X = X;
+        r.Y = Y;
+        // Z = ZZZ / ZZ = ZZZ * ZZ^(-1)
+        r.Z = ZZZ * ZZ.inv();
+        return r;
+    }
+
+    // XYZZ + XYZZ full addition (11M + 2S)
+    // For merge kernel (combining partial sums).
+    __device__ __forceinline__ bn254_g1_xyzz_t& operator+=(const bn254_g1_xyzz_t& other) {
+        if (other.is_infinity()) return *this;
+        if (is_infinity()) {
+            *this = other;
+            return *this;
+        }
+
+        bn254_fq_t U1 = X * other.ZZ;          // X1 * ZZ2   (1M)
+        bn254_fq_t U2 = other.X * ZZ;           // X2 * ZZ1   (1M)
+        bn254_fq_t S1 = Y * other.ZZZ;          // Y1 * ZZZ2  (1M)
+        bn254_fq_t S2 = other.Y * ZZZ;          // Y2 * ZZZ1  (1M)
+
+        bn254_fq_t H = U2 - U1;
+        bn254_fq_t R = S2 - S1;
+
+        bn254_fq_t H_sq = H.sqr();              // H^2        (1S)
+        bn254_fq_t H_cu = H_sq * H;             // H^3        (1M)
+        bn254_fq_t V = U1 * H_sq;               // U1 * H^2   (1M)
+
+        bn254_fq_t R_sq = R.sqr();              // R^2        (1S)
+        X = R_sq - H_cu - V.dbl();              // X3
+
+        Y = R * (V - X) - S1 * H_cu;            // Y3         (2M)
+
+        bn254_fq_t ZZ_prod = ZZ * other.ZZ;     // ZZ1*ZZ2    (1M)
+        bn254_fq_t ZZZ_prod = ZZZ * other.ZZZ;  // ZZZ1*ZZZ2  (1M)
+        ZZ = ZZ_prod * H_sq;                     // ZZ3        (1M)
+        ZZZ = ZZZ_prod * H_cu;                   // ZZZ3       (1M)
+        return *this;
+        // Total: 11M + 2S (vs Jacobian 12M + 4S)
     }
 };

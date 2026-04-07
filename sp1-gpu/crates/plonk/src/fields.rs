@@ -624,6 +624,76 @@ fn batch_inv_fr_parallel(values: &[Fr]) -> Vec<Fr> {
     result
 }
 
+/// In-place batch inversion using Montgomery's trick: writes results back into `values`.
+/// Parallel chunked approach for large arrays, same algorithm as `batch_inv_fr_parallel`
+/// but avoids allocating a separate result vector.
+pub fn batch_inv_fr_inplace(values: &mut [Fr]) {
+    use rayon::prelude::*;
+
+    let n = values.len();
+    if n == 0 {
+        return;
+    }
+    if n == 1 {
+        values[0] = values[0].inv();
+        return;
+    }
+
+    let num_threads = rayon::current_num_threads().max(1);
+    let chunk_size = n.div_ceil(num_threads);
+
+    // Step 1: Compute per-chunk prefix products (parallel)
+    let chunks: Vec<&[Fr]> = values.chunks(chunk_size).collect();
+    let chunk_prefixes: Vec<Vec<Fr>> = chunks
+        .par_iter()
+        .map(|chunk| {
+            let mut prefix = vec![Fr::ZERO; chunk.len()];
+            prefix[0] = chunk[0];
+            for i in 1..chunk.len() {
+                prefix[i] = prefix[i - 1] * chunk[i];
+            }
+            prefix
+        })
+        .collect();
+
+    // Step 2: Sequential cross-chunk corrections (O(num_chunks))
+    let mut chunk_totals = vec![Fr::ONE; chunks.len()];
+    for i in 1..chunks.len() {
+        chunk_totals[i] = chunk_totals[i - 1] * chunk_prefixes[i - 1].last().copied().unwrap();
+    }
+
+    let total_product =
+        *chunk_totals.last().unwrap() * *chunk_prefixes.last().unwrap().last().unwrap();
+    let total_inv = total_product.inv();
+
+    // Step 3: Compute per-chunk inverse corrections (sequential, O(num_chunks))
+    let mut chunk_inv_corrections = vec![Fr::ZERO; chunks.len()];
+    {
+        let mut running_inv = total_inv;
+        for i in (0..chunks.len()).rev() {
+            chunk_inv_corrections[i] = running_inv;
+            running_inv *= *chunk_prefixes[i].last().unwrap();
+        }
+    }
+
+    // Step 4: Parallel backward passes writing in-place
+    let result_chunks: Vec<&mut [Fr]> = values.chunks_mut(chunk_size).collect();
+    result_chunks.into_par_iter().enumerate().for_each(|(ci, result_chunk)| {
+        let prefix = &chunk_prefixes[ci];
+        let mut inv_prod = chunk_inv_corrections[ci];
+        let ct = chunk_totals[ci];
+
+        let clen = result_chunk.len();
+        for i in (1..clen).rev() {
+            // Read original value before overwriting
+            let orig = result_chunk[i];
+            result_chunk[i] = inv_prod * ct * prefix[i - 1];
+            inv_prod *= orig;
+        }
+        result_chunk[0] = inv_prod * ct;
+    });
+}
+
 // ============================================================================
 // Utility functions
 // ============================================================================

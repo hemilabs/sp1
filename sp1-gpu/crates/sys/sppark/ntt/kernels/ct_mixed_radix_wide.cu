@@ -3,7 +3,11 @@
 // SPDX-License-Identifier: Apache-2.0
 
 template <int intermediate_mul, class fr_t>
+#ifdef __HIPCC__
+__launch_bounds__(512, 2) __global__  // RDNA3: 2 blocks/CU for better occupancy
+#else
 __launch_bounds__(768, 1) __global__
+#endif
 void _CT_NTT(const unsigned int radix, const unsigned int lg_domain_size,
              const unsigned int stage, const unsigned int iterations,
              fr_t* d_inout, const fr_t (*d_partial_twiddles)[WINDOW_SIZE],

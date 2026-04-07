@@ -31,7 +31,11 @@ if(NOT USE_HIP)
     # Natural batch heuristic: batch=2 at N=2^25 enables double-buffered
     # H2D+compute overlap on sppark's 3 CUDA streams.
 else()
-    # HIP: Portable Pippenger MSM using hipCUB DeviceRadixSort + our own kernels
+    # HIP: Custom Pippenger MSM using our optimized bn254_fq_t Montgomery multiply
+    # (with m0 decomposition trick and NO_CARRY optimization for RDNA3).
+    # sppark's MSM was tested on HIP and is 1.4-2.4x slower due to unoptimized
+    # mont_t.hip field arithmetic. Our custom MSM is faster despite the
+    # BUCKET_PAR=128 merge overhead because the field multiply is faster.
     add_library(msm_objs OBJECT
         bn254_msm_hip.cu
     )

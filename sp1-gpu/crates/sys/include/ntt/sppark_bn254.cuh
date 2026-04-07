@@ -9,6 +9,15 @@
 
 #ifndef __HIPCC__
 #include <cuda.h>
+#else
+// HIP compatibility: define CUDA-specific macros for sppark headers.
+#ifndef __align__
+#define __align__(n) __attribute__((aligned(n)))
+#endif
+#ifndef __forceinline__
+#define __forceinline__ __attribute__((always_inline)) inline
+#endif
+#include <hip/hip_runtime.h>
 #endif
 
 // This include pulls in alt_bn128.hpp -> mont_t -> fr_t for BN254

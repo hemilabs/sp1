@@ -391,13 +391,25 @@ fn main() {
             println!("cargo:rustc-link-lib=hiprtc");
         }
         GpuBackend::Cuda => {
-            // Add CUDA library search paths
-            if let Ok(cuda_path) = env::var("CUDA_PATH") {
-                println!("cargo:rustc-link-search=native={cuda_path}/lib64");
-                println!("cargo:rustc-link-search=native={cuda_path}/lib");
-            } else {
-                println!("cargo:rustc-link-search=native=/usr/local/cuda/lib64");
-            }
+            // Add CUDA library search paths.
+            // IMPORTANT: must match the CUDA version used by nvcc to avoid
+            // cudaDeviceProp ABI mismatch (struct layout changed between CUDA 12 and 13).
+            let cuda_path = env::var("CUDA_PATH").unwrap_or_else(|_| {
+                // Auto-detect from nvcc location: /usr/local/cuda-13.1/bin/nvcc -> /usr/local/cuda-13.1
+                if let Ok(output) = std::process::Command::new("which").arg("nvcc").output() {
+                    if let Ok(path) = String::from_utf8(output.stdout) {
+                        let path = path.trim();
+                        if let Some(cuda_root) =
+                            std::path::Path::new(path).parent().and_then(|p| p.parent())
+                        {
+                            return cuda_root.to_string_lossy().into_owned();
+                        }
+                    }
+                }
+                "/usr/local/cuda".to_string()
+            });
+            println!("cargo:rustc-link-search=native={cuda_path}/lib64");
+            println!("cargo:rustc-link-search=native={cuda_path}/lib");
 
             // Link CUDA runtime libraries
             println!("cargo:rustc-link-lib=cudart");

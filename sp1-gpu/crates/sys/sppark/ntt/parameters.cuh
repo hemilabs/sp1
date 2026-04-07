@@ -45,8 +45,15 @@ typedef size_t index_t;
 
 // static: per-TU storage to avoid link conflicts when multiple NTT
 // instantiations (KoalaBear + BN254) are compiled into the same binary.
+#ifndef __HIPCC__
 static __device__ __constant__ fr_t forward_radix6_twiddles[32] = {};
 static __device__ __constant__ fr_t inverse_radix6_twiddles[32] = {};
+#else
+// HIP: __constant__ with static linkage causes symbol resolution issues without -fgpu-rdc.
+// Use __device__ without static for hipGetSymbolAddress to find them.
+__device__ fr_t forward_radix6_twiddles[32] = {};
+__device__ fr_t inverse_radix6_twiddles[32] = {};
+#endif
 
 #if !defined(__CUDA_ARCH__) && !defined(__HIP_DEVICE_COMPILE__)
 # if defined(FEATURE_BLS12_377)

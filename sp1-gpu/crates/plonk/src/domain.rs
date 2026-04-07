@@ -12,6 +12,7 @@ use crate::fields::Fr;
 #[cfg(feature = "cuda")]
 pub(crate) mod gpu_ntt {
     use crate::fields::Fr;
+    use rayon::prelude::*;
     use std::ffi::c_void;
     use std::sync::{LazyLock, Mutex, Once};
 
@@ -144,8 +145,20 @@ pub(crate) mod gpu_ntt {
 
         ensure_initialized();
 
-        // Pack all polynomials into a contiguous buffer
-        let mut packed = vec![Fr::ZERO; poly_count * n];
+        // Pack all polynomials into a contiguous buffer (pre-faulted)
+        let total = poly_count * n;
+        let mut packed = {
+            let mut v = Vec::with_capacity(total);
+            unsafe { v.set_len(total) };
+            use rayon::prelude::*;
+            let chunk = (total / rayon::current_num_threads().max(1)).max(4096);
+            v.par_chunks_mut(chunk).for_each(|c| {
+                for slot in c.iter_mut() {
+                    unsafe { std::ptr::write_volatile(slot as *mut Fr, Fr::ZERO) };
+                }
+            });
+            v
+        };
         for (i, poly) in polys.iter().enumerate() {
             assert_eq!(poly.len(), n, "All polynomials must have length 2^lg_domain_size");
             packed[i * n..(i + 1) * n].copy_from_slice(poly);
@@ -473,8 +486,12 @@ pub(crate) mod gpu_ntt {
             panic!("GPU iNTT failed in fused ifft+coset_fft");
         }
 
-        // Step 2: Download coefficients to CPU (needed for Round 4/5)
-        let mut coeffs = vec![Fr::ZERO; n];
+        // Step 2: Download coefficients to CPU (pre-fault pages for DMA)
+        let mut coeffs = Vec::with_capacity(n);
+        unsafe { coeffs.set_len(n); }
+        coeffs.par_chunks_mut(128).for_each(|chunk| {
+            unsafe { std::ptr::write_volatile(&mut chunk[0] as *mut Fr, Fr::ZERO); }
+        });
         let err = unsafe {
             sp1_gpu_sys::runtime::cuda_mem_copy_device_to_host(
                 coeffs.as_mut_ptr() as *mut c_void,
@@ -519,6 +536,100 @@ pub(crate) mod gpu_ntt {
         }
 
         (coeffs, DeviceBuffer { ptr: d_out, _len: big_n, _bytes: byte_size_4n })
+    }
+
+    /// Fused iFFT + coset FFT returning BOTH coefficients AND coset evals to host.
+    /// Avoids one D2H + H2D round-trip compared to separate iFFT + coset_fft_padded.
+    #[allow(dead_code)]
+    pub fn gpu_ifft_then_coset_fft_to_host(
+        evals: &[Fr],
+        lg_n: u32,
+        lg_4n: u32,
+    ) -> (Vec<Fr>, Vec<Fr>) {
+        ensure_initialized();
+
+        let n = 1usize << lg_n;
+        let big_n = 1usize << lg_4n;
+        assert_eq!(evals.len(), n);
+        assert_eq!(big_n, 4 * n);
+
+        let elem_size = std::mem::size_of::<Fr>();
+        let byte_size_n = n * elem_size;
+        let byte_size_4n = big_n * elem_size;
+        let stream = unsafe { sp1_gpu_sys::runtime::DEFAULT_STREAM };
+
+        // Step 1: Upload evals (N) to GPU via cached buffer (4N capacity)
+        let d_ptr = get_device_buffer(byte_size_4n);
+        let err = unsafe {
+            sp1_gpu_sys::runtime::cuda_mem_copy_host_to_device(
+                d_ptr,
+                evals.as_ptr() as *const c_void,
+                byte_size_n,
+            )
+        };
+        if err != unsafe { sp1_gpu_sys::runtime::CUDA_SUCCESS_CSL } {
+            panic!("H2D failed for fused ifft+coset_fft_to_host");
+        }
+
+        // Step 2: iNTT
+        let err = unsafe { sp1_gpu_sys::dft_bn254::batch_iNTT_bn254(d_ptr, lg_n, 1, stream) };
+        if err != unsafe { sp1_gpu_sys::runtime::CUDA_SUCCESS_CSL } {
+            panic!("GPU iNTT failed in fused ifft+coset_fft_to_host");
+        }
+
+        // Step 3: D2H download coefficients (N elements, pre-faulted per page)
+        let mut coeffs = Vec::with_capacity(n);
+        unsafe { coeffs.set_len(n); }
+        coeffs.par_chunks_mut(128).for_each(|chunk| {
+            unsafe { std::ptr::write_volatile(&mut chunk[0] as *mut Fr, Fr::ZERO); }
+        });
+        let err = unsafe {
+            sp1_gpu_sys::runtime::cuda_mem_copy_device_to_host(
+                coeffs.as_mut_ptr() as *mut c_void,
+                d_ptr,
+                byte_size_n,
+            )
+        };
+        if err != unsafe { sp1_gpu_sys::runtime::CUDA_SUCCESS_CSL } {
+            panic!("D2H failed for coefficients in fused ifft+coset_fft_to_host");
+        }
+
+        // Step 4: Zero-pad to 4N on device
+        let err = unsafe {
+            sp1_gpu_sys::runtime::cuda_mem_set(
+                (d_ptr as *mut u8).add(byte_size_n) as *mut c_void,
+                0,
+                byte_size_4n - byte_size_n,
+            )
+        };
+        if err != unsafe { sp1_gpu_sys::runtime::CUDA_SUCCESS_CSL } {
+            panic!("cuda_mem_set failed for zero-pad in fused ifft+coset_fft_to_host");
+        }
+
+        // Step 5: Coset NTT
+        let err = unsafe { sp1_gpu_sys::dft_bn254::batch_coset_NTT_bn254(d_ptr, lg_4n, 1, stream) };
+        if err != unsafe { sp1_gpu_sys::runtime::CUDA_SUCCESS_CSL } {
+            panic!("GPU coset NTT failed in fused ifft+coset_fft_to_host");
+        }
+
+        // Step 6: D2H download coset evals (4N elements, pre-faulted per page)
+        let mut coset_evals = Vec::with_capacity(big_n);
+        unsafe { coset_evals.set_len(big_n); }
+        coset_evals.par_chunks_mut(128).for_each(|chunk| {
+            unsafe { std::ptr::write_volatile(&mut chunk[0] as *mut Fr, Fr::ZERO); }
+        });
+        let err = unsafe {
+            sp1_gpu_sys::runtime::cuda_mem_copy_device_to_host(
+                coset_evals.as_mut_ptr() as *mut c_void,
+                d_ptr,
+                byte_size_4n,
+            )
+        };
+        if err != unsafe { sp1_gpu_sys::runtime::CUDA_SUCCESS_CSL } {
+            panic!("D2H failed for coset evals in fused ifft+coset_fft_to_host");
+        }
+
+        (coeffs, coset_evals)
     }
 
     /// Free the persistent GPU NTT buffer, releasing its GPU memory.
