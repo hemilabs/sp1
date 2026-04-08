@@ -89,6 +89,15 @@ extern "C" {
         h_zh_val_4: *const c_void,
     ) -> CudaRustError;
 
+    /// GPU polynomial evaluation at a single point via hierarchical Horner.
+    /// Coefficients must be on device. Result is downloaded to host.
+    pub fn bn254_gpu_poly_eval(
+        d_coeffs: *const c_void,
+        n: u32,
+        h_x: *const c_void,
+        h_result: *mut c_void,
+    ) -> CudaRustError;
+
     /// BN254 element-wise add: d_a[i] += d_b[i] for i in 0..n
     pub fn bn254_elementwise_add(d_a: *mut c_void, d_b: *const c_void, n: usize);
 

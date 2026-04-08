@@ -630,3 +630,104 @@ void bn254_elementwise_fma(void* d_a, const void* d_b, const void* d_c, size_t n
         (fr_t*)d_a, (const fr_t*)d_b, (const fr_t*)d_c, (uint32_t)n);
     cudaDeviceSynchronize();
 }
+
+// ============================================================
+// GPU Horner polynomial evaluation via hierarchical chunking
+// ============================================================
+
+// Each thread evaluates a chunk of K coefficients via sequential Horner.
+// Thread t computes: partial[t] = c[t*K] + c[t*K+1]*x + ... + c[t*K+K-1]*x^(K-1)
+// The caller combines: p(x) = partial[0] + x^K * partial[1] + x^(2K) * partial[2] + ...
+__global__ void bn254_horner_chunk_kernel(
+    const fr_t* __restrict__ coeffs,
+    const fr_t* __restrict__ d_x,  // evaluation point (1 element)
+    fr_t* __restrict__ partials,   // output: one partial per thread
+    uint32_t n,                    // total polynomial degree + 1
+    uint32_t num_chunks            // number of chunks (= number of threads)
+) {
+    uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= num_chunks) return;
+
+    fr_t x = d_x[0];
+    uint32_t chunk_size = (n + num_chunks - 1) / num_chunks;
+    uint32_t start = tid * chunk_size;
+    uint32_t end = start + chunk_size;
+    if (end > n) end = n;
+
+    // Horner's method on this chunk: result = c[end-1] + x*(c[end-2] + x*(...))
+    fr_t acc = fr_t::zero();
+    for (uint32_t i = end; i > start; ) {
+        --i;
+        acc = acc * x + coeffs[i];
+    }
+    partials[tid] = acc;
+}
+
+// Single-thread kernel to combine partial Horner results.
+// Computes x^chunk_size via repeated squaring, then Horner-combines:
+//   result = partial[K-1] + x_k * (partial[K-2] + x_k * (...partial[0]...))
+__global__ void bn254_horner_combine_kernel(
+    const fr_t* __restrict__ partials,
+    const fr_t* __restrict__ d_x,
+    fr_t* __restrict__ d_result,
+    uint32_t num_chunks,
+    uint32_t chunk_size
+) {
+    fr_t x = d_x[0];
+
+    // x^chunk_size via repeated squaring
+    fr_t x_k = fr_t::one();
+    fr_t base = x;
+    uint32_t exp = chunk_size;
+    while (exp > 0) {
+        if (exp & 1) x_k = x_k * base;
+        base = base * base;
+        exp >>= 1;
+    }
+
+    // Horner combination of partials
+    fr_t result = partials[num_chunks - 1];
+    for (int i = (int)num_chunks - 2; i >= 0; --i) {
+        result = result * x_k + partials[i];
+    }
+    d_result[0] = result;
+}
+
+extern "C"
+rustCudaError_t bn254_gpu_poly_eval(
+    const void* d_coeffs,    // Device pointer to coefficients [n]
+    uint32_t n,              // Number of coefficients
+    const void* h_x,         // Host pointer to evaluation point (1 Fr)
+    void* h_result           // Host pointer to output result (1 Fr)
+) {
+    const uint32_t NUM_CHUNKS = 256;
+    size_t elem_sz = sizeof(fr_t);
+    uint32_t chunk_size = (n + NUM_CHUNKS - 1) / NUM_CHUNKS;
+
+    // Upload evaluation point
+    fr_t* d_x = nullptr;
+    CUDA_OK(cudaMalloc(&d_x, elem_sz));
+    CUDA_OK(cudaMemcpy(d_x, h_x, elem_sz, cudaMemcpyHostToDevice));
+
+    // Allocate partials + result
+    fr_t* d_partials = nullptr;
+    CUDA_OK(cudaMalloc(&d_partials, (NUM_CHUNKS + 1) * elem_sz));
+    fr_t* d_result = d_partials + NUM_CHUNKS;
+
+    // Phase 1: parallel chunked Horner (256 threads)
+    bn254_horner_chunk_kernel<<<1, NUM_CHUNKS>>>(
+        (const fr_t*)d_coeffs, d_x, d_partials, n, NUM_CHUNKS);
+    CUDA_OK(cudaGetLastError());
+
+    // Phase 2: single-thread combination (~256 muls, ~57 microseconds)
+    bn254_horner_combine_kernel<<<1, 1>>>(
+        d_partials, d_x, d_result, NUM_CHUNKS, chunk_size);
+    CUDA_OK(cudaGetLastError());
+
+    // Download single result
+    CUDA_OK(cudaMemcpy(h_result, d_result, elem_sz, cudaMemcpyDeviceToHost));
+
+    cudaFree(d_x);
+    cudaFree(d_partials);
+    return CUDA_SUCCESS_CSL;
+}

@@ -1242,9 +1242,7 @@ impl PlonkProver {
             };
             (h0, h1, h2)
         };
-        // Free device h_coeffs buffer (no longer needed after h MSMs)
-        #[cfg(feature = "cuda")]
-        drop(d_h_coeffs);
+        // Keep d_h_coeffs alive until after Round 4 GPU evals of h0/h1 at zeta.
         #[cfg(not(feature = "cuda"))]
         let (commit_h0, commit_h1, commit_h2) = {
             use crate::g1::G1Jacobian;
@@ -1294,14 +1292,44 @@ impl PlonkProver {
         tracing::info!("Round 4: Evaluations & linearization");
         let t = std::time::Instant::now();
 
-        // Evaluate ALL needed polynomials at ζ in parallel (16 independent Horner evals).
-        // This enables computing const_lin as a scalar dot product, eliminating the
-        // expensive O(N) Horner evaluation of the full linearization polynomial (~886ms saved).
+        // Spawn GPU h0/h1 eval on a background thread to overlap with CPU evals below.
+        // The GPU eval takes ~60ms while CPU evals take ~1s — fully hidden.
+        #[cfg(feature = "cuda")]
+        let gpu_eval_handle = {
+            let stride = n + 2;
+            let elem_sz = std::mem::size_of::<Fr>();
+            let zeta_copy = zeta;
+            // Extract device pointer before moving d_h_coeffs to thread
+            let d_h_ptr = d_h_coeffs.as_ref().map(|d| d.ptr as usize);
+            std::thread::spawn(move || {
+                let mut h0_z = Fr::ZERO;
+                let mut h1_z = Fr::ZERO;
+                if let Some(ptr_val) = d_h_ptr {
+                    let d_h0_ptr = ptr_val as *const std::ffi::c_void;
+                    let d_h1_ptr = unsafe { (ptr_val as *const u8).add(stride * elem_sz) as *const std::ffi::c_void };
+                    let _ = unsafe {
+                        sp1_gpu_sys::plonk::bn254_gpu_poly_eval(
+                            d_h0_ptr, stride as u32,
+                            &zeta_copy as *const Fr as *const std::ffi::c_void,
+                            &mut h0_z as *mut Fr as *mut std::ffi::c_void,
+                        )
+                    };
+                    let _ = unsafe {
+                        sp1_gpu_sys::plonk::bn254_gpu_poly_eval(
+                            d_h1_ptr, stride as u32,
+                            &zeta_copy as *const Fr as *const std::ffi::c_void,
+                            &mut h1_z as *mut Fr as *mut std::ffi::c_void,
+                        )
+                    };
+                }
+                (h0_z, h1_z)
+            })
+        };
+
         let zeta_omega = zeta * domain.omega;
         use crate::polynomial::eval_poly_at;
 
-        // Use par_iter over a vec of (poly, point) tuples for true parallelism.
-        // Skip h2 eval if h2 is zero (saves one Horner eval slot for other work).
+        // CPU evals: all polynomials except h0/h1 (GPU-evaluated above)
         let mut eval_tasks: Vec<(&[Fr], Fr)> = vec![
             (&l_coeffs, zeta),       // 0: l_zeta
             (&r_coeffs, zeta),       // 1: r_zeta
@@ -1316,14 +1344,11 @@ impl PlonkProver {
             (qk_coeffs, zeta),       // 10: qk_zeta
             (s3_coeffs, zeta),       // 11: s3_zeta
             (&z_coeffs, zeta),       // 12: z_zeta
-            (h0_coeffs, zeta),       // 13: h0_zeta
-            (h1_coeffs, zeta),       // 14: h1_zeta
         ];
         if !h2_is_zero {
-            eval_tasks.push((h2_coeffs, zeta)); // 15: h2_zeta (only if non-zero)
+            eval_tasks.push((h2_coeffs, zeta)); // 13: h2_zeta (only if non-zero)
         }
         // Add qcp + bsb22 polynomials to the same parallel batch
-        let base_count = eval_tasks.len(); // 15 or 16
         for q in qcp_coeffs.iter() {
             eval_tasks.push((q.as_slice(), zeta));
         }
@@ -1347,12 +1372,17 @@ impl PlonkProver {
         let qk_zeta = evals[10];
         let s3_zeta = evals[11];
         let z_zeta = evals[12];
-        let h0_zeta = evals[13];
-        let h1_zeta = evals[14];
-        let h2_zeta = if h2_is_zero { Fr::ZERO } else { evals[15] };
+        // h0/h1 evaluated on GPU (join background thread); h2 from CPU batch (if non-zero)
+        #[cfg(feature = "cuda")]
+        let (h0_zeta, h1_zeta) = gpu_eval_handle.join().expect("GPU h0/h1 eval panicked");
+        #[cfg(feature = "cuda")]
+        drop(d_h_coeffs); // Free device h_coeffs now that GPU evals are done
+        #[cfg(not(feature = "cuda"))]
+        let (h0_zeta, h1_zeta) = (eval_poly_at(h0_coeffs, &zeta), eval_poly_at(h1_coeffs, &zeta));
+        let h2_zeta = if h2_is_zero { Fr::ZERO } else { evals[13] };
 
         // Extract qcp and bsb22 evaluations from the same batch
-        let mut idx = if h2_is_zero { 15 } else { 16 };
+        let mut idx = if h2_is_zero { 13 } else { 14 };
         let qcp_zeta: Vec<Fr> = (0..qcp_coeffs.len()).map(|_| { let v = evals[idx]; idx += 1; v }).collect();
         let bsb22_zeta: Vec<Fr> = (0..bsb22_coeffs.len()).map(|_| { let v = evals[idx]; idx += 1; v }).collect();
 
