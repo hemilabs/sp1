@@ -272,15 +272,25 @@ rustCudaError_t sp1_plonk_quotient_eval_fused(
             CUDA_OK(cudaStreamSynchronize(stream[buf]));
         }
 
-        // Async upload static arrays for this chunk (9 arrays)
+        // Async upload static arrays for this chunk (9 arrays).
+        // Skip PCIe transfer for NULL pointers (e.g. all-zero qm); memset instead.
         for (int a = 0; a < NUM_STATIC - 1; a++) {
-            CUDA_OK(cudaMemcpyAsync(
-                d_chunk[buf] + (size_t)a * chunk_size,
-                (const char*)h_static[a] + offset * elem_sz,
-                this_chunk * elem_sz,
-                cudaMemcpyHostToDevice,
-                stream[buf]
-            ));
+            if (h_static[a] != nullptr) {
+                CUDA_OK(cudaMemcpyAsync(
+                    d_chunk[buf] + (size_t)a * chunk_size,
+                    (const char*)h_static[a] + offset * elem_sz,
+                    this_chunk * elem_sz,
+                    cudaMemcpyHostToDevice,
+                    stream[buf]
+                ));
+            } else {
+                CUDA_OK(cudaMemsetAsync(
+                    d_chunk[buf] + (size_t)a * chunk_size,
+                    0,
+                    this_chunk * elem_sz,
+                    stream[buf]
+                ));
+            }
         }
 
         // Launch kernel on this stream (waits for its own async uploads)
@@ -561,15 +571,26 @@ rustCudaError_t sp1_plonk_quotient_eval_streamed(
             CUDA_OK(cudaStreamSynchronize(stream[buf]));
         }
 
-        // Async upload all 14 arrays for this chunk
+        // Async upload all 14 arrays for this chunk.
+        // If a host pointer is NULL (e.g. qm is all-zero), memset to zero instead
+        // of streaming 1 GiB of zeros over PCIe.
         for (int a = 0; a < NUM_STREAMED - 1; a++) {
-            CUDA_OK(cudaMemcpyAsync(
-                d_chunk[buf] + (size_t)a * chunk_size,
-                (const char*)h_arrays[a] + offset * elem_sz,
-                this_chunk * elem_sz,
-                cudaMemcpyHostToDevice,
-                stream[buf]
-            ));
+            if (h_arrays[a] != nullptr) {
+                CUDA_OK(cudaMemcpyAsync(
+                    d_chunk[buf] + (size_t)a * chunk_size,
+                    (const char*)h_arrays[a] + offset * elem_sz,
+                    this_chunk * elem_sz,
+                    cudaMemcpyHostToDevice,
+                    stream[buf]
+                ));
+            } else {
+                CUDA_OK(cudaMemsetAsync(
+                    d_chunk[buf] + (size_t)a * chunk_size,
+                    0,
+                    this_chunk * elem_sz,
+                    stream[buf]
+                ));
+            }
         }
 
         // Launch kernel on this stream (waits for its own async uploads)

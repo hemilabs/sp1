@@ -13,6 +13,7 @@ using cudaStream_t = hipStream_t;
 #define cudaMemcpyHostToDevice hipMemcpyHostToDevice
 #define cudaMemcpyDeviceToHost hipMemcpyDeviceToHost
 #define cudaMemset hipMemset
+#define cudaMemsetAsync hipMemsetAsync
 #define cudaMemGetInfo hipMemGetInfo
 #define cudaGetLastError hipGetLastError
 #define cudaDeviceSynchronize hipDeviceSynchronize

@@ -105,6 +105,9 @@ pub(crate) struct CachedFrData {
     /// Total ~768 KB pinned memory, replaces 4.3 GiB coset_points PCIe transfer.
     omega_lo_table: Vec<Fr>,
     omega_hi_table: Vec<Fr>,
+    /// True if qm polynomial is all-zero (common in SP1 circuits).
+    /// When true, we pass nullptr to the quotient kernel to skip 1 GiB PCIe streaming.
+    qm_is_zero: bool,
 }
 
 impl PlonkProver {
@@ -432,6 +435,7 @@ impl PlonkProver {
             omega_powers,
             ql_coeffs,
             qr_coeffs,
+            qm_is_zero: qm_coeffs.par_iter().all(|c| c.is_zero()),
             qm_coeffs,
             qo_coeffs,
             qk_coeffs,
@@ -452,15 +456,15 @@ impl PlonkProver {
             coset_points,
             x_minus_one_n_inv: batch_inv_fr(&x_minus_one_n),
             zh_inv: batch_inv_fr(&zh_values),
-            // Compute 4 cyclic constants for zh_values and zh_inv.
-            // zh_values[i] = (coset_shift * omega_4n^i)^N - 1 = coset_shift^N * omega_4^i - 1
-            // Since omega_4n^(i*N) = omega_4^i has period 4, only 4 distinct values exist.
             zh_vals_4: [zh_values[0], zh_values[1], zh_values[2], zh_values[3]],
-            zh_invs_4: [Fr::ZERO; 4], // filled below after struct init
+            zh_invs_4: [Fr::ZERO; 4],
             zh_values,
             omega_lo_table,
             omega_hi_table,
         };
+        if cached.qm_is_zero {
+            eprintln!("[info] qm is all-zero — will skip 1 GiB PCIe stream in quotient kernel");
+        }
         // Fill zh_invs_4 from the already-computed zh_inv
         cached.zh_invs_4 = [cached.zh_inv[0], cached.zh_inv[1], cached.zh_inv[2], cached.zh_inv[3]];
 
@@ -503,7 +507,9 @@ impl PlonkProver {
             };
             pin("ql_coset_evals", &cached.ql_coset_evals, &mut pin_failures);
             pin("qr_coset_evals", &cached.qr_coset_evals, &mut pin_failures);
-            pin("qm_coset_evals", &cached.qm_coset_evals, &mut pin_failures);
+            if !cached.qm_is_zero {
+                pin("qm_coset_evals", &cached.qm_coset_evals, &mut pin_failures);
+            }
             pin("qo_coset_evals", &cached.qo_coset_evals, &mut pin_failures);
             pin("qk_coset_evals", &cached.qk_coset_evals, &mut pin_failures);
             pin("s1_coset_evals", &cached.s1_coset_evals, &mut pin_failures);
@@ -2221,7 +2227,11 @@ impl PlonkProver {
                 // 9 static arrays
                 self.cached.ql_coset_evals.as_ptr() as *const c_void,
                 self.cached.qr_coset_evals.as_ptr() as *const c_void,
-                self.cached.qm_coset_evals.as_ptr() as *const c_void,
+                if self.cached.qm_is_zero {
+                    std::ptr::null()
+                } else {
+                    self.cached.qm_coset_evals.as_ptr() as *const c_void
+                },
                 self.cached.qo_coset_evals.as_ptr() as *const c_void,
                 qk_plus_pi.as_ptr() as *const c_void,
                 self.cached.s1_coset_evals.as_ptr() as *const c_void,
@@ -2380,7 +2390,11 @@ impl PlonkProver {
                 // 9 static arrays
                 self.cached.ql_coset_evals.as_ptr() as *const c_void,
                 self.cached.qr_coset_evals.as_ptr() as *const c_void,
-                self.cached.qm_coset_evals.as_ptr() as *const c_void,
+                if self.cached.qm_is_zero {
+                    std::ptr::null()
+                } else {
+                    self.cached.qm_coset_evals.as_ptr() as *const c_void
+                },
                 self.cached.qo_coset_evals.as_ptr() as *const c_void,
                 qk_plus_pi.as_ptr() as *const c_void,
                 self.cached.s1_coset_evals.as_ptr() as *const c_void,
@@ -2600,7 +2614,11 @@ impl PlonkProver {
                     // 9 static arrays
                     self.cached.ql_coset_evals.as_ptr() as *const c_void,
                     self.cached.qr_coset_evals.as_ptr() as *const c_void,
-                    self.cached.qm_coset_evals.as_ptr() as *const c_void,
+                    if self.cached.qm_is_zero {
+                        std::ptr::null()
+                    } else {
+                        self.cached.qm_coset_evals.as_ptr() as *const c_void
+                    },
                     self.cached.qo_coset_evals.as_ptr() as *const c_void,
                     qk_plus_pi.as_ptr() as *const c_void,
                     self.cached.s1_coset_evals.as_ptr() as *const c_void,
