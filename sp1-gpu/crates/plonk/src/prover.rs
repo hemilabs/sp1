@@ -820,7 +820,16 @@ impl PlonkProver {
 
         // On main thread: run PI+BSB22 fused iFFT+cosetFFT while grand product runs
         #[cfg(feature = "cuda")]
-        let (pi_bsb22_precomputed, bsb22_coeffs_from_aux) = {
+        let (
+            pi_bsb22_precomputed,
+            bsb22_coeffs_from_aux,
+            l_coeffs_early,
+            r_coeffs_early,
+            o_coeffs_early,
+            d_l_early,
+            d_r_early,
+            d_o_early,
+        ) = {
             let big_log = self.cached.big_domain.log_size;
             let lg_n = domain.log_size;
 
@@ -863,6 +872,52 @@ impl PlonkProver {
                 bsb22_coeffs_list.push(coeffs);
                 bsb22_coset_evals.push(evals);
             }
+            // L/R/O iFFT+cosetFFTs: overlap with grand product (CPU).
+            // These only need wire data (already available), not alpha or z_lagrange.
+            // Saves ~2s by hiding L/R/O NTTs behind the 4.4s grand product.
+            use crate::domain::gpu_ntt::{
+                gpu_ifft_then_coset_fft_to_device, gpu_ifft_then_coset_fft_to_device_from_device,
+            };
+            let (l_coeffs_early, d_l_early) = if !d_l_upload.is_null() {
+                let r = gpu_ifft_then_coset_fft_to_device_from_device(
+                    d_l_upload as *const std::ffi::c_void,
+                    lg_n,
+                    big_log,
+                );
+                unsafe {
+                    sp1_gpu_sys::runtime::cuda_free(d_l_upload as *const std::ffi::c_void);
+                }
+                r
+            } else {
+                gpu_ifft_then_coset_fft_to_device(&l_fr, lg_n, big_log)
+            };
+            let (r_coeffs_early, d_r_early) = if !d_r_upload.is_null() {
+                let r = gpu_ifft_then_coset_fft_to_device_from_device(
+                    d_r_upload as *const std::ffi::c_void,
+                    lg_n,
+                    big_log,
+                );
+                unsafe {
+                    sp1_gpu_sys::runtime::cuda_free(d_r_upload as *const std::ffi::c_void);
+                }
+                r
+            } else {
+                gpu_ifft_then_coset_fft_to_device(&r_fr, lg_n, big_log)
+            };
+            let (o_coeffs_early, d_o_early) = if !d_o_upload.is_null() {
+                let r = gpu_ifft_then_coset_fft_to_device_from_device(
+                    d_o_upload as *const std::ffi::c_void,
+                    lg_n,
+                    big_log,
+                );
+                unsafe {
+                    sp1_gpu_sys::runtime::cuda_free(d_o_upload as *const std::ffi::c_void);
+                }
+                r
+            } else {
+                gpu_ifft_then_coset_fft_to_device(&o_fr, lg_n, big_log)
+            };
+
             crate::domain::gpu_ntt::free_ntt_buffer();
 
             // Defer CPU fusion: spawn on background thread to overlap with Z commit MSM.
@@ -892,7 +947,16 @@ impl PlonkProver {
                 pi_bsb22
             });
 
-            (fusion_handle, bsb22_coeffs_list)
+            (
+                fusion_handle,
+                bsb22_coeffs_list,
+                l_coeffs_early,
+                r_coeffs_early,
+                o_coeffs_early,
+                d_l_early,
+                d_r_early,
+                d_o_early,
+            )
         };
 
         // Join grand product thread
@@ -1012,54 +1076,14 @@ impl PlonkProver {
             let cfft_padded = |c: &[Fr]| crate::domain::gpu_ntt::gpu_coset_fft_padded(c, big_log);
 
             if use_gpu_quotient {
-                // >=20 GiB path: fused iFFT+cosetFFT keeps L/R/O/Z on GPU as DeviceBuffers.
-                // Use pre-uploaded device copies for L/R/O to skip H2D (~300ms each on AMD VM).
-                use crate::domain::gpu_ntt::{
-                    gpu_ifft_then_coset_fft_to_device,
-                    gpu_ifft_then_coset_fft_to_device_from_device,
-                };
+                // >=20 GiB path: L/R/O NTTs already done during grand product overlap.
+                // Only Z iFFT+cosetFFT needed here (Z depends on grand product result).
+                use crate::domain::gpu_ntt::gpu_ifft_then_coset_fft_to_device;
                 let lg = domain.log_size;
                 let _t_ntt = std::time::Instant::now();
-                let (l_c, d_l) = if !d_l_upload.is_null() {
-                    let r = gpu_ifft_then_coset_fft_to_device_from_device(
-                        d_l_upload as *const std::ffi::c_void,
-                        lg,
-                        big_log,
-                    );
-                    unsafe {
-                        sp1_gpu_sys::runtime::cuda_free(d_l_upload as *const std::ffi::c_void)
-                    };
-                    r
-                } else {
-                    gpu_ifft_then_coset_fft_to_device(&l_fr, lg, big_log)
-                };
-                let (r_c, d_r) = if !d_r_upload.is_null() {
-                    let r = gpu_ifft_then_coset_fft_to_device_from_device(
-                        d_r_upload as *const std::ffi::c_void,
-                        lg,
-                        big_log,
-                    );
-                    unsafe {
-                        sp1_gpu_sys::runtime::cuda_free(d_r_upload as *const std::ffi::c_void)
-                    };
-                    r
-                } else {
-                    gpu_ifft_then_coset_fft_to_device(&r_fr, lg, big_log)
-                };
-                let (o_c, d_o) = if !d_o_upload.is_null() {
-                    let r = gpu_ifft_then_coset_fft_to_device_from_device(
-                        d_o_upload as *const std::ffi::c_void,
-                        lg,
-                        big_log,
-                    );
-                    unsafe {
-                        sp1_gpu_sys::runtime::cuda_free(d_o_upload as *const std::ffi::c_void)
-                    };
-                    r
-                } else {
-                    gpu_ifft_then_coset_fft_to_device(&o_fr, lg, big_log)
-                };
-                // Z is always new (computed by grand product, never pre-uploaded)
+                let (l_c, d_l) = (l_coeffs_early, d_l_early);
+                let (r_c, d_r) = (r_coeffs_early, d_r_early);
+                let (o_c, d_o) = (o_coeffs_early, d_o_early);
                 let (z_c, d_z) = gpu_ifft_then_coset_fft_to_device(&z_lagrange, lg, big_log);
                 crate::domain::gpu_ntt::free_ntt_buffer();
                 unsafe { sp1_gpu_sys::dft_bn254::bn254_ntt_clear_twiddle_cache() };
@@ -1085,35 +1109,22 @@ impl PlonkProver {
                     Vec::new(),
                 )
             } else {
-                // <20 GiB path: iFFT + coset FFTs return to CPU (no DeviceBuffers)
-                // Free pre-uploaded wire buffers (won't be reused in this path)
-                if !d_l_upload.is_null() {
-                    unsafe {
-                        sp1_gpu_sys::runtime::cuda_free(d_l_upload as *const std::ffi::c_void)
-                    };
-                }
-                if !d_r_upload.is_null() {
-                    unsafe {
-                        sp1_gpu_sys::runtime::cuda_free(d_r_upload as *const std::ffi::c_void)
-                    };
-                }
-                if !d_o_upload.is_null() {
-                    unsafe {
-                        sp1_gpu_sys::runtime::cuda_free(d_o_upload as *const std::ffi::c_void)
-                    };
-                }
+                // <20 GiB path: L/R/O already computed during grand product overlap.
+                // Drop device buffers (won't be used in CPU quotient path).
+                drop(d_l_early);
+                drop(d_r_early);
+                drop(d_o_early);
+                // Recompute coset evals from coefficients for CPU quotient path.
+                let l_coset = cfft_padded(&l_coeffs_early);
+                let r_coset = cfft_padded(&r_coeffs_early);
+                let o_coset = cfft_padded(&o_coeffs_early);
                 let lg = domain.log_size;
-                let (l_c, l_coset) =
-                    crate::domain::gpu_ntt::gpu_ifft_then_coset_fft_to_host(&l_fr, lg, big_log);
-                let (r_c, r_coset) =
-                    crate::domain::gpu_ntt::gpu_ifft_then_coset_fft_to_host(&r_fr, lg, big_log);
-                let (o_c, o_coset) =
-                    crate::domain::gpu_ntt::gpu_ifft_then_coset_fft_to_host(&o_fr, lg, big_log);
                 let (z_c, z_coset) = crate::domain::gpu_ntt::gpu_ifft_then_coset_fft_to_host(
                     &z_lagrange,
                     lg,
                     big_log,
                 );
+                let (l_c, r_c, o_c) = (l_coeffs_early, r_coeffs_early, o_coeffs_early);
                 crate::domain::gpu_ntt::free_ntt_buffer();
                 unsafe { sp1_gpu_sys::dft_bn254::bn254_ntt_clear_twiddle_cache() };
                 inv_precompute.join().expect("inverse twiddle precompute failed");
