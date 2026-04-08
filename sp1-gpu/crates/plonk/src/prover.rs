@@ -537,6 +537,7 @@ impl PlonkProver {
         assert_eq!(o.len(), n, "O wire length must equal domain size");
 
         tracing::info!(n, public_inputs = public_inputs.len(), "Starting PLONK proof generation");
+        let _t_total = std::time::Instant::now();
 
         // Use cached circuit-static data (converted once in new())
         let domain = &self.cached.domain;
@@ -596,9 +597,35 @@ impl PlonkProver {
         let persistent_lag_msm = srs_upload_handle.join().expect("SRS upload thread panicked");
         eprintln!("[T] 2. PersistentMsm::new for Lagrange SRS (overlapped): {:?}", t.elapsed());
 
+        // Pre-upload wire scalars to GPU for later reuse in iFFT (saves 3 × 1 GiB H2D = ~0.9s on AMD VM).
+        // The MSM still uses host scalars (via depadding), but iFFT can use these device copies.
+        #[cfg(feature = "cuda")]
+        let (d_l_upload, d_r_upload, d_o_upload) = {
+            use std::ffi::c_void;
+            let elem_sz = std::mem::size_of::<Fr>();
+            let n = l_fr.len();
+            let byte_sz = n * elem_sz;
+            let mut alloc = |data: &[Fr]| -> *mut c_void {
+                let mut ptr: *mut c_void = std::ptr::null_mut();
+                let err = unsafe { sp1_gpu_sys::runtime::cuda_malloc(&mut ptr as *mut _, byte_sz) };
+                if err != unsafe { sp1_gpu_sys::runtime::CUDA_SUCCESS_CSL } {
+                    return std::ptr::null_mut(); // Fallback: will re-upload in iFFT
+                }
+                let err = unsafe {
+                    sp1_gpu_sys::runtime::cuda_mem_copy_host_to_device(
+                        ptr, data.as_ptr() as *const c_void, byte_sz,
+                    )
+                };
+                if err != unsafe { sp1_gpu_sys::runtime::CUDA_SUCCESS_CSL } {
+                    unsafe { sp1_gpu_sys::runtime::cuda_free(ptr as *const c_void) };
+                    return std::ptr::null_mut();
+                }
+                ptr
+            };
+            (alloc(&l_fr), alloc(&r_fr), alloc(&o_fr))
+        };
+
         // Commit wire polynomials using persistent MSM with depadding.
-        // Depadding removes hot scalar values that cause Pippenger bucket serialization,
-        // then corrects via binary-mask MSMs. This is 6x faster than direct MSM on wire scalars.
         #[cfg(feature = "cuda")]
         let (commit_l, commit_r, commit_o) = {
             let t = std::time::Instant::now();
@@ -993,13 +1020,33 @@ impl PlonkProver {
             let cfft_padded = |c: &[Fr]| crate::domain::gpu_ntt::gpu_coset_fft_padded(c, big_log);
 
             if use_gpu_quotient {
-                // >=20 GiB path: fused iFFT+cosetFFT keeps L/R/O/Z on GPU as DeviceBuffers
-                use crate::domain::gpu_ntt::gpu_ifft_then_coset_fft_to_device;
+                // >=20 GiB path: fused iFFT+cosetFFT keeps L/R/O/Z on GPU as DeviceBuffers.
+                // Use pre-uploaded device copies for L/R/O to skip H2D (~300ms each on AMD VM).
+                use crate::domain::gpu_ntt::{gpu_ifft_then_coset_fft_to_device, gpu_ifft_then_coset_fft_to_device_from_device};
                 let lg = domain.log_size;
                 let _t_ntt = std::time::Instant::now();
-                let (l_c, d_l) = gpu_ifft_then_coset_fft_to_device(&l_fr, lg, big_log);
-                let (r_c, d_r) = gpu_ifft_then_coset_fft_to_device(&r_fr, lg, big_log);
-                let (o_c, d_o) = gpu_ifft_then_coset_fft_to_device(&o_fr, lg, big_log);
+                let (l_c, d_l) = if !d_l_upload.is_null() {
+                    let r = gpu_ifft_then_coset_fft_to_device_from_device(d_l_upload as *const std::ffi::c_void, lg, big_log);
+                    unsafe { sp1_gpu_sys::runtime::cuda_free(d_l_upload as *const std::ffi::c_void) };
+                    r
+                } else {
+                    gpu_ifft_then_coset_fft_to_device(&l_fr, lg, big_log)
+                };
+                let (r_c, d_r) = if !d_r_upload.is_null() {
+                    let r = gpu_ifft_then_coset_fft_to_device_from_device(d_r_upload as *const std::ffi::c_void, lg, big_log);
+                    unsafe { sp1_gpu_sys::runtime::cuda_free(d_r_upload as *const std::ffi::c_void) };
+                    r
+                } else {
+                    gpu_ifft_then_coset_fft_to_device(&r_fr, lg, big_log)
+                };
+                let (o_c, d_o) = if !d_o_upload.is_null() {
+                    let r = gpu_ifft_then_coset_fft_to_device_from_device(d_o_upload as *const std::ffi::c_void, lg, big_log);
+                    unsafe { sp1_gpu_sys::runtime::cuda_free(d_o_upload as *const std::ffi::c_void) };
+                    r
+                } else {
+                    gpu_ifft_then_coset_fft_to_device(&o_fr, lg, big_log)
+                };
+                // Z is always new (computed by grand product, never pre-uploaded)
                 let (z_c, d_z) = gpu_ifft_then_coset_fft_to_device(&z_lagrange, lg, big_log);
                 crate::domain::gpu_ntt::free_ntt_buffer();
                 unsafe { sp1_gpu_sys::dft_bn254::bn254_ntt_clear_twiddle_cache() };
@@ -1023,6 +1070,10 @@ impl PlonkProver {
                 )
             } else {
                 // <20 GiB path: iFFT + coset FFTs return to CPU (no DeviceBuffers)
+                // Free pre-uploaded wire buffers (won't be reused in this path)
+                if !d_l_upload.is_null() { unsafe { sp1_gpu_sys::runtime::cuda_free(d_l_upload as *const std::ffi::c_void) }; }
+                if !d_r_upload.is_null() { unsafe { sp1_gpu_sys::runtime::cuda_free(d_r_upload as *const std::ffi::c_void) }; }
+                if !d_o_upload.is_null() { unsafe { sp1_gpu_sys::runtime::cuda_free(d_o_upload as *const std::ffi::c_void) }; }
                 let lg = domain.log_size;
                 let (l_c, l_coset) = crate::domain::gpu_ntt::gpu_ifft_then_coset_fft_to_host(&l_fr, lg, big_log);
                 let (r_c, r_coset) = crate::domain::gpu_ntt::gpu_ifft_then_coset_fft_to_host(&r_fr, lg, big_log);
@@ -1661,6 +1712,7 @@ impl PlonkProver {
             z_shifted_opening,
         };
 
+        eprintln!("[T] TOTAL prove body: {:?}", _t_total.elapsed());
         Ok(proof)
     }
 
