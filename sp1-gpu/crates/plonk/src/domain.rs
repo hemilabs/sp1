@@ -450,6 +450,69 @@ pub(crate) mod gpu_ntt {
     /// keeping the coset evals on device. Also returns the coefficients to the host.
     /// Saves one D2H + H2D round-trip (~2 GiB) compared to separate iFFT + coset_fft_to_device.
     /// Note: Requires 4N contiguous device memory. Use separate path on memory-constrained GPUs.
+    /// Fused iFFT + coset FFT, returning ONLY the DeviceBuffer (no coefficient download).
+    /// Used when coefficients are not needed (e.g., PI polynomial in PLONK).
+    /// Saves ~300ms D2H transfer on AMD VM PCIe.
+    pub fn gpu_ifft_then_coset_fft_to_device_no_coeffs(
+        evals: &[Fr],
+        lg_n: u32,
+        lg_4n: u32,
+    ) -> DeviceBuffer {
+        ensure_initialized();
+
+        let n = 1usize << lg_n;
+        let big_n = 1usize << lg_4n;
+        assert_eq!(evals.len(), n);
+        assert_eq!(big_n, 4 * n);
+
+        let elem_size = std::mem::size_of::<Fr>();
+        let byte_size_n = n * elem_size;
+        let byte_size_4n = big_n * elem_size;
+        let stream = unsafe { sp1_gpu_sys::runtime::DEFAULT_STREAM };
+
+        let d_scratch = get_device_buffer(byte_size_4n);
+        let err = unsafe {
+            sp1_gpu_sys::runtime::cuda_mem_copy_host_to_device(
+                d_scratch, evals.as_ptr() as *const c_void, byte_size_n,
+            )
+        };
+        if err != unsafe { sp1_gpu_sys::runtime::CUDA_SUCCESS_CSL } {
+            panic!("H2D failed for fused ifft+coset_fft_no_coeffs");
+        }
+
+        let err = unsafe { sp1_gpu_sys::dft_bn254::batch_iNTT_bn254(d_scratch, lg_n, 1, stream) };
+        if err != unsafe { sp1_gpu_sys::runtime::CUDA_SUCCESS_CSL } {
+            panic!("GPU iNTT failed in fused ifft+coset_fft_no_coeffs");
+        }
+
+        // Skip coefficient D2H — not needed by caller
+
+        let err = unsafe {
+            sp1_gpu_sys::runtime::cuda_mem_set(
+                (d_scratch as *mut u8).add(byte_size_n) as *mut c_void, 0,
+                byte_size_4n - byte_size_n,
+            )
+        };
+        if err != unsafe { sp1_gpu_sys::runtime::CUDA_SUCCESS_CSL } {
+            panic!("cuda_mem_set failed for zero-pad in fused ifft+coset_fft_no_coeffs");
+        }
+
+        let err =
+            unsafe { sp1_gpu_sys::dft_bn254::batch_coset_NTT_bn254(d_scratch, lg_4n, 1, stream) };
+        if err != unsafe { sp1_gpu_sys::runtime::CUDA_SUCCESS_CSL } {
+            panic!("GPU coset NTT failed in fused ifft+coset_fft_no_coeffs");
+        }
+
+        let d_out = d_scratch;
+        {
+            let mut buf = BUFFER_CACHE.lock().unwrap();
+            buf.ptr = std::ptr::null_mut();
+            buf.capacity_bytes = 0;
+        }
+
+        DeviceBuffer { ptr: d_out, _len: big_n, _bytes: byte_size_4n }
+    }
+
     /// Fused iFFT + coset FFT from a pre-uploaded device pointer.
     /// Copies d_src (N elements) into the NTT buffer, runs iFFT + coset FFT.
     /// Saves one H2D upload (~300ms on AMD VM PCIe).
