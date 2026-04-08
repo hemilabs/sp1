@@ -164,7 +164,23 @@ struct bn254_fq_t {
         bn254_fq_t r;
         r.data[0] = t0; r.data[1] = t1; r.data[2] = t2; r.data[3] = t3;
         r.data[4] = t4; r.data[5] = t5; r.data[6] = t6; r.data[7] = t7;
-        if (t8 || r.gte_p()) r.sub_p();
+        // Branchless conditional subtraction: compute r - P, then select based
+        // on whether r >= P (or t8 overflow). Avoids warp divergence on every
+        // field multiplication (~50% probability of needing subtraction).
+        {
+            uint32_t sub[N];
+            uint64_t borrow = 0;
+            for (int i = 0; i < N; i++) {
+                uint64_t diff = (uint64_t)r.data[i] - device::ALT_BN128_P[i] - borrow;
+                sub[i] = (uint32_t)diff;
+                borrow = (diff >> 63) & 1;
+            }
+            // Select r-P if no borrow (r >= P) or if t8 overflow
+            uint32_t do_sub = (t8 != 0) | (borrow == 0);
+            for (int i = 0; i < N; i++) {
+                r.data[i] = do_sub ? sub[i] : r.data[i];
+            }
+        }
         return r;
     }
 
@@ -173,70 +189,14 @@ struct bn254_fq_t {
         return *this;
     }
 
-    // Dedicated squaring: computes (a^2 * R^{-1}) mod P
-    // Uses schoolbook squaring with symmetry (36 muls vs 64 for general multiply)
-    // then N rounds of Montgomery reduction.
-    // Off-diagonal products a[i]*a[j] for i<j appear twice; compute once and double.
+    // Squaring: computes (a^2 * R^{-1}) mod P
+    // Uses generic Montgomery multiplication (CIOS) to avoid the w[17] temporary
+    // array that causes register spills to scratch memory on RDNA3.
+    // Although schoolbook squaring uses only 36 muls vs 64 for generic mul,
+    // the w[17] array spills ~17 VGPRs to VRAM scratch at ~100+ cycle latency
+    // each, making it slower than the spill-free CIOS multiplication path.
     __device__ __forceinline__ bn254_fq_t sqr() const {
-        const uint32_t m0 = device::ALT_BN128_M0;
-        uint32_t w[2 * N + 1] = {0};
-
-        // Step 1: Upper triangle — accumulate a[i]*a[j] for i < j into w[i+j]
-        // These products appear twice in the full square; we double below.
-        // 28 multiplications for N=8 (vs 64 for general schoolbook).
-        for (int i = 0; i < N; i++) {
-            uint64_t carry = 0;
-            for (int j = i + 1; j < N; j++) {
-                uint64_t prod = (uint64_t)data[i] * data[j] + w[i + j] + carry;
-                w[i + j] = (uint32_t)prod;
-                carry = prod >> 32;
-            }
-            w[i + N] = (uint32_t)((uint64_t)w[i + N] + carry);
-        }
-
-        // Step 2: Double the off-diagonal part (left shift by 1 bit)
-        uint32_t top_bit = 0;
-        for (int i = 0; i < 2 * N; i++) {
-            uint32_t new_top = w[i] >> 31;
-            w[i] = (w[i] << 1) | top_bit;
-            top_bit = new_top;
-        }
-        w[2 * N] = top_bit;
-
-        // Step 3: Add diagonal products a[i]^2 (8 squarings)
-        uint64_t carry = 0;
-        for (int i = 0; i < N; i++) {
-            uint64_t diag = (uint64_t)data[i] * data[i];
-            uint64_t sum = (uint64_t)w[2 * i] + (uint32_t)diag + carry;
-            w[2 * i] = (uint32_t)sum;
-            sum = (uint64_t)w[2 * i + 1] + (diag >> 32) + (sum >> 32);
-            w[2 * i + 1] = (uint32_t)sum;
-            carry = sum >> 32;
-        }
-        w[2 * N] += (uint32_t)carry;
-
-        // Step 4: Montgomery reduction (N rounds)
-        for (int i = 0; i < N; i++) {
-            uint32_t m = w[i] * m0;
-            uint64_t rc = 0;
-            for (int j = 0; j < N; j++) {
-                uint64_t prod = (uint64_t)m * device::ALT_BN128_P[j] + w[i + j] + rc;
-                w[i + j] = (uint32_t)prod;
-                rc = prod >> 32;
-            }
-            // Branchless carry propagation: no early-exit break to avoid warp divergence.
-            for (int k = i + N; k <= 2 * N; k++) {
-                uint64_t sum = (uint64_t)w[k] + rc;
-                w[k] = (uint32_t)sum;
-                rc = sum >> 32;
-            }
-        }
-
-        // Result is in w[N..2N-1]
-        bn254_fq_t r;
-        for (int i = 0; i < N; i++) r.data[i] = w[N + i];
-        if (w[2 * N] || r.gte_p()) r.sub_p();
-        return r;
+        return *this * *this;
     }
 
     // Modular negation: -a mod P
