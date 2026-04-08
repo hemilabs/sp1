@@ -1876,6 +1876,10 @@ impl PlonkProver {
     /// Commit with depadding using a persistent MSM context (SRS pre-uploaded to GPU).
     /// Same algorithm as commit_lagrange_depad but uses the persistent context for all
     /// MSM calls, avoiding redundant 2 GiB SRS uploads per wire.
+    /// Commit with depadding using a persistent MSM context (SRS pre-uploaded to GPU).
+    /// Detects hot scalar values via 1% sampling, zeros them, runs GPU MSM on the
+    /// sparse result, then adds back hot contributions via CPU tree-reduction
+    /// (overlapped with the GPU MSM).
     #[cfg(feature = "cuda")]
     fn commit_lagrange_depad_persistent(
         srs: &[G1Affine],
@@ -1887,8 +1891,7 @@ impl PlonkProver {
         assert!(evals.len() <= srs.len());
         let n = evals.len();
 
-        // Detect hot values via sampling: hash 1% of elements to find candidates,
-        // then do a full parallel count on candidates to get exact frequencies.
+        // Detect hot values via 1% sampling, then single-pass exact counting.
         use std::collections::HashMap;
         let sample_size = (n / 100).max(1);
         let step = (n / sample_size).max(1);
@@ -1896,19 +1899,33 @@ impl PlonkProver {
         for i in (0..n).step_by(step.max(1)) {
             *sample_freq.entry(evals[i]).or_default() += 1;
         }
-        // With 1% sampling, a value appearing >100 times in sample = >10K in full dataset
         let mut candidates: Vec<Fr> =
             sample_freq.iter().filter(|(_, &count)| count > 100).map(|(v, _)| *v).collect();
         if !candidates.contains(&evals[n - 1]) {
             candidates.push(evals[n - 1]);
         }
 
-        let hot_values: Vec<(Fr, usize)> = candidates
-            .par_iter()
-            .map(|&val| {
-                let count: usize = evals.par_iter().filter(|&&v| v == val).count();
-                (val, count)
+        // Single-pass counting: O(n) instead of O(candidates × n).
+        let candidate_set: std::collections::HashSet<Fr> = candidates.iter().copied().collect();
+        let counts: HashMap<Fr, usize> = evals
+            .par_chunks(8192)
+            .map(|chunk| {
+                let mut local = HashMap::new();
+                for v in chunk {
+                    if candidate_set.contains(v) {
+                        *local.entry(*v).or_default() += 1;
+                    }
+                }
+                local
             })
+            .reduce(HashMap::new, |mut a, b| {
+                for (k, v) in b {
+                    *a.entry(k).or_default() += v;
+                }
+                a
+            });
+        let hot_values: Vec<(Fr, usize)> = counts
+            .into_iter()
             .filter(|(v, count)| *count >= DEDUP_THRESHOLD && !v.is_zero())
             .collect();
 
@@ -1917,12 +1934,11 @@ impl PlonkProver {
         }
 
         // Clone evals and zero hot values in a single parallel pass
-        // (combines 1 GiB memcpy + zero scan into one pass)
         let hot_set: std::collections::HashSet<Fr> = hot_values.iter().map(|(v, _)| *v).collect();
         let zeroed: Vec<Fr> =
             evals.par_iter().map(|s| if hot_set.contains(s) { Fr::ZERO } else { *s }).collect();
 
-        // Overlap: start CPU correction tree-reduction WHILE the GPU runs the main MSM.
+        // Overlap: CPU correction tree-reduction runs WHILE GPU does the main MSM.
         use crate::g1::G1Jacobian;
 
         let hot_values_clone = hot_values.clone();
@@ -1934,30 +1950,30 @@ impl PlonkProver {
         let correction_handle = std::thread::spawn(move || {
             let srs = unsafe { std::slice::from_raw_parts(srs_ptr as *const G1Affine, srs_len) };
             let evals = unsafe { std::slice::from_raw_parts(evals_ptr as *const Fr, evals_len) };
-            let hot_srs_sums: Vec<G1Jacobian> = hot_values_clone
-                .par_iter()
-                .map(|(hot_val, _count)| {
-                    let partial_sums: Vec<G1Jacobian> = evals
-                        .par_chunks(8192)
-                        .enumerate()
-                        .map(|(chunk_idx, chunk)| {
-                            let base = chunk_idx * 8192;
-                            let mut acc = G1Jacobian::INFINITY;
-                            for (j, v) in chunk.iter().enumerate() {
-                                if *v == *hot_val {
-                                    acc = acc.add_affine(&srs[base + j]);
-                                }
-                            }
-                            acc
-                        })
-                        .collect();
-                    let mut sum = G1Jacobian::INFINITY;
-                    for ps in &partial_sums {
-                        sum = sum.add(ps);
+            let num_hot = hot_values_clone.len();
+            let hot_map: HashMap<Fr, usize> =
+                hot_values_clone.iter().enumerate().map(|(i, (v, _))| (*v, i)).collect();
+            // Single pass over evals: accumulate SRS sums for ALL hot values at once.
+            let chunk_sums: Vec<Vec<G1Jacobian>> = evals
+                .par_chunks(8192)
+                .enumerate()
+                .map(|(chunk_idx, chunk)| {
+                    let base = chunk_idx * 8192;
+                    let mut accs = vec![G1Jacobian::INFINITY; num_hot];
+                    for (j, v) in chunk.iter().enumerate() {
+                        if let Some(&idx) = hot_map.get(v) {
+                            accs[idx] = accs[idx].add_affine(&srs[base + j]);
+                        }
                     }
-                    sum
+                    accs
                 })
                 .collect();
+            let mut hot_srs_sums = vec![G1Jacobian::INFINITY; num_hot];
+            for chunk_accs in &chunk_sums {
+                for (i, acc) in chunk_accs.iter().enumerate() {
+                    hot_srs_sums[i] = hot_srs_sums[i].add(acc);
+                }
+            }
             (hot_srs_sums, hot_values_clone)
         });
 

@@ -324,6 +324,10 @@ unsafe impl Sync for PersistentMsm {}
 
 #[cfg(feature = "cuda")]
 impl PersistentMsm {
+    pub fn npoints(&self) -> usize {
+        self.npoints
+    }
+
     /// Create a persistent MSM context, uploading SRS points to GPU once.
     /// Pre-allocates all working buffers to eliminate per-call hipMalloc overhead.
     pub fn new(points: &[G1Affine]) -> Self {
