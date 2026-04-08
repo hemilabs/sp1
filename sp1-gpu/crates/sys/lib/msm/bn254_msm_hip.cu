@@ -88,7 +88,7 @@ static rustCudaError_t msm_one_window(
     const uint16_t* d_digits_win,    // digits for this window [n]
     const uint32_t* d_packed_win,    // [n] packed point indices with sign in high bit
     bn254_g1_t* d_window_result,     // output: 1 point
-    bn254_g1_t* d_buckets,           // scratch: [NUM_BUCKETS]
+    bn254_g1_xyzz_t* d_buckets,      // scratch: [NUM_BUCKETS] (XYZZ coords)
     uint32_t* d_bucket_offsets,      // scratch: [NUM_BUCKETS]
     uint32_t* d_bucket_counts,       // scratch: [NUM_BUCKETS]
     uint16_t* d_sorted_digits,       // scratch: [n]
@@ -228,7 +228,7 @@ rustCudaError_t sp1_bn254_msm(void* result, const void* points, size_t npoints,
     uint16_t* d_digits = nullptr;              // single window
     uint32_t* d_packed = nullptr;              // single window, sign in bit 31
     uint8_t* d_carries = nullptr;              // inter-window carry bits
-    bn254_g1_t* d_buckets = nullptr;
+    bn254_g1_xyzz_t* d_buckets = nullptr;
     bn254_g1_t* d_window_results = nullptr;
     bn254_g1_t* d_final_result = nullptr;
     uint32_t* d_bucket_offsets = nullptr;
@@ -241,7 +241,7 @@ rustCudaError_t sp1_bn254_msm(void* result, const void* points, size_t npoints,
     CUDA_OK(hipMalloc(&d_digits, n * sizeof(uint16_t)));         // single window
     CUDA_OK(hipMalloc(&d_packed, n * sizeof(uint32_t)));         // single window
     CUDA_OK(hipMalloc(&d_carries, n * sizeof(uint8_t)));         // carry bits
-    CUDA_OK(hipMalloc(&d_buckets, NUM_BUCKETS * sizeof(bn254_g1_t)));
+    CUDA_OK(hipMalloc(&d_buckets, NUM_BUCKETS * sizeof(bn254_g1_xyzz_t)));
     CUDA_OK(hipMalloc(&d_window_results, NUM_WINDOWS * sizeof(bn254_g1_t)));
     CUDA_OK(hipMalloc(&d_final_result, sizeof(bn254_g1_t)));
     CUDA_OK(hipMalloc(&d_bucket_offsets, NUM_BUCKETS * sizeof(uint32_t)));
@@ -381,7 +381,7 @@ struct hip_msm_context {
     uint16_t* d_digits;             // single window
     uint32_t* d_packed;             // single window, sign in bit 31
     uint8_t* d_carries;             // inter-window carry bits
-    bn254_g1_t* d_buckets;
+    bn254_g1_xyzz_t* d_buckets;
     bn254_g1_t* d_window_results;
     bn254_g1_t* d_final_result;
     uint32_t* d_bucket_offsets;
@@ -403,7 +403,7 @@ static rustCudaError_t alloc_working_buffers(hip_msm_context* ctx, int n) {
     CUDA_OK(hipMalloc(&ctx->d_digits, n * sizeof(uint16_t)));     // single window
     CUDA_OK(hipMalloc(&ctx->d_packed, n * sizeof(uint32_t)));     // single window, sign in bit 31
     CUDA_OK(hipMalloc(&ctx->d_carries, n * sizeof(uint8_t)));     // carry bits
-    CUDA_OK(hipMalloc(&ctx->d_buckets, NUM_BUCKETS * sizeof(bn254_g1_t)));
+    CUDA_OK(hipMalloc(&ctx->d_buckets, NUM_BUCKETS * sizeof(bn254_g1_xyzz_t)));
     CUDA_OK(hipMalloc(&ctx->d_window_results, NUM_WINDOWS * sizeof(bn254_g1_t)));
     CUDA_OK(hipMalloc(&ctx->d_final_result, sizeof(bn254_g1_t)));
     CUDA_OK(hipMalloc(&ctx->d_bucket_offsets, NUM_BUCKETS * sizeof(uint32_t)));
