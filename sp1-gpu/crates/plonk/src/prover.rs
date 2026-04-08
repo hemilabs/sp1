@@ -486,26 +486,35 @@ impl PlonkProver {
         #[cfg(feature = "cuda")]
         {
             use std::ffi::c_void;
-            let pin = |v: &[Fr]| unsafe {
-                let _ = sp1_gpu_sys::runtime::cuda_host_register(
+            let mut pin_failures = 0u32;
+            let pin = |name: &str, v: &[Fr], failures: &mut u32| unsafe {
+                let err = sp1_gpu_sys::runtime::cuda_host_register(
                     v.as_ptr() as *const c_void,
                     std::mem::size_of_val(v),
                 );
+                if err != sp1_gpu_sys::runtime::CUDA_SUCCESS_CSL {
+                    *failures += 1;
+                    eprintln!(
+                        "[WARN] cuda_host_register failed for {} ({} bytes)",
+                        name,
+                        std::mem::size_of_val(v)
+                    );
+                }
             };
-            pin(&cached.ql_coset_evals);
-            pin(&cached.qr_coset_evals);
-            pin(&cached.qm_coset_evals);
-            pin(&cached.qo_coset_evals);
-            pin(&cached.qk_coset_evals);
-            pin(&cached.s1_coset_evals);
-            pin(&cached.s2_coset_evals);
-            pin(&cached.s3_coset_evals);
-            // coset_points, zh_inv, zh_values no longer transferred to GPU
-            // (computed on-the-fly in kernel from lookup tables + 4 cyclic constants)
-            pin(&cached.x_minus_one_n_inv);
-            // Pin omega lookup tables for DMA upload (~768 KB total)
-            pin(&cached.omega_lo_table);
-            pin(&cached.omega_hi_table);
+            pin("ql_coset_evals", &cached.ql_coset_evals, &mut pin_failures);
+            pin("qr_coset_evals", &cached.qr_coset_evals, &mut pin_failures);
+            pin("qm_coset_evals", &cached.qm_coset_evals, &mut pin_failures);
+            pin("qo_coset_evals", &cached.qo_coset_evals, &mut pin_failures);
+            pin("qk_coset_evals", &cached.qk_coset_evals, &mut pin_failures);
+            pin("s1_coset_evals", &cached.s1_coset_evals, &mut pin_failures);
+            pin("s2_coset_evals", &cached.s2_coset_evals, &mut pin_failures);
+            pin("s3_coset_evals", &cached.s3_coset_evals, &mut pin_failures);
+            pin("x_minus_one_n_inv", &cached.x_minus_one_n_inv, &mut pin_failures);
+            pin("omega_lo_table", &cached.omega_lo_table, &mut pin_failures);
+            pin("omega_hi_table", &cached.omega_hi_table, &mut pin_failures);
+            if pin_failures > 0 {
+                eprintln!("[WARN] {pin_failures} of 11 host memory pinning calls failed — PCIe bandwidth may be degraded");
+            }
         }
 
         tracing::info!("VK commitments and cached Fr data computed");
@@ -613,7 +622,9 @@ impl PlonkProver {
                 }
                 let err = unsafe {
                     sp1_gpu_sys::runtime::cuda_mem_copy_host_to_device(
-                        ptr, data.as_ptr() as *const c_void, byte_sz,
+                        ptr,
+                        data.as_ptr() as *const c_void,
+                        byte_sz,
                     )
                 };
                 if err != unsafe { sp1_gpu_sys::runtime::CUDA_SUCCESS_CSL } {
@@ -808,19 +819,22 @@ impl PlonkProver {
             let lg_n = domain.log_size;
 
             // PI: iFFT + coset FFT, skip coefficient download (not needed)
-            let d_pi_coset =
-                crate::domain::gpu_ntt::gpu_ifft_then_coset_fft_to_device_no_coeffs(
-                    &pi_poly_evals, lg_n, big_log,
-                );
+            let d_pi_coset = crate::domain::gpu_ntt::gpu_ifft_then_coset_fft_to_device_no_coeffs(
+                &pi_poly_evals,
+                lg_n,
+                big_log,
+            );
 
             // Download PI coset evals to CPU for fusion
             let big_n = 1usize << big_log;
             let elem_sz = std::mem::size_of::<Fr>();
             let byte_sz = big_n * elem_sz;
             let mut pi_coset_evals = Vec::with_capacity(big_n);
-            unsafe { pi_coset_evals.set_len(big_n); }
-            pi_coset_evals.par_chunks_mut(128).for_each(|chunk| {
-                unsafe { std::ptr::write_volatile(&mut chunk[0] as *mut Fr, Fr::ZERO); }
+            unsafe {
+                pi_coset_evals.set_len(big_n);
+            }
+            pi_coset_evals.par_chunks_mut(128).for_each(|chunk| unsafe {
+                std::ptr::write_volatile(&mut chunk[0] as *mut Fr, Fr::ZERO);
             });
             let err = unsafe {
                 sp1_gpu_sys::runtime::cuda_mem_copy_device_to_host(
@@ -845,17 +859,34 @@ impl PlonkProver {
             }
             crate::domain::gpu_ntt::free_ntt_buffer();
 
-            // Fuse qk + pi + qcp*bsb22 on CPU (faster than GPU fusion on slow PCIe)
-            let qcp_evals = &self.cached.qcp_coset_evals;
-            let mut pi_bsb22 = pi_coset_evals;
-            pi_bsb22.par_iter_mut().enumerate().for_each(|(i, v)| {
-                *v += self.cached.qk_coset_evals[i];
-                for (qcp_ev, bsb22_ev) in qcp_evals.iter().zip(bsb22_coset_evals.iter()) {
-                    *v += qcp_ev[i] * bsb22_ev[i];
-                }
+            // Defer CPU fusion: spawn on background thread to overlap with Z commit MSM.
+            // The fusion takes ~0.7s and the Z commit MSM takes ~1.4s — fully hidden.
+            let qk_ptr = self.cached.qk_coset_evals.as_ptr() as usize;
+            let qk_len = self.cached.qk_coset_evals.len();
+            let qcp_ptrs: Vec<(usize, usize)> = self
+                .cached
+                .qcp_coset_evals
+                .iter()
+                .map(|v| (v.as_ptr() as usize, v.len()))
+                .collect();
+            let fusion_handle = std::thread::spawn(move || {
+                let qk = unsafe { std::slice::from_raw_parts(qk_ptr as *const Fr, qk_len) };
+                let mut pi_bsb22 = pi_coset_evals;
+                pi_bsb22.par_iter_mut().enumerate().for_each(|(i, v)| {
+                    *v += qk[i];
+                    for (j, (qcp_ptr, qcp_len)) in qcp_ptrs.iter().enumerate() {
+                        if j < bsb22_coset_evals.len() {
+                            let qcp = unsafe {
+                                std::slice::from_raw_parts(*qcp_ptr as *const Fr, *qcp_len)
+                            };
+                            *v += qcp[i] * bsb22_coset_evals[j][i];
+                        }
+                    }
+                });
+                pi_bsb22
             });
 
-            (pi_bsb22, bsb22_coeffs_list)
+            (fusion_handle, bsb22_coeffs_list)
         };
 
         // Join grand product thread
@@ -886,6 +917,7 @@ impl PlonkProver {
         eprintln!("[T] 4. Grand product (overlapped with PI NTTs): {:?}", t.elapsed());
 
         // Commit Z (reuses persistent Lagrange MSM context -- no SRS re-upload)
+        // CPU fusion runs concurrently on background thread.
         let t = std::time::Instant::now();
         #[cfg(feature = "cuda")]
         let commit_z = persistent_lag_msm.msm(&z_lagrange).to_affine();
@@ -895,6 +927,10 @@ impl PlonkProver {
         drop(persistent_lag_msm);
         eprintln!("[T] 5. Z commit: {:?}", t.elapsed());
         let commit_z_bn = commit_z.to_bn254();
+
+        // Join CPU fusion thread (was overlapping with Z commit MSM above)
+        #[cfg(feature = "cuda")]
+        let pi_bsb22_precomputed = pi_bsb22_precomputed.join().expect("CPU fusion thread panicked");
 
         // Bind BSB22 + Z, derive alpha
         let t = std::time::Instant::now();
@@ -972,26 +1008,47 @@ impl PlonkProver {
             if use_gpu_quotient {
                 // >=20 GiB path: fused iFFT+cosetFFT keeps L/R/O/Z on GPU as DeviceBuffers.
                 // Use pre-uploaded device copies for L/R/O to skip H2D (~300ms each on AMD VM).
-                use crate::domain::gpu_ntt::{gpu_ifft_then_coset_fft_to_device, gpu_ifft_then_coset_fft_to_device_from_device};
+                use crate::domain::gpu_ntt::{
+                    gpu_ifft_then_coset_fft_to_device,
+                    gpu_ifft_then_coset_fft_to_device_from_device,
+                };
                 let lg = domain.log_size;
                 let _t_ntt = std::time::Instant::now();
                 let (l_c, d_l) = if !d_l_upload.is_null() {
-                    let r = gpu_ifft_then_coset_fft_to_device_from_device(d_l_upload as *const std::ffi::c_void, lg, big_log);
-                    unsafe { sp1_gpu_sys::runtime::cuda_free(d_l_upload as *const std::ffi::c_void) };
+                    let r = gpu_ifft_then_coset_fft_to_device_from_device(
+                        d_l_upload as *const std::ffi::c_void,
+                        lg,
+                        big_log,
+                    );
+                    unsafe {
+                        sp1_gpu_sys::runtime::cuda_free(d_l_upload as *const std::ffi::c_void)
+                    };
                     r
                 } else {
                     gpu_ifft_then_coset_fft_to_device(&l_fr, lg, big_log)
                 };
                 let (r_c, d_r) = if !d_r_upload.is_null() {
-                    let r = gpu_ifft_then_coset_fft_to_device_from_device(d_r_upload as *const std::ffi::c_void, lg, big_log);
-                    unsafe { sp1_gpu_sys::runtime::cuda_free(d_r_upload as *const std::ffi::c_void) };
+                    let r = gpu_ifft_then_coset_fft_to_device_from_device(
+                        d_r_upload as *const std::ffi::c_void,
+                        lg,
+                        big_log,
+                    );
+                    unsafe {
+                        sp1_gpu_sys::runtime::cuda_free(d_r_upload as *const std::ffi::c_void)
+                    };
                     r
                 } else {
                     gpu_ifft_then_coset_fft_to_device(&r_fr, lg, big_log)
                 };
                 let (o_c, d_o) = if !d_o_upload.is_null() {
-                    let r = gpu_ifft_then_coset_fft_to_device_from_device(d_o_upload as *const std::ffi::c_void, lg, big_log);
-                    unsafe { sp1_gpu_sys::runtime::cuda_free(d_o_upload as *const std::ffi::c_void) };
+                    let r = gpu_ifft_then_coset_fft_to_device_from_device(
+                        d_o_upload as *const std::ffi::c_void,
+                        lg,
+                        big_log,
+                    );
+                    unsafe {
+                        sp1_gpu_sys::runtime::cuda_free(d_o_upload as *const std::ffi::c_void)
+                    };
                     r
                 } else {
                     gpu_ifft_then_coset_fft_to_device(&o_fr, lg, big_log)
@@ -1001,7 +1058,10 @@ impl PlonkProver {
                 crate::domain::gpu_ntt::free_ntt_buffer();
                 unsafe { sp1_gpu_sys::dft_bn254::bn254_ntt_clear_twiddle_cache() };
                 inv_precompute.join().expect("inverse twiddle precompute failed");
-                eprintln!("[T] 7-ntt. L/R/O/Z iFFT+cosetFFT (aux done earlier): {:?}", _t_ntt.elapsed());
+                eprintln!(
+                    "[T] 7-ntt. L/R/O/Z iFFT+cosetFFT (aux done earlier): {:?}",
+                    _t_ntt.elapsed()
+                );
 
                 (
                     l_c,
@@ -1021,14 +1081,33 @@ impl PlonkProver {
             } else {
                 // <20 GiB path: iFFT + coset FFTs return to CPU (no DeviceBuffers)
                 // Free pre-uploaded wire buffers (won't be reused in this path)
-                if !d_l_upload.is_null() { unsafe { sp1_gpu_sys::runtime::cuda_free(d_l_upload as *const std::ffi::c_void) }; }
-                if !d_r_upload.is_null() { unsafe { sp1_gpu_sys::runtime::cuda_free(d_r_upload as *const std::ffi::c_void) }; }
-                if !d_o_upload.is_null() { unsafe { sp1_gpu_sys::runtime::cuda_free(d_o_upload as *const std::ffi::c_void) }; }
+                if !d_l_upload.is_null() {
+                    unsafe {
+                        sp1_gpu_sys::runtime::cuda_free(d_l_upload as *const std::ffi::c_void)
+                    };
+                }
+                if !d_r_upload.is_null() {
+                    unsafe {
+                        sp1_gpu_sys::runtime::cuda_free(d_r_upload as *const std::ffi::c_void)
+                    };
+                }
+                if !d_o_upload.is_null() {
+                    unsafe {
+                        sp1_gpu_sys::runtime::cuda_free(d_o_upload as *const std::ffi::c_void)
+                    };
+                }
                 let lg = domain.log_size;
-                let (l_c, l_coset) = crate::domain::gpu_ntt::gpu_ifft_then_coset_fft_to_host(&l_fr, lg, big_log);
-                let (r_c, r_coset) = crate::domain::gpu_ntt::gpu_ifft_then_coset_fft_to_host(&r_fr, lg, big_log);
-                let (o_c, o_coset) = crate::domain::gpu_ntt::gpu_ifft_then_coset_fft_to_host(&o_fr, lg, big_log);
-                let (z_c, z_coset) = crate::domain::gpu_ntt::gpu_ifft_then_coset_fft_to_host(&z_lagrange, lg, big_log);
+                let (l_c, l_coset) =
+                    crate::domain::gpu_ntt::gpu_ifft_then_coset_fft_to_host(&l_fr, lg, big_log);
+                let (r_c, r_coset) =
+                    crate::domain::gpu_ntt::gpu_ifft_then_coset_fft_to_host(&r_fr, lg, big_log);
+                let (o_c, o_coset) =
+                    crate::domain::gpu_ntt::gpu_ifft_then_coset_fft_to_host(&o_fr, lg, big_log);
+                let (z_c, z_coset) = crate::domain::gpu_ntt::gpu_ifft_then_coset_fft_to_host(
+                    &z_lagrange,
+                    lg,
+                    big_log,
+                );
                 crate::domain::gpu_ntt::free_ntt_buffer();
                 unsafe { sp1_gpu_sys::dft_bn254::bn254_ntt_clear_twiddle_cache() };
                 inv_precompute.join().expect("inverse twiddle precompute failed");
@@ -1082,19 +1161,22 @@ impl PlonkProver {
             // Uses rayon parallel evaluation — faster than GPU-streamed on slow PCIe.
             // A GPU-streamed variant (compute_quotient_streamed) is also available for
             // bare-metal systems with fast PCIe where GPU compute beats CPU rayon.
-            (self.compute_quotient_streamed(
-                n,
-                domain,
-                &alpha,
-                &beta,
-                &gamma,
-                &coset_shift,
-                pi_bsb22_evals,
-                l_coset_cpu,
-                r_coset_cpu,
-                o_coset_cpu,
-                z_coset_cpu,
-            ), None)
+            (
+                self.compute_quotient_streamed(
+                    n,
+                    domain,
+                    &alpha,
+                    &beta,
+                    &gamma,
+                    &coset_shift,
+                    pi_bsb22_evals,
+                    l_coset_cpu,
+                    r_coset_cpu,
+                    o_coset_cpu,
+                    z_coset_cpu,
+                ),
+                None,
+            )
         };
         #[cfg(not(feature = "cuda"))]
         let h_coeffs = self.compute_quotient(
@@ -1124,27 +1206,22 @@ impl PlonkProver {
 
         eprintln!("[T] 7. Round 3 (iFFT + coset FFT + quotient): {:?}", t.elapsed());
 
-        // Start SRS canonical upload while CPU does split + h2_nnz (overlaps ~600ms upload
-        // with ~100ms CPU work). On HIP this works because the GPU is idle after the quotient.
+        // Start SRS canonical upload while CPU does split + h2_nnz
         let t = std::time::Instant::now();
         #[cfg(feature = "cuda")]
         let srs_can_handle = {
             let ptr_val = srs_canonical.as_ptr() as usize;
             let len = srs_canonical.len();
             std::thread::spawn(move || {
-                let srs = unsafe {
-                    std::slice::from_raw_parts(ptr_val as *const G1Affine, len)
-                };
+                let srs = unsafe { std::slice::from_raw_parts(ptr_val as *const G1Affine, len) };
                 crate::g1::PersistentMsm::new(srs)
             })
         };
 
-        // Split h into h0, h1, h2 at degree boundaries (CPU, overlapped with SRS upload)
         let (h0_coeffs, h1_coeffs, h2_coeffs) = split_quotient(&h_coeffs, n);
         let h2_nnz: usize = h2_coeffs.par_iter().filter(|c| !c.is_zero()).count();
         let h2_is_zero = h2_nnz == 0;
 
-        // Wait for SRS canonical upload
         #[cfg(feature = "cuda")]
         let persistent_can_msm = srs_can_handle.join().expect("SRS canonical upload panicked");
 
@@ -1159,8 +1236,12 @@ impl PlonkProver {
             let (h0, h1) = if let Some(ref d_h) = d_h_coeffs {
                 // Device MSM: h0/h1 scalars are already on GPU at known offsets
                 let d_h0_ptr = d_h.ptr; // offset 0
-                let d_h1_ptr = unsafe { (d_h.ptr as *mut u8).add(stride * elem_sz) as *const std::ffi::c_void };
-                let h0 = persistent_can_msm.msm_device(d_h0_ptr as *const std::ffi::c_void, stride).to_affine();
+                let d_h1_ptr = unsafe {
+                    (d_h.ptr as *mut u8).add(stride * elem_sz) as *const std::ffi::c_void
+                };
+                let h0 = persistent_can_msm
+                    .msm_device(d_h0_ptr as *const std::ffi::c_void, stride)
+                    .to_affine();
                 let h1 = persistent_can_msm.msm_device(d_h1_ptr, stride).to_affine();
                 (h0, h1)
             } else {
@@ -1257,17 +1338,21 @@ impl PlonkProver {
                 let mut h1_z = Fr::ZERO;
                 if let Some(ptr_val) = d_h_ptr {
                     let d_h0_ptr = ptr_val as *const std::ffi::c_void;
-                    let d_h1_ptr = unsafe { (ptr_val as *const u8).add(stride * elem_sz) as *const std::ffi::c_void };
+                    let d_h1_ptr = unsafe {
+                        (ptr_val as *const u8).add(stride * elem_sz) as *const std::ffi::c_void
+                    };
                     let _ = unsafe {
                         sp1_gpu_sys::plonk::bn254_gpu_poly_eval(
-                            d_h0_ptr, stride as u32,
+                            d_h0_ptr,
+                            stride as u32,
                             &zeta_copy as *const Fr as *const std::ffi::c_void,
                             &mut h0_z as *mut Fr as *mut std::ffi::c_void,
                         )
                     };
                     let _ = unsafe {
                         sp1_gpu_sys::plonk::bn254_gpu_poly_eval(
-                            d_h1_ptr, stride as u32,
+                            d_h1_ptr,
+                            stride as u32,
                             &zeta_copy as *const Fr as *const std::ffi::c_void,
                             &mut h1_z as *mut Fr as *mut std::ffi::c_void,
                         )
@@ -1334,8 +1419,20 @@ impl PlonkProver {
 
         // Extract qcp and bsb22 evaluations from the same batch
         let mut idx = if h2_is_zero { 13 } else { 14 };
-        let qcp_zeta: Vec<Fr> = (0..qcp_coeffs.len()).map(|_| { let v = evals[idx]; idx += 1; v }).collect();
-        let bsb22_zeta: Vec<Fr> = (0..bsb22_coeffs.len()).map(|_| { let v = evals[idx]; idx += 1; v }).collect();
+        let qcp_zeta: Vec<Fr> = (0..qcp_coeffs.len())
+            .map(|_| {
+                let v = evals[idx];
+                idx += 1;
+                v
+            })
+            .collect();
+        let bsb22_zeta: Vec<Fr> = (0..bsb22_coeffs.len())
+            .map(|_| {
+                let v = evals[idx];
+                idx += 1;
+                v
+            })
+            .collect();
 
         // Compute const_lin as scalar dot product (O(1) instead of O(N) Horner eval).
         // const_lin = Σ scalar_i * component_i(ζ)
@@ -1613,25 +1710,25 @@ impl PlonkProver {
         };
         crate::polynomial::linear_combination_into(&mut result, &fused_polys, &fused_scalars);
         result[0] -= eval_correction;
-        let folded = Polynomial::new(result);
+        let mut folded = Polynomial::new(result);
         // Drop fused_polys to release borrows on z_coeffs, l_coeffs etc.
         drop(fused_polys);
         drop(fused_scalars);
 
         // Divide and z_shifted divide run in parallel on CPU (independent operations).
+        // Use in-place div_by_linear to avoid 2 × 1 GiB allocation (~0.3s saved).
         let (batch_quotient, z_shifted_quotient) = rayon::join(
             || {
-                let (q, r) = folded.div_by_linear(&zeta);
+                let r = folded.div_by_linear_in_place(&zeta);
                 debug_assert!(r.is_zero(), "Batch opening remainder must be zero");
-                q
+                folded
             },
             || {
-                // In-place subtraction of constant term (avoids 1 GiB clone)
                 let mut z_poly = Polynomial::new(z_coeffs);
                 z_poly.coeffs[0] -= z_shifted_zeta;
-                let (q, r) = z_poly.div_by_linear(&zeta_omega);
+                let r = z_poly.div_by_linear_in_place(&zeta_omega);
                 debug_assert!(r.is_zero(), "Z-shifted opening remainder must be zero");
-                q
+                z_poly
             },
         );
 
@@ -2148,9 +2245,8 @@ impl PlonkProver {
         // Free per-proof host vectors now that the kernel is done
         // Unpin qk_plus_pi first
         unsafe {
-            let _ = sp1_gpu_sys::runtime::cuda_host_unregister(
-                qk_plus_pi.as_ptr() as *const c_void,
-            );
+            let _ =
+                sp1_gpu_sys::runtime::cuda_host_unregister(qk_plus_pi.as_ptr() as *const c_void);
         }
         drop(qk_plus_pi);
         drop(l_coset);
@@ -2175,9 +2271,11 @@ impl PlonkProver {
 
         // Download h_coeffs (pre-fault pages to avoid DMA page faults)
         let mut h_coeffs = Vec::with_capacity(big_n);
-        unsafe { h_coeffs.set_len(big_n); }
-        h_coeffs.par_chunks_mut(128).for_each(|chunk| {
-            unsafe { std::ptr::write_volatile(&mut chunk[0] as *mut Fr, Fr::ZERO); }
+        unsafe {
+            h_coeffs.set_len(big_n);
+        }
+        h_coeffs.par_chunks_mut(128).for_each(|chunk| unsafe {
+            std::ptr::write_volatile(&mut chunk[0] as *mut Fr, Fr::ZERO);
         });
         let err = unsafe {
             sp1_gpu_sys::runtime::cuda_mem_copy_device_to_host(
@@ -2306,9 +2404,8 @@ impl PlonkProver {
         drop(d_z);
         // Unpin and free qk_plus_pi
         unsafe {
-            let _ = sp1_gpu_sys::runtime::cuda_host_unregister(
-                qk_plus_pi.as_ptr() as *const c_void,
-            );
+            let _ =
+                sp1_gpu_sys::runtime::cuda_host_unregister(qk_plus_pi.as_ptr() as *const c_void);
         }
         drop(qk_plus_pi);
         // Sync + clear caches + free NTT buffer to ensure memory is freed
@@ -2318,8 +2415,14 @@ impl PlonkProver {
         {
             let mut free: usize = 0;
             let mut total: usize = 0;
-            unsafe { sp1_gpu_sys::runtime::cuda_mem_get_info(&mut free as *mut _, &mut total as *mut _) };
-            eprintln!("  [VRAM] before coset iFFT: free={} MiB, total={} MiB", free / (1024*1024), total / (1024*1024));
+            unsafe {
+                sp1_gpu_sys::runtime::cuda_mem_get_info(&mut free as *mut _, &mut total as *mut _)
+            };
+            eprintln!(
+                "  [VRAM] before coset iFFT: free={} MiB, total={} MiB",
+                free / (1024 * 1024),
+                total / (1024 * 1024)
+            );
         }
 
         // Coset iFFT on GPU
@@ -2346,9 +2449,11 @@ impl PlonkProver {
         // Download h_coeffs to CPU (for Round 4/5) while keeping device copy for h MSMs.
         let _t_d2h = std::time::Instant::now();
         let mut h_coeffs = Vec::with_capacity(big_n);
-        unsafe { h_coeffs.set_len(big_n); }
-        h_coeffs.par_chunks_mut(128).for_each(|chunk| {
-            unsafe { std::ptr::write_volatile(&mut chunk[0] as *mut Fr, Fr::ZERO); }
+        unsafe {
+            h_coeffs.set_len(big_n);
+        }
+        h_coeffs.par_chunks_mut(128).for_each(|chunk| unsafe {
+            std::ptr::write_volatile(&mut chunk[0] as *mut Fr, Fr::ZERO);
         });
         let err = unsafe {
             sp1_gpu_sys::runtime::cuda_mem_copy_device_to_host(
@@ -2518,7 +2623,7 @@ impl PlonkProver {
             // Unpin qk_plus_pi
             unsafe {
                 let _ = sp1_gpu_sys::runtime::cuda_host_unregister(
-                    qk_plus_pi.as_ptr() as *const c_void,
+                    qk_plus_pi.as_ptr() as *const c_void
                 );
             }
             drop(qk_plus_pi);

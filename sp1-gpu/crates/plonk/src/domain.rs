@@ -473,7 +473,9 @@ pub(crate) mod gpu_ntt {
         let d_scratch = get_device_buffer(byte_size_4n);
         let err = unsafe {
             sp1_gpu_sys::runtime::cuda_mem_copy_host_to_device(
-                d_scratch, evals.as_ptr() as *const c_void, byte_size_n,
+                d_scratch,
+                evals.as_ptr() as *const c_void,
+                byte_size_n,
             )
         };
         if err != unsafe { sp1_gpu_sys::runtime::CUDA_SUCCESS_CSL } {
@@ -489,7 +491,8 @@ pub(crate) mod gpu_ntt {
 
         let err = unsafe {
             sp1_gpu_sys::runtime::cuda_mem_set(
-                (d_scratch as *mut u8).add(byte_size_n) as *mut c_void, 0,
+                (d_scratch as *mut u8).add(byte_size_n) as *mut c_void,
+                0,
                 byte_size_4n - byte_size_n,
             )
         };
@@ -535,9 +538,7 @@ pub(crate) mod gpu_ntt {
         // Step 1: D2D copy from pre-uploaded source into NTT scratch buffer
         let d_scratch = get_device_buffer(byte_size_4n);
         let err = unsafe {
-            sp1_gpu_sys::runtime::cuda_mem_copy_device_to_device(
-                d_scratch, d_src, byte_size_n,
-            )
+            sp1_gpu_sys::runtime::cuda_mem_copy_device_to_device(d_scratch, d_src, byte_size_n)
         };
         if err != unsafe { sp1_gpu_sys::runtime::CUDA_SUCCESS_CSL } {
             panic!("D2D failed for fused ifft+coset_fft from device");
@@ -550,9 +551,11 @@ pub(crate) mod gpu_ntt {
 
         // Step 2: Download coefficients to CPU
         let mut coeffs = Vec::with_capacity(n);
-        unsafe { coeffs.set_len(n); }
-        coeffs.par_chunks_mut(128).for_each(|chunk| {
-            unsafe { std::ptr::write_volatile(&mut chunk[0] as *mut Fr, Fr::ZERO); }
+        unsafe {
+            coeffs.set_len(n);
+        }
+        coeffs.par_chunks_mut(128).for_each(|chunk| unsafe {
+            std::ptr::write_volatile(&mut chunk[0] as *mut Fr, Fr::ZERO);
         });
         let err = unsafe {
             sp1_gpu_sys::runtime::cuda_mem_copy_device_to_host(
@@ -631,9 +634,11 @@ pub(crate) mod gpu_ntt {
 
         // Step 2: Download coefficients to CPU (pre-fault pages for DMA)
         let mut coeffs = Vec::with_capacity(n);
-        unsafe { coeffs.set_len(n); }
-        coeffs.par_chunks_mut(128).for_each(|chunk| {
-            unsafe { std::ptr::write_volatile(&mut chunk[0] as *mut Fr, Fr::ZERO); }
+        unsafe {
+            coeffs.set_len(n);
+        }
+        coeffs.par_chunks_mut(128).for_each(|chunk| unsafe {
+            std::ptr::write_volatile(&mut chunk[0] as *mut Fr, Fr::ZERO);
         });
         let err = unsafe {
             sp1_gpu_sys::runtime::cuda_mem_copy_device_to_host(
@@ -722,9 +727,11 @@ pub(crate) mod gpu_ntt {
 
         // Step 3: D2H download coefficients (N elements, pre-faulted per page)
         let mut coeffs = Vec::with_capacity(n);
-        unsafe { coeffs.set_len(n); }
-        coeffs.par_chunks_mut(128).for_each(|chunk| {
-            unsafe { std::ptr::write_volatile(&mut chunk[0] as *mut Fr, Fr::ZERO); }
+        unsafe {
+            coeffs.set_len(n);
+        }
+        coeffs.par_chunks_mut(128).for_each(|chunk| unsafe {
+            std::ptr::write_volatile(&mut chunk[0] as *mut Fr, Fr::ZERO);
         });
         let err = unsafe {
             sp1_gpu_sys::runtime::cuda_mem_copy_device_to_host(
@@ -757,9 +764,11 @@ pub(crate) mod gpu_ntt {
 
         // Step 6: D2H download coset evals (4N elements, pre-faulted per page)
         let mut coset_evals = Vec::with_capacity(big_n);
-        unsafe { coset_evals.set_len(big_n); }
-        coset_evals.par_chunks_mut(128).for_each(|chunk| {
-            unsafe { std::ptr::write_volatile(&mut chunk[0] as *mut Fr, Fr::ZERO); }
+        unsafe {
+            coset_evals.set_len(big_n);
+        }
+        coset_evals.par_chunks_mut(128).for_each(|chunk| unsafe {
+            std::ptr::write_volatile(&mut chunk[0] as *mut Fr, Fr::ZERO);
         });
         let err = unsafe {
             sp1_gpu_sys::runtime::cuda_mem_copy_device_to_host(
