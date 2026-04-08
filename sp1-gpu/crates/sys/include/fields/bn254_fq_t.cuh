@@ -76,7 +76,7 @@ struct bn254_fq_t {
         }
     }
 
-    // Modular addition
+    // Modular addition (branchless conditional subtraction)
     __device__ __forceinline__ bn254_fq_t operator+(const bn254_fq_t& b) const {
         bn254_fq_t r;
         uint64_t carry = 0;
@@ -85,7 +85,20 @@ struct bn254_fq_t {
             r.data[i] = (uint32_t)sum;
             carry = sum >> 32;
         }
-        if (carry || r.gte_p()) r.sub_p();
+        // Branchless: compute r - P, select if r >= P
+        {
+            uint32_t sub[N];
+            uint64_t borrow = 0;
+            for (int i = 0; i < N; i++) {
+                uint64_t diff = (uint64_t)r.data[i] - device::ALT_BN128_P[i] - borrow;
+                sub[i] = (uint32_t)diff;
+                borrow = (diff >> 63) & 1;
+            }
+            uint32_t do_sub = (carry != 0) | (borrow == 0);
+            for (int i = 0; i < N; i++) {
+                r.data[i] = do_sub ? sub[i] : r.data[i];
+            }
+        }
         return r;
     }
 
@@ -221,7 +234,20 @@ struct bn254_fq_t {
             r.data[i] = (uint32_t)sum;
             carry = sum >> 32;
         }
-        if (carry || r.gte_p()) r.sub_p();
+        // Branchless conditional subtraction (same pattern as operator*)
+        {
+            uint32_t sub[N];
+            uint64_t borrow = 0;
+            for (int i = 0; i < N; i++) {
+                uint64_t diff = (uint64_t)r.data[i] - device::ALT_BN128_P[i] - borrow;
+                sub[i] = (uint32_t)diff;
+                borrow = (diff >> 63) & 1;
+            }
+            uint32_t do_sub = (carry != 0) | (borrow == 0);
+            for (int i = 0; i < N; i++) {
+                r.data[i] = do_sub ? sub[i] : r.data[i];
+            }
+        }
         return r;
     }
 
