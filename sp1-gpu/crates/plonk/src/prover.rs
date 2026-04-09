@@ -783,28 +783,24 @@ impl PlonkProver {
                 // Batch invert denominators IN-PLACE
                 batch_inv_fr_inplace(&mut denominators);
 
-                // Compute ratios: num[i] * inv_den[i] (parallel)
-                let ratios: Vec<Fr> = numerators
-                    .par_iter()
-                    .zip(denominators.par_iter())
-                    .map(|(n, d)| *n * *d)
-                    .collect();
-
-                // Parallel prefix product: Z[0] = 1, Z[i] = Z[i-1] * ratio[i-1]
+                // Fused ratio + prefix product: compute Z[i] = prod(num[j]/den[j], j<i)
+                // Avoids allocating a separate 1 GiB `ratios` Vec.
                 let z = {
                     let num_chunks = rayon::current_num_threads().max(1);
                     let chunk_size = gp_n.div_ceil(num_chunks);
 
-                    let chunk_prefixes: Vec<Vec<Fr>> = ratios
+                    // Each chunk computes its local prefix product of num[i]*inv_den[i]
+                    let chunk_prefixes: Vec<Vec<Fr>> = numerators
                         .par_chunks(chunk_size)
-                        .map(|chunk| {
-                            let mut prefix = Vec::with_capacity(chunk.len());
+                        .zip(denominators.par_chunks(chunk_size))
+                        .map(|(num_chunk, den_chunk)| {
+                            let mut prefix = Vec::with_capacity(num_chunk.len() + 1);
                             let mut acc = Fr::ONE;
-                            for &r in chunk {
+                            for (&n, &d) in num_chunk.iter().zip(den_chunk.iter()) {
                                 prefix.push(acc);
-                                acc *= r;
+                                acc *= n * d; // ratio = num * inv_den
                             }
-                            prefix.push(acc);
+                            prefix.push(acc); // chunk product
                             prefix
                         })
                         .collect();
@@ -826,7 +822,7 @@ impl PlonkProver {
                     z
                 };
 
-                let final_product = z[gp_n - 1] * ratios[gp_n - 1];
+                let final_product = z[gp_n - 1] * numerators[gp_n - 1] * denominators[gp_n - 1];
                 (z, final_product)
             })
         };
