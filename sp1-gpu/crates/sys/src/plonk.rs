@@ -108,4 +108,27 @@ extern "C" {
         d_c: *const c_void,
         n: usize,
     );
+
+    /// GPU-accelerated grand product (permutation polynomial Z) for BN254 PLONK.
+    ///
+    /// Computes Z[0] = 1, Z[i] = Z[i-1] * (num[i-1] / den[i-1]) where:
+    ///   num[i] = (l[i] + beta*omega[i] + gamma) * (r[i] + beta*omega[i]*k1 + gamma) * (o[i] + beta*omega[i]*k1^2 + gamma)
+    ///   den[i] = (l[i] + beta*s1[i] + gamma) * (r[i] + beta*s2[i] + gamma) * (o[i] + beta*s3[i] + gamma)
+    ///
+    /// All device arrays must be [n] elements of BN254 Fr in Montgomery form.
+    /// Scalar constants (h_beta, h_gamma, h_k1) are HOST pointers to single Fr elements.
+    pub fn sp1_bn254_grand_product(
+        d_l: *const c_void,
+        d_r: *const c_void,
+        d_o: *const c_void,
+        d_s1: *const c_void,
+        d_s2: *const c_void,
+        d_s3: *const c_void,
+        d_omega: *const c_void,
+        h_beta: *const c_void,
+        h_gamma: *const c_void,
+        h_k1: *const c_void,
+        n: u32,
+        d_z_out: *mut c_void,
+    ) -> CudaRustError;
 }
