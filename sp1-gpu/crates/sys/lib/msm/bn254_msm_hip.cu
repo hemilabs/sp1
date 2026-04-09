@@ -550,7 +550,7 @@ rustCudaError_t sp1_bn254_msm_invoke(void* ctx_ptr, void* result,
 
     if (do_timing) hipEventRecord(ev_windows);
 
-    // Combine windows
+    // Combine windows (GPU single-thread Horner's method)
     hipLaunchKernelGGL(window_combine_kernel,
         dim3(1), dim3(1), 0, 0,
         ctx->d_window_results, ctx->d_final_result, NUM_WINDOWS, WINDOW_BITS);
