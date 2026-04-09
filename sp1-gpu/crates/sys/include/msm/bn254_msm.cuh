@@ -663,4 +663,35 @@ __global__ void window_combine_kernel(
     *final_result = result;
 }
 
+// ================================================================
+// Kernel: Zero scalars matching hot values (for GPU-side depadding).
+// Each thread checks one scalar against the hot value list and zeros
+// it if there's a match. Hot values are passed as device-resident
+// array of (SCALAR_LIMBS * uint32_t) each.
+// ================================================================
+__global__ void zero_hot_scalars_kernel(
+    uint32_t* __restrict__ scalars,     // [n * SCALAR_LIMBS] in Montgomery form
+    const uint32_t* __restrict__ hot_values,  // [num_hot * SCALAR_LIMBS]
+    int n,
+    int num_hot
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+
+    const uint32_t* s = &scalars[idx * SCALAR_LIMBS];
+
+    for (int h = 0; h < num_hot; h++) {
+        const uint32_t* hv = &hot_values[h * SCALAR_LIMBS];
+        bool match = true;
+        for (int k = 0; k < SCALAR_LIMBS; k++) {
+            if (s[k] != hv[k]) { match = false; break; }
+        }
+        if (match) {
+            uint32_t* sw = &scalars[idx * SCALAR_LIMBS];
+            for (int k = 0; k < SCALAR_LIMBS; k++) sw[k] = 0;
+            return;
+        }
+    }
+}
+
 } // namespace bn254_msm

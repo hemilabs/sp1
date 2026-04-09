@@ -430,6 +430,56 @@ impl PersistentMsm {
         G1Jacobian::from_bn254(&result)
     }
 
+    /// MSM with device scalars + GPU-side depadding.
+    /// Copies device scalars to internal buffer, zeros entries matching hot_values
+    /// on GPU, then runs MSM. Saves ~300ms H2D + ~70ms CPU clone per wire.
+    /// hot_values must be in Montgomery form (same as the scalars).
+    pub fn msm_device_depad(
+        &self,
+        d_scalars: *const std::ffi::c_void,
+        n: usize,
+        hot_values: &[crate::fields::Fr],
+    ) -> G1Jacobian {
+        use crate::{BN254Fq, BN254G1Jacobian};
+        use std::ffi::c_void;
+
+        assert!(n <= self.npoints);
+
+        let mut result = BN254G1Jacobian {
+            x: BN254Fq { limbs: [0; 8] },
+            y: BN254Fq { limbs: [0; 8] },
+            z: BN254Fq { limbs: [0; 8] },
+        };
+
+        let hot_ptr = if hot_values.is_empty() {
+            std::ptr::null()
+        } else {
+            hot_values.as_ptr() as *const c_void
+        };
+
+        let err = unsafe {
+            sp1_gpu_sys::msm::sp1_bn254_msm_invoke_device_depad(
+                self.ctx,
+                &mut result as *mut BN254G1Jacobian as *mut c_void,
+                n,
+                d_scalars,
+                true, // mont=true: scalars are in Montgomery form
+                hot_ptr,
+                hot_values.len() as i32,
+            )
+        };
+        if err != unsafe { sp1_gpu_sys::runtime::CUDA_SUCCESS_CSL } {
+            let msg = if err.message.is_null() {
+                "unknown error".to_string()
+            } else {
+                unsafe { std::ffi::CStr::from_ptr(err.message) }.to_string_lossy().into_owned()
+            };
+            panic!("Persistent MSM invoke (device depad) failed: {}", msg);
+        }
+
+        G1Jacobian::from_bn254(&result)
+    }
+
     /// MSM with pre-converted canonical BN254Fr scalars (skips to_bn254fr conversion).
     /// Used for binary mask MSMs where scalars are known constants.
     pub fn msm_raw(&self, canonical_scalars: &[crate::BN254Fr]) -> G1Jacobian {

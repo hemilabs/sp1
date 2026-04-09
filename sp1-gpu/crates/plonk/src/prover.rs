@@ -642,20 +642,33 @@ impl PlonkProver {
             (alloc(&l_fr), alloc(&r_fr), alloc(&o_fr))
         };
 
-        // Commit wire polynomials using persistent MSM with depadding.
+        // Commit wire polynomials using persistent MSM with GPU-side depadding.
+        // Pass device scalar pointers to avoid redundant H2D uploads (~300ms each).
         #[cfg(feature = "cuda")]
         let (commit_l, commit_r, commit_o) = {
             let t = std::time::Instant::now();
-            let cl =
-                Self::commit_lagrange_depad_persistent(srs_lagrange, &l_fr, &persistent_lag_msm);
+            let cl = Self::commit_lagrange_depad_persistent(
+                srs_lagrange,
+                &l_fr,
+                &persistent_lag_msm,
+                d_l_upload,
+            );
             eprintln!("[T] 3a. commit_lagrange_depad_persistent L: {:?}", t.elapsed());
             let t = std::time::Instant::now();
-            let cr =
-                Self::commit_lagrange_depad_persistent(srs_lagrange, &r_fr, &persistent_lag_msm);
+            let cr = Self::commit_lagrange_depad_persistent(
+                srs_lagrange,
+                &r_fr,
+                &persistent_lag_msm,
+                d_r_upload,
+            );
             eprintln!("[T] 3b. commit_lagrange_depad_persistent R: {:?}", t.elapsed());
             let t = std::time::Instant::now();
-            let co =
-                Self::commit_lagrange_depad_persistent(srs_lagrange, &o_fr, &persistent_lag_msm);
+            let co = Self::commit_lagrange_depad_persistent(
+                srs_lagrange,
+                &o_fr,
+                &persistent_lag_msm,
+                d_o_upload,
+            );
             eprintln!("[T] 3c. commit_lagrange_depad_persistent O: {:?}", t.elapsed());
             (cl, cr, co)
         };
@@ -1890,18 +1903,17 @@ impl PlonkProver {
         result.to_affine()
     }
 
-    /// Commit with depadding using a persistent MSM context (SRS pre-uploaded to GPU).
-    /// Same algorithm as commit_lagrange_depad but uses the persistent context for all
-    /// MSM calls, avoiding redundant 2 GiB SRS uploads per wire.
-    /// Commit with depadding using a persistent MSM context (SRS pre-uploaded to GPU).
-    /// Detects hot scalar values via 1% sampling, zeros them, runs GPU MSM on the
-    /// sparse result, then adds back hot contributions via CPU tree-reduction
-    /// (overlapped with the GPU MSM).
+    /// Commit with depadding using device scalars + GPU-side zeroing.
+    /// Detects hot scalar values via 1% sampling, then:
+    /// - If d_scalars is available: GPU-side D2D + zero + MSM (saves ~370ms H2D + clone)
+    /// - Fallback: CPU clone + zero + host MSM (original path)
+    /// CPU correction (SRS sum for hot values) overlaps with GPU MSM.
     #[cfg(feature = "cuda")]
     fn commit_lagrange_depad_persistent(
         srs: &[G1Affine],
         evals: &[Fr],
         persistent: &crate::g1::PersistentMsm,
+        d_scalars: *mut std::ffi::c_void,
     ) -> G1Affine {
         const DEDUP_THRESHOLD: usize = 100_000;
 
@@ -1946,18 +1958,78 @@ impl PlonkProver {
             .filter(|(v, count)| *count >= DEDUP_THRESHOLD && !v.is_zero())
             .collect();
 
+        // GPU-side depad path: use device scalars + GPU zeroing kernel.
+        // Saves ~300ms H2D upload + ~70ms CPU clone per wire commit.
+        if !d_scalars.is_null() {
+            // Extract hot Fr values for GPU zeroing kernel
+            let hot_fr_values: Vec<Fr> = hot_values.iter().map(|(v, _)| *v).collect();
+
+            // Spawn CPU correction thread (SRS sum for hot values) — overlaps with GPU MSM
+            use crate::g1::G1Jacobian;
+            let hot_values_clone = hot_values.clone();
+            let srs_ptr = srs.as_ptr() as usize;
+            let srs_len = srs.len();
+            let evals_ptr = evals.as_ptr() as usize;
+            let evals_len = evals.len();
+
+            let correction_handle = std::thread::spawn(move || {
+                let srs =
+                    unsafe { std::slice::from_raw_parts(srs_ptr as *const G1Affine, srs_len) };
+                let evals =
+                    unsafe { std::slice::from_raw_parts(evals_ptr as *const Fr, evals_len) };
+                let num_hot = hot_values_clone.len();
+                let hot_map: HashMap<Fr, usize> =
+                    hot_values_clone.iter().enumerate().map(|(i, (v, _))| (*v, i)).collect();
+                let chunk_sums: Vec<Vec<G1Jacobian>> = evals
+                    .par_chunks(8192)
+                    .enumerate()
+                    .map(|(chunk_idx, chunk)| {
+                        let base = chunk_idx * 8192;
+                        let mut accs = vec![G1Jacobian::INFINITY; num_hot];
+                        for (j, v) in chunk.iter().enumerate() {
+                            if let Some(&idx) = hot_map.get(v) {
+                                accs[idx] = accs[idx].add_affine(&srs[base + j]);
+                            }
+                        }
+                        accs
+                    })
+                    .collect();
+                let mut hot_srs_sums = vec![G1Jacobian::INFINITY; num_hot];
+                for chunk_accs in &chunk_sums {
+                    for (i, acc) in chunk_accs.iter().enumerate() {
+                        hot_srs_sums[i] = hot_srs_sums[i].add(acc);
+                    }
+                }
+                (hot_srs_sums, hot_values_clone)
+            });
+
+            // GPU MSM with device-side depadding (D2D copy + GPU zero + MSM)
+            let mut result = if hot_fr_values.is_empty() {
+                persistent.msm_device(d_scalars as *const std::ffi::c_void, n)
+            } else {
+                persistent.msm_device_depad(d_scalars as *const std::ffi::c_void, n, &hot_fr_values)
+            };
+
+            // Wait for CPU correction and apply
+            let (hot_srs_sums, _) = correction_handle.join().unwrap();
+            for ((hot_val, _), srs_sum) in hot_values.iter().zip(hot_srs_sums.iter()) {
+                let contribution = srs_sum.scalar_mul(&hot_val.to_canonical());
+                result = result.add(&contribution);
+            }
+
+            return result.to_affine();
+        }
+
+        // Fallback: CPU clone + zero + host MSM (when device scalars not available)
         if hot_values.is_empty() {
             return persistent.msm(&evals[..n]).to_affine();
         }
 
-        // Clone evals and zero hot values in a single parallel pass
         let hot_set: std::collections::HashSet<Fr> = hot_values.iter().map(|(v, _)| *v).collect();
         let zeroed: Vec<Fr> =
             evals.par_iter().map(|s| if hot_set.contains(s) { Fr::ZERO } else { *s }).collect();
 
-        // Overlap: CPU correction tree-reduction runs WHILE GPU does the main MSM.
         use crate::g1::G1Jacobian;
-
         let hot_values_clone = hot_values.clone();
         let srs_ptr = srs.as_ptr() as usize;
         let srs_len = srs.len();
@@ -1970,7 +2042,6 @@ impl PlonkProver {
             let num_hot = hot_values_clone.len();
             let hot_map: HashMap<Fr, usize> =
                 hot_values_clone.iter().enumerate().map(|(i, (v, _))| (*v, i)).collect();
-            // Single pass over evals: accumulate SRS sums for ALL hot values at once.
             let chunk_sums: Vec<Vec<G1Jacobian>> = evals
                 .par_chunks(8192)
                 .enumerate()
@@ -1994,10 +2065,7 @@ impl PlonkProver {
             (hot_srs_sums, hot_values_clone)
         });
 
-        // Main MSM on zeroed scalars (GPU — runs concurrently with CPU correction)
         let mut result = persistent.msm(&zeroed);
-
-        // Wait for CPU correction and apply
         let (hot_srs_sums, _) = correction_handle.join().unwrap();
 
         for ((hot_val, _), srs_sum) in hot_values.iter().zip(hot_srs_sums.iter()) {

@@ -66,6 +66,20 @@ extern "C" {
         mont: bool,
     ) -> CudaRustError;
 
+    /// Run MSM with device scalars + GPU-side depadding.
+    /// D2D copies scalars, zeros entries matching hot_values on GPU, then MSMs.
+    /// hot_values_host: host pointer to num_hot Fr values in Montgomery form.
+    /// Saves ~300ms H2D upload + ~70ms CPU clone vs host-scalar depadding path.
+    pub fn sp1_bn254_msm_invoke_device_depad(
+        ctx: *mut c_void,
+        result: *mut c_void,
+        npoints: usize,
+        d_scalars: *const c_void,
+        mont: bool,
+        hot_values_host: *const c_void,
+        num_hot: i32,
+    ) -> CudaRustError;
+
     /// Destroy a persistent MSM context, freeing GPU resources.
     pub fn sp1_bn254_msm_destroy(ctx: *mut c_void);
 }

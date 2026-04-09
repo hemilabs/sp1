@@ -647,6 +647,86 @@ rustCudaError_t sp1_bn254_msm_invoke_device(void* ctx_ptr, void* result,
     return CUDA_SUCCESS_CSL;
 }
 
+/// Run MSM with device scalars + GPU-side depadding.
+/// Copies device scalars to internal buffer, zeros entries matching hot_values,
+/// then runs the standard MSM. Saves 300ms H2D + 70ms CPU clone per wire commit.
+/// hot_values_host: host pointer to num_hot Fr values in Montgomery form.
+extern "C"
+rustCudaError_t sp1_bn254_msm_invoke_device_depad(void* ctx_ptr, void* result,
+                                                    size_t npoints, const void* d_scalars, bool mont,
+                                                    const void* hot_values_host, int num_hot)
+{
+    auto* ctx = reinterpret_cast<hip_msm_context*>(ctx_ptr);
+    int n = (int)npoints;
+    size_t elem32 = sizeof(uint32_t);
+
+    // D2D copy: caller's device scalars → pre-allocated ctx->d_scalars (~1ms for 1 GiB)
+    CUDA_OK(hipMemcpy(ctx->d_scalars, d_scalars, n * SCALAR_LIMBS * elem32, hipMemcpyDeviceToDevice));
+
+    // GPU-side depadding: zero scalars matching hot values
+    if (num_hot > 0 && hot_values_host) {
+        // Upload hot values to GPU (tiny: num_hot × 32 bytes, typically 96 bytes)
+        uint32_t* d_hot_values = nullptr;
+        size_t hot_bytes = num_hot * SCALAR_LIMBS * elem32;
+        CUDA_OK(hipMalloc(&d_hot_values, hot_bytes));
+        CUDA_OK(hipMemcpy(d_hot_values, hot_values_host, hot_bytes, hipMemcpyHostToDevice));
+
+        // Launch zeroing kernel
+        int threads = 256;
+        int blocks = (n + threads - 1) / threads;
+        hipLaunchKernelGGL(bn254_msm::zero_hot_scalars_kernel,
+            dim3(blocks), dim3(threads), 0, 0,
+            ctx->d_scalars, d_hot_values, n, num_hot);
+        CUDA_OK(hipGetLastError());
+        hipFree(d_hot_values);
+    }
+
+    // Montgomery conversion on GPU if needed
+    if (mont) {
+        int threads = 256;
+        int blocks = (n + threads - 1) / threads;
+        hipLaunchKernelGGL(mont_to_canonical_kernel,
+            dim3(blocks), dim3(threads), 0, 0, ctx->d_scalars, n);
+        CUDA_OK(hipGetLastError());
+    }
+
+    // Initialize carries
+    CUDA_OK(hipMemset(ctx->d_carries, 0, n * sizeof(uint8_t)));
+
+    // Process windows
+    for (int w = 0; w < NUM_WINDOWS; w++) {
+        {
+            int threads = 256;
+            int blocks = (n + threads - 1) / threads;
+            hipLaunchKernelGGL(bn254_msm::scalar_decompose_packed_kernel,
+                dim3(blocks), dim3(threads), 0, 0,
+                ctx->d_scalars, ctx->d_digits, ctx->d_packed, ctx->d_carries, n, w);
+            CUDA_OK(hipGetLastError());
+        }
+        msm_one_window(
+            ctx->d_points, ctx->d_digits, ctx->d_packed,
+            ctx->d_window_results + w, ctx->d_buckets,
+            ctx->d_bucket_offsets, ctx->d_bucket_counts,
+            ctx->d_sorted_digits, ctx->d_sorted_packed,
+            ctx->d_sort_temp, ctx->sort_temp_bytes,
+            ctx->d_partial_sums,
+            ctx->d_reduce_partials, ctx->d_reduce_suffixes,
+            n
+        );
+    }
+
+    // Combine windows
+    hipLaunchKernelGGL(bn254_msm::window_combine_kernel,
+        dim3(1), dim3(1), 0, 0,
+        ctx->d_window_results, ctx->d_final_result, NUM_WINDOWS, WINDOW_BITS);
+    CUDA_OK(hipGetLastError());
+
+    // Download result
+    CUDA_OK(hipMemcpy(result, ctx->d_final_result, sizeof(bn254_g1_t), hipMemcpyDeviceToHost));
+
+    return CUDA_SUCCESS_CSL;
+}
+
 extern "C"
 void sp1_bn254_msm_destroy(void* ctx_ptr)
 {
