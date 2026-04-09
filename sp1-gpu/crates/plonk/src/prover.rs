@@ -731,103 +731,104 @@ impl PlonkProver {
             pi_ev
         };
 
-        // Spawn grand product on background thread using batch_inv_fr_inplace.
-        // Raw pointers (as usize for Send) to avoid borrow conflicts.
+        // GPU grand product: compute Z polynomial on GPU (15x faster kernel).
+        // Uploads s1/s2/s3/omega temporarily, uses d_l/r/o_upload for wire data.
+        // Z stays on device (d_z_gp) — used directly for Z commit MSM and Z NTT.
         let t = std::time::Instant::now();
         #[cfg(feature = "cuda")]
-        let grand_product_handle = {
-            let omega_ptr = self.cached.omega_powers.as_ptr() as usize;
-            let l_ptr = l_fr.as_ptr() as usize;
-            let r_ptr = r_fr.as_ptr() as usize;
-            let o_ptr = o_fr.as_ptr() as usize;
-            let s1_ptr = s1.as_ptr() as usize;
-            let s2_ptr = s2.as_ptr() as usize;
-            let s3_ptr = s3.as_ptr() as usize;
-            let gp_n = n;
-            let gp_beta = beta;
-            let gp_gamma = gamma;
-            let gp_coset_shift = coset_shift;
-            std::thread::spawn(move || {
-                let omega_powers =
-                    unsafe { std::slice::from_raw_parts(omega_ptr as *const Fr, gp_n) };
-                let l = unsafe { std::slice::from_raw_parts(l_ptr as *const Fr, gp_n) };
-                let r = unsafe { std::slice::from_raw_parts(r_ptr as *const Fr, gp_n) };
-                let o = unsafe { std::slice::from_raw_parts(o_ptr as *const Fr, gp_n) };
-                let s1 = unsafe { std::slice::from_raw_parts(s1_ptr as *const Fr, gp_n) };
-                let s2 = unsafe { std::slice::from_raw_parts(s2_ptr as *const Fr, gp_n) };
-                let s3 = unsafe { std::slice::from_raw_parts(s3_ptr as *const Fr, gp_n) };
+        let d_z_gp = {
+            use std::ffi::c_void;
+            let elem_sz = std::mem::size_of::<Fr>();
+            let byte_sz = n * elem_sz;
 
-                let k1 = gp_coset_shift;
-                let k2 = k1 * k1;
+            // Upload s1/s2/s3/omega to GPU (4 × 1 GiB, ~1.1s on VM PCIe)
+            let mut d_s1_tmp: *mut c_void = std::ptr::null_mut();
+            let mut d_s2_tmp: *mut c_void = std::ptr::null_mut();
+            let mut d_s3_tmp: *mut c_void = std::ptr::null_mut();
+            let mut d_omega_tmp: *mut c_void = std::ptr::null_mut();
+            let mut d_z_out: *mut c_void = std::ptr::null_mut();
+            unsafe {
+                sp1_gpu_sys::runtime::cuda_malloc(&mut d_s1_tmp as *mut _, byte_sz);
+                sp1_gpu_sys::runtime::cuda_malloc(&mut d_s2_tmp as *mut _, byte_sz);
+                sp1_gpu_sys::runtime::cuda_malloc(&mut d_s3_tmp as *mut _, byte_sz);
+                sp1_gpu_sys::runtime::cuda_malloc(&mut d_omega_tmp as *mut _, byte_sz);
+                sp1_gpu_sys::runtime::cuda_malloc(&mut d_z_out as *mut _, byte_sz);
+                sp1_gpu_sys::runtime::cuda_mem_copy_host_to_device(
+                    d_s1_tmp,
+                    s1.as_ptr() as *const c_void,
+                    byte_sz,
+                );
+                sp1_gpu_sys::runtime::cuda_mem_copy_host_to_device(
+                    d_s2_tmp,
+                    s2.as_ptr() as *const c_void,
+                    byte_sz,
+                );
+                sp1_gpu_sys::runtime::cuda_mem_copy_host_to_device(
+                    d_s3_tmp,
+                    s3.as_ptr() as *const c_void,
+                    byte_sz,
+                );
+                sp1_gpu_sys::runtime::cuda_mem_copy_host_to_device(
+                    d_omega_tmp,
+                    self.cached.omega_powers.as_ptr() as *const c_void,
+                    byte_sz,
+                );
+            }
 
-                // Compute element-wise numerators and denominators (parallel)
-                let (numerators, mut denominators): (Vec<Fr>, Vec<Fr>) = (0..gp_n)
-                    .into_par_iter()
-                    .map(|i| {
-                        let w = omega_powers[i];
-                        let beta_w = gp_beta * w;
-                        let n1 = l[i] + beta_w + gp_gamma;
-                        let n2 = r[i] + beta_w * k1 + gp_gamma;
-                        let n3 = o[i] + beta_w * k2 + gp_gamma;
-                        let num = n1 * n2 * n3;
+            // GPU grand product kernel (0.4s compute)
+            let err = unsafe {
+                sp1_gpu_sys::plonk::sp1_bn254_grand_product(
+                    d_l_upload as *const c_void,
+                    d_r_upload as *const c_void,
+                    d_o_upload as *const c_void,
+                    d_s1_tmp as *const c_void,
+                    d_s2_tmp as *const c_void,
+                    d_s3_tmp as *const c_void,
+                    d_omega_tmp as *const c_void,
+                    &beta as *const Fr as *const c_void,
+                    &gamma as *const Fr as *const c_void,
+                    &coset_shift as *const Fr as *const c_void,
+                    n as u32,
+                    d_z_out,
+                )
+            };
+            if err != unsafe { sp1_gpu_sys::runtime::CUDA_SUCCESS_CSL } {
+                panic!("GPU grand product kernel failed");
+            }
 
-                        let d1 = l[i] + gp_beta * s1[i] + gp_gamma;
-                        let d2 = r[i] + gp_beta * s2[i] + gp_gamma;
-                        let d3 = o[i] + gp_beta * s3[i] + gp_gamma;
-                        let den = d1 * d2 * d3;
+            // Free temporary uploads (4 GiB freed, needed for NTTs next)
+            unsafe {
+                sp1_gpu_sys::runtime::cuda_free(d_s1_tmp as *const c_void);
+                sp1_gpu_sys::runtime::cuda_free(d_s2_tmp as *const c_void);
+                sp1_gpu_sys::runtime::cuda_free(d_s3_tmp as *const c_void);
+                sp1_gpu_sys::runtime::cuda_free(d_omega_tmp as *const c_void);
+            }
 
-                        (num, den)
-                    })
-                    .unzip();
+            d_z_out // Z stays on device for Z commit MSM + Z NTT
+        };
+        eprintln!("[T] 4. Grand product (GPU): {:?}", t.elapsed());
 
-                // Batch invert denominators IN-PLACE
-                batch_inv_fr_inplace(&mut denominators);
-
-                // Fused ratio + prefix product: compute Z[i] = prod(num[j]/den[j], j<i)
-                // Avoids allocating a separate 1 GiB `ratios` Vec.
-                let z = {
-                    let num_chunks = rayon::current_num_threads().max(1);
-                    let chunk_size = gp_n.div_ceil(num_chunks);
-
-                    // Each chunk computes its local prefix product of num[i]*inv_den[i]
-                    let chunk_prefixes: Vec<Vec<Fr>> = numerators
-                        .par_chunks(chunk_size)
-                        .zip(denominators.par_chunks(chunk_size))
-                        .map(|(num_chunk, den_chunk)| {
-                            let mut prefix = Vec::with_capacity(num_chunk.len() + 1);
-                            let mut acc = Fr::ONE;
-                            for (&n, &d) in num_chunk.iter().zip(den_chunk.iter()) {
-                                prefix.push(acc);
-                                acc *= n * d; // ratio = num * inv_den
-                            }
-                            prefix.push(acc); // chunk product
-                            prefix
-                        })
-                        .collect();
-
-                    let mut chunk_cumulative = vec![Fr::ONE; chunk_prefixes.len()];
-                    for i in 1..chunk_prefixes.len() {
-                        chunk_cumulative[i] = chunk_cumulative[i - 1]
-                            * chunk_prefixes[i - 1][chunk_prefixes[i - 1].len() - 1];
-                    }
-
-                    let mut z = vec![Fr::ZERO; gp_n];
-                    z.par_chunks_mut(chunk_size).enumerate().for_each(|(ci, z_chunk)| {
-                        let cumul = chunk_cumulative[ci];
-                        let prefix = &chunk_prefixes[ci];
-                        for (j, z_val) in z_chunk.iter_mut().enumerate() {
-                            *z_val = cumul * prefix[j];
-                        }
-                    });
-                    z
-                };
-
-                let final_product = z[gp_n - 1] * numerators[gp_n - 1] * denominators[gp_n - 1];
-                (z, final_product)
-            })
+        // Also download Z to host (needed for CPU evaluation in Round 4)
+        #[cfg(feature = "cuda")]
+        let z_lagrange = {
+            let byte_sz = n * std::mem::size_of::<Fr>();
+            let mut z = Vec::with_capacity(n);
+            unsafe { z.set_len(n) };
+            z.par_chunks_mut(128).for_each(|chunk| unsafe {
+                std::ptr::write_volatile(&mut chunk[0] as *mut Fr, Fr::ZERO);
+            });
+            unsafe {
+                sp1_gpu_sys::runtime::cuda_mem_copy_device_to_host(
+                    z.as_mut_ptr() as *mut std::ffi::c_void,
+                    d_z_gp as *const std::ffi::c_void,
+                    byte_sz,
+                );
+            }
+            z
         };
 
-        // On main thread: run PI+BSB22 fused iFFT+cosetFFT while grand product runs
+        // PI+BSB22 NTTs + L/R/O early NTTs (now sequential, not overlapped with GP)
+        // The GPU is free since GP finished synchronously.
         #[cfg(feature = "cuda")]
         let (
             pi_bsb22_precomputed,
@@ -968,18 +969,8 @@ impl PlonkProver {
             )
         };
 
-        // Join grand product thread
-        #[cfg(feature = "cuda")]
-        let (z_lagrange, final_product) =
-            grand_product_handle.join().expect("Grand product thread panicked");
-        #[cfg(feature = "cuda")]
-        {
-            anyhow::ensure!(
-                final_product == Fr::ONE,
-                "Grand product check failed: Z[N] != 1. Wire assignments violate copy constraints."
-            );
-        }
-
+        // GPU grand product already completed synchronously above (z_lagrange on host, d_z_gp on device).
+        // CPU fallback for non-cuda builds:
         #[cfg(not(feature = "cuda"))]
         let z_lagrange = self.compute_grand_product(
             &l_fr,
@@ -993,13 +984,14 @@ impl PlonkProver {
             domain,
             &coset_shift,
         )?;
-        eprintln!("[T] 4. Grand product (overlapped with PI NTTs): {:?}", t.elapsed());
 
         // Commit Z (reuses persistent Lagrange MSM context -- no SRS re-upload)
         // CPU fusion runs concurrently on background thread.
         let t = std::time::Instant::now();
+        // Z commit: use device pointer d_z_gp (saves 300ms H2D upload vs host path)
         #[cfg(feature = "cuda")]
-        let commit_z = persistent_lag_msm.msm(&z_lagrange).to_affine();
+        let commit_z =
+            persistent_lag_msm.msm_device(d_z_gp as *const std::ffi::c_void, n).to_affine();
         #[cfg(not(feature = "cuda"))]
         let commit_z = self.commit_lagrange(srs_lagrange, &z_lagrange);
         #[cfg(feature = "cuda")]
@@ -1087,13 +1079,29 @@ impl PlonkProver {
             if use_gpu_quotient {
                 // >=20 GiB path: L/R/O NTTs already done during grand product overlap.
                 // Only Z iFFT+cosetFFT needed here (Z depends on grand product result).
-                use crate::domain::gpu_ntt::gpu_ifft_then_coset_fft_to_device;
+                use crate::domain::gpu_ntt::{
+                    gpu_ifft_then_coset_fft_to_device,
+                    gpu_ifft_then_coset_fft_to_device_from_device,
+                };
                 let lg = domain.log_size;
                 let _t_ntt = std::time::Instant::now();
                 let (l_c, d_l) = (l_coeffs_early, d_l_early);
                 let (r_c, d_r) = (r_coeffs_early, d_r_early);
                 let (o_c, d_o) = (o_coeffs_early, d_o_early);
-                let (z_c, d_z) = gpu_ifft_then_coset_fft_to_device(&z_lagrange, lg, big_log);
+                // Z NTT from device: d_z_gp already on GPU from grand product (saves 300ms H2D)
+                let (z_c, d_z) = if !d_z_gp.is_null() {
+                    let r = gpu_ifft_then_coset_fft_to_device_from_device(
+                        d_z_gp as *const std::ffi::c_void,
+                        lg,
+                        big_log,
+                    );
+                    unsafe {
+                        sp1_gpu_sys::runtime::cuda_free(d_z_gp as *const std::ffi::c_void);
+                    }
+                    r
+                } else {
+                    gpu_ifft_then_coset_fft_to_device(&z_lagrange, lg, big_log)
+                };
                 crate::domain::gpu_ntt::free_ntt_buffer();
                 unsafe { sp1_gpu_sys::dft_bn254::bn254_ntt_clear_twiddle_cache() };
                 inv_precompute.join().expect("inverse twiddle precompute failed");
