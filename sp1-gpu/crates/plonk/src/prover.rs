@@ -2467,6 +2467,7 @@ impl PlonkProver {
                 },
                 self.cached.qo_coset_evals.as_ptr() as *const c_void,
                 qk_plus_pi.as_ptr() as *const c_void,
+                std::ptr::null(), // d_qk_plus_pi: null = use host-streamed path
                 self.cached.s1_coset_evals.as_ptr() as *const c_void,
                 self.cached.s2_coset_evals.as_ptr() as *const c_void,
                 self.cached.s3_coset_evals.as_ptr() as *const c_void,
@@ -2702,6 +2703,7 @@ impl PlonkProver {
                     },
                     self.cached.qo_coset_evals.as_ptr() as *const c_void,
                     qk_plus_pi.as_ptr() as *const c_void,
+                    std::ptr::null(), // d_qk_plus_pi: null = use host-streamed path
                     self.cached.s1_coset_evals.as_ptr() as *const c_void,
                     self.cached.s2_coset_evals.as_ptr() as *const c_void,
                     self.cached.s3_coset_evals.as_ptr() as *const c_void,

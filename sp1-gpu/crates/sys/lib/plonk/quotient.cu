@@ -38,7 +38,12 @@ __global__ void plonk_quotient_fused_kernel(
     const fr_t* __restrict__ d_o,
     const fr_t* __restrict__ d_z,
     // Static arrays (chunk buffer, chunk_size elements, 9 arrays packed)
+    // Slot layout: 0:ql, 1:qr, 2:qm, 3:qo, 4:qk_plus_pi*, 5:s1, 6:s2, 7:s3, 8:xm1n_inv
+    // *Slot 4 is only used when d_qk_plus_pi is null.
     const fr_t* __restrict__ chunk_data,
+    // Optional: qk_plus_pi on device (full big_n). If non-null, reads from here
+    // instead of chunk_data slot 4 (saves 4 GiB PCIe streaming per proof).
+    const fr_t* __restrict__ d_qk_plus_pi,
     // Omega lookup tables (device-resident, uploaded once)
     const fr_t* __restrict__ lo_table,
     const fr_t* __restrict__ hi_table,
@@ -103,7 +108,9 @@ __global__ void plonk_quotient_fused_kernel(
         gate += qo * o;
     }
     {
-        fr_t qk_plus_pi = chunk_data[4 * chunk_size + tid];
+        // Read qk_plus_pi from device array (if fused on GPU) or chunk buffer (host-streamed).
+        fr_t qk_plus_pi = d_qk_plus_pi ? d_qk_plus_pi[global_idx]
+                                        : chunk_data[4 * chunk_size + tid];
         gate += qk_plus_pi;
     }
 
@@ -159,7 +166,8 @@ rustCudaError_t sp1_plonk_quotient_eval_fused(
     const void* h_qr_evals,
     const void* h_qm_evals,
     const void* h_qo_evals,
-    const void* h_qk_plus_pi,
+    const void* h_qk_plus_pi,   // Host OR null if d_qk_plus_pi is provided
+    const void* d_qk_plus_pi,   // Device: optional device-resident qk+pi [big_n] (or null)
     const void* h_s1_evals,
     const void* h_s2_evals,
     const void* h_s3_evals,
@@ -252,9 +260,11 @@ rustCudaError_t sp1_plonk_quotient_eval_fused(
     fr_t& zh_val2 = reinterpret_cast<fr_t&>(zh_val_raw[2]);
     fr_t& zh_val3 = reinterpret_cast<fr_t&>(zh_val_raw[3]);
 
-    // 9 static arrays to upload per chunk
+    // 9 static arrays to upload per chunk.
+    // Slot 4 (qk_plus_pi) is null when d_qk_plus_pi is provided (device-resident).
     const void* h_static[NUM_STATIC] = {
-        h_ql_evals, h_qr_evals, h_qm_evals, h_qo_evals, h_qk_plus_pi,
+        h_ql_evals, h_qr_evals, h_qm_evals, h_qo_evals,
+        d_qk_plus_pi ? nullptr : h_qk_plus_pi,  // skip streaming if on device
         h_s1_evals, h_s2_evals, h_s3_evals,
         h_xm1n_inv,
         nullptr  // reserved
@@ -301,6 +311,7 @@ rustCudaError_t sp1_plonk_quotient_eval_fused(
             (const fr_t*)d_l_evals, (const fr_t*)d_r_evals,
             (const fr_t*)d_o_evals, (const fr_t*)d_z_evals,
             d_chunk[buf],
+            (const fr_t*)d_qk_plus_pi,  // null if host-streamed, non-null if device-resident
             d_lo_table, d_hi_table,
             alpha, beta_v, gamma_v, k1_v, k2_v, alpha_sq_v, one_mont_v,
             coset_shift_v,

@@ -22,6 +22,7 @@ extern "C" {
         h_qm_evals: *const c_void,
         h_qo_evals: *const c_void,
         h_qk_plus_pi: *const c_void,
+        d_qk_plus_pi: *const c_void, // Device-resident qk+pi (or null)
         h_s1_evals: *const c_void,
         h_s2_evals: *const c_void,
         h_s3_evals: *const c_void,
