@@ -439,13 +439,39 @@ __global__ void bucket_accumulate_parallel_packed_kernel(
         i += BUCKET_PAR;
     }
 
-    // Remaining points: unsafe add (no infinity/P==Q checks, 7M+2S)
-    for (; i < count; i += BUCKET_PAR) {
+    // Remaining points: double-buffered load to overlap memory latency
+    // with EC computation. Issue the load for the NEXT point while computing
+    // add_affine_unsafe on the current one. The random SRS point load has
+    // ~400-600 cycle DRAM latency, hidden behind ~10K cycle EC addition.
+    if (i < count) {
+        // Pre-load first iteration's data
         uint32_t packed = sorted_packed_indices[offset + i];
         uint32_t pt_idx = packed & 0x7FFFFFFFu;
         bn254_g1_affine_t p = points[pt_idx];
-        if (packed >> 31) p.y = -p.y;
-        accum.add_affine_unsafe(p);
+
+        uint32_t next_i = i + BUCKET_PAR;
+        for (;;) {
+            // Pre-fetch next iteration's point while we process the current one
+            bn254_g1_affine_t next_p;
+            uint32_t next_packed;
+            bool has_next = (next_i < count);
+            if (has_next) {
+                next_packed = sorted_packed_indices[offset + next_i];
+                uint32_t next_pt_idx = next_packed & 0x7FFFFFFFu;
+                next_p = points[next_pt_idx]; // issued NOW, completes during add below
+            }
+
+            // Process current point
+            if (packed >> 31) p.y = -p.y;
+            accum.add_affine_unsafe(p);
+
+            if (!has_next) break;
+
+            // Rotate: next becomes current
+            p = next_p;
+            packed = next_packed;
+            next_i += BUCKET_PAR;
+        }
     }
 
     partial_sums[(size_t)bucket_id * BUCKET_PAR + par_id] = accum;
