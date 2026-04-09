@@ -107,7 +107,7 @@ struct bn254_fq_t {
         return *this;
     }
 
-    // Modular subtraction
+    // Modular subtraction (branchless conditional add-P)
     __device__ __forceinline__ bn254_fq_t operator-(const bn254_fq_t& b) const {
         bn254_fq_t r;
         uint64_t borrow = 0;
@@ -116,7 +116,20 @@ struct bn254_fq_t {
             r.data[i] = (uint32_t)diff;
             borrow = (diff >> 63) & 1;
         }
-        if (borrow) r.add_p();
+        // Branchless: compute r + P, select if borrow
+        {
+            uint32_t added[N];
+            uint64_t carry = 0;
+            for (int i = 0; i < N; i++) {
+                uint64_t sum = (uint64_t)r.data[i] + device::ALT_BN128_P[i] + carry;
+                added[i] = (uint32_t)sum;
+                carry = sum >> 32;
+            }
+            uint32_t do_add = (borrow != 0);
+            for (int i = 0; i < N; i++) {
+                r.data[i] = do_add ? added[i] : r.data[i];
+            }
+        }
         return r;
     }
 
@@ -212,16 +225,22 @@ struct bn254_fq_t {
         return *this * *this;
     }
 
-    // Modular negation: -a mod P
+    // Modular negation: -a mod P (branchless)
     __device__ __forceinline__ bn254_fq_t operator-() const {
-        if (is_zero()) return *this;
+        // Compute P - a. If a == 0, result is P but we need 0.
+        // Use branchless: mask with (a != 0) to avoid warp divergence.
         bn254_fq_t r;
         uint64_t borrow = 0;
+        uint32_t nonzero = 0;
         for (int i = 0; i < N; i++) {
+            nonzero |= data[i];
             uint64_t diff = (uint64_t)device::ALT_BN128_P[i] - data[i] - borrow;
             r.data[i] = (uint32_t)diff;
             borrow = (diff >> 63) & 1;
         }
+        // If a was zero, result should be zero (not P)
+        uint32_t mask = (nonzero != 0) ? 0xFFFFFFFFu : 0u;
+        for (int i = 0; i < N; i++) r.data[i] &= mask;
         return r;
     }
 
