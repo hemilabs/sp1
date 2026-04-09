@@ -808,24 +808,11 @@ impl PlonkProver {
         };
         eprintln!("[T] 4. Grand product (GPU): {:?}", t.elapsed());
 
-        // Also download Z to host (needed for CPU evaluation in Round 4)
+        // Z lagrange is NOT downloaded here — it stays on device (d_z_gp).
+        // The Z commit uses msm_device(d_z_gp), Z NTT uses from_device(d_z_gp).
+        // z_lagrange is only needed for the <20 GiB fallback and non-cuda paths.
         #[cfg(feature = "cuda")]
-        let z_lagrange = {
-            let byte_sz = n * std::mem::size_of::<Fr>();
-            let mut z = Vec::with_capacity(n);
-            unsafe { z.set_len(n) };
-            z.par_chunks_mut(128).for_each(|chunk| unsafe {
-                std::ptr::write_volatile(&mut chunk[0] as *mut Fr, Fr::ZERO);
-            });
-            unsafe {
-                sp1_gpu_sys::runtime::cuda_mem_copy_device_to_host(
-                    z.as_mut_ptr() as *mut std::ffi::c_void,
-                    d_z_gp as *const std::ffi::c_void,
-                    byte_sz,
-                );
-            }
-            z
-        };
+        let z_lagrange: Vec<Fr> = Vec::new();
 
         // PI+BSB22 NTTs + L/R/O early NTTs (now sequential, not overlapped with GP)
         // The GPU is free since GP finished synchronously.
@@ -1848,7 +1835,7 @@ impl PlonkProver {
     /// contribution via a binary-scalar GPU MSM + scalar-mul.
     #[cfg_attr(feature = "cuda", allow(dead_code))]
     fn commit_lagrange_depad(&self, srs: &[G1Affine], evals: &[Fr]) -> G1Affine {
-        const DEDUP_THRESHOLD: usize = 100_000;
+        const DEDUP_THRESHOLD: usize = 8_192;
 
         assert!(evals.len() <= srs.len());
         let n = evals.len();
@@ -1919,7 +1906,7 @@ impl PlonkProver {
         persistent: &crate::g1::PersistentMsm,
         d_scalars: *mut std::ffi::c_void,
     ) -> G1Affine {
-        const DEDUP_THRESHOLD: usize = 100_000;
+        const DEDUP_THRESHOLD: usize = 8_192;
 
         assert!(evals.len() <= srs.len());
         let n = evals.len();
@@ -2559,20 +2546,31 @@ impl PlonkProver {
         }
         eprintln!("[T] 7b. Coset iFFT: {:?}", _t_ifft.elapsed());
 
-        // Download h_coeffs to CPU (for Round 4/5) while keeping device copy for h MSMs.
+        // Download only the used portion of h_coeffs: 3*(N+2) elements out of 4N.
+        // split_quotient uses h[0..3*(N+2)]; the tail (3*(N+2)..4N) is unused.
+        // This saves ~1 GiB of D2H transfer.
         let _t_d2h = std::time::Instant::now();
-        let mut h_coeffs = Vec::with_capacity(big_n);
+        let h_download_len = 3 * (n + 2); // only what split_quotient needs
+        let h_download_bytes = h_download_len * std::mem::size_of::<Fr>();
+        let mut h_coeffs = Vec::with_capacity(h_download_len);
         unsafe {
-            h_coeffs.set_len(big_n);
+            h_coeffs.set_len(h_download_len);
         }
         h_coeffs.par_chunks_mut(128).for_each(|chunk| unsafe {
             std::ptr::write_volatile(&mut chunk[0] as *mut Fr, Fr::ZERO);
         });
+        // Pin for DMA-speed D2H transfer (avoids staging buffer penalty)
+        unsafe {
+            let _ = sp1_gpu_sys::runtime::cuda_host_register(
+                h_coeffs.as_ptr() as *const c_void,
+                h_download_bytes,
+            );
+        }
         let err = unsafe {
             sp1_gpu_sys::runtime::cuda_mem_copy_device_to_host(
                 h_coeffs.as_mut_ptr() as *mut c_void,
                 d_output_ptr,
-                output_bytes,
+                h_download_bytes,
             )
         };
         if err != unsafe { sp1_gpu_sys::runtime::CUDA_SUCCESS_CSL } {
