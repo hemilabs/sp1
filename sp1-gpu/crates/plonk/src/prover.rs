@@ -1010,72 +1010,91 @@ impl PlonkProver {
                 (None, Some(pi_bsb22), bsb22_coeffs_list, Vec::new(), None, None)
             };
 
-            // Free wire upload buffers (3 GiB) before NTTs — VRAM headroom for NTT temp.
-            unsafe {
-                if !d_l_upload.is_null() {
-                    sp1_gpu_sys::runtime::cuda_free(d_l_upload as *const c_void);
+            // NTT VRAM strategy: sppark NTT (CUDA) is fully in-place (no temp buffer),
+            // so d_qk_plus_pi can stay on device during NTTs. The RDNA3 NTT (HIP)
+            // needs a 4 GiB temp buffer, requiring d_qk_plus_pi spill.
+            #[cfg(hip_backend)]
+            {
+                // HIP path: free wire uploads + spill d_qk_plus_pi for NTT temp headroom
+                unsafe {
+                    if !d_l_upload.is_null() {
+                        sp1_gpu_sys::runtime::cuda_free(d_l_upload as *const c_void);
+                    }
+                    if !d_r_upload.is_null() {
+                        sp1_gpu_sys::runtime::cuda_free(d_r_upload as *const c_void);
+                    }
+                    if !d_o_upload.is_null() {
+                        sp1_gpu_sys::runtime::cuda_free(d_o_upload as *const c_void);
+                    }
                 }
-                if !d_r_upload.is_null() {
-                    sp1_gpu_sys::runtime::cuda_free(d_r_upload as *const c_void);
-                }
-                if !d_o_upload.is_null() {
-                    sp1_gpu_sys::runtime::cuda_free(d_o_upload as *const c_void);
-                }
+                let qk_plus_pi_host = if d_qk_plus_pi_opt.is_some() {
+                    let d_qk = d_qk_plus_pi_opt.as_ref().unwrap();
+                    let mut h = vec![Fr::ZERO; big_n];
+                    let err = unsafe {
+                        sp1_gpu_sys::runtime::cuda_mem_copy_device_to_host(
+                            h.as_mut_ptr() as *mut c_void, d_qk.ptr, byte_sz_4n,
+                        )
+                    };
+                    if err != unsafe { sp1_gpu_sys::runtime::CUDA_SUCCESS_CSL } {
+                        panic!("D2H failed for d_qk_plus_pi spill");
+                    }
+                    drop(d_qk_plus_pi_opt.take().unwrap());
+                    Some(h)
+                } else {
+                    None
+                };
             }
 
-            // Spill d_qk_plus_pi to host to free 4 GiB during Z/L/R/O NTTs.
-            // The NTT's transpose stage needs a 4 GiB temp buffer that won't fit
-            // alongside 5 × 4 GiB device buffers (28 GiB > 24 GiB GPU).
-            // Re-upload after NTTs. Total PCIe: 8 GiB, mostly overlapped with NTT compute.
-            let qk_plus_pi_host = if d_qk_plus_pi_opt.is_some() {
-                let d_qk = d_qk_plus_pi_opt.as_ref().unwrap();
-                let mut h = vec![Fr::ZERO; big_n];
-                let err = unsafe {
-                    sp1_gpu_sys::runtime::cuda_mem_copy_device_to_host(
-                        h.as_mut_ptr() as *mut c_void, d_qk.ptr, byte_sz_4n,
-                    )
-                };
-                if err != unsafe { sp1_gpu_sys::runtime::CUDA_SUCCESS_CSL } {
-                    panic!("D2H failed for d_qk_plus_pi spill");
-                }
-                drop(d_qk_plus_pi_opt.take().unwrap());
-                Some(h)
-            } else {
-                None
-            };
-
-            // Z NTT from host (d_z_gp freed to save 1 GiB headroom).
+            // Z NTT: use device pointer if available (saves H2D)
+            use crate::domain::gpu_ntt::gpu_ifft_then_coset_fft_to_device_from_device;
             let (z_coeffs_r2, d_z_r2) = if use_gpu_quotient {
-                let z_host = if !d_z_gp.is_null() {
-                    let byte_sz_n = n * elem_sz;
-                    let mut z_h = Vec::with_capacity(n);
-                    unsafe { z_h.set_len(n); }
+                if !d_z_gp.is_null() {
+                    let r = gpu_ifft_then_coset_fft_to_device_from_device(
+                        d_z_gp as *const c_void, lg_n, big_log,
+                    );
                     unsafe {
-                        sp1_gpu_sys::runtime::cuda_mem_copy_device_to_host(
-                            z_h.as_mut_ptr() as *mut c_void,
-                            d_z_gp as *const c_void, byte_sz_n,
-                        );
                         sp1_gpu_sys::runtime::cuda_free(d_z_gp as *const c_void);
                     }
-                    z_h
+                    (r.0, Some(r.1))
                 } else {
-                    z_lagrange.clone()
-                };
-                let r = gpu_ifft_then_coset_fft_to_device(&z_host, lg_n, big_log);
-                (r.0, Some(r.1))
+                    let r = gpu_ifft_then_coset_fft_to_device(&z_lagrange, lg_n, big_log);
+                    (r.0, Some(r.1))
+                }
             } else {
                 (Vec::new(), None)
             };
 
-            // L/R/O iFFT+cosetFFTs from host.
-            let (l_coeffs_early, d_l_early) =
-                gpu_ifft_then_coset_fft_to_device(&l_fr, lg_n, big_log);
-            let (r_coeffs_early, d_r_early) =
-                gpu_ifft_then_coset_fft_to_device(&r_fr, lg_n, big_log);
-            let (o_coeffs_early, d_o_early) =
-                gpu_ifft_then_coset_fft_to_device(&o_fr, lg_n, big_log);
+            // L/R/O iFFT+cosetFFTs: use device pointers from GP if available
+            let (l_coeffs_early, d_l_early) = if !d_l_upload.is_null() {
+                let r = gpu_ifft_then_coset_fft_to_device_from_device(
+                    d_l_upload as *const c_void, lg_n, big_log,
+                );
+                unsafe { sp1_gpu_sys::runtime::cuda_free(d_l_upload as *const c_void); }
+                r
+            } else {
+                gpu_ifft_then_coset_fft_to_device(&l_fr, lg_n, big_log)
+            };
+            let (r_coeffs_early, d_r_early) = if !d_r_upload.is_null() {
+                let r = gpu_ifft_then_coset_fft_to_device_from_device(
+                    d_r_upload as *const c_void, lg_n, big_log,
+                );
+                unsafe { sp1_gpu_sys::runtime::cuda_free(d_r_upload as *const c_void); }
+                r
+            } else {
+                gpu_ifft_then_coset_fft_to_device(&r_fr, lg_n, big_log)
+            };
+            let (o_coeffs_early, d_o_early) = if !d_o_upload.is_null() {
+                let r = gpu_ifft_then_coset_fft_to_device_from_device(
+                    d_o_upload as *const c_void, lg_n, big_log,
+                );
+                unsafe { sp1_gpu_sys::runtime::cuda_free(d_o_upload as *const c_void); }
+                r
+            } else {
+                gpu_ifft_then_coset_fft_to_device(&o_fr, lg_n, big_log)
+            };
 
-            // Re-upload d_qk_plus_pi from host (NTTs done, VRAM freed by steal).
+            // HIP: re-upload spilled d_qk_plus_pi
+            #[cfg(hip_backend)]
             if let Some(h) = qk_plus_pi_host {
                 let mut d_ptr: *mut c_void = std::ptr::null_mut();
                 unsafe {
