@@ -1350,7 +1350,8 @@ impl PlonkProver {
 
         eprintln!("[T] 7. Round 3 (iFFT + coset FFT + quotient): {:?}", t.elapsed());
 
-        // Start SRS canonical upload while CPU does split + h2_nnz
+        // SRS canonical upload was started before quotient kernel (overlapped).
+        // Just measure post-quotient time from here.
         let t = std::time::Instant::now();
         #[cfg(feature = "cuda")]
         let srs_can_handle = {
