@@ -672,6 +672,9 @@ impl PlonkProver {
             eprintln!("[T] 3c. commit_lagrange_depad_persistent O: {:?}", t.elapsed());
             (cl, cr, co)
         };
+        // Wrap in Option so GPU path can take() and drop it early to free ~3.8 GiB VRAM.
+        #[cfg(feature = "cuda")]
+        let mut persistent_lag_msm_opt = Some(persistent_lag_msm);
         #[cfg(not(feature = "cuda"))]
         let (commit_l, commit_r, commit_o) = {
             let cl = self.commit_lagrange_depad(srs_lagrange, &l_fr);
@@ -814,145 +817,289 @@ impl PlonkProver {
         #[cfg(feature = "cuda")]
         let z_lagrange: Vec<Fr> = Vec::new();
 
-        // PI+BSB22 NTTs + L/R/O early NTTs (now sequential, not overlapped with GP)
-        // The GPU is free since GP finished synchronously.
+        // Determine GPU path early (before NTTs) so we can keep d_pi_coset on device.
+        #[cfg(feature = "cuda")]
+        let use_gpu_quotient = {
+            let mut total: usize = 0;
+            let mut free: usize = 0;
+            unsafe {
+                sp1_gpu_sys::runtime::cuda_mem_get_info(&mut free as *mut _, &mut total as *mut _)
+            };
+            total >= 20 * 1024 * 1024 * 1024
+        };
+
+        // PI+BSB22 NTTs + GPU qk+pi fusion + L/R/O early NTTs.
+        // GPU path (≥20 GiB): keep d_pi_coset and d_bsb22 on device, fuse on GPU.
+        //   Eliminates PI D2H (1.1s) and reduces quotient PCIe by one 4 GiB stream.
+        // CPU path (<20 GiB): D2H everything, fuse on CPU background thread.
         #[cfg(feature = "cuda")]
         let (
-            pi_bsb22_precomputed,
+            d_qk_plus_pi_precomputed,
+            pi_bsb22_cpu_opt,
             bsb22_coeffs_from_aux,
             l_coeffs_early,
             r_coeffs_early,
             o_coeffs_early,
+            z_coeffs_early,
             d_l_early,
             d_r_early,
             d_o_early,
+            d_z_early,
+            commit_z_r2,
         ) = {
+            use std::ffi::c_void;
             let big_log = self.cached.big_domain.log_size;
             let lg_n = domain.log_size;
+            let big_n = 1usize << big_log;
+            let elem_sz = std::mem::size_of::<Fr>();
+            let byte_sz_4n = big_n * elem_sz;
 
-            // PI: iFFT + coset FFT, skip coefficient download (not needed)
+            use crate::domain::gpu_ntt::gpu_ifft_then_coset_fft_to_device;
+
+            // PI: iFFT + coset FFT, keep on device
             let d_pi_coset = crate::domain::gpu_ntt::gpu_ifft_then_coset_fft_to_device_no_coeffs(
                 &pi_poly_evals,
                 lg_n,
                 big_log,
             );
 
-            // Download PI coset evals to CPU for fusion
-            let big_n = 1usize << big_log;
-            let elem_sz = std::mem::size_of::<Fr>();
-            let byte_sz = big_n * elem_sz;
-            let mut pi_coset_evals = Vec::with_capacity(big_n);
-            unsafe {
-                pi_coset_evals.set_len(big_n);
-            }
-            pi_coset_evals.par_chunks_mut(128).for_each(|chunk| unsafe {
-                std::ptr::write_volatile(&mut chunk[0] as *mut Fr, Fr::ZERO);
-            });
-            let err = unsafe {
-                sp1_gpu_sys::runtime::cuda_mem_copy_device_to_host(
-                    pi_coset_evals.as_mut_ptr() as *mut std::ffi::c_void,
-                    d_pi_coset.ptr,
-                    byte_sz,
-                )
-            };
-            if err != unsafe { sp1_gpu_sys::runtime::CUDA_SUCCESS_CSL } {
-                panic!("D2H failed for pi coset evals");
-            }
-            drop(d_pi_coset);
+            let (mut d_qk_plus_pi_opt, pi_bsb22_cpu_opt, bsb22_coeffs_list, z_c_opt, d_z_opt, commit_z_r2) =
+                if use_gpu_quotient {
+                // ≥20 GiB path: GPU fusion.
+                // Order: PI → BSB22 → Z NTT → GPU fusion → L/R/O NTTs.
+                // Z NTT runs BEFORE GPU fusion so its 4 GiB NTT temp buffer fits.
 
-            // BSB22: fused iFFT + coset FFT, both results to host
-            let mut bsb22_coeffs_list = Vec::with_capacity(bsb22_polys_fr.len());
-            let mut bsb22_coset_evals = Vec::with_capacity(bsb22_polys_fr.len());
-            for p in bsb22_polys_fr.iter() {
-                let (coeffs, evals) =
-                    crate::domain::gpu_ntt::gpu_ifft_then_coset_fft_to_host(p, lg_n, big_log);
-                bsb22_coeffs_list.push(coeffs);
-                bsb22_coset_evals.push(evals);
+                // BSB22: iFFT+cosetFFT, coefficients to host, coset evals kept on device.
+                let mut bsb22_coeffs_list = Vec::with_capacity(bsb22_polys_fr.len());
+                let mut d_bsb22_coset = Vec::with_capacity(bsb22_polys_fr.len());
+                for p in bsb22_polys_fr.iter() {
+                    let (coeffs, d_evals) =
+                        gpu_ifft_then_coset_fft_to_device(p, lg_n, big_log);
+                    bsb22_coeffs_list.push(coeffs);
+                    d_bsb22_coset.push(d_evals);
+                }
+
+                // Z commit BEFORE freeing persistent_lag_msm.
+                // d_z_gp stays alive for Z NTT in R3 (after L/R/O NTTs).
+                let commit_z_inner = {
+                    let t = std::time::Instant::now();
+                    let msm = persistent_lag_msm_opt.take()
+                        .expect("persistent_lag_msm should be available for Z commit");
+                    let c = msm
+                        .msm_device(d_z_gp as *const c_void, n)
+                        .to_affine();
+                    drop(msm); // Frees ~3.8 GiB VRAM
+                    eprintln!("[T] 5. Z commit (in R2, MSM freed): {:?}", t.elapsed());
+                    c
+                };
+
+                // GPU fusion: d_qk_plus_pi = d_pi_coset + qk + sum(qcp[i]*bsb22[i])
+                // VRAM: d_pi_coset(4) + d_bsb22(4) + d_z(4) = 12 GiB, ~12 GiB free
+                let d_qk_plus_pi = d_pi_coset;
+
+                // Add qcp[i] * bsb22[i] for each BSB22 polynomial (usually 1 for SP1)
+                for (i, d_bsb22) in d_bsb22_coset.iter().enumerate() {
+                    if i < self.cached.qcp_coset_evals.len() {
+                        let qcp = &self.cached.qcp_coset_evals[i];
+                        let mut d_qcp: *mut c_void = std::ptr::null_mut();
+                        unsafe {
+                            sp1_gpu_sys::runtime::cuda_malloc(
+                                &mut d_qcp as *mut _,
+                                byte_sz_4n,
+                            );
+                            sp1_gpu_sys::runtime::cuda_mem_copy_host_to_device(
+                                d_qcp,
+                                qcp.as_ptr() as *const c_void,
+                                byte_sz_4n,
+                            );
+                            sp1_gpu_sys::plonk::bn254_elementwise_fma(
+                                d_qk_plus_pi.ptr,
+                                d_qcp as *const c_void,
+                                d_bsb22.ptr as *const c_void,
+                                big_n,
+                            );
+                            sp1_gpu_sys::runtime::cuda_free(d_qcp as *const c_void);
+                        }
+                    }
+                }
+                drop(d_bsb22_coset);
+
+                // Add qk_coset_evals
+                {
+                    let qk = &self.cached.qk_coset_evals;
+                    let mut d_qk: *mut c_void = std::ptr::null_mut();
+                    unsafe {
+                        sp1_gpu_sys::runtime::cuda_malloc(&mut d_qk as *mut _, byte_sz_4n);
+                        sp1_gpu_sys::runtime::cuda_mem_copy_host_to_device(
+                            d_qk,
+                            qk.as_ptr() as *const c_void,
+                            byte_sz_4n,
+                        );
+                        sp1_gpu_sys::plonk::bn254_elementwise_add(
+                            d_qk_plus_pi.ptr,
+                            d_qk as *const c_void,
+                            big_n,
+                        );
+                        sp1_gpu_sys::runtime::cuda_free(d_qk as *const c_void);
+                    }
+                }
+
+                eprintln!("[T] 4b. GPU qk+pi fusion: done (pi D2H eliminated)");
+
+                (Some(d_qk_plus_pi), None::<std::thread::JoinHandle<Vec<Fr>>>, bsb22_coeffs_list, Vec::<Fr>::new(), None::<crate::domain::gpu_ntt::DeviceBuffer>, Some(commit_z_inner))
+            } else {
+                // <20 GiB path: D2H pi_coset, BSB22 to host, CPU fusion (original path)
+                let mut pi_coset_evals = Vec::with_capacity(big_n);
+                unsafe {
+                    pi_coset_evals.set_len(big_n);
+                }
+                pi_coset_evals.par_chunks_mut(128).for_each(|chunk| unsafe {
+                    std::ptr::write_volatile(&mut chunk[0] as *mut Fr, Fr::ZERO);
+                });
+                let err = unsafe {
+                    sp1_gpu_sys::runtime::cuda_mem_copy_device_to_host(
+                        pi_coset_evals.as_mut_ptr() as *mut c_void,
+                        d_pi_coset.ptr,
+                        byte_sz_4n,
+                    )
+                };
+                if err != unsafe { sp1_gpu_sys::runtime::CUDA_SUCCESS_CSL } {
+                    panic!("D2H failed for pi coset evals");
+                }
+                drop(d_pi_coset);
+
+                let mut bsb22_coeffs_list = Vec::with_capacity(bsb22_polys_fr.len());
+                let mut bsb22_coset_evals = Vec::with_capacity(bsb22_polys_fr.len());
+                for p in bsb22_polys_fr.iter() {
+                    let (coeffs, evals) =
+                        crate::domain::gpu_ntt::gpu_ifft_then_coset_fft_to_host(p, lg_n, big_log);
+                    bsb22_coeffs_list.push(coeffs);
+                    bsb22_coset_evals.push(evals);
+                }
+
+                // CPU fusion on background thread
+                let qk_ptr = self.cached.qk_coset_evals.as_ptr() as usize;
+                let qk_len = self.cached.qk_coset_evals.len();
+                let qcp_ptrs: Vec<(usize, usize)> = self
+                    .cached
+                    .qcp_coset_evals
+                    .iter()
+                    .map(|v| (v.as_ptr() as usize, v.len()))
+                    .collect();
+                let pi_bsb22 = std::thread::spawn(move || {
+                    let qk = unsafe { std::slice::from_raw_parts(qk_ptr as *const Fr, qk_len) };
+                    let mut pi_bsb22 = pi_coset_evals;
+                    pi_bsb22.par_iter_mut().enumerate().for_each(|(i, v)| {
+                        *v += qk[i];
+                        for (j, (qcp_ptr, qcp_len)) in qcp_ptrs.iter().enumerate() {
+                            if j < bsb22_coset_evals.len() {
+                                let qcp = unsafe {
+                                    std::slice::from_raw_parts(*qcp_ptr as *const Fr, *qcp_len)
+                                };
+                                *v += qcp[i] * bsb22_coset_evals[j][i];
+                            }
+                        }
+                    });
+                    pi_bsb22
+                });
+
+                (None, Some(pi_bsb22), bsb22_coeffs_list, Vec::new(), None, None)
+            };
+
+            // Free wire upload buffers (3 GiB) before NTTs — VRAM headroom for NTT temp.
+            unsafe {
+                if !d_l_upload.is_null() {
+                    sp1_gpu_sys::runtime::cuda_free(d_l_upload as *const c_void);
+                }
+                if !d_r_upload.is_null() {
+                    sp1_gpu_sys::runtime::cuda_free(d_r_upload as *const c_void);
+                }
+                if !d_o_upload.is_null() {
+                    sp1_gpu_sys::runtime::cuda_free(d_o_upload as *const c_void);
+                }
             }
-            // L/R/O iFFT+cosetFFTs: overlap with grand product (CPU).
-            // These only need wire data (already available), not alpha or z_lagrange.
-            // Saves ~2s by hiding L/R/O NTTs behind the 4.4s grand product.
-            use crate::domain::gpu_ntt::{
-                gpu_ifft_then_coset_fft_to_device, gpu_ifft_then_coset_fft_to_device_from_device,
-            };
-            let (l_coeffs_early, d_l_early) = if !d_l_upload.is_null() {
-                let r = gpu_ifft_then_coset_fft_to_device_from_device(
-                    d_l_upload as *const std::ffi::c_void,
-                    lg_n,
-                    big_log,
-                );
-                unsafe {
-                    sp1_gpu_sys::runtime::cuda_free(d_l_upload as *const std::ffi::c_void);
+
+            // Spill d_qk_plus_pi to host to free 4 GiB during Z/L/R/O NTTs.
+            // The NTT's transpose stage needs a 4 GiB temp buffer that won't fit
+            // alongside 5 × 4 GiB device buffers (28 GiB > 24 GiB GPU).
+            // Re-upload after NTTs. Total PCIe: 8 GiB, mostly overlapped with NTT compute.
+            let qk_plus_pi_host = if d_qk_plus_pi_opt.is_some() {
+                let d_qk = d_qk_plus_pi_opt.as_ref().unwrap();
+                let mut h = vec![Fr::ZERO; big_n];
+                let err = unsafe {
+                    sp1_gpu_sys::runtime::cuda_mem_copy_device_to_host(
+                        h.as_mut_ptr() as *mut c_void, d_qk.ptr, byte_sz_4n,
+                    )
+                };
+                if err != unsafe { sp1_gpu_sys::runtime::CUDA_SUCCESS_CSL } {
+                    panic!("D2H failed for d_qk_plus_pi spill");
                 }
-                r
+                drop(d_qk_plus_pi_opt.take().unwrap());
+                Some(h)
             } else {
-                gpu_ifft_then_coset_fft_to_device(&l_fr, lg_n, big_log)
+                None
             };
-            let (r_coeffs_early, d_r_early) = if !d_r_upload.is_null() {
-                let r = gpu_ifft_then_coset_fft_to_device_from_device(
-                    d_r_upload as *const std::ffi::c_void,
-                    lg_n,
-                    big_log,
-                );
+
+            // Z NTT from host (d_z_gp freed to save 1 GiB headroom).
+            let (z_coeffs_r2, d_z_r2) = if use_gpu_quotient {
+                let z_host = if !d_z_gp.is_null() {
+                    let byte_sz_n = n * elem_sz;
+                    let mut z_h = Vec::with_capacity(n);
+                    unsafe { z_h.set_len(n); }
+                    unsafe {
+                        sp1_gpu_sys::runtime::cuda_mem_copy_device_to_host(
+                            z_h.as_mut_ptr() as *mut c_void,
+                            d_z_gp as *const c_void, byte_sz_n,
+                        );
+                        sp1_gpu_sys::runtime::cuda_free(d_z_gp as *const c_void);
+                    }
+                    z_h
+                } else {
+                    z_lagrange.clone()
+                };
+                let r = gpu_ifft_then_coset_fft_to_device(&z_host, lg_n, big_log);
+                (r.0, Some(r.1))
+            } else {
+                (Vec::new(), None)
+            };
+
+            // L/R/O iFFT+cosetFFTs from host.
+            let (l_coeffs_early, d_l_early) =
+                gpu_ifft_then_coset_fft_to_device(&l_fr, lg_n, big_log);
+            let (r_coeffs_early, d_r_early) =
+                gpu_ifft_then_coset_fft_to_device(&r_fr, lg_n, big_log);
+            let (o_coeffs_early, d_o_early) =
+                gpu_ifft_then_coset_fft_to_device(&o_fr, lg_n, big_log);
+
+            // Re-upload d_qk_plus_pi from host (NTTs done, VRAM freed by steal).
+            if let Some(h) = qk_plus_pi_host {
+                let mut d_ptr: *mut c_void = std::ptr::null_mut();
                 unsafe {
-                    sp1_gpu_sys::runtime::cuda_free(d_r_upload as *const std::ffi::c_void);
+                    sp1_gpu_sys::runtime::cuda_malloc(&mut d_ptr as *mut _, byte_sz_4n);
+                    sp1_gpu_sys::runtime::cuda_mem_copy_host_to_device(
+                        d_ptr, h.as_ptr() as *const c_void, byte_sz_4n,
+                    );
                 }
-                r
-            } else {
-                gpu_ifft_then_coset_fft_to_device(&r_fr, lg_n, big_log)
-            };
-            let (o_coeffs_early, d_o_early) = if !d_o_upload.is_null() {
-                let r = gpu_ifft_then_coset_fft_to_device_from_device(
-                    d_o_upload as *const std::ffi::c_void,
-                    lg_n,
-                    big_log,
-                );
-                unsafe {
-                    sp1_gpu_sys::runtime::cuda_free(d_o_upload as *const std::ffi::c_void);
-                }
-                r
-            } else {
-                gpu_ifft_then_coset_fft_to_device(&o_fr, lg_n, big_log)
-            };
+                d_qk_plus_pi_opt = Some(crate::domain::gpu_ntt::DeviceBuffer {
+                    ptr: d_ptr, _len: big_n, _bytes: byte_sz_4n,
+                });
+            }
 
             crate::domain::gpu_ntt::free_ntt_buffer();
 
-            // Defer CPU fusion: spawn on background thread to overlap with Z commit MSM.
-            // The fusion takes ~0.7s and the Z commit MSM takes ~1.4s — fully hidden.
-            let qk_ptr = self.cached.qk_coset_evals.as_ptr() as usize;
-            let qk_len = self.cached.qk_coset_evals.len();
-            let qcp_ptrs: Vec<(usize, usize)> = self
-                .cached
-                .qcp_coset_evals
-                .iter()
-                .map(|v| (v.as_ptr() as usize, v.len()))
-                .collect();
-            let fusion_handle = std::thread::spawn(move || {
-                let qk = unsafe { std::slice::from_raw_parts(qk_ptr as *const Fr, qk_len) };
-                let mut pi_bsb22 = pi_coset_evals;
-                pi_bsb22.par_iter_mut().enumerate().for_each(|(i, v)| {
-                    *v += qk[i];
-                    for (j, (qcp_ptr, qcp_len)) in qcp_ptrs.iter().enumerate() {
-                        if j < bsb22_coset_evals.len() {
-                            let qcp = unsafe {
-                                std::slice::from_raw_parts(*qcp_ptr as *const Fr, *qcp_len)
-                            };
-                            *v += qcp[i] * bsb22_coset_evals[j][i];
-                        }
-                    }
-                });
-                pi_bsb22
-            });
-
             (
-                fusion_handle,
+                d_qk_plus_pi_opt,
+                pi_bsb22_cpu_opt,
                 bsb22_coeffs_list,
                 l_coeffs_early,
                 r_coeffs_early,
                 o_coeffs_early,
+                z_coeffs_r2,
                 d_l_early,
                 d_r_early,
                 d_o_early,
+                d_z_r2,
+                commit_z_r2,
             )
         };
 
@@ -972,23 +1119,29 @@ impl PlonkProver {
             &coset_shift,
         )?;
 
-        // Commit Z (reuses persistent Lagrange MSM context -- no SRS re-upload)
-        // CPU fusion runs concurrently on background thread.
-        let t = std::time::Instant::now();
-        // Z commit: use device pointer d_z_gp (saves 300ms H2D upload vs host path)
+        // Commit Z: GPU path may have done this in R2 to free MSM context VRAM early.
         #[cfg(feature = "cuda")]
-        let commit_z =
-            persistent_lag_msm.msm_device(d_z_gp as *const std::ffi::c_void, n).to_affine();
+        let commit_z = if let Some(cz) = commit_z_r2 {
+            cz
+        } else {
+            let t = std::time::Instant::now();
+            let msm = persistent_lag_msm_opt.take()
+                .expect("persistent_lag_msm should be available for Z commit (CPU path)");
+            let c = msm.msm_device(d_z_gp as *const std::ffi::c_void, n).to_affine();
+            drop(msm);
+            eprintln!("[T] 5. Z commit: {:?}", t.elapsed());
+            c
+        };
+        #[cfg(feature = "cuda")]
+        drop(persistent_lag_msm_opt); // Free MSM if not already taken
         #[cfg(not(feature = "cuda"))]
         let commit_z = self.commit_lagrange(srs_lagrange, &z_lagrange);
-        #[cfg(feature = "cuda")]
-        drop(persistent_lag_msm);
-        eprintln!("[T] 5. Z commit: {:?}", t.elapsed());
         let commit_z_bn = commit_z.to_bn254();
 
-        // Join CPU fusion thread (was overlapping with Z commit MSM above)
+        // Join CPU fusion thread if on the CPU fusion path
         #[cfg(feature = "cuda")]
-        let pi_bsb22_precomputed = pi_bsb22_precomputed.join().expect("CPU fusion thread panicked");
+        let pi_bsb22_cpu = pi_bsb22_cpu_opt
+            .map(|handle| handle.join().expect("CPU fusion thread panicked"));
 
         // Bind BSB22 + Z, derive alpha
         let t = std::time::Instant::now();
@@ -1008,26 +1161,6 @@ impl PlonkProver {
         tracing::info!("Round 3: Quotient polynomial h(X)");
         let t = std::time::Instant::now();
 
-        // Convert per-proof polynomials to coefficient form + coset evals.
-        // Two paths based on GPU VRAM:
-        //   ≥20 GiB: Keep 4 coset FFT results on GPU as DeviceBuffers, use GPU quotient kernel
-        //   <20 GiB: All coset FFTs return to CPU, compute quotient on CPU with rayon
-        #[cfg(feature = "cuda")]
-        let gpu_vram_bytes = {
-            let mut free: usize = 0;
-            let mut total: usize = 0;
-            unsafe {
-                sp1_gpu_sys::runtime::cuda_mem_get_info(&mut free as *mut _, &mut total as *mut _)
-            };
-            total
-        };
-        #[cfg(feature = "cuda")]
-        let use_gpu_quotient = gpu_vram_bytes >= 20 * 1024 * 1024 * 1024; // 20 GiB threshold
-
-        // pi_bsb22_evals already computed during Round 2 overlap (cuda path)
-        #[cfg(feature = "cuda")]
-        let pi_bsb22_evals = pi_bsb22_precomputed;
-
         #[cfg(feature = "cuda")]
         let (
             l_coeffs,
@@ -1045,14 +1178,9 @@ impl PlonkProver {
             z_coset_cpu,
         ) = {
             let big_log = self.cached.big_domain.log_size;
-
-            // BSB22 coefficients already computed during Round 2 aux NTT overlap
             let bsb22 = bsb22_coeffs_from_aux;
 
-            // Start precomputing INVERSE twiddle VALUES on a background CPU thread.
-            // CPU-only computation (~2s with OpenMP) overlaps with GPU coset FFTs.
-            // No GPU upload -- that happens later when the coset iFFT calls ensure(),
-            // which finds host_valid=true and does a fast re-upload (~300ms).
+            // Precompute INVERSE twiddle VALUES on a background CPU thread.
             let inv_precompute = {
                 let lg = big_log;
                 std::thread::spawn(move || unsafe {
@@ -1060,65 +1188,39 @@ impl PlonkProver {
                 })
             };
 
-            // Coset FFTs: two paths based on VRAM (only L/R/O/Z -- PI+BSB22 already done)
-            let cfft_padded = |c: &[Fr]| crate::domain::gpu_ntt::gpu_coset_fft_padded(c, big_log);
-
             if use_gpu_quotient {
-                // >=20 GiB path: L/R/O NTTs already done during grand product overlap.
-                // Only Z iFFT+cosetFFT needed here (Z depends on grand product result).
-                use crate::domain::gpu_ntt::{
-                    gpu_ifft_then_coset_fft_to_device,
-                    gpu_ifft_then_coset_fft_to_device_from_device,
-                };
-                let lg = domain.log_size;
+                // ≥20 GiB path: L/R/O + Z NTTs all done in R2.
                 let _t_ntt = std::time::Instant::now();
-                let (l_c, d_l) = (l_coeffs_early, d_l_early);
-                let (r_c, d_r) = (r_coeffs_early, d_r_early);
-                let (o_c, d_o) = (o_coeffs_early, d_o_early);
-                // Z NTT from device: d_z_gp already on GPU from grand product (saves 300ms H2D)
-                let (z_c, d_z) = if !d_z_gp.is_null() {
-                    let r = gpu_ifft_then_coset_fft_to_device_from_device(
-                        d_z_gp as *const std::ffi::c_void,
-                        lg,
-                        big_log,
-                    );
-                    unsafe {
-                        sp1_gpu_sys::runtime::cuda_free(d_z_gp as *const std::ffi::c_void);
-                    }
-                    r
-                } else {
-                    gpu_ifft_then_coset_fft_to_device(&z_lagrange, lg, big_log)
-                };
                 crate::domain::gpu_ntt::free_ntt_buffer();
                 unsafe { sp1_gpu_sys::dft_bn254::bn254_ntt_clear_twiddle_cache() };
                 inv_precompute.join().expect("inverse twiddle precompute failed");
                 eprintln!(
-                    "[T] 7-ntt. L/R/O/Z iFFT+cosetFFT (aux done earlier): {:?}",
+                    "[T] 7-ntt. L/R/O/Z all done in R2: {:?}",
                     _t_ntt.elapsed()
                 );
 
                 (
-                    l_c,
-                    r_c,
-                    o_c,
-                    z_c,
+                    l_coeffs_early,
+                    r_coeffs_early,
+                    o_coeffs_early,
+                    z_coeffs_early,
                     bsb22,
-                    Some(d_l),
-                    Some(d_r),
-                    Some(d_o),
-                    Some(d_z),
+                    Some(d_l_early),
+                    Some(d_r_early),
+                    Some(d_o_early),
+                    d_z_early,
                     Vec::new(),
                     Vec::new(),
                     Vec::new(),
                     Vec::new(),
                 )
             } else {
-                // <20 GiB path: L/R/O already computed during grand product overlap.
-                // Drop device buffers (won't be used in CPU quotient path).
+                // <20 GiB path: L/R/O already computed in R2.
                 drop(d_l_early);
                 drop(d_r_early);
                 drop(d_o_early);
-                // Recompute coset evals from coefficients for CPU quotient path.
+                let cfft_padded =
+                    |c: &[Fr]| crate::domain::gpu_ntt::gpu_coset_fft_padded(c, big_log);
                 let l_coset = cfft_padded(&l_coeffs_early);
                 let r_coset = cfft_padded(&r_coeffs_early);
                 let o_coset = cfft_padded(&o_coeffs_early);
@@ -1170,7 +1272,7 @@ impl PlonkProver {
                 &beta,
                 &gamma,
                 &coset_shift,
-                pi_bsb22_evals,
+                d_qk_plus_pi_precomputed.expect("GPU path requires d_qk_plus_pi"),
                 d_l.unwrap(),
                 d_r.unwrap(),
                 d_o.unwrap(),
@@ -1179,9 +1281,7 @@ impl PlonkProver {
             (h, Some(d_h))
         } else {
             // CPU quotient path for GPUs with <20 GiB VRAM.
-            // Uses rayon parallel evaluation — faster than GPU-streamed on slow PCIe.
-            // A GPU-streamed variant (compute_quotient_streamed) is also available for
-            // bare-metal systems with fast PCIe where GPU compute beats CPU rayon.
+            let pi_bsb22_evals = pi_bsb22_cpu.expect("CPU path requires pi_bsb22");
             (
                 self.compute_quotient_streamed(
                     n,
@@ -2402,7 +2502,7 @@ impl PlonkProver {
         beta: &Fr,
         gamma: &Fr,
         coset_shift: &Fr,
-        pi_bsb22: Vec<Fr>,
+        d_qk_plus_pi: crate::domain::gpu_ntt::DeviceBuffer,
         d_l: crate::domain::gpu_ntt::DeviceBuffer,
         d_r: crate::domain::gpu_ntt::DeviceBuffer,
         d_o: crate::domain::gpu_ntt::DeviceBuffer,
@@ -2421,34 +2521,22 @@ impl PlonkProver {
         let beta_k1 = *beta * k1;
         let beta_k2 = *beta * k2;
 
-        // Fuse qk + pi_bsb22 on CPU (replaces separate qk and pi_bsb22 arrays)
-        let mut qk_plus_pi = pi_bsb22;
-        qk_plus_pi.par_iter_mut().enumerate().for_each(|(i, v)| {
-            *v += self.cached.qk_coset_evals[i];
-        });
-
-        // Pin qk_plus_pi for DMA upload
-        unsafe {
-            let _ = sp1_gpu_sys::runtime::cuda_host_register(
-                qk_plus_pi.as_ptr() as *const c_void,
-                std::mem::size_of_val(qk_plus_pi.as_slice()),
-            );
-        }
-
         // Free NTT scratch buffer and twiddle caches to make room for quotient output.
         crate::domain::gpu_ntt::free_ntt_buffer();
         unsafe { sp1_gpu_sys::dft_bn254::bn254_ntt_clear_twiddle_cache() };
 
-        // Allocate output buffer on GPU
-        let mut d_output_ptr: *mut c_void = std::ptr::null_mut();
+        // In-place quotient output: write into d_l's buffer instead of allocating
+        // a fresh d_output (saves 4 GiB VRAM).
+        //
+        // Safety: each thread reads d_l[global_idx] exactly once into a register
+        // before any writes happen, and writes output[global_idx] exactly once.
+        // No other thread touches d_l[global_idx] (it's pointwise). The d_z buffer
+        // CANNOT be reused this way because the kernel reads d_z[(idx+4)%big_n],
+        // which creates cross-thread RAW dependencies.
         let output_bytes = big_n * std::mem::size_of::<Fr>();
-        let err =
-            unsafe { sp1_gpu_sys::runtime::cuda_malloc(&mut d_output_ptr as *mut _, output_bytes) };
-        if err != unsafe { sp1_gpu_sys::runtime::CUDA_SUCCESS_CSL } {
-            panic!("cuda_malloc failed for quotient output ({output_bytes} bytes)");
-        }
+        let d_output_ptr: *mut c_void = d_l.ptr;
 
-        // Run fused quotient kernel
+        // Run fused quotient kernel (writes in-place into d_l)
         let _t_kernel = std::time::Instant::now();
         let err = unsafe {
             sp1_gpu_sys::plonk::sp1_plonk_quotient_eval_fused(
@@ -2466,8 +2554,8 @@ impl PlonkProver {
                     self.cached.qm_coset_evals.as_ptr() as *const c_void
                 },
                 self.cached.qo_coset_evals.as_ptr() as *const c_void,
-                qk_plus_pi.as_ptr() as *const c_void,
-                std::ptr::null(), // d_qk_plus_pi: null = use host-streamed path
+                std::ptr::null(), // h_qk_plus_pi: not needed, using device-resident path
+                d_qk_plus_pi.ptr as *const c_void, // device-resident qk+pi (eliminates PCIe streaming for slot 4)
                 self.cached.s1_coset_evals.as_ptr() as *const c_void,
                 self.cached.s2_coset_evals.as_ptr() as *const c_void,
                 self.cached.s3_coset_evals.as_ptr() as *const c_void,
@@ -2498,17 +2586,18 @@ impl PlonkProver {
 
         eprintln!("[T] 7a. Quotient kernel: {:?}", _t_kernel.elapsed());
 
-        // Free per-proof device buffers and NTT twiddle caches
-        drop(d_l);
+        // Transfer ownership of d_l's buffer to d_h (in-place quotient output).
+        // Set d_l.ptr to null so its Drop is a no-op (we keep the buffer alive
+        // as the quotient output / future h_coeffs).
+        let mut d_l_taken = d_l;
+        let d_h_inplace_ptr = d_l_taken.ptr;
+        d_l_taken.ptr = std::ptr::null_mut();
+        drop(d_l_taken);
+        // Free the other per-proof device buffers (no longer needed).
         drop(d_r);
         drop(d_o);
         drop(d_z);
-        // Unpin and free qk_plus_pi
-        unsafe {
-            let _ =
-                sp1_gpu_sys::runtime::cuda_host_unregister(qk_plus_pi.as_ptr() as *const c_void);
-        }
-        drop(qk_plus_pi);
+        drop(d_qk_plus_pi);
         // Sync + clear caches + free NTT buffer to ensure memory is freed
         unsafe { sp1_gpu_sys::runtime::cuda_device_synchronize() };
         unsafe { sp1_gpu_sys::dft_bn254::bn254_ntt_clear_twiddle_cache() };
@@ -2580,7 +2669,10 @@ impl PlonkProver {
         eprintln!("[T] 7c. D2H download: {:?}", _t_d2h.elapsed());
 
         // Return both CPU coefficients and the device pointer (for h0/h1 device MSM).
-        // d_output_ptr stays allocated — caller frees via DeviceBuffer drop.
+        // d_output_ptr is the in-place buffer originally owned by d_l; ownership is
+        // now transferred to the returned DeviceBuffer.
+        let _ = d_h_inplace_ptr; // silence unused warning if assertions fire
+        debug_assert_eq!(d_output_ptr, d_h_inplace_ptr);
         let d_h = crate::domain::gpu_ntt::DeviceBuffer {
             ptr: d_output_ptr,
             _len: big_n,

@@ -367,8 +367,7 @@ static rustCudaError_t ensure_twiddles(uint32_t lg_n) {
         fprintf(stderr, "[RDNA3 NTT] hipDeviceSynchronize failed: %s\n", hipGetErrorString(sync_err));
         return rustCudaError_t{.message = hipGetErrorString(sync_err)};
     }
-    fprintf(stderr, "[RDNA3 NTT] Twiddle tables initialized for lg_n=%u\n", lg_n);
-    fflush(stderr);
+    // Twiddle tables initialized for lg_n
     g_cache.cached_lg_n = lg_n;
     g_cache.initialized = true;
     return CUDA_SUCCESS_CSL;
@@ -397,14 +396,15 @@ __global__ void bn254_coset_mul_kernel(
     d_data[idx] = d_data[idx] * factor;
 }
 
+// d_temp_ext: optional pre-allocated temp buffer (N elements). If non-null,
+// the NTT uses it instead of hipMalloc. Caller manages lifetime.
 static rustCudaError_t run_ntt_four_step(
-    fr_t* d_inout, uint32_t lg_n, bool inverse, bool coset, hipStream_t stream
+    fr_t* d_inout, uint32_t lg_n, bool inverse, bool coset, hipStream_t stream,
+    fr_t* d_temp_ext = nullptr
 ) {
     uint32_t N = 1u << lg_n;
 
-    fprintf(stderr, "[RDNA3 NTT] run_ntt_four_step: lg_n=%u, inv=%d, coset=%d, N=%u\n",
-            lg_n, (int)inverse, (int)coset, N);
-    fflush(stderr);
+    // NTT debug logging removed for performance (was ~8 fprintf calls per proof)
     rustCudaError_t err = ensure_twiddles(lg_n);
     if (err.message != CUDA_SUCCESS_CSL.message) return err;
 
@@ -414,21 +414,40 @@ static rustCudaError_t run_ntt_four_step(
     fr_t* omega_hi = inverse ? g_cache.d_inv_omega_hi : g_cache.d_fwd_omega_hi;
     fr_t* small_twiddles = inverse ? g_cache.d_inv_small_twiddles : g_cache.d_fwd_small_twiddles;
 
-    // Use second half of d_inout as temp buffer (caller allocates 2N elements).
-    // For functions that can't provide 2N (e.g., gpu_fft at N elements), try hipMalloc.
+    // Temp buffer for transpose stages (lg_n > 10).
+    // Priority: 1) caller-provided d_temp_ext, 2) hipMalloc full N,
+    //           3) hipMalloc smaller (tiled transpose), 4) d_inout + N fallback.
     fr_t* d_temp_local = nullptr;
     bool temp_is_owned = false;
+    size_t temp_elems = 0; // actual number of elements in temp buffer (0 = full N)
     if (lg_n > 10) {
-        // First try: use d_inout + N (assumes caller allocated 2N)
-        // We have no way to know the actual allocation size, so try hipMalloc as fallback.
-        hipError_t herr = hipMalloc(&d_temp_local, (size_t)N * sizeof(fr_t));
-        if (herr != hipSuccess) {
-            // OOM: try using d_inout + N (risky if caller only allocated N).
-            // The gpu_coset_fft_padded caller allocates 2N, so this is safe there.
-            d_temp_local = d_inout + N;
+        if (d_temp_ext) {
+            d_temp_local = d_temp_ext;
             temp_is_owned = false;
+            temp_elems = N; // assume caller provided N elements
         } else {
-            temp_is_owned = true;
+            hipError_t herr = hipMalloc(&d_temp_local, (size_t)N * sizeof(fr_t));
+            if (herr == hipSuccess) {
+                temp_is_owned = true;
+                temp_elems = N;
+            } else {
+                // OOM for full N. Try smaller allocation for tiled transpose.
+                // TILE_DIM=32 rows per strip. Each strip needs strip_rows × max_cols elements.
+                // For the largest transpose (step 2: N/1024 × 1024), strip = 32 × 1024 = 32K.
+                // Try 1/32 of N (covers one strip of the largest transpose).
+                size_t try_elems = N / 32;
+                if (try_elems < 32 * 1024) try_elems = 32 * 1024;
+                herr = hipMalloc(&d_temp_local, try_elems * sizeof(fr_t));
+                if (herr == hipSuccess) {
+                    temp_is_owned = true;
+                    temp_elems = try_elems;
+                } else {
+                    // Last resort: d_inout + N (risky if caller only allocated N)
+                    d_temp_local = d_inout + N;
+                    temp_is_owned = false;
+                    temp_elems = N;
+                }
+            }
         }
     }
 
@@ -661,6 +680,37 @@ extern "C" rustCudaError_t batch_coset_NTT_bn254(
             lg_domain_size, false, true, stream);
         if (err.message != CUDA_SUCCESS_CSL.message) return err;
     }
+    return CUDA_SUCCESS_CSL;
+}
+
+// Variants with pre-allocated temp buffer (avoids hipMalloc during VRAM-tight phases).
+extern "C" rustCudaError_t batch_iNTT_bn254_with_temp(
+    fr_t* d_inout, uint32_t lg_domain_size, uint32_t poly_count,
+    const hipStream_t stream, void* d_temp
+) {
+    if (lg_domain_size == 0 || poly_count == 0) return CUDA_SUCCESS_CSL;
+    uint32_t domain_size = 1u << lg_domain_size;
+    for (uint32_t p = 0; p < poly_count; p++) {
+        rustCudaError_t err = run_ntt_four_step(d_inout + p * domain_size,
+            lg_domain_size, true, false, stream, (fr_t*)d_temp);
+        if (err.message != CUDA_SUCCESS_CSL.message) return err;
+    }
+    CUDA_OK(hipDeviceSynchronize());
+    return CUDA_SUCCESS_CSL;
+}
+
+extern "C" rustCudaError_t batch_coset_NTT_bn254_with_temp(
+    fr_t* d_inout, uint32_t lg_domain_size, uint32_t poly_count,
+    const hipStream_t stream, void* d_temp
+) {
+    if (lg_domain_size == 0 || poly_count == 0) return CUDA_SUCCESS_CSL;
+    uint32_t domain_size = 1u << lg_domain_size;
+    for (uint32_t p = 0; p < poly_count; p++) {
+        rustCudaError_t err = run_ntt_four_step(d_inout + p * domain_size,
+            lg_domain_size, false, true, stream, (fr_t*)d_temp);
+        if (err.message != CUDA_SUCCESS_CSL.message) return err;
+    }
+    CUDA_OK(hipDeviceSynchronize());
     return CUDA_SUCCESS_CSL;
 }
 

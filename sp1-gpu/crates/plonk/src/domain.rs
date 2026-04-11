@@ -615,7 +615,7 @@ pub(crate) mod gpu_ntt {
         let stream = unsafe { sp1_gpu_sys::runtime::DEFAULT_STREAM };
 
         // Step 1: Upload evals → iFFT → coefficients on device
-        let d_scratch = get_device_buffer(byte_size_4n); // need 4N for later coset FFT
+        let d_scratch = get_device_buffer(byte_size_4n);
         let err = unsafe {
             sp1_gpu_sys::runtime::cuda_mem_copy_host_to_device(
                 d_scratch,
@@ -627,7 +627,9 @@ pub(crate) mod gpu_ntt {
             panic!("H2D failed for fused ifft+coset_fft");
         }
 
-        let err = unsafe { sp1_gpu_sys::dft_bn254::batch_iNTT_bn254(d_scratch, lg_n, 1, stream) };
+        let err = unsafe {
+            sp1_gpu_sys::dft_bn254::batch_iNTT_bn254(d_scratch, lg_n, 1, stream)
+        };
         if err != unsafe { sp1_gpu_sys::runtime::CUDA_SUCCESS_CSL } {
             panic!("GPU iNTT failed in fused ifft+coset_fft");
         }
@@ -652,7 +654,6 @@ pub(crate) mod gpu_ntt {
         }
 
         // Step 3: Zero-pad coefficients to 4N on device, then coset FFT
-        // The first N elements are already the coefficients from step 1.
         let err = unsafe {
             sp1_gpu_sys::runtime::cuda_mem_set(
                 (d_scratch as *mut u8).add(byte_size_n) as *mut c_void,
@@ -664,23 +665,19 @@ pub(crate) mod gpu_ntt {
             panic!("cuda_mem_set failed for zero-pad in fused ifft+coset_fft");
         }
 
-        let err =
-            unsafe { sp1_gpu_sys::dft_bn254::batch_coset_NTT_bn254(d_scratch, lg_4n, 1, stream) };
+        let err = unsafe {
+            sp1_gpu_sys::dft_bn254::batch_coset_NTT_bn254(d_scratch, lg_4n, 1, stream)
+        };
         if err != unsafe { sp1_gpu_sys::runtime::CUDA_SUCCESS_CSL } {
             panic!("GPU coset NTT failed in fused ifft+coset_fft");
         }
 
-        // Step 4: Copy coset evals to independent device buffer
-        let mut d_out: *mut c_void = std::ptr::null_mut();
-        let err = unsafe { sp1_gpu_sys::runtime::cuda_malloc(&mut d_out as *mut _, byte_size_4n) };
-        if err != unsafe { sp1_gpu_sys::runtime::CUDA_SUCCESS_CSL } {
-            panic!("cuda_malloc failed for fused ifft+coset_fft output");
-        }
-        let err = unsafe {
-            sp1_gpu_sys::runtime::cuda_mem_copy_device_to_device(d_out, d_scratch, byte_size_4n)
-        };
-        if err != unsafe { sp1_gpu_sys::runtime::CUDA_SUCCESS_CSL } {
-            panic!("D2D copy failed for fused ifft+coset_fft");
+        // Step 4: Steal the NTT buffer as the output DeviceBuffer.
+        let d_out = d_scratch;
+        {
+            let mut buf = BUFFER_CACHE.lock().unwrap();
+            buf.ptr = std::ptr::null_mut();
+            buf.capacity_bytes = 0;
         }
 
         (coeffs, DeviceBuffer { ptr: d_out, _len: big_n, _bytes: byte_size_4n })

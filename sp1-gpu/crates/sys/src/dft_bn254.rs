@@ -53,6 +53,26 @@ extern "C" {
         stream: CudaStreamHandle,
     ) -> CudaRustError;
 
+    /// Inverse NTT with pre-allocated temp buffer (avoids hipMalloc during VRAM-tight phases).
+    /// d_temp must point to at least 2^lg_domain_size elements of device memory.
+    pub fn batch_iNTT_bn254_with_temp(
+        d_inout: *mut c_void,
+        lg_domain_size: u32,
+        poly_count: u32,
+        stream: CudaStreamHandle,
+        d_temp: *mut c_void,
+    ) -> CudaRustError;
+
+    /// Forward coset NTT with pre-allocated temp buffer.
+    /// d_temp must point to at least 2^lg_domain_size elements of device memory.
+    pub fn batch_coset_NTT_bn254_with_temp(
+        d_inout: *mut c_void,
+        lg_domain_size: u32,
+        poly_count: u32,
+        stream: CudaStreamHandle,
+        d_temp: *mut c_void,
+    ) -> CudaRustError;
+
     /// Clear all cached NTT twiddle factors from GPU memory.
     /// Called before large GPU memory allocations to prevent OOM.
     /// Available on HIP; on CUDA (sppark), this is a no-op.

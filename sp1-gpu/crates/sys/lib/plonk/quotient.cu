@@ -31,7 +31,10 @@ __launch_bounds__(256, 4)
 __launch_bounds__(256, 2)
 #endif
 __global__ void plonk_quotient_fused_kernel(
-    fr_t* __restrict__ output,
+    // output is NOT __restrict__: caller passes d_l as output for in-place
+    // quotient evaluation (saves 4 GiB VRAM). d_l keeps __restrict__ because
+    // all reads go through d_l and all writes go through output.
+    fr_t* output,
     // Per-proof arrays (device-resident, full big_n)
     const fr_t* __restrict__ d_l,
     const fr_t* __restrict__ d_r,
