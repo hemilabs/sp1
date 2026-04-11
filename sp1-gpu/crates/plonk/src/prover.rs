@@ -1287,8 +1287,8 @@ impl PlonkProver {
 
         // Compute quotient polynomial on coset domain (size 4N)
         #[cfg(feature = "cuda")]
-        let (h_coeffs, d_h_coeffs) = if use_gpu_quotient {
-            let (h, d_h) = self.compute_quotient_with_device_bufs(
+        let (h_coeffs, d_h_coeffs, srs_can_handle_early) = if use_gpu_quotient {
+            let (h, d_h, srs_h) = self.compute_quotient_with_device_bufs(
                 n,
                 domain,
                 &alpha,
@@ -1300,8 +1300,10 @@ impl PlonkProver {
                 d_r.unwrap(),
                 d_o.unwrap(),
                 d_z.unwrap(),
+                srs_canonical.as_ptr() as usize,
+                srs_canonical.len(),
             );
-            (h, Some(d_h))
+            (h, Some(d_h), srs_h)
         } else {
             // CPU quotient path for GPUs with <20 GiB VRAM.
             let pi_bsb22_evals = pi_bsb22_cpu.expect("CPU path requires pi_bsb22");
@@ -1319,6 +1321,7 @@ impl PlonkProver {
                     o_coset_cpu,
                     z_coset_cpu,
                 ),
+                None,
                 None,
             )
         };
@@ -1354,14 +1357,14 @@ impl PlonkProver {
         // Just measure post-quotient time from here.
         let t = std::time::Instant::now();
         #[cfg(feature = "cuda")]
-        let srs_can_handle = {
+        let srs_can_handle = srs_can_handle_early.unwrap_or_else(|| {
             let ptr_val = srs_canonical.as_ptr() as usize;
             let len = srs_canonical.len();
             std::thread::spawn(move || {
                 let srs = unsafe { std::slice::from_raw_parts(ptr_val as *const G1Affine, len) };
                 crate::g1::PersistentMsm::new(srs)
             })
-        };
+        });
 
         let (h0_coeffs, h1_coeffs, h2_coeffs) = split_quotient(&h_coeffs, n);
         let h2_nnz: usize = h2_coeffs.par_iter().filter(|c| !c.is_zero()).count();
@@ -2531,7 +2534,13 @@ impl PlonkProver {
         d_r: crate::domain::gpu_ntt::DeviceBuffer,
         d_o: crate::domain::gpu_ntt::DeviceBuffer,
         d_z: crate::domain::gpu_ntt::DeviceBuffer,
-    ) -> (Vec<Fr>, crate::domain::gpu_ntt::DeviceBuffer) {
+        srs_can_ptr: usize,
+        srs_can_len: usize,
+    ) -> (
+        Vec<Fr>,
+        crate::domain::gpu_ntt::DeviceBuffer,
+        Option<std::thread::JoinHandle<crate::g1::PersistentMsm>>,
+    ) {
         use std::ffi::c_void;
 
         let big_n = 4 * n;
@@ -2622,6 +2631,23 @@ impl PlonkProver {
         drop(d_o);
         drop(d_z);
         drop(d_qk_plus_pi);
+
+        // Start SRS canonical upload NOW — ~16 GiB just freed, D2H follows.
+        // PCIe Gen4 is full-duplex: SRS H2D (host→device) runs simultaneously
+        // with h_coeffs D2H (device→host), hiding ~0.3s of SRS upload.
+        let srs_can_handle = if srs_can_ptr != 0 {
+            let ptr = srs_can_ptr;
+            let len = srs_can_len;
+            Some(std::thread::spawn(move || {
+                let srs = unsafe {
+                    std::slice::from_raw_parts(ptr as *const G1Affine, len)
+                };
+                crate::g1::PersistentMsm::new(srs)
+            }))
+        } else {
+            None
+        };
+
         // Sync + clear caches + free NTT buffer to ensure memory is freed
         unsafe { sp1_gpu_sys::runtime::cuda_device_synchronize() };
         unsafe { sp1_gpu_sys::dft_bn254::bn254_ntt_clear_twiddle_cache() };
@@ -2702,7 +2728,7 @@ impl PlonkProver {
             _len: big_n,
             _bytes: output_bytes,
         };
-        (h_coeffs, d_h)
+        (h_coeffs, d_h, srs_can_handle)
     }
 
     #[allow(clippy::too_many_arguments)]
