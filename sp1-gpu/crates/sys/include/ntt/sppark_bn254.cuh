@@ -187,8 +187,10 @@ extern "C" rustCudaError_t batch_coset_iNTT_bn254(
     return CUDA_SUCCESS_CSL;
 }
 
+// sppark NTT is fully in-place (Cooley-Tukey butterflies) — no temp buffer needed.
+extern "C" bool bn254_ntt_needs_temp_buffer() { return false; }
+
 /// No-op on CUDA (sppark manages twiddles internally).
-/// On HIP, this clears the manually managed twiddle cache.
 extern "C" void bn254_ntt_clear_twiddle_cache() {
     // sppark manages its own twiddle factors; nothing to clear
 }

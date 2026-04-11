@@ -73,6 +73,10 @@ extern "C" {
         d_temp: *mut c_void,
     ) -> CudaRustError;
 
+    /// Returns true if the NTT implementation needs a separate N-element temp buffer
+    /// for transpose stages (RDNA3 four-step NTT). Returns false for in-place NTTs (sppark).
+    pub fn bn254_ntt_needs_temp_buffer() -> bool;
+
     /// Clear all cached NTT twiddle factors from GPU memory.
     /// Called before large GPU memory allocations to prevent OOM.
     /// Available on HIP; on CUDA (sppark), this is a no-op.

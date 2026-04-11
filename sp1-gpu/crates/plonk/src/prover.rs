@@ -648,9 +648,7 @@ impl PlonkProver {
 
         // Start s1/s2/s3/omega uploads on background thread to overlap with wire commit MSMs.
         // These don't depend on gamma/beta (circuit-static data). Saves ~0.16s on 4090.
-        // Note: on HIP/AMD, GPU memory ops from background threads may crash due to
-        // device context issues. Only enable on non-HIP CUDA builds.
-        #[cfg(all(feature = "cuda", not(hip_backend)))]
+        #[cfg(feature = "cuda")]
         let gp_upload_handle = {
             use std::ffi::c_void;
             let s1_ptr = self.cached.s1.as_ptr() as usize;
@@ -784,33 +782,10 @@ impl PlonkProver {
             let elem_sz = std::mem::size_of::<Fr>();
             let byte_sz = n * elem_sz;
 
-            // s1/s2/s3/omega: use pre-uploaded from background thread (CUDA) or upload inline (HIP)
-            #[cfg(not(hip_backend))]
+            // s1/s2/s3/omega were uploaded in background during wire commits
             let (d_s1_tmp, d_s2_tmp, d_s3_tmp, d_omega_tmp) = {
                 let (a, b, c, d) = gp_upload_handle.join().expect("GP upload thread panicked");
                 (a as *mut c_void, b as *mut c_void, c as *mut c_void, d as *mut c_void)
-            };
-            #[cfg(hip_backend)]
-            let (d_s1_tmp, d_s2_tmp, d_s3_tmp, d_omega_tmp) = {
-                let mut a: *mut c_void = std::ptr::null_mut();
-                let mut b: *mut c_void = std::ptr::null_mut();
-                let mut c: *mut c_void = std::ptr::null_mut();
-                let mut d: *mut c_void = std::ptr::null_mut();
-                unsafe {
-                    sp1_gpu_sys::runtime::cuda_malloc(&mut a as *mut _, byte_sz);
-                    sp1_gpu_sys::runtime::cuda_malloc(&mut b as *mut _, byte_sz);
-                    sp1_gpu_sys::runtime::cuda_malloc(&mut c as *mut _, byte_sz);
-                    sp1_gpu_sys::runtime::cuda_malloc(&mut d as *mut _, byte_sz);
-                    sp1_gpu_sys::runtime::cuda_mem_copy_host_to_device(
-                        a, s1.as_ptr() as *const c_void, byte_sz);
-                    sp1_gpu_sys::runtime::cuda_mem_copy_host_to_device(
-                        b, s2.as_ptr() as *const c_void, byte_sz);
-                    sp1_gpu_sys::runtime::cuda_mem_copy_host_to_device(
-                        c, s3.as_ptr() as *const c_void, byte_sz);
-                    sp1_gpu_sys::runtime::cuda_mem_copy_host_to_device(
-                        d, self.cached.omega_powers.as_ptr() as *const c_void, byte_sz);
-                }
-                (a, b, c, d)
             };
             let mut d_z_out: *mut c_void = std::ptr::null_mut();
             unsafe {
@@ -1080,10 +1055,15 @@ impl PlonkProver {
                 };
             }
 
-            // Z NTT: use device pointer if available (saves H2D)
+            // sppark NTT (CUDA) is fully in-place → d_qk_plus_pi stays on device.
+            // RDNA3 NTT (HIP) needs 4 GiB temp → must spill d_qk_plus_pi.
+            let use_device_ntt =
+                !unsafe { sp1_gpu_sys::dft_bn254::bn254_ntt_needs_temp_buffer() };
+
+            // Z NTT: CUDA uses device pointer (saves H2D), HIP uses host (avoids OOM)
             use crate::domain::gpu_ntt::gpu_ifft_then_coset_fft_to_device_from_device;
             let (z_coeffs_r2, d_z_r2) = if use_gpu_quotient {
-                if !d_z_gp.is_null() {
+                if use_device_ntt && !d_z_gp.is_null() {
                     let r = gpu_ifft_then_coset_fft_to_device_from_device(
                         d_z_gp as *const c_void, lg_n, big_log,
                     );
@@ -1092,15 +1072,63 @@ impl PlonkProver {
                     }
                     (r.0, Some(r.1))
                 } else {
-                    let r = gpu_ifft_then_coset_fft_to_device(&z_lagrange, lg_n, big_log);
+                    // HIP path or no device Z: D2H to host, free device, NTT from host
+                    let z_host = if !d_z_gp.is_null() {
+                        let byte_sz_n = n * elem_sz;
+                        let mut z_h = Vec::with_capacity(n);
+                        unsafe { z_h.set_len(n); }
+                        unsafe {
+                            sp1_gpu_sys::runtime::cuda_mem_copy_device_to_host(
+                                z_h.as_mut_ptr() as *mut c_void,
+                                d_z_gp as *const c_void, byte_sz_n,
+                            );
+                            sp1_gpu_sys::runtime::cuda_free(d_z_gp as *const c_void);
+                        }
+                        z_h
+                    } else {
+                        z_lagrange.clone()
+                    };
+                    let r = gpu_ifft_then_coset_fft_to_device(&z_host, lg_n, big_log);
                     (r.0, Some(r.1))
                 }
             } else {
                 (Vec::new(), None)
             };
 
-            // L/R/O iFFT+cosetFFTs: use device pointers from GP if available
-            let (l_coeffs_early, d_l_early) = if !d_l_upload.is_null() {
+            // When NTT needs external temp buffer (RDNA3), spill d_qk_plus_pi and
+            // free wire uploads to make room.
+            let qk_plus_pi_host = if !use_device_ntt {
+                unsafe {
+                    if !d_l_upload.is_null() {
+                        sp1_gpu_sys::runtime::cuda_free(d_l_upload as *const c_void);
+                    }
+                    if !d_r_upload.is_null() {
+                        sp1_gpu_sys::runtime::cuda_free(d_r_upload as *const c_void);
+                    }
+                    if !d_o_upload.is_null() {
+                        sp1_gpu_sys::runtime::cuda_free(d_o_upload as *const c_void);
+                    }
+                }
+                if d_qk_plus_pi_opt.is_some() {
+                    let d_qk = d_qk_plus_pi_opt.as_ref().unwrap();
+                    let mut h = vec![Fr::ZERO; big_n];
+                    let err = unsafe {
+                        sp1_gpu_sys::runtime::cuda_mem_copy_device_to_host(
+                            h.as_mut_ptr() as *mut c_void, d_qk.ptr, byte_sz_4n,
+                        )
+                    };
+                    if err != unsafe { sp1_gpu_sys::runtime::CUDA_SUCCESS_CSL } {
+                        panic!("D2H failed for d_qk_plus_pi spill");
+                    }
+                    drop(d_qk_plus_pi_opt.take().unwrap());
+                    Some(h)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            let (l_coeffs_early, d_l_early) = if use_device_ntt && !d_l_upload.is_null() {
                 let r = gpu_ifft_then_coset_fft_to_device_from_device(
                     d_l_upload as *const c_void, lg_n, big_log,
                 );
@@ -1109,7 +1137,7 @@ impl PlonkProver {
             } else {
                 gpu_ifft_then_coset_fft_to_device(&l_fr, lg_n, big_log)
             };
-            let (r_coeffs_early, d_r_early) = if !d_r_upload.is_null() {
+            let (r_coeffs_early, d_r_early) = if use_device_ntt && !d_r_upload.is_null() {
                 let r = gpu_ifft_then_coset_fft_to_device_from_device(
                     d_r_upload as *const c_void, lg_n, big_log,
                 );
@@ -1118,7 +1146,7 @@ impl PlonkProver {
             } else {
                 gpu_ifft_then_coset_fft_to_device(&r_fr, lg_n, big_log)
             };
-            let (o_coeffs_early, d_o_early) = if !d_o_upload.is_null() {
+            let (o_coeffs_early, d_o_early) = if use_device_ntt && !d_o_upload.is_null() {
                 let r = gpu_ifft_then_coset_fft_to_device_from_device(
                     d_o_upload as *const c_void, lg_n, big_log,
                 );
@@ -1128,8 +1156,7 @@ impl PlonkProver {
                 gpu_ifft_then_coset_fft_to_device(&o_fr, lg_n, big_log)
             };
 
-            // HIP: re-upload spilled d_qk_plus_pi
-            #[cfg(hip_backend)]
+            // Re-upload spilled d_qk_plus_pi (only when NTT needed spill for temp headroom)
             if let Some(h) = qk_plus_pi_host {
                 let mut d_ptr: *mut c_void = std::ptr::null_mut();
                 unsafe {
@@ -2668,8 +2695,7 @@ impl PlonkProver {
         drop(d_qk_plus_pi);
 
         // Start SRS canonical upload NOW — ~16 GiB just freed, D2H follows.
-        // PCIe Gen4 is full-duplex: SRS H2D (host→device) runs simultaneously
-        // with h_coeffs D2H (device→host), hiding ~0.3s of SRS upload.
+        // PCIe Gen4 is full-duplex: SRS H2D overlaps with h_coeffs D2H.
         let srs_can_handle = if srs_can_ptr != 0 {
             let ptr = srs_can_ptr;
             let len = srs_can_len;
@@ -2682,6 +2708,7 @@ impl PlonkProver {
         } else {
             None
         };
+        // (srs_can_handle is always Some or None from the if above)
 
         // Sync + clear caches + free NTT buffer to ensure memory is freed
         unsafe { sp1_gpu_sys::runtime::cuda_device_synchronize() };

@@ -727,6 +727,9 @@ extern "C" rustCudaError_t batch_coset_iNTT_bn254(
     return CUDA_SUCCESS_CSL;
 }
 
+// RDNA3 four-step NTT needs an N-element temp buffer for its transpose stages.
+extern "C" bool bn254_ntt_needs_temp_buffer() { return true; }
+
 extern "C" void bn254_ntt_clear_twiddle_cache() {
     // Custom twiddle cache is tiny (4 MiB) — no need to clear
     // Temp buffer is now per-call, nothing to free here.
