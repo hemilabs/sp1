@@ -646,6 +646,40 @@ impl PlonkProver {
             (alloc(&l_fr), alloc(&r_fr), alloc(&o_fr))
         };
 
+        // Start s1/s2/s3/omega uploads on background thread to overlap with wire commit MSMs.
+        // These don't depend on gamma/beta (circuit-static data). Saves ~0.16s on 4090.
+        #[cfg(feature = "cuda")]
+        let gp_upload_handle = {
+            use std::ffi::c_void;
+            let s1_ptr = self.cached.s1.as_ptr() as usize;
+            let s2_ptr = self.cached.s2.as_ptr() as usize;
+            let s3_ptr = self.cached.s3.as_ptr() as usize;
+            let omega_ptr = self.cached.omega_powers.as_ptr() as usize;
+            let byte_sz = n * std::mem::size_of::<Fr>();
+            std::thread::spawn(move || {
+                let mut d_s1: *mut c_void = std::ptr::null_mut();
+                let mut d_s2: *mut c_void = std::ptr::null_mut();
+                let mut d_s3: *mut c_void = std::ptr::null_mut();
+                let mut d_omega: *mut c_void = std::ptr::null_mut();
+                unsafe {
+                    sp1_gpu_sys::runtime::cuda_malloc(&mut d_s1 as *mut _, byte_sz);
+                    sp1_gpu_sys::runtime::cuda_malloc(&mut d_s2 as *mut _, byte_sz);
+                    sp1_gpu_sys::runtime::cuda_malloc(&mut d_s3 as *mut _, byte_sz);
+                    sp1_gpu_sys::runtime::cuda_malloc(&mut d_omega as *mut _, byte_sz);
+                    sp1_gpu_sys::runtime::cuda_mem_copy_host_to_device(
+                        d_s1, s1_ptr as *const c_void, byte_sz);
+                    sp1_gpu_sys::runtime::cuda_mem_copy_host_to_device(
+                        d_s2, s2_ptr as *const c_void, byte_sz);
+                    sp1_gpu_sys::runtime::cuda_mem_copy_host_to_device(
+                        d_s3, s3_ptr as *const c_void, byte_sz);
+                    sp1_gpu_sys::runtime::cuda_mem_copy_host_to_device(
+                        d_omega, omega_ptr as *const c_void, byte_sz);
+                }
+                // Wrap pointers as usize to be Send
+                (d_s1 as usize, d_s2 as usize, d_s3 as usize, d_omega as usize)
+            })
+        };
+
         // Commit wire polynomials using persistent MSM with GPU-side depadding.
         // Pass device scalar pointers to avoid redundant H2D uploads (~300ms each).
         #[cfg(feature = "cuda")]
@@ -748,38 +782,16 @@ impl PlonkProver {
             let elem_sz = std::mem::size_of::<Fr>();
             let byte_sz = n * elem_sz;
 
-            // Upload s1/s2/s3/omega to GPU (4 × 1 GiB, ~1.1s on VM PCIe)
-            let mut d_s1_tmp: *mut c_void = std::ptr::null_mut();
-            let mut d_s2_tmp: *mut c_void = std::ptr::null_mut();
-            let mut d_s3_tmp: *mut c_void = std::ptr::null_mut();
-            let mut d_omega_tmp: *mut c_void = std::ptr::null_mut();
+            // s1/s2/s3/omega were uploaded in background during wire commits
+            let (d_s1_val, d_s2_val, d_s3_val, d_omega_val) =
+                gp_upload_handle.join().expect("GP upload thread panicked");
+            let d_s1_tmp = d_s1_val as *mut c_void;
+            let d_s2_tmp = d_s2_val as *mut c_void;
+            let d_s3_tmp = d_s3_val as *mut c_void;
+            let d_omega_tmp = d_omega_val as *mut c_void;
             let mut d_z_out: *mut c_void = std::ptr::null_mut();
             unsafe {
-                sp1_gpu_sys::runtime::cuda_malloc(&mut d_s1_tmp as *mut _, byte_sz);
-                sp1_gpu_sys::runtime::cuda_malloc(&mut d_s2_tmp as *mut _, byte_sz);
-                sp1_gpu_sys::runtime::cuda_malloc(&mut d_s3_tmp as *mut _, byte_sz);
-                sp1_gpu_sys::runtime::cuda_malloc(&mut d_omega_tmp as *mut _, byte_sz);
                 sp1_gpu_sys::runtime::cuda_malloc(&mut d_z_out as *mut _, byte_sz);
-                sp1_gpu_sys::runtime::cuda_mem_copy_host_to_device(
-                    d_s1_tmp,
-                    s1.as_ptr() as *const c_void,
-                    byte_sz,
-                );
-                sp1_gpu_sys::runtime::cuda_mem_copy_host_to_device(
-                    d_s2_tmp,
-                    s2.as_ptr() as *const c_void,
-                    byte_sz,
-                );
-                sp1_gpu_sys::runtime::cuda_mem_copy_host_to_device(
-                    d_s3_tmp,
-                    s3.as_ptr() as *const c_void,
-                    byte_sz,
-                );
-                sp1_gpu_sys::runtime::cuda_mem_copy_host_to_device(
-                    d_omega_tmp,
-                    self.cached.omega_powers.as_ptr() as *const c_void,
-                    byte_sz,
-                );
             }
 
             // GPU grand product kernel (0.4s compute)
