@@ -518,8 +518,11 @@ impl PlonkProver {
             pin("x_minus_one_n_inv", &cached.x_minus_one_n_inv, &mut pin_failures);
             pin("omega_lo_table", &cached.omega_lo_table, &mut pin_failures);
             pin("omega_hi_table", &cached.omega_hi_table, &mut pin_failures);
+            for (i, qcp) in cached.qcp_coset_evals.iter().enumerate() {
+                pin(&format!("qcp_coset_evals[{i}]"), qcp, &mut pin_failures);
+            }
             if pin_failures > 0 {
-                eprintln!("[WARN] {pin_failures} of 11 host memory pinning calls failed — PCIe bandwidth may be degraded");
+                eprintln!("[WARN] {pin_failures} host memory pinning calls failed — PCIe bandwidth may be degraded");
             }
         }
 
@@ -581,6 +584,7 @@ impl PlonkProver {
         let bsb22_polys_fr: Vec<Vec<Fr>> =
             bsb22_polys.iter().map(|p| p.par_iter().map(Fr::from_bn254fr).collect()).collect();
         eprintln!("[T] 1. Wire BN254Fr→Fr conversion: {:?}", t.elapsed());
+
         let srs_canonical = &self.cached.srs_canonical;
         let s1 = &self.cached.s1;
         let s2 = &self.cached.s2;
