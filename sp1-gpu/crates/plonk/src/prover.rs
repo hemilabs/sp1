@@ -648,7 +648,9 @@ impl PlonkProver {
 
         // Start s1/s2/s3/omega uploads on background thread to overlap with wire commit MSMs.
         // These don't depend on gamma/beta (circuit-static data). Saves ~0.16s on 4090.
-        #[cfg(feature = "cuda")]
+        // Note: on HIP/AMD, GPU memory ops from background threads may crash due to
+        // device context issues. Only enable on non-HIP CUDA builds.
+        #[cfg(all(feature = "cuda", not(hip_backend)))]
         let gp_upload_handle = {
             use std::ffi::c_void;
             let s1_ptr = self.cached.s1.as_ptr() as usize;
@@ -782,13 +784,34 @@ impl PlonkProver {
             let elem_sz = std::mem::size_of::<Fr>();
             let byte_sz = n * elem_sz;
 
-            // s1/s2/s3/omega were uploaded in background during wire commits
-            let (d_s1_val, d_s2_val, d_s3_val, d_omega_val) =
-                gp_upload_handle.join().expect("GP upload thread panicked");
-            let d_s1_tmp = d_s1_val as *mut c_void;
-            let d_s2_tmp = d_s2_val as *mut c_void;
-            let d_s3_tmp = d_s3_val as *mut c_void;
-            let d_omega_tmp = d_omega_val as *mut c_void;
+            // s1/s2/s3/omega: use pre-uploaded from background thread (CUDA) or upload inline (HIP)
+            #[cfg(not(hip_backend))]
+            let (d_s1_tmp, d_s2_tmp, d_s3_tmp, d_omega_tmp) = {
+                let (a, b, c, d) = gp_upload_handle.join().expect("GP upload thread panicked");
+                (a as *mut c_void, b as *mut c_void, c as *mut c_void, d as *mut c_void)
+            };
+            #[cfg(hip_backend)]
+            let (d_s1_tmp, d_s2_tmp, d_s3_tmp, d_omega_tmp) = {
+                let mut a: *mut c_void = std::ptr::null_mut();
+                let mut b: *mut c_void = std::ptr::null_mut();
+                let mut c: *mut c_void = std::ptr::null_mut();
+                let mut d: *mut c_void = std::ptr::null_mut();
+                unsafe {
+                    sp1_gpu_sys::runtime::cuda_malloc(&mut a as *mut _, byte_sz);
+                    sp1_gpu_sys::runtime::cuda_malloc(&mut b as *mut _, byte_sz);
+                    sp1_gpu_sys::runtime::cuda_malloc(&mut c as *mut _, byte_sz);
+                    sp1_gpu_sys::runtime::cuda_malloc(&mut d as *mut _, byte_sz);
+                    sp1_gpu_sys::runtime::cuda_mem_copy_host_to_device(
+                        a, s1.as_ptr() as *const c_void, byte_sz);
+                    sp1_gpu_sys::runtime::cuda_mem_copy_host_to_device(
+                        b, s2.as_ptr() as *const c_void, byte_sz);
+                    sp1_gpu_sys::runtime::cuda_mem_copy_host_to_device(
+                        c, s3.as_ptr() as *const c_void, byte_sz);
+                    sp1_gpu_sys::runtime::cuda_mem_copy_host_to_device(
+                        d, self.cached.omega_powers.as_ptr() as *const c_void, byte_sz);
+                }
+                (a, b, c, d)
+            };
             let mut d_z_out: *mut c_void = std::ptr::null_mut();
             unsafe {
                 sp1_gpu_sys::runtime::cuda_malloc(&mut d_z_out as *mut _, byte_sz);
