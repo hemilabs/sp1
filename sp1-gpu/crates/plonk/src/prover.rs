@@ -2700,9 +2700,10 @@ impl PlonkProver {
 
         // Download only the used portion of h_coeffs: 3*(N+2) elements out of 4N.
         // split_quotient uses h[0..3*(N+2)]; the tail (3*(N+2)..4N) is unused.
-        // This saves ~1 GiB of D2H transfer.
+        // Sync first so the D2H timer doesn't include iNTT tail execution.
+        unsafe { sp1_gpu_sys::runtime::cuda_device_synchronize() };
         let _t_d2h = std::time::Instant::now();
-        let h_download_len = 3 * (n + 2); // only what split_quotient needs
+        let h_download_len = 3 * (n + 2);
         let h_download_bytes = h_download_len * std::mem::size_of::<Fr>();
         let mut h_coeffs = Vec::with_capacity(h_download_len);
         unsafe {
@@ -2711,12 +2712,15 @@ impl PlonkProver {
         h_coeffs.par_chunks_mut(128).for_each(|chunk| unsafe {
             std::ptr::write_volatile(&mut chunk[0] as *mut Fr, Fr::ZERO);
         });
-        // Pin for DMA-speed D2H transfer (avoids staging buffer penalty)
-        unsafe {
-            let _ = sp1_gpu_sys::runtime::cuda_host_register(
+        // Pin for DMA-speed D2H (unpinned 4090: 11 GB/s, pinned: 25 GB/s)
+        let pin_err = unsafe {
+            sp1_gpu_sys::runtime::cuda_host_register(
                 h_coeffs.as_ptr() as *const c_void,
                 h_download_bytes,
-            );
+            )
+        };
+        if pin_err != unsafe { sp1_gpu_sys::runtime::CUDA_SUCCESS_CSL } {
+            eprintln!("[WARN] h_coeffs pinning failed — D2H will use slower staging path");
         }
         let err = unsafe {
             sp1_gpu_sys::runtime::cuda_mem_copy_device_to_host(
