@@ -173,6 +173,75 @@ rustCudaError_t sp1_bn254_msm_invoke_device(void* ctx,
     }
 }
 
+/// Zero-depad kernel: for each scalar, if it matches any hot value, set to zero.
+/// hot_values are in shared memory for fast comparison.
+__global__ void bn254_depad_kernel(
+    uint32_t* __restrict__ d_scalars,  // [npoints * 8] words, modified in-place
+    const uint32_t* __restrict__ hot_values,  // [num_hot * 8] in global (small)
+    int num_hot, int npoints)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= npoints) return;
+
+    const uint32_t* s = d_scalars + idx * 8;
+    for (int h = 0; h < num_hot; h++) {
+        const uint32_t* hv = hot_values + h * 8;
+        bool match = true;
+        for (int w = 0; w < 8; w++) {
+            if (s[w] != hv[w]) { match = false; break; }
+        }
+        if (match) {
+            uint32_t* sw = d_scalars + idx * 8;
+            for (int w = 0; w < 8; w++) sw[w] = 0;
+            return;
+        }
+    }
+}
+
+/// Device-depad MSM for CUDA/sppark path.
+/// Copies scalars to a temp buffer, zeros hot values, then MSMs.
+extern "C"
+rustCudaError_t sp1_bn254_msm_invoke_device_depad(
+    void* ctx, void* result, size_t npoints,
+    const void* d_scalars, bool mont,
+    const void* hot_values_host, int num_hot)
+{
+    if (num_hot <= 0) {
+        return sp1_bn254_msm_invoke_device(ctx, result, npoints, d_scalars, mont);
+    }
+
+    size_t scalar_bytes = npoints * 8 * sizeof(uint32_t);
+
+    // Copy scalars to temp buffer (don't modify originals)
+    void* d_tmp = nullptr;
+    cudaError_t cerr = cudaMalloc(&d_tmp, scalar_bytes);
+    if (cerr != cudaSuccess) {
+        return rustCudaError_t{.message = "cudaMalloc failed for depad temp"};
+    }
+    cudaMemcpy(d_tmp, d_scalars, scalar_bytes, cudaMemcpyDeviceToDevice);
+
+    // Upload hot values to device
+    size_t hot_bytes = num_hot * 8 * sizeof(uint32_t);
+    void* d_hot = nullptr;
+    cudaMalloc(&d_hot, hot_bytes);
+    cudaMemcpy(d_hot, hot_values_host, hot_bytes, cudaMemcpyHostToDevice);
+
+    // Zero matching scalars
+    int threads = 256;
+    int blocks = ((int)npoints + threads - 1) / threads;
+    bn254_depad_kernel<<<blocks, threads>>>(
+        (uint32_t*)d_tmp, (const uint32_t*)d_hot, num_hot, (int)npoints);
+    cudaDeviceSynchronize();
+
+    cudaFree(d_hot);
+
+    // MSM on depadded scalars
+    rustCudaError_t err = sp1_bn254_msm_invoke_device(ctx, result, npoints, d_tmp, mont);
+
+    cudaFree(d_tmp);
+    return err;
+}
+
 /// Destroy a persistent MSM context, freeing GPU resources.
 extern "C"
 void sp1_bn254_msm_destroy(void* ctx)

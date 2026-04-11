@@ -13,6 +13,34 @@
 
 using fr_t = bn254_t;
 
+// Cross-platform Fermat inverse: HIP bn254_t has .inv(), sppark mont_t does not.
+#ifndef __HIPCC__
+namespace {
+__device__ __forceinline__ fr_t fr_inv(fr_t x) {
+    // Fermat: x^(p-2) mod p. p-2 for BN254 Fr:
+    const uint64_t exp[4] = {
+        0x43e1f593efffffffULL, 0x2833e84879b97091ULL,
+        0xb85045b68181585dULL, 0x30644e72e131a029ULL
+    };
+    fr_t result = fr_t::one();
+    fr_t base = x;
+    for (int w = 0; w < 4; w++) {
+        uint64_t e = exp[w];
+        for (int b = 0; b < 64; b++) {
+            if (e & 1) result = result * base;
+            base = base * base;
+            e >>= 1;
+        }
+    }
+    return result;
+}
+}
+#else
+namespace {
+__device__ __forceinline__ fr_t fr_inv(fr_t x) { return x.inv(); }
+}
+#endif
+
 // Chunk size for sequential-per-block prefix scans.
 // Each block processes this many elements sequentially (thread 0 only).
 // 4096 elements gives good balance: not too many blocks (N/4096 = 8192 for N=2^25),
@@ -131,7 +159,7 @@ __global__ void batch_inv_cross_kernel(
     }
 
     // Single Fermat inversion of total product
-    fr_t inv_total = acc.inv();
+    fr_t inv_total = fr_inv(acc);
 
     // Backward: inv_cum[c] = inv(tails[0]*...*tails[c])
     d_inv_cum[num_chunks - 1] = inv_total;

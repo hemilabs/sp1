@@ -14,6 +14,13 @@
 
 using fr_t = bn254_t;
 
+// Cross-platform helpers: sppark's mont_t (CUDA) lacks zero()/set_to_zero().
+#ifndef __HIPCC__
+namespace { __device__ __forceinline__ fr_t fr_zero() { fr_t z; memset(&z, 0, sizeof(z)); return z; } }
+#else
+namespace { __device__ __forceinline__ fr_t fr_zero() { return fr_t::zero(); } }
+#endif
+
 // Number of static arrays uploaded per chunk from CPU.
 // 9 data arrays + 1 reserved slot = 10.
 static constexpr int NUM_STATIC = 10;
@@ -690,7 +697,7 @@ __global__ void bn254_horner_chunk_kernel(
     if (end > n) end = n;
 
     // Horner's method on this chunk: result = c[end-1] + x*(c[end-2] + x*(...))
-    fr_t acc = fr_t::zero();
+    fr_t acc = fr_zero();
     for (uint32_t i = end; i > start; ) {
         --i;
         acc = acc * x + coeffs[i];
