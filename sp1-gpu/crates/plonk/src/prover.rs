@@ -573,17 +573,28 @@ impl PlonkProver {
             })
         };
 
-        // Convert per-proof wire values to Montgomery Fr for arithmetic (parallel)
+        // Convert per-proof wire values to Montgomery Fr for arithmetic.
+        // L converted first (needed for L upload+MSM), R+O deferred to background
+        // thread to overlap with L MSM GPU compute (~0.35s → ~0.12s on critical path).
         let t = std::time::Instant::now();
         let l_fr: Vec<Fr> = l.par_iter().map(Fr::from_bn254fr).collect();
-        let r_fr: Vec<Fr> = r.par_iter().map(Fr::from_bn254fr).collect();
-        let o_fr: Vec<Fr> = o.par_iter().map(Fr::from_bn254fr).collect();
         let pi_fr: Vec<Fr> = public_inputs.iter().map(Fr::from_bn254fr).collect();
-
-        // Convert per-proof BSB22 committed polynomials (parallel inner loop)
         let bsb22_polys_fr: Vec<Vec<Fr>> =
             bsb22_polys.iter().map(|p| p.par_iter().map(Fr::from_bn254fr).collect()).collect();
-        eprintln!("[T] 1. Wire BN254Fr→Fr conversion: {:?}", t.elapsed());
+
+        // Defer R+O conversion to background — hidden behind L MSM GPU compute
+        let r_ptr = r.as_ptr() as usize;
+        let r_len = r.len();
+        let o_ptr = o.as_ptr() as usize;
+        let o_len = o.len();
+        let ro_convert_handle = std::thread::spawn(move || {
+            let r_slice = unsafe { std::slice::from_raw_parts(r_ptr as *const BN254Fr, r_len) };
+            let o_slice = unsafe { std::slice::from_raw_parts(o_ptr as *const BN254Fr, o_len) };
+            let r_fr: Vec<Fr> = r_slice.par_iter().map(Fr::from_bn254fr).collect();
+            let o_fr: Vec<Fr> = o_slice.par_iter().map(Fr::from_bn254fr).collect();
+            (r_fr, o_fr)
+        });
+        eprintln!("[T] 1. Wire BN254Fr→Fr conversion (L+PI+BSB22, R+O deferred): {:?}", t.elapsed());
 
         let srs_canonical = &self.cached.srs_canonical;
         let s1 = &self.cached.s1;
@@ -616,34 +627,25 @@ impl PlonkProver {
         let persistent_lag_msm = srs_upload_handle.join().expect("SRS upload thread panicked");
         eprintln!("[T] 2. PersistentMsm::new for Lagrange SRS (overlapped): {:?}", t.elapsed());
 
-        // Pre-upload wire scalars to GPU for later reuse in iFFT (saves 3 × 1 GiB H2D = ~0.9s on AMD VM).
-        // The MSM still uses host scalars (via depadding), but iFFT can use these device copies.
+        // Upload L wire scalars to GPU immediately (L conversion already done).
+        // R+O uploads deferred until their conversions complete (after L MSM).
         #[cfg(feature = "cuda")]
-        let (d_l_upload, d_r_upload, d_o_upload) = {
+        let d_l_upload = {
             use std::ffi::c_void;
             let elem_sz = std::mem::size_of::<Fr>();
-            let n = l_fr.len();
             let byte_sz = n * elem_sz;
-            let mut alloc = |data: &[Fr]| -> *mut c_void {
-                let mut ptr: *mut c_void = std::ptr::null_mut();
-                let err = unsafe { sp1_gpu_sys::runtime::cuda_malloc(&mut ptr as *mut _, byte_sz) };
-                if err != unsafe { sp1_gpu_sys::runtime::CUDA_SUCCESS_CSL } {
-                    return std::ptr::null_mut(); // Fallback: will re-upload in iFFT
-                }
-                let err = unsafe {
+            let mut ptr: *mut c_void = std::ptr::null_mut();
+            let err = unsafe { sp1_gpu_sys::runtime::cuda_malloc(&mut ptr as *mut _, byte_sz) };
+            if err == unsafe { sp1_gpu_sys::runtime::CUDA_SUCCESS_CSL } {
+                let _ = unsafe {
                     sp1_gpu_sys::runtime::cuda_mem_copy_host_to_device(
                         ptr,
-                        data.as_ptr() as *const c_void,
+                        l_fr.as_ptr() as *const c_void,
                         byte_sz,
                     )
                 };
-                if err != unsafe { sp1_gpu_sys::runtime::CUDA_SUCCESS_CSL } {
-                    unsafe { sp1_gpu_sys::runtime::cuda_free(ptr as *const c_void) };
-                    return std::ptr::null_mut();
-                }
-                ptr
-            };
-            (alloc(&l_fr), alloc(&r_fr), alloc(&o_fr))
+            }
+            ptr
         };
 
         // Start s1/s2/s3/omega uploads on background thread to overlap with wire commit MSMs.
@@ -681,9 +683,10 @@ impl PlonkProver {
         };
 
         // Commit wire polynomials using persistent MSM with GPU-side depadding.
-        // Pass device scalar pointers to avoid redundant H2D uploads (~300ms each).
+        // L MSM starts immediately (L conversion already done).
+        // R+O conversions run on background thread, overlapped with L MSM GPU compute.
         #[cfg(feature = "cuda")]
-        let (commit_l, commit_r, commit_o) = {
+        let (commit_l, commit_r, commit_o, r_fr, o_fr, d_r_upload, d_o_upload) = {
             let t = std::time::Instant::now();
             let cl = Self::commit_lagrange_depad_persistent(
                 srs_lagrange,
@@ -692,6 +695,32 @@ impl PlonkProver {
                 d_l_upload,
             );
             eprintln!("[T] 3a. commit_lagrange_depad_persistent L: {:?}", t.elapsed());
+
+            // Join R+O conversion (should be done — hidden behind L MSM's GPU compute)
+            let (r_fr, o_fr) = ro_convert_handle.join().expect("R+O conversion panicked");
+
+            // Upload R+O to device
+            let (d_r_upload, d_o_upload) = {
+                use std::ffi::c_void;
+                let byte_sz = n * std::mem::size_of::<Fr>();
+                let mut upload = |data: &[Fr]| -> *mut c_void {
+                    let mut ptr: *mut c_void = std::ptr::null_mut();
+                    let err =
+                        unsafe { sp1_gpu_sys::runtime::cuda_malloc(&mut ptr as *mut _, byte_sz) };
+                    if err == unsafe { sp1_gpu_sys::runtime::CUDA_SUCCESS_CSL } {
+                        let _ = unsafe {
+                            sp1_gpu_sys::runtime::cuda_mem_copy_host_to_device(
+                                ptr,
+                                data.as_ptr() as *const c_void,
+                                byte_sz,
+                            )
+                        };
+                    }
+                    ptr
+                };
+                (upload(&r_fr), upload(&o_fr))
+            };
+
             let t = std::time::Instant::now();
             let cr = Self::commit_lagrange_depad_persistent(
                 srs_lagrange,
@@ -708,11 +737,13 @@ impl PlonkProver {
                 d_o_upload,
             );
             eprintln!("[T] 3c. commit_lagrange_depad_persistent O: {:?}", t.elapsed());
-            (cl, cr, co)
+            (cl, cr, co, r_fr, o_fr, d_r_upload, d_o_upload)
         };
         // Wrap in Option so GPU path can take() and drop it early to free ~3.8 GiB VRAM.
         #[cfg(feature = "cuda")]
         let mut persistent_lag_msm_opt = Some(persistent_lag_msm);
+        #[cfg(not(feature = "cuda"))]
+        let (r_fr, o_fr) = ro_convert_handle.join().expect("R+O conversion panicked");
         #[cfg(not(feature = "cuda"))]
         let (commit_l, commit_r, commit_o) = {
             let cl = self.commit_lagrange_depad(srs_lagrange, &l_fr);
