@@ -1341,8 +1341,25 @@ impl PlonkProver {
                 let r_coset = cfft_padded(&r_coeffs_early);
                 let o_coset = cfft_padded(&o_coeffs_early);
                 let lg = domain.log_size;
+                // On CUDA path, z_lagrange is empty (Z stayed on device as d_z_gp).
+                // Download Z from device if needed.
+                let z_lag_for_ntt = if z_lagrange.is_empty() && !d_z_gp.is_null() {
+                    let byte_sz_n = n * std::mem::size_of::<Fr>();
+                    let mut z_h = vec![Fr::ZERO; n];
+                    unsafe {
+                        sp1_gpu_sys::runtime::cuda_mem_copy_device_to_host(
+                            z_h.as_mut_ptr() as *mut std::ffi::c_void,
+                            d_z_gp as *const std::ffi::c_void,
+                            byte_sz_n,
+                        );
+                        sp1_gpu_sys::runtime::cuda_free(d_z_gp as *const std::ffi::c_void);
+                    }
+                    z_h
+                } else {
+                    z_lagrange.clone()
+                };
                 let (z_c, z_coset) = crate::domain::gpu_ntt::gpu_ifft_then_coset_fft_to_host(
-                    &z_lagrange,
+                    &z_lag_for_ntt,
                     lg,
                     big_log,
                 );
