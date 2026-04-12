@@ -198,6 +198,16 @@ extern "C" void bn254_ntt_clear_twiddle_cache() {
 /// No-op on CUDA.
 extern "C" void bn254_ntt_clear_forward_twiddle_cache() {}
 
+// Stubs for _with_temp variants (sppark NTT doesn't need external temp).
+extern "C" rustCudaError_t batch_iNTT_bn254_with_temp(
+    void* d_inout, uint32_t lg, uint32_t poly_count, const cudaStream_t s, void*) {
+    return batch_iNTT_bn254(d_inout, lg, poly_count, s);
+}
+extern "C" rustCudaError_t batch_coset_NTT_bn254_with_temp(
+    void* d_inout, uint32_t lg, uint32_t poly_count, const cudaStream_t s, void*) {
+    return batch_coset_NTT_bn254(d_inout, lg, poly_count, s);
+}
+
 /// No-op on CUDA. On HIP, precomputes twiddle factor values on CPU only.
 extern "C" void bn254_ntt_precompute_host(uint32_t lg_n, bool inverse) {}
 

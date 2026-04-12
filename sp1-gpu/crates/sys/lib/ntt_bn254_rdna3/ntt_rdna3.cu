@@ -419,34 +419,19 @@ static rustCudaError_t run_ntt_four_step(
     //           3) hipMalloc smaller (tiled transpose), 4) d_inout + N fallback.
     fr_t* d_temp_local = nullptr;
     bool temp_is_owned = false;
-    size_t temp_elems = 0; // actual number of elements in temp buffer (0 = full N)
     if (lg_n > 10) {
         if (d_temp_ext) {
             d_temp_local = d_temp_ext;
             temp_is_owned = false;
-            temp_elems = N; // assume caller provided N elements
         } else {
             hipError_t herr = hipMalloc(&d_temp_local, (size_t)N * sizeof(fr_t));
             if (herr == hipSuccess) {
                 temp_is_owned = true;
-                temp_elems = N;
             } else {
-                // OOM for full N. Try smaller allocation for tiled transpose.
-                // TILE_DIM=32 rows per strip. Each strip needs strip_rows × max_cols elements.
-                // For the largest transpose (step 2: N/1024 × 1024), strip = 32 × 1024 = 32K.
-                // Try 1/32 of N (covers one strip of the largest transpose).
-                size_t try_elems = N / 32;
-                if (try_elems < 32 * 1024) try_elems = 32 * 1024;
-                herr = hipMalloc(&d_temp_local, try_elems * sizeof(fr_t));
-                if (herr == hipSuccess) {
-                    temp_is_owned = true;
-                    temp_elems = try_elems;
-                } else {
-                    // Last resort: d_inout + N (risky if caller only allocated N)
-                    d_temp_local = d_inout + N;
-                    temp_is_owned = false;
-                    temp_elems = N;
-                }
+                // OOM: can't allocate temp buffer for transpose.
+                // The prover should ensure VRAM headroom via the
+                // bn254_ntt_needs_temp_buffer() check and spill path.
+                return rustCudaError_t{.message = "out of memory"};
             }
         }
     }
