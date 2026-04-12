@@ -151,22 +151,21 @@ func FreeGroth16Bn254Proof(proof *C.C_Groth16Bn254Proof) {
 }
 
 //export ExportGroth16GpuData
-func ExportGroth16GpuData(dataDir *C.char, outputDir *C.char) *C.char {
+func ExportGroth16GpuData(dataDir *C.char, outputDir *C.char) (errStr *C.char) {
 	defer func() {
 		if r := recover(); r != nil {
-			// Panic recovery — return error string instead of crashing Rust process
-			fmt.Fprintf(os.Stderr, "[groth16-export] panic: %v\n", r)
+			errStr = C.CString(fmt.Sprintf("[groth16-export] panic: %v", r))
 		}
 	}()
 	sp1.ExportGroth16GpuData(C.GoString(dataDir), C.GoString(outputDir))
-	return nil // nil = success
+	return nil
 }
 
 //export ExportGroth16GpuWitness
-func ExportGroth16GpuWitness(dataDir *C.char, witnessPath *C.char, outputDir *C.char) *C.char {
+func ExportGroth16GpuWitness(dataDir *C.char, witnessPath *C.char, outputDir *C.char) (errStr *C.char) {
 	defer func() {
 		if r := recover(); r != nil {
-			fmt.Fprintf(os.Stderr, "[groth16-witness] panic: %v\n", r)
+			errStr = C.CString(fmt.Sprintf("[groth16-witness] panic: %v", r))
 		}
 	}()
 	sp1.ExportGroth16GpuWitness(C.GoString(dataDir), C.GoString(witnessPath), C.GoString(outputDir))
