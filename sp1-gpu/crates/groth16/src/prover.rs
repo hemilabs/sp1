@@ -65,11 +65,24 @@ impl Groth16Prover {
             .map(|(_, v)| *v)
             .collect();
 
-        // Filter wire values for K MSM (private wires only, excluding commitments)
-        let filtered_wire_values: Vec<Fr> = wire_values_fr[self.data.nb_public..]
-            .iter()
-            .copied()
-            .collect();
+        // Filter wire values for K MSM: private wires excluding committed wires.
+        // gnark's filterHeap removes PrivateCommitted + CommitmentIndex wire indices.
+        let filtered_wire_values: Vec<Fr> = {
+            let private_wires = &wire_values_fr[self.data.nb_public..];
+            if self.data.k_wire_filter.is_empty() {
+                private_wires.to_vec()
+            } else {
+                // Build a set of indices to remove (relative to nb_public)
+                let remove_set: std::collections::HashSet<usize> =
+                    self.data.k_wire_filter.iter().copied().collect();
+                private_wires
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, _)| !remove_set.contains(i))
+                    .map(|(_, v)| *v)
+                    .collect()
+            }
+        };
 
         eprintln!(
             "[T] 2. Filter wire values (A={}, B={}, K={}): {:?}",
