@@ -100,7 +100,7 @@ impl G2Jacobian {
         let v = self.x * i;
         let x3 = r.square() - j - v.double();
         let y3 = r * (v - x3) - (self.y * j).double();
-        let z3 = ((self.z + h).square() - z1z1 - hh);
+        let z3 = (self.z + h).square() - z1z1 - hh;
 
         Self { x: x3, y: y3, z: z3 }
     }
@@ -248,4 +248,68 @@ pub fn g2_msm(bases: &[G2Affine], scalars: &[Fr]) -> G2Jacobian {
         result = result.add(&window_results[w]);
     }
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::fq2::Fq2;
+    use crate::Fq;
+
+    fn test_g2_point() -> G2Affine {
+        // A valid G2 point on the BN254 twist curve.
+        // Use the generator: we construct it from known coordinates.
+        // For testing, we'll use the identity and doubling properties.
+        G2Affine::INFINITY
+    }
+
+    #[test]
+    fn test_g2_infinity() {
+        assert!(G2Affine::INFINITY.is_infinity());
+        assert!(G2Jacobian::INFINITY.is_infinity());
+    }
+
+    #[test]
+    fn test_g2_jacobian_add_infinity() {
+        let p = G2Jacobian::INFINITY;
+        let q = G2Jacobian::INFINITY;
+        assert!(p.add(&q).is_infinity());
+    }
+
+    #[test]
+    fn test_g2_affine_to_jacobian_infinity() {
+        let p = G2Affine::INFINITY;
+        assert!(p.to_jacobian().is_infinity());
+    }
+
+    #[test]
+    fn test_g2_double_infinity() {
+        let p = G2Jacobian::INFINITY;
+        assert!(p.double().is_infinity());
+    }
+
+    #[test]
+    fn test_g2_add_affine_with_infinity() {
+        let p = G2Jacobian::INFINITY;
+        let q = G2Affine::INFINITY;
+        assert!(p.add_affine(&q).is_infinity());
+    }
+
+    #[test]
+    fn test_g2_scalar_mul_zero() {
+        // Any point * 0 = infinity
+        let p = G2Jacobian {
+            x: Fq2::new(Fq::from_u64(1), Fq::from_u64(2)),
+            y: Fq2::new(Fq::from_u64(3), Fq::from_u64(4)),
+            z: Fq2::ONE,
+        };
+        let zero = [0u8; 32];
+        assert!(p.scalar_mul(&zero).is_infinity());
+    }
+
+    #[test]
+    fn test_g2_msm_empty() {
+        let result = g2_msm(&[], &[]);
+        assert!(result.is_infinity());
+    }
 }

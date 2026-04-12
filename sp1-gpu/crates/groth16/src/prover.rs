@@ -5,7 +5,7 @@
 //!
 //! Reference: gnark's backend/groth16/bn254/prove.go
 
-use crate::g2::{g2_msm, G2Affine, G2Jacobian};
+use crate::g2::{g2_msm, G2Affine};
 use crate::types::{Groth16Proof, Groth16ProvingData, Groth16WitnessData};
 use crate::{BN254Fr, BN254G1Affine, Fr, G1Affine, G1Jacobian};
 use rayon::prelude::*;

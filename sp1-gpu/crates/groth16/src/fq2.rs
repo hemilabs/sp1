@@ -159,3 +159,83 @@ impl std::ops::SubAssign for Fq2 {
 impl std::ops::MulAssign for Fq2 {
     fn mul_assign(&mut self, rhs: Self) { *self = *self * rhs; }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_fq2_mul_identity() {
+        let a = Fq2::new(Fq::from_u64(7), Fq::from_u64(3));
+        assert_eq!(a * Fq2::ONE, a);
+        assert_eq!(Fq2::ONE * a, a);
+    }
+
+    #[test]
+    fn test_fq2_mul_zero() {
+        let a = Fq2::new(Fq::from_u64(7), Fq::from_u64(3));
+        let zero = Fq2::ZERO;
+        let result = a * zero;
+        assert!(result.is_zero());
+    }
+
+    #[test]
+    fn test_fq2_add_sub_roundtrip() {
+        let a = Fq2::new(Fq::from_u64(42), Fq::from_u64(17));
+        let b = Fq2::new(Fq::from_u64(99), Fq::from_u64(55));
+        assert_eq!((a + b) - b, a);
+        assert_eq!((a - b) + b, a);
+    }
+
+    #[test]
+    fn test_fq2_mul_commutativity() {
+        let a = Fq2::new(Fq::from_u64(7), Fq::from_u64(13));
+        let b = Fq2::new(Fq::from_u64(19), Fq::from_u64(23));
+        assert_eq!(a * b, b * a);
+    }
+
+    #[test]
+    fn test_fq2_square_vs_mul() {
+        let a = Fq2::new(Fq::from_u64(42), Fq::from_u64(17));
+        assert_eq!(a.square(), a * a);
+    }
+
+    #[test]
+    fn test_fq2_inverse_roundtrip() {
+        let a = Fq2::new(Fq::from_u64(7), Fq::from_u64(3));
+        let inv = a.inverse().unwrap();
+        let product = a * inv;
+        assert_eq!(product, Fq2::ONE);
+    }
+
+    #[test]
+    fn test_fq2_inverse_zero() {
+        assert!(Fq2::ZERO.inverse().is_none());
+    }
+
+    #[test]
+    fn test_fq2_mul_by_nonresidue() {
+        // (9+u) * 1 = 9 + u
+        let one = Fq2::ONE;
+        let result = one.mul_by_nonresidue();
+        assert_eq!(result.c0, Fq::from_u64(9));
+        assert_eq!(result.c1, Fq::ONE);
+    }
+
+    #[test]
+    fn test_fq2_conjugate() {
+        let a = Fq2::new(Fq::from_u64(7), Fq::from_u64(3));
+        let conj = a.conjugate();
+        assert_eq!(conj.c0, a.c0);
+        assert_eq!(conj.c1, -a.c1);
+        // a * conj(a) should be real (c1 = 0)
+        let product = a * conj;
+        assert!(product.c1.is_zero());
+    }
+
+    #[test]
+    fn test_fq2_double() {
+        let a = Fq2::new(Fq::from_u64(7), Fq::from_u64(3));
+        assert_eq!(a.double(), a + a);
+    }
+}
