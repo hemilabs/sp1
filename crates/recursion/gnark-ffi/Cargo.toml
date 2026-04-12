@@ -27,6 +27,7 @@ bincode = { workspace = true }
 anyhow = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
+sp1-gpu-groth16 = { path = "../../../sp1-gpu/crates/groth16" }
 
 [build-dependencies]
 bindgen = { workspace = true }
