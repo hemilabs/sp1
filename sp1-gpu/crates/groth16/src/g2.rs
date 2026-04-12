@@ -122,7 +122,7 @@ impl G2Jacobian {
         let s2 = other.y * z1z1 * self.z;
 
         let h = u2 - u1;
-        let r = s2 - s1;
+        let r = (s2 - s1).double(); // add-2007-bl requires r = 2*(S2-S1)
 
         if h.is_zero() {
             if r.is_zero() {
