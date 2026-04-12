@@ -276,8 +276,11 @@ fn load_g2_points(path: &std::path::Path) -> anyhow::Result<Vec<G2Affine>> {
             }
             Fq::from_bn254fq_canonical(&canonical)
         };
-        let x = Fq2::new(load_fq(offset), load_fq(offset + 32));
-        let y = Fq2::new(load_fq(offset + 64), load_fq(offset + 96));
+        // gnark G2Affine.RawBytes() serializes as [X.A1, X.A0, Y.A1, Y.A0] (each 32 bytes).
+        // After reverseBytes: file layout is [X.A1_LE, X.A0_LE, Y.A1_LE, Y.A0_LE].
+        // Fq2 = c0 + c1*u, where c0 = A0 (real), c1 = A1 (imaginary).
+        let x = Fq2::new(load_fq(offset + 32), load_fq(offset));       // c0=A0, c1=A1
+        let y = Fq2::new(load_fq(offset + 96), load_fq(offset + 64));  // c0=A0, c1=A1
         points.push(G2Affine { x, y });
     }
     Ok(points)
