@@ -126,7 +126,7 @@ func ExportGroth16GpuWitness(dataDir string, witnessPath string, outputDir strin
 	fmt.Printf("[groth16-witness] Solved in %s (W=%d, A=%d, B=%d, C=%d)\n",
 		time.Since(start), len(solution.W), len(solution.A), len(solution.B), len(solution.C))
 
-	// Compute PoK for commitments
+	// Compute PoK for commitments (matching gnark prove.go:110-127 exactly)
 	var commitmentPok bn254.G1Affine
 	if len(commitmentInfo) > 0 {
 		poks := make([]bn254.G1Affine, len(_pk.CommitmentKeys))
@@ -135,8 +135,13 @@ func ExportGroth16GpuWitness(dataDir string, witnessPath string, outputDir strin
 				panic(fmt.Sprintf("ProveKnowledge failed: %v", err))
 			}
 		}
-		// Fold PoKs
-		challenge, err := fr.Hash(commitments[0].Marshal(), []byte("G16-BSB22"), 1)
+		// Fold PoKs: challenge is hash of ALL commitment wire values (not G1 points!)
+		// gnark prove.go uses wireValues[commitmentInfo[i].CommitmentIndex].Marshal()
+		commitmentsSerialized := make([]byte, fr.Bytes*len(commitmentInfo))
+		for i := range commitmentInfo {
+			copy(commitmentsSerialized[fr.Bytes*i:], solution.W[commitmentInfo[i].CommitmentIndex].Marshal())
+		}
+		challenge, err := fr.Hash(commitmentsSerialized, []byte("G16-BSB22"), 1)
 		if err != nil {
 			panic(fmt.Sprintf("PoK challenge failed: %v", err))
 		}
