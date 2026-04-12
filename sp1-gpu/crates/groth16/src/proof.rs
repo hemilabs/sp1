@@ -74,12 +74,12 @@ fn write_g1_be(buf: &mut Vec<u8>, pt: &BN254G1Affine) {
 }
 
 /// Write a G2 affine point as 128 bytes big-endian canonical (gnark raw encoding).
-/// Order: X.A0, X.A1, Y.A0, Y.A1 (matching gnark's RawBytes())
+/// Order: X.A1, X.A0, Y.A1, Y.A0 (matching gnark's RawBytes() which puts A1 first)
 fn write_g2_be(buf: &mut Vec<u8>, pt: &G2Affine) {
-    write_fq_be_from_montgomery(buf, &pt.x.c0);
-    write_fq_be_from_montgomery(buf, &pt.x.c1);
-    write_fq_be_from_montgomery(buf, &pt.y.c0);
-    write_fq_be_from_montgomery(buf, &pt.y.c1);
+    write_fq_be_from_montgomery(buf, &pt.x.c1); // A1 first
+    write_fq_be_from_montgomery(buf, &pt.x.c0); // A0 second
+    write_fq_be_from_montgomery(buf, &pt.y.c1); // A1 first
+    write_fq_be_from_montgomery(buf, &pt.y.c0); // A0 second
 }
 
 /// Write a BN254Fq (Montgomery form u32 limbs) as 32 bytes big-endian canonical.
