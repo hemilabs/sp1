@@ -664,6 +664,26 @@ void bn254_elementwise_add(void* d_a, const void* d_b, size_t n) {
     cudaDeviceSynchronize();
 }
 
+// Groth16 H polynomial pointwise: d_a[i] = (d_a[i] * d_b[i] - d_c[i]) * den
+__global__ void bn254_h_poly_kernel(
+    fr_t* d_a, const fr_t* d_b, const fr_t* d_c, fr_t den, uint32_t n
+) {
+    uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) d_a[i] = (d_a[i] * d_b[i] - d_c[i]) * den;
+}
+
+extern "C"
+void bn254_h_poly_pointwise(void* d_a, const void* d_b, const void* d_c,
+                             const void* h_den, size_t n) {
+    fr_t den;
+    memcpy(&den, h_den, sizeof(fr_t));
+    uint32_t threads = 256;
+    uint32_t blocks = ((uint32_t)n + threads - 1) / threads;
+    bn254_h_poly_kernel<<<blocks, threads>>>(
+        (fr_t*)d_a, (const fr_t*)d_b, (const fr_t*)d_c, den, (uint32_t)n);
+    cudaDeviceSynchronize();
+}
+
 extern "C"
 void bn254_elementwise_fma(void* d_a, const void* d_b, const void* d_c, size_t n) {
     uint32_t threads = 256;

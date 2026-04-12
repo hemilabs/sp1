@@ -113,9 +113,30 @@ impl Groth16Prover {
         let kr_delta = g1_scalar_mul(&g1_delta.to_jacobian(), &kr);
         eprintln!("[T] 4. Scalar multiplications: {:?}", t.elapsed());
 
-        // 5. G1 MSMs (GPU-accelerated)
+        // 5. MSMs: G2 on CPU (background) overlapped with G1 on GPU
         let t = std::time::Instant::now();
 
+        // Start G2 MSM on background thread (CPU Pippenger, ~3-5s)
+        // This runs concurrently with all 4 G1 GPU MSMs.
+        let g2_beta = self.data.pk_g2_beta;
+        let g2_delta = self.data.pk_g2_delta;
+        let g2_b_ptr = self.data.pk_g2_b.as_ptr() as usize;
+        let g2_b_len = self.data.pk_g2_b.len();
+        let wvb_ptr = wire_values_b.as_ptr() as usize;
+        let wvb_len = wire_values_b.len();
+        let s_copy = s;
+        let g2_handle = std::thread::spawn(move || {
+            let g2_b = unsafe { std::slice::from_raw_parts(g2_b_ptr as *const G2Affine, g2_b_len) };
+            let wvb = unsafe { std::slice::from_raw_parts(wvb_ptr as *const Fr, wvb_len) };
+            let bs2_msm = g2_msm(g2_b, wvb);
+            let s_bytes = s_copy.to_le_bytes();
+            let mut s_arr = [0u8; 32];
+            s_arr.copy_from_slice(&s_bytes);
+            let s_g2_delta = g2_delta.to_jacobian().scalar_mul(&s_arr);
+            bs2_msm.add(&s_g2_delta).add(&g2_beta.to_jacobian())
+        });
+
+        // G1 MSMs on GPU (concurrent with G2 CPU MSM)
         // Ar = MSM(G1.A, wireValuesA) + Alpha + r*Delta
         let ar_msm = self.g1_msm(&self.data.pk_g1_a, &wire_values_a);
         let ar = ar_msm
@@ -151,23 +172,10 @@ impl Groth16Prover {
             .add(&r_bs1)
             .add(&kr_delta);
 
-        // 6. G2 MSM (CPU Pippenger)
+        // 6. Join G2 MSM (should be done — hidden behind G1 GPU MSMs)
         let t = std::time::Instant::now();
-        let g2_beta = self.data.pk_g2_beta;
-        let g2_delta = self.data.pk_g2_delta;
-
-        // Bs2 = G2_MSM(G2.B, wireValuesB) + s*G2.Delta + G2.Beta
-        let bs2_msm = g2_msm(&self.data.pk_g2_b, &wire_values_b);
-        let s_g2_delta = {
-            let s_bytes = s.to_le_bytes();
-            let mut s_arr = [0u8; 32];
-            s_arr.copy_from_slice(&s_bytes);
-            g2_delta.to_jacobian().scalar_mul(&s_arr)
-        };
-        let bs2 = bs2_msm
-            .add(&s_g2_delta)
-            .add(&g2_beta.to_jacobian());
-        eprintln!("[T] 6. G2 MSM (CPU, N={}): {:?}", wire_values_b.len(), t.elapsed());
+        let bs2 = g2_handle.join().expect("G2 MSM thread panicked");
+        eprintln!("[T] 6. G2 MSM join (CPU, N={}): {:?}", wire_values_b.len(), t.elapsed());
 
         // 7. Assemble proof
         let proof = Groth16Proof {
@@ -267,33 +275,32 @@ impl Groth16Prover {
             sp1_gpu_sys::dft_bn254::batch_coset_NTT_bn254(d_c, lg_n, 1, stream);
         }
 
-        // Download coset evals to CPU for pointwise multiplication
-        // (could be a GPU kernel, but this is simple and the NTTs dominate)
-        unsafe {
-            sp1_gpu_sys::runtime::cuda_mem_copy_device_to_host(a.as_mut_ptr() as _, d_a, byte_sz);
-            sp1_gpu_sys::runtime::cuda_mem_copy_device_to_host(b.as_mut_ptr() as _, d_b, byte_sz);
-            sp1_gpu_sys::runtime::cuda_mem_copy_device_to_host(c.as_mut_ptr() as _, d_c, byte_sz);
-        }
-
-        // Pointwise: h[i] = (a[i] * b[i] - c[i]) * den
-        // den = 1 / (g^N - 1) where g is the multiplicative generator used for coset
+        // GPU pointwise: a[i] = (a[i] * b[i] - c[i]) * den (no CPU round-trip)
         let g = Fr::from_u64(5); // BN254 multiplicative generator
         let g_n = fr_pow_u64(&g, n as u64);
         let den = (g_n - Fr::ONE).inv();
-        let _ = &den; // used in closure below
 
-        let mut h: Vec<Fr> = a
-            .par_iter()
-            .zip(b.par_iter())
-            .zip(c.par_iter())
-            .map(|((ai, bi), ci)| (*ai * *bi - *ci) * den)
-            .collect();
-
-        // Upload h to GPU for coset iNTT
         unsafe {
-            sp1_gpu_sys::runtime::cuda_mem_copy_host_to_device(d_a, h.as_ptr() as _, byte_sz);
+            sp1_gpu_sys::plonk::bn254_h_poly_pointwise(
+                d_a,
+                d_b as *const c_void,
+                d_c as *const c_void,
+                &den as *const Fr as *const c_void,
+                n,
+            );
+        }
+
+        // Coset iNTT in-place on d_a (result stays on GPU until download)
+        unsafe {
             sp1_gpu_sys::dft_bn254::batch_coset_iNTT_bn254(d_a, lg_n, 1, stream);
-            sp1_gpu_sys::runtime::cuda_mem_copy_device_to_host(h.as_mut_ptr() as _, d_a, byte_sz);
+        }
+
+        // Download result
+        let mut h = vec![Fr::ZERO; n];
+        unsafe {
+            sp1_gpu_sys::runtime::cuda_mem_copy_device_to_host(
+                h.as_mut_ptr() as _, d_a, byte_sz,
+            );
         }
 
         // Free GPU buffer

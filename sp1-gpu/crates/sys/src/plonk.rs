@@ -99,6 +99,16 @@ extern "C" {
         h_result: *mut c_void,
     ) -> CudaRustError;
 
+    /// BN254 H polynomial pointwise: d_a[i] = (d_a[i] * d_b[i] - d_c[i]) * den
+    /// den is a host pointer to a single Fr element.
+    pub fn bn254_h_poly_pointwise(
+        d_a: *mut c_void,
+        d_b: *const c_void,
+        d_c: *const c_void,
+        h_den: *const c_void,
+        n: usize,
+    );
+
     /// BN254 element-wise add: d_a[i] += d_b[i] for i in 0..n
     pub fn bn254_elementwise_add(d_a: *mut c_void, d_b: *const c_void, n: usize);
 
