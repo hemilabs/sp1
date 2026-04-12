@@ -121,26 +121,33 @@ impl Groth16Bn254Prover {
         let raw_proof_bytes = gpu_proof.to_raw_bytes();
         let raw_proof_hex = hex::encode(&raw_proof_bytes);
 
-        let solidity_proof_bytes = gpu_proof.to_solidity_bytes();
-        let encoded_proof_hex = hex::encode(&solidity_proof_bytes);
+        // Public inputs come from the witness JSON, NOT from wire values.
+        // gnark's internal wire ordering doesn't match the logical public input order.
+        // The GnarkWitness stores them as named fields: VkeyHash, CommittedValuesDigest,
+        // ExitCode, VkRoot, ProofNonce (matching the Go NewSP1Groth16Proof in utils.go).
+        let public_inputs = [
+            gnark_witness.vkey_hash.clone(),
+            gnark_witness.committed_values_digest.clone(),
+            gnark_witness.exit_code.clone(),
+            gnark_witness.vk_root.clone(),
+            gnark_witness.proof_nonce.clone(),
+        ];
 
-        // Extract public inputs from the witness data
-        // The first 5 wire values (excluding wire 0 which is always 1) are public inputs
-        let mut public_inputs = ["".to_string(), "".to_string(), "".to_string(), "".to_string(), "".to_string()];
-        for i in 0..5 {
-            if i + 1 < witness_data.wire_values.len() {
-                let val = &witness_data.wire_values[i + 1];
-                // Convert BN254Fr to decimal string
-                let fr = sp1_gpu_groth16::Fr::from_bn254fr(val);
-                let canonical = fr.to_canonical();
-                let mut bytes = [0u8; 32];
-                for (j, &limb) in canonical.iter().enumerate() {
-                    let start = j * 8;
-                    bytes[start..start + 8].copy_from_slice(&limb.to_le_bytes());
-                }
-                public_inputs[i] = num_bigint::BigUint::from_bytes_le(&bytes).to_string();
-            }
+        // encoded_proof must include the 96-byte prefix (exit_code, vk_root, proof_nonce)
+        // before the Solidity proof bytes, matching the Go path's NewSP1Groth16Proof.
+        let solidity_proof_bytes = gpu_proof.to_solidity_bytes();
+        let mut encoded_bytes = Vec::with_capacity(96 + solidity_proof_bytes.len());
+        // Prepend exit_code, vk_root, proof_nonce as 32-byte BE uint256
+        for field in [&gnark_witness.exit_code, &gnark_witness.vk_root, &gnark_witness.proof_nonce] {
+            let val = field.parse::<num_bigint::BigUint>().unwrap_or_default();
+            let be_bytes = val.to_bytes_be();
+            // Pad to 32 bytes
+            let padding = 32usize.saturating_sub(be_bytes.len());
+            encoded_bytes.extend(std::iter::repeat(0u8).take(padding));
+            encoded_bytes.extend(&be_bytes[be_bytes.len().saturating_sub(32)..]);
         }
+        encoded_bytes.extend(&solidity_proof_bytes);
+        let encoded_proof_hex = hex::encode(&encoded_bytes);
 
         Groth16Bn254Proof {
             public_inputs,
