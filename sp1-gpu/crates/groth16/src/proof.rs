@@ -87,16 +87,7 @@ fn write_fq_be_canonical(buf: &mut Vec<u8>, fq: &BN254Fq) {
     // BN254Fq stores Montgomery form as u32 LE limbs.
     // Convert to Fq (u64 Montgomery) → canonical → big-endian bytes.
     let mont = Fq::from_bn254fq_raw(fq);
-    let canonical = mont.to_canonical();
-    // canonical is [u64; 4] in LE order. Convert to 32 bytes BE.
-    let mut bytes = [0u8; 32];
-    for (i, &limb) in canonical.iter().enumerate() {
-        let le_bytes = limb.to_le_bytes();
-        bytes[24 - i * 8..32 - i * 8].copy_from_slice(&le_bytes);
-    }
-    // Reverse to big-endian
-    bytes.reverse();
-    buf.extend_from_slice(&bytes);
+    write_fq_be_from_montgomery(buf, &mont);
 }
 
 /// Write an Fq element (Montgomery form) as 32 bytes big-endian canonical.
