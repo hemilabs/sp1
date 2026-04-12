@@ -9,19 +9,15 @@ keywords.workspace = true
 categories.workspace = true
 
 [features]
-cuda = ["sp1-gpu-sys"]
+cuda = ["sp1-gpu-sys", "sp1-gpu-plonk/cuda"]
 
 [dependencies]
-sha2 = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
 rayon = { workspace = true }
 rand = { workspace = true }
 sp1-gpu-sys = { workspace = true, optional = true }
 sp1-gpu-plonk = { path = "../plonk" }
-
-[dev-dependencies]
-num-bigint = { workspace = true }
 
 [lints]
 workspace = true

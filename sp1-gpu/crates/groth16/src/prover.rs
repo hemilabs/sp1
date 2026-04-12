@@ -326,27 +326,17 @@ impl Groth16Prover {
         domain.cpu_coset_ifft(&h_coset, &coset_shift)
     }
 
-    /// Run a G1 MSM using the GPU (or CPU fallback).
+    /// Run a G1 MSM using GPU (via plonk's msm dispatcher) or CPU fallback.
     fn g1_msm(&self, bases: &[BN254G1Affine], scalars: &[Fr]) -> G1Jacobian {
         let n = bases.len().min(scalars.len());
         if n == 0 {
             return G1Jacobian::INFINITY;
         }
-
-        #[cfg(feature = "cuda")]
-        {
-            use sp1_gpu_plonk::g1::msm;
-            let bases_g1: Vec<G1Affine> =
-                bases[..n].par_iter().map(G1Affine::from_bn254).collect();
-            msm(&bases_g1[..n], &scalars[..n])
-        }
-        #[cfg(not(feature = "cuda"))]
-        {
-            use sp1_gpu_plonk::g1::msm;
-            let bases_g1: Vec<G1Affine> =
-                bases[..n].par_iter().map(G1Affine::from_bn254).collect();
-            msm(&bases_g1[..n], &scalars[..n])
-        }
+        // plonk::g1::msm dispatches to GPU (sppark/HIP) or CPU based on plonk's cuda feature
+        use sp1_gpu_plonk::g1::msm;
+        let bases_g1: Vec<G1Affine> =
+            bases[..n].par_iter().map(G1Affine::from_bn254).collect();
+        msm(&bases_g1[..n], &scalars[..n])
     }
 }
 
