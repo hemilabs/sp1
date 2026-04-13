@@ -106,7 +106,7 @@ if(USE_HIP)
     add_subdirectory(lib/merkle_tree)
     add_subdirectory(lib/mle)
     add_subdirectory(lib/ntt)
-    # add_subdirectory(lib/ntt_bn254_rdna3)  # Custom NTT: correct proofs, slower than sppark (needs optimization)
+    # add_subdirectory(lib/ntt_bn254_rdna3)  # Compiled via lib/ntt/ CMakeLists when USE_HIP=ON
     add_subdirectory(lib/runtime)
     add_subdirectory(lib/scan)
     add_subdirectory(lib/sum_and_reduce)

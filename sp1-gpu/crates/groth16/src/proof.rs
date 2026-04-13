@@ -36,9 +36,21 @@ impl Groth16Proof {
     }
 
     /// Serialize for Solidity verification (Ethereum ABI encoding).
-    /// Format: Ar.X, Ar.Y, Bs.X[1], Bs.X[0], Bs.Y[1], Bs.Y[0], Krs.X, Krs.Y, [Commitments], CommitmentPok
-    /// All as uint256 big-endian.
+    /// Always produces exactly 256 bytes: Ar.X, Ar.Y, Bs.X[1], Bs.X[0], Bs.Y[1], Bs.Y[0],
+    /// Krs.X, Krs.Y — all as uint256 big-endian.
+    ///
+    /// SP1's on-chain Groth16 verifier expects exactly GROTH16_PROOF_LENGTH (256) bytes and
+    /// does not support BSB22 commitments. The `assert!` panics (in both debug and release
+    /// builds) if the circuit ever adds commitments, so the failure mode is a loud prover-side
+    /// panic rather than a silent on-chain `InvalidData` rejection. Extending the verifier is
+    /// required before this assertion can be relaxed.
     pub fn to_solidity_bytes(&self) -> Vec<u8> {
+        assert!(
+            self.commitments.is_empty(),
+            "SP1 Groth16 verifier expects exactly 256 bytes (0 BSB22 commitments); \
+             got {} commitments. Extending the verifier is required before adding commitments.",
+            self.commitments.len(),
+        );
         let mut buf = Vec::new();
 
         // Ar (2 x 32 bytes)
@@ -53,16 +65,15 @@ impl Groth16Proof {
         write_fq_be_canonical(&mut buf, &self.krs.x);
         write_fq_be_canonical(&mut buf, &self.krs.y);
 
-        // Commitments
-        for c in &self.commitments {
-            write_fq_be_canonical(&mut buf, &c.x);
-            write_fq_be_canonical(&mut buf, &c.y);
-        }
-
-        // CommitmentPok
-        write_fq_be_canonical(&mut buf, &self.commitment_pok.x);
-        write_fq_be_canonical(&mut buf, &self.commitment_pok.y);
-
+        // No commitments / CommitmentPok — assert above guarantees self.commitments is empty.
+        // gnark's MarshalSolidity truncates to 8*32=256 bytes when len(Commitments)==0, and
+        // SP1's verifier expects exactly GROTH16_PROOF_LENGTH (256) bytes.
+        debug_assert_eq!(
+            buf.len(),
+            256,
+            "to_solidity_bytes produced {} bytes, expected 256",
+            buf.len()
+        );
         buf
     }
 }
@@ -101,7 +112,7 @@ fn write_fq_be_from_montgomery(buf: &mut Vec<u8>, fq: &Fq) {
     buf.extend_from_slice(&bytes);
 }
 
-/// Write Fq2 in Solidity order: A1 first, then A0 (reversed from gnark's raw order).
+/// Write Fq2 as A1 first, then A0 (same as gnark's raw order and Ethereum pairing precompile).
 fn write_fq2_be_canonical_solidity(buf: &mut Vec<u8>, fq2: &Fq2) {
     write_fq_be_from_montgomery(buf, &fq2.c1); // A1 first for Solidity
     write_fq_be_from_montgomery(buf, &fq2.c0); // A0 second

@@ -13,9 +13,8 @@ use sp1_gpu_cudart::{
     sys::{
         merkle_tree::{
             compress_batched_merkle_tree_bn254_kernel,
-            compress_batched_merkle_tree_koala_bear_16_kernel,
-            compress_merkle_tree_bn254_kernel, compress_merkle_tree_koala_bear_16_kernel,
-            compute_openings_merkle_tree_bn254_kernel,
+            compress_batched_merkle_tree_koala_bear_16_kernel, compress_merkle_tree_bn254_kernel,
+            compress_merkle_tree_koala_bear_16_kernel, compute_openings_merkle_tree_bn254_kernel,
             compute_openings_merkle_tree_koala_bear_16_kernel,
             compute_paths_merkle_tree_bn254_kernel, compute_paths_merkle_tree_koala_bear_16_kernel,
             leaf_hash_merkle_tree_bn254_kernel, leaf_hash_merkle_tree_koala_bear_16_kernel,
@@ -155,20 +154,10 @@ where
             let grid_dim: Dim3 = (1u32, 1, 1).into();
             let start_layer = batch_start - 1; // highest small layer (inclusive)
             let end_layer = 0u32; // lowest layer (inclusive)
-            let args = args!(
-                hasher_device.as_raw(),
-                tree.digests.as_mut_ptr(),
-                start_layer,
-                end_layer
-            );
+            let args =
+                args!(hasher_device.as_raw(), tree.digests.as_mut_ptr(), start_layer, end_layer);
             unsafe {
-                scope.launch_kernel(
-                    K::compress_batched_kernel(),
-                    grid_dim,
-                    block_dim,
-                    &args,
-                    0,
-                )?;
+                scope.launch_kernel(K::compress_batched_kernel(), grid_dim, block_dim, &args, 0)?;
             }
         }
 

@@ -33,9 +33,17 @@ sp1-gpu-groth16 = { path = "../../../sp1-gpu/crates/groth16" }
 bindgen = { workspace = true }
 cfg-if = { workspace = true }
 
+[dev-dependencies]
+dirs = "5.0.1"
+
+[[example]]
+name = "bench_groth16"
+required-features = ["native"]
+
 [features]
 native = []
 groth16-cuda = []
+cuda = ["sp1-gpu-groth16/cuda"]
 
 [lints]
 workspace = true

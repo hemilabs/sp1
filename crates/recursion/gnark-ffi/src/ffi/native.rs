@@ -5,12 +5,8 @@
 //! Although we cast to *mut c_char because the Go signatures can't be immutable, the Go functions
 //! should not modify the strings.
 
-use crate::{Groth16Bn254Proof, PlonkBn254Proof, SP1_CIRCUIT_VERSION};
-use cfg_if::cfg_if;
-use std::{
-    ffi::{c_char, CStr, CString},
-    mem::forget,
-};
+use crate::{Groth16Bn254Proof, PlonkBn254Proof};
+use std::ffi::{c_char, CStr, CString};
 
 #[allow(warnings, clippy::all)]
 mod bind {

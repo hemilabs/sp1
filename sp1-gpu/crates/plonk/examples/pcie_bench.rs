@@ -11,14 +11,14 @@ fn main() {
     }
 
     let sizes: Vec<usize> = vec![
-        1 << 20,       // 1 MiB
-        4 << 20,       // 4 MiB
-        16 << 20,      // 16 MiB
-        64 << 20,      // 64 MiB
-        256 << 20,     // 256 MiB
-        1 << 30,       // 1 GiB
-        2usize << 30,  // 2 GiB
-        4usize << 30,  // 4 GiB
+        1 << 20,      // 1 MiB
+        4 << 20,      // 4 MiB
+        16 << 20,     // 16 MiB
+        64 << 20,     // 64 MiB
+        256 << 20,    // 256 MiB
+        1 << 30,      // 1 GiB
+        2usize << 30, // 2 GiB
+        4usize << 30, // 4 GiB
     ];
 
     println!("PCIe Bandwidth Benchmark");
@@ -49,8 +49,7 @@ fn main() {
     for &size in &sizes {
         // Allocate device buffer
         let mut d_ptr: *mut c_void = std::ptr::null_mut();
-        let err =
-            unsafe { sp1_gpu_sys::runtime::cuda_malloc(&mut d_ptr as *mut _, size) };
+        let err = unsafe { sp1_gpu_sys::runtime::cuda_malloc(&mut d_ptr as *mut _, size) };
         if err != unsafe { sp1_gpu_sys::runtime::CUDA_SUCCESS_CSL } {
             println!("{:>10} SKIP (OOM)", format_size(size));
             continue;
@@ -81,10 +80,7 @@ fn main() {
 
         // --- Pin the host buffer ---
         unsafe {
-            sp1_gpu_sys::runtime::cuda_host_register(
-                h_buf.as_ptr() as *const c_void,
-                size,
-            );
+            sp1_gpu_sys::runtime::cuda_host_register(h_buf.as_ptr() as *const c_void, size);
         }
 
         // --- H2D pinned ---

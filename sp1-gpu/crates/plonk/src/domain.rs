@@ -627,9 +627,7 @@ pub(crate) mod gpu_ntt {
             panic!("H2D failed for fused ifft+coset_fft");
         }
 
-        let err = unsafe {
-            sp1_gpu_sys::dft_bn254::batch_iNTT_bn254(d_scratch, lg_n, 1, stream)
-        };
+        let err = unsafe { sp1_gpu_sys::dft_bn254::batch_iNTT_bn254(d_scratch, lg_n, 1, stream) };
         if err != unsafe { sp1_gpu_sys::runtime::CUDA_SUCCESS_CSL } {
             panic!("GPU iNTT failed in fused ifft+coset_fft");
         }
@@ -665,9 +663,8 @@ pub(crate) mod gpu_ntt {
             panic!("cuda_mem_set failed for zero-pad in fused ifft+coset_fft");
         }
 
-        let err = unsafe {
-            sp1_gpu_sys::dft_bn254::batch_coset_NTT_bn254(d_scratch, lg_4n, 1, stream)
-        };
+        let err =
+            unsafe { sp1_gpu_sys::dft_bn254::batch_coset_NTT_bn254(d_scratch, lg_4n, 1, stream) };
         if err != unsafe { sp1_gpu_sys::runtime::CUDA_SUCCESS_CSL } {
             panic!("GPU coset NTT failed in fused ifft+coset_fft");
         }

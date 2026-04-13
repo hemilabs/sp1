@@ -561,6 +561,7 @@ checksum = "d69eab57e8d2663efa5c63135b2af4f396d66424f88954c21104125ab6b3e6bc"
 dependencies = [
  "ark-ec",
  "ark-ff 0.5.0",
+ "ark-r1cs-std",
  "ark-std 0.5.0",
 ]
 
@@ -777,6 +778,23 @@ dependencies = [
  "fnv",
  "hashbrown 0.15.5",
  "rayon",
+]
+
+[[package]]
+name = "ark-r1cs-std"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "941551ef1df4c7a401de7068758db6503598e6f01850bdb2cfdb614a1f9dbea1"
+dependencies = [
+ "ark-ec",
+ "ark-ff 0.5.0",
+ "ark-relations",
+ "ark-std 0.5.0",
+ "educe",
+ "num-bigint 0.4.6",
+ "num-integer",
+ "num-traits",
+ "tracing",
 ]
 
 [[package]]
@@ -6933,6 +6951,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "sp1-gpu-groth16"
+version = "6.0.2"
+dependencies = [
+ "anyhow",
+ "ark-bn254",
+ "ark-ec",
+ "ark-ff 0.5.0",
+ "ark-serialize 0.5.0",
+ "rand 0.8.5",
+ "rayon",
+ "sp1-gpu-plonk",
+ "sp1-gpu-sys",
+ "tracing",
+]
+
+[[package]]
 name = "sp1-gpu-jagged-assist"
 version = "6.0.2"
 dependencies = [
@@ -7675,6 +7709,7 @@ dependencies = [
  "bincode",
  "bindgen",
  "cfg-if",
+ "dirs",
  "hex",
  "num-bigint 0.4.6",
  "serde",
@@ -7682,6 +7717,7 @@ dependencies = [
  "sha2",
  "slop-algebra",
  "slop-symmetric",
+ "sp1-gpu-groth16",
  "sp1-hypercube",
  "sp1-primitives",
  "sp1-recursion-compiler",

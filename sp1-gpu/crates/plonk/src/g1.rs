@@ -8,6 +8,7 @@ use crate::{BN254G1Affine, BN254G1Jacobian};
 
 /// G1 affine point with Fq coordinates (Montgomery form).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(C)]
 pub struct G1Affine {
     pub x: Fq,
     pub y: Fq,
@@ -15,6 +16,7 @@ pub struct G1Affine {
 
 /// G1 Jacobian point: (X, Y, Z) where affine (x,y) = (X/Z², Y/Z³).
 #[derive(Clone, Copy, Debug)]
+#[repr(C)]
 pub struct G1Jacobian {
     pub x: Fq,
     pub y: Fq,

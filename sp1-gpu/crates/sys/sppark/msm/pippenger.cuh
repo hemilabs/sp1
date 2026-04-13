@@ -153,10 +153,12 @@ void breakdown(vec2d_t<uint32_t> digits, const scalar_t scalars[], size_t len,
 
 // On HIP/RDNA4, the integrate kernel with 256-bit EC arithmetic needs
 // many VGPRs. Use moderate block size for latency hiding.
-#ifdef __HIPCC__
-# define MSM_INTEGRATE_NTHREADS 128
-#else
-# define MSM_INTEGRATE_NTHREADS MSM_NTHREADS
+#ifndef MSM_INTEGRATE_NTHREADS
+# ifdef __HIPCC__
+#  define MSM_INTEGRATE_NTHREADS 128
+# else
+#  define MSM_INTEGRATE_NTHREADS MSM_NTHREADS
+# endif
 #endif
 #ifndef MSM_NSTREAMS
 # define MSM_NSTREAMS 8

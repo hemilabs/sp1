@@ -82,4 +82,47 @@ extern "C" {
 
     /// Destroy a persistent MSM context, freeing GPU resources.
     pub fn sp1_bn254_msm_destroy(ctx: *mut c_void);
+
+    // ========================================================================
+    // G2 MSM (sppark-templated, CUDA-only)
+    // ========================================================================
+
+    /// Compute BN254 G2 MSM: result = sum(scalars[i] * points[i]).
+    ///
+    /// # Arguments
+    /// * `result` - Host pointer to Jacobian G2 point (3 × 2 × 8 × u32 = 192 bytes).
+    /// * `points` - Host pointer to affine G2 points (npoints × 128 bytes each).
+    ///   Coordinates (Fq2) are in Montgomery form; layout (X.c0, X.c1, Y.c0, Y.c1).
+    /// * `npoints` - Number of point-scalar pairs.
+    /// * `scalars` - Host pointer to BN254 Fr scalars (npoints × 32 bytes each),
+    ///   in canonical (non-Montgomery) form.
+    /// * `ffi_affine_sz` - Size of one affine point in bytes (128 for G2).
+    pub fn sp1_bn254_g2_msm(
+        result: *mut c_void,
+        points: *const c_void,
+        npoints: usize,
+        scalars: *const c_void,
+        ffi_affine_sz: usize,
+        mont: bool,
+    ) -> CudaRustError;
+
+    /// Create a persistent G2 MSM context with SRS points pre-uploaded to GPU.
+    pub fn sp1_bn254_g2_msm_create(
+        ctx_out: *mut *mut c_void,
+        points: *const c_void,
+        npoints: usize,
+        ffi_affine_sz: usize,
+    ) -> CudaRustError;
+
+    /// Run G2 MSM using a persistent context. Only uploads scalars.
+    pub fn sp1_bn254_g2_msm_invoke(
+        ctx: *mut c_void,
+        result: *mut c_void,
+        npoints: usize,
+        scalars: *const c_void,
+        mont: bool,
+    ) -> CudaRustError;
+
+    /// Destroy a persistent G2 MSM context.
+    pub fn sp1_bn254_g2_msm_destroy(ctx: *mut c_void);
 }

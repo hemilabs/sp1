@@ -675,8 +675,12 @@ __global__ void bn254_h_poly_kernel(
 extern "C"
 void bn254_h_poly_pointwise(void* d_a, const void* d_b, const void* d_c,
                              const void* h_den, size_t n) {
-    fr_t den;
-    memcpy(&den, h_den, sizeof(fr_t));
+    // `fr_t`'s default constructor is __device__-only on sppark, so zero-
+    // initialize as bytes and then memcpy the caller-provided Montgomery scalar
+    // on top. This avoids invoking the device-only ctor from host code.
+    alignas(fr_t) unsigned char den_storage[sizeof(fr_t)] = {0};
+    memcpy(den_storage, h_den, sizeof(fr_t));
+    fr_t den = *reinterpret_cast<fr_t*>(den_storage);
     uint32_t threads = 256;
     uint32_t blocks = ((uint32_t)n + threads - 1) / threads;
     bn254_h_poly_kernel<<<blocks, threads>>>(

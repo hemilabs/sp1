@@ -106,13 +106,17 @@ async fn main() {
             tracing::info!("proof time: {:?}", proof_time);
 
             let (num_shards, cycles) = if let SP1Proof::Core(ref shard_proofs) = &proof.proof {
-                use std::borrow::Borrow;
                 use sp1_hypercube::air::PublicValues;
-                let max_ts = shard_proofs.iter().map(|p| {
-                    let pv: &PublicValues<[_; 4], [_; 3], [_; 4], _> =
-                        p.public_values.as_slice().borrow();
-                    pv.range().timestamp_range.1
-                }).max().unwrap_or(0);
+                use std::borrow::Borrow;
+                let max_ts = shard_proofs
+                    .iter()
+                    .map(|p| {
+                        let pv: &PublicValues<[_; 4], [_; 3], [_; 4], _> =
+                            p.public_values.as_slice().borrow();
+                        pv.range().timestamp_range.1
+                    })
+                    .max()
+                    .unwrap_or(0);
                 (shard_proofs.len(), max_ts as usize)
             } else {
                 (0, 0)

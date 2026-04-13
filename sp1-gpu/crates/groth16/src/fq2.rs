@@ -7,6 +7,7 @@ use sp1_gpu_plonk::fields::Fq;
 
 /// Element of Fq2 = Fq[u] / (u^2 + 1).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(C)]
 pub struct Fq2 {
     pub c0: Fq,
     pub c1: Fq,
@@ -29,28 +30,19 @@ impl Fq2 {
     /// Addition: (a0+a1*u) + (b0+b1*u) = (a0+b0) + (a1+b1)*u
     #[inline]
     pub fn add(&self, other: &Self) -> Self {
-        Self {
-            c0: self.c0 + other.c0,
-            c1: self.c1 + other.c1,
-        }
+        Self { c0: self.c0 + other.c0, c1: self.c1 + other.c1 }
     }
 
     /// Subtraction: (a0+a1*u) - (b0+b1*u) = (a0-b0) + (a1-b1)*u
     #[inline]
     pub fn sub(&self, other: &Self) -> Self {
-        Self {
-            c0: self.c0 - other.c0,
-            c1: self.c1 - other.c1,
-        }
+        Self { c0: self.c0 - other.c0, c1: self.c1 - other.c1 }
     }
 
     /// Negation: -(a0+a1*u) = (-a0) + (-a1)*u
     #[inline]
     pub fn neg(&self) -> Self {
-        Self {
-            c0: -self.c0,
-            c1: -self.c1,
-        }
+        Self { c0: -self.c0, c1: -self.c1 }
     }
 
     /// Multiplication using Karatsuba:
@@ -78,10 +70,7 @@ impl Fq2 {
     /// Double: 2*(a0+a1*u) = 2*a0 + 2*a1*u
     #[inline]
     pub fn double(&self) -> Self {
-        Self {
-            c0: self.c0 + self.c0,
-            c1: self.c1 + self.c1,
-        }
+        Self { c0: self.c0 + self.c0, c1: self.c1 + self.c1 }
     }
 
     /// Inverse: 1/(a0+a1*u) = (a0-a1*u) / (a0^2+a1^2)
@@ -93,10 +82,7 @@ impl Fq2 {
             return None;
         }
         let norm_inv = norm.inv();
-        Some(Self {
-            c0: self.c0 * norm_inv,
-            c1: -(self.c1 * norm_inv),
-        })
+        Some(Self { c0: self.c0 * norm_inv, c1: -(self.c1 * norm_inv) })
     }
 
     /// Multiply by non-residue for sextic twist: multiply by (9+u)
@@ -112,52 +98,60 @@ impl Fq2 {
         let nine_a0 = a0_8 + t0;
         let a1_8 = t1.double().double().double();
         let nine_a1 = a1_8 + t1;
-        Self {
-            c0: nine_a0 - t1,
-            c1: t0 + nine_a1,
-        }
+        Self { c0: nine_a0 - t1, c1: t0 + nine_a1 }
     }
 
     /// Conjugate: conj(a0+a1*u) = a0 - a1*u
     #[inline]
     pub fn conjugate(&self) -> Self {
-        Self {
-            c0: self.c0,
-            c1: -self.c1,
-        }
+        Self { c0: self.c0, c1: -self.c1 }
     }
 }
 
 impl std::ops::Add for Fq2 {
     type Output = Self;
-    fn add(self, rhs: Self) -> Self { Fq2::add(&self, &rhs) }
+    fn add(self, rhs: Self) -> Self {
+        Fq2::add(&self, &rhs)
+    }
 }
 
 impl std::ops::Sub for Fq2 {
     type Output = Self;
-    fn sub(self, rhs: Self) -> Self { Fq2::sub(&self, &rhs) }
+    fn sub(self, rhs: Self) -> Self {
+        Fq2::sub(&self, &rhs)
+    }
 }
 
 impl std::ops::Mul for Fq2 {
     type Output = Self;
-    fn mul(self, rhs: Self) -> Self { Fq2::mul(&self, &rhs) }
+    fn mul(self, rhs: Self) -> Self {
+        Fq2::mul(&self, &rhs)
+    }
 }
 
 impl std::ops::Neg for Fq2 {
     type Output = Self;
-    fn neg(self) -> Self { Fq2::neg(&self) }
+    fn neg(self) -> Self {
+        Fq2::neg(&self)
+    }
 }
 
 impl std::ops::AddAssign for Fq2 {
-    fn add_assign(&mut self, rhs: Self) { *self = *self + rhs; }
+    fn add_assign(&mut self, rhs: Self) {
+        *self = *self + rhs;
+    }
 }
 
 impl std::ops::SubAssign for Fq2 {
-    fn sub_assign(&mut self, rhs: Self) { *self = *self - rhs; }
+    fn sub_assign(&mut self, rhs: Self) {
+        *self = *self - rhs;
+    }
 }
 
 impl std::ops::MulAssign for Fq2 {
-    fn mul_assign(&mut self, rhs: Self) { *self = *self * rhs; }
+    fn mul_assign(&mut self, rhs: Self) {
+        *self = *self * rhs;
+    }
 }
 
 #[cfg(test)]

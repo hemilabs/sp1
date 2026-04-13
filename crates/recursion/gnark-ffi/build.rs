@@ -36,6 +36,7 @@ fn main() {
 
             if cfg!(feature = "groth16-cuda") {
                 println!("cargo:rustc-link-search=native=/usr/local/lib");
+                println!("cargo:rustc-link-search=native=/home/max/icicle-install/usr/local/lib");
                 println!("cargo:rustc-link-lib=dylib=icicle_device");
                 println!("cargo:rustc-link-lib=dylib=icicle_field_bn254");
                 println!("cargo:rustc-link-lib=dylib=icicle_curve_bn254");

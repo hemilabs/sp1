@@ -19,5 +19,12 @@ rand = { workspace = true }
 sp1-gpu-sys = { workspace = true, optional = true }
 sp1-gpu-plonk = { path = "../plonk" }
 
+# For fast BN254 G2 MSM — arkworks' VariableBaseMSM is a production-grade
+# batch-affine Pippenger parallelized via rayon.
+ark-bn254 = { version = "0.5", default-features = false, features = ["std", "curve"] }
+ark-ec = { version = "0.5", default-features = false, features = ["parallel"] }
+ark-ff = { version = "0.5", default-features = false, features = ["parallel"] }
+ark-serialize = { version = "0.5", default-features = false }
+
 [lints]
 workspace = true

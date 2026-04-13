@@ -75,11 +75,7 @@ impl Groth16Bn254Prover {
     /// 2. Rust GPU prover computes H polynomial (7 NTTs) + 4 G1 MSMs + 1 G2 MSM
     /// 3. Proof is serialized in gnark-compatible format
     #[cfg(feature = "native")]
-    pub fn prove_gpu<C: Config>(
-        &self,
-        witness: Witness<C>,
-        build_dir: &Path,
-    ) -> Groth16Bn254Proof {
+    pub fn prove_gpu<C: Config>(&self, witness: Witness<C>, build_dir: &Path) -> Groth16Bn254Proof {
         use crate::ffi::{export_groth16_gpu_data, export_groth16_gpu_witness};
 
         // Write witness to temp file for Go
@@ -113,9 +109,7 @@ impl Groth16Bn254Prover {
         // GPU prove
         tracing::info!("Running GPU Groth16 prover...");
         let prover = sp1_gpu_groth16::prover::Groth16Prover::new(proving_data);
-        let gpu_proof = prover
-            .prove(&witness_data)
-            .expect("GPU Groth16 prove failed");
+        let gpu_proof = prover.prove(&witness_data).expect("GPU Groth16 prove failed");
 
         // Convert to Groth16Bn254Proof format
         let raw_proof_bytes = gpu_proof.to_raw_bytes();
@@ -138,8 +132,10 @@ impl Groth16Bn254Prover {
         let solidity_proof_bytes = gpu_proof.to_solidity_bytes();
         let mut encoded_bytes = Vec::with_capacity(96 + solidity_proof_bytes.len());
         // Prepend exit_code, vk_root, proof_nonce as 32-byte BE uint256
-        for field in [&gnark_witness.exit_code, &gnark_witness.vk_root, &gnark_witness.proof_nonce] {
-            let val = field.parse::<num_bigint::BigUint>().unwrap_or_default();
+        for field in [&gnark_witness.exit_code, &gnark_witness.vk_root, &gnark_witness.proof_nonce]
+        {
+            let val =
+                field.parse::<BigUint>().expect("failed to parse public input field as BigUint");
             let be_bytes = val.to_bytes_be();
             // Pad to 32 bytes
             let padding = 32usize.saturating_sub(be_bytes.len());

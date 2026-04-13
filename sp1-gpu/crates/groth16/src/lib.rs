@@ -10,8 +10,8 @@
 pub mod fq2;
 pub mod g2;
 pub mod proof;
-pub mod types;
 pub mod prover;
+pub mod types;
 
 // Re-export core types from plonk crate
 pub use sp1_gpu_plonk::fields::{Fq, Fr};

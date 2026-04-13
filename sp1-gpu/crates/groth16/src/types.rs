@@ -6,6 +6,7 @@
 use crate::fq2::Fq2;
 use crate::g2::G2Affine;
 use crate::{BN254Fr, BN254G1Affine, Fq, Fr};
+use rayon::prelude::*;
 
 /// Groth16 proving data loaded from exported binary files.
 pub struct Groth16ProvingData {
@@ -30,6 +31,9 @@ pub struct Groth16ProvingData {
 
     /// Proving key G2 points
     pub pk_g2_b: Vec<G2Affine>,
+    /// Pre-converted arkworks G2 bases for fast MSM. Converted once at load
+    /// time to avoid paying the ~6s Fq→ark-Fq conversion on every proof.
+    pub pk_g2_b_ark: Vec<ark_bn254::G2Affine>,
 
     /// Scalar proving key elements
     pub pk_g1_alpha: BN254G1Affine,
@@ -51,8 +55,9 @@ pub struct Groth16ProvingData {
 
 /// Solved Groth16 witness data (exported from gnark R1CS solver).
 pub struct Groth16WitnessData {
-    /// All wire values (public + private)
-    pub wire_values: Vec<BN254Fr>,
+    /// All wire values (public + private), pre-converted to Montgomery Fr at
+    /// load time to avoid ~350ms per-proof conversion in the hot prove path.
+    pub wire_values: Vec<Fr>,
     /// A constraint evaluation vector
     pub solution_a: Vec<BN254Fr>,
     /// B constraint evaluation vector
@@ -123,7 +128,39 @@ impl Groth16ProvingData {
             k_wire_filter.push(read_u64(&meta, &mut off) as usize);
         }
 
+        // Domain sanity: must be a non-zero power of two so trailing_zeros(), `domain_size - 1`,
+        // and all downstream NTT indexing are well-defined.
+        anyhow::ensure!(
+            domain_size > 0 && domain_size.is_power_of_two(),
+            "domain_size ({domain_size}) must be a non-zero power of two",
+        );
+        anyhow::ensure!(
+            nb_wires >= nb_public,
+            "nb_wires ({nb_wires}) must be >= nb_public ({nb_public})",
+        );
+        anyhow::ensure!(
+            nb_infinity_a <= nb_wires,
+            "nb_infinity_a ({nb_infinity_a}) must be <= nb_wires ({nb_wires})",
+        );
+        anyhow::ensure!(
+            nb_infinity_b <= nb_wires,
+            "nb_infinity_b ({nb_infinity_b}) must be <= nb_wires ({nb_wires})",
+        );
+
         let lg_domain_size = domain_size.trailing_zeros();
+
+        // Cross-validate nb_infinity_{a,b} counters against the infinity masks to
+        // detect metadata/export corruption early.
+        let mask_infinity_a = infinity_a.iter().filter(|b| **b).count();
+        let mask_infinity_b = infinity_b.iter().filter(|b| **b).count();
+        anyhow::ensure!(
+            mask_infinity_a == nb_infinity_a,
+            "infinity_a mask count ({mask_infinity_a}) does not match nb_infinity_a ({nb_infinity_a})",
+        );
+        anyhow::ensure!(
+            mask_infinity_b == nb_infinity_b,
+            "infinity_b mask count ({mask_infinity_b}) does not match nb_infinity_b ({nb_infinity_b})",
+        );
 
         // Load PK G1 points
         let pk_g1_a = load_g1_points(&dir.join("pk_g1_a.bin"))?;
@@ -131,15 +168,74 @@ impl Groth16ProvingData {
         let pk_g1_z = load_g1_points(&dir.join("pk_g1_z.bin"))?;
         let pk_g1_k = load_g1_points(&dir.join("pk_g1_k.bin"))?;
 
+        // Validate PK sizes against metadata so a length mismatch surfaces here rather
+        // than as an MSM-time `assert_eq!` panic.
+        anyhow::ensure!(
+            pk_g1_a.len() == nb_wires - nb_infinity_a,
+            "pk_g1_a.len() ({}) != nb_wires - nb_infinity_a ({} - {} = {})",
+            pk_g1_a.len(),
+            nb_wires,
+            nb_infinity_a,
+            nb_wires - nb_infinity_a,
+        );
+        anyhow::ensure!(
+            pk_g1_b.len() == nb_wires - nb_infinity_b,
+            "pk_g1_b.len() ({}) != nb_wires - nb_infinity_b ({} - {} = {})",
+            pk_g1_b.len(),
+            nb_wires,
+            nb_infinity_b,
+            nb_wires - nb_infinity_b,
+        );
+        anyhow::ensure!(
+            pk_g1_z.len() == domain_size - 1,
+            "pk_g1_z.len() ({}) != domain_size - 1 ({})",
+            pk_g1_z.len(),
+            domain_size - 1,
+        );
+        // pk_g1_k length matches gnark setup: nbWires - nbPublic - len(k_wire_filter),
+        // where k_wire_filter is PrivateCommitted wires + CommitmentIndex wires.
+        let expected_k_len = nb_wires - nb_public - k_wire_filter.len();
+        anyhow::ensure!(
+            pk_g1_k.len() == expected_k_len,
+            "pk_g1_k.len() ({}) != nb_wires - nb_public - k_wire_filter.len() ({} - {} - {} = {})",
+            pk_g1_k.len(),
+            nb_wires,
+            nb_public,
+            k_wire_filter.len(),
+            expected_k_len,
+        );
+
         // Load PK G2 points
         let pk_g2_b = load_g2_points(&dir.join("pk_g2_b.bin"))?;
+        anyhow::ensure!(
+            pk_g2_b.len() == nb_wires - nb_infinity_b,
+            "pk_g2_b.len() ({}) != nb_wires - nb_infinity_b ({} - {} = {})",
+            pk_g2_b.len(),
+            nb_wires,
+            nb_infinity_b,
+            nb_wires - nb_infinity_b,
+        );
+        // Pre-convert G2 bases to arkworks format (pays ~6s one-time, saves ~6s
+        // on every proof). Parallel conversion.
+        let t = std::time::Instant::now();
+        let pk_g2_b_ark = crate::g2::g2_affine_to_ark_batch(&pk_g2_b);
+        eprintln!("[groth16-load] pk_g2_b → arkworks conversion: {:?}", t.elapsed());
 
-        // Load scalar PK elements
+        // Load scalar PK elements (each file must contain exactly one point).
         let alpha_pts = load_g1_points(&dir.join("pk_g1_alpha.bin"))?;
         let beta_pts = load_g1_points(&dir.join("pk_g1_beta.bin"))?;
         let delta_pts = load_g1_points(&dir.join("pk_g1_delta.bin"))?;
         let g2_beta_pts = load_g2_points(&dir.join("pk_g2_beta.bin"))?;
         let g2_delta_pts = load_g2_points(&dir.join("pk_g2_delta.bin"))?;
+        for (name, len) in [
+            ("pk_g1_alpha.bin", alpha_pts.len()),
+            ("pk_g1_beta.bin", beta_pts.len()),
+            ("pk_g1_delta.bin", delta_pts.len()),
+            ("pk_g2_beta.bin", g2_beta_pts.len()),
+            ("pk_g2_delta.bin", g2_delta_pts.len()),
+        ] {
+            anyhow::ensure!(len == 1, "{name} must contain exactly 1 point, got {len}");
+        }
 
         Ok(Self {
             domain_size,
@@ -153,6 +249,7 @@ impl Groth16ProvingData {
             pk_g1_z,
             pk_g1_k,
             pk_g2_b,
+            pk_g2_b_ark,
             pk_g1_alpha: alpha_pts[0],
             pk_g1_beta: beta_pts[0],
             pk_g1_delta: delta_pts[0],
@@ -171,7 +268,14 @@ impl Groth16WitnessData {
     pub fn load(dir: &str) -> anyhow::Result<Self> {
         let dir = std::path::Path::new(dir);
 
-        let wire_values = load_fr_elements(&dir.join("wire_values.bin"))?;
+        // Pre-convert wire_values from canonical BN254Fr to Montgomery Fr at load
+        // time. This moves ~350ms of per-proof CPU work to the one-time load path.
+        let wire_values_raw = load_fr_elements(&dir.join("wire_values.bin"))?;
+        let wire_values: Vec<Fr> = wire_values_raw
+            .par_iter()
+            .map(Fr::from_bn254fr)
+            .collect();
+        drop(wire_values_raw);
         let solution_a = load_fr_elements(&dir.join("solution_a.bin"))?;
         let solution_b = load_fr_elements(&dir.join("solution_b.bin"))?;
         let solution_c = load_fr_elements(&dir.join("solution_c.bin"))?;
@@ -185,22 +289,21 @@ impl Groth16WitnessData {
         let commitment_pok = if dir.join("commitment_pok.bin").exists() {
             let pts = load_g1_points(&dir.join("commitment_pok.bin"))?;
             if pts.is_empty() {
-                BN254G1Affine { x: crate::BN254Fq { limbs: [0; 8] }, y: crate::BN254Fq { limbs: [0; 8] } }
+                BN254G1Affine {
+                    x: crate::BN254Fq { limbs: [0; 8] },
+                    y: crate::BN254Fq { limbs: [0; 8] },
+                }
             } else {
                 pts[0]
             }
         } else {
-            BN254G1Affine { x: crate::BN254Fq { limbs: [0; 8] }, y: crate::BN254Fq { limbs: [0; 8] } }
+            BN254G1Affine {
+                x: crate::BN254Fq { limbs: [0; 8] },
+                y: crate::BN254Fq { limbs: [0; 8] },
+            }
         };
 
-        Ok(Self {
-            wire_values,
-            solution_a,
-            solution_b,
-            solution_c,
-            commitments,
-            commitment_pok,
-        })
+        Ok(Self { wire_values, solution_a, solution_b, solution_c, commitments, commitment_pok })
     }
 }
 
@@ -244,10 +347,7 @@ fn load_g1_points(path: &std::path::Path) -> anyhow::Result<Vec<BN254G1Affine>> 
         }
         let mont_x = Fq::from_bn254fq_canonical(&canonical_x);
         let mont_y = Fq::from_bn254fq_canonical(&canonical_y);
-        points.push(BN254G1Affine {
-            x: mont_x.to_bn254fq_raw(),
-            y: mont_y.to_bn254fq_raw(),
-        });
+        points.push(BN254G1Affine { x: mont_x.to_bn254fq_raw(), y: mont_y.to_bn254fq_raw() });
     }
     Ok(points)
 }
@@ -264,7 +364,7 @@ fn load_g2_points(path: &std::path::Path) -> anyhow::Result<Vec<G2Affine>> {
     let mut points = Vec::with_capacity(n);
     for i in 0..n {
         let offset = i * 128;
-        // Each G2 point: X.c0(32) + X.c1(32) + Y.c0(32) + Y.c1(32), LE canonical
+        // Each G2 point: [X.A1_LE, X.A0_LE, Y.A1_LE, Y.A0_LE] (A1 first), 32 bytes each
         let load_fq = |off: usize| -> Fq {
             let mut canonical = crate::BN254Fq { limbs: [0; 8] };
             unsafe {
@@ -279,8 +379,8 @@ fn load_g2_points(path: &std::path::Path) -> anyhow::Result<Vec<G2Affine>> {
         // gnark G2Affine.RawBytes() serializes as [X.A1, X.A0, Y.A1, Y.A0] (each 32 bytes).
         // After reverseBytes: file layout is [X.A1_LE, X.A0_LE, Y.A1_LE, Y.A0_LE].
         // Fq2 = c0 + c1*u, where c0 = A0 (real), c1 = A1 (imaginary).
-        let x = Fq2::new(load_fq(offset + 32), load_fq(offset));       // c0=A0, c1=A1
-        let y = Fq2::new(load_fq(offset + 96), load_fq(offset + 64));  // c0=A0, c1=A1
+        let x = Fq2::new(load_fq(offset + 32), load_fq(offset)); // c0=A0, c1=A1
+        let y = Fq2::new(load_fq(offset + 96), load_fq(offset + 64)); // c0=A0, c1=A1
         points.push(G2Affine { x, y });
     }
     Ok(points)

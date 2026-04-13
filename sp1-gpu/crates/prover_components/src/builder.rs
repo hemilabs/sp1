@@ -68,8 +68,14 @@ pub async fn cuda_worker_builder(scope: TaskScope) -> SP1WorkerBuilder<SP1CudaPr
 
     let core_verifier = SP1CudaProverComponents::core_verifier();
     let core_prover = Arc::new(
-        new_cuda_prover(core_verifier.clone(), num_elts, num_workers, recompute_first_layer, scope.clone())
-            .await,
+        new_cuda_prover(
+            core_verifier.clone(),
+            num_elts,
+            num_workers,
+            recompute_first_layer,
+            scope.clone(),
+        )
+        .await,
     );
 
     // TODO: tune this more precisely and make it a constant.
@@ -87,14 +93,26 @@ pub async fn cuda_worker_builder(scope: TaskScope) -> SP1WorkerBuilder<SP1CudaPr
 
     let shrink_verifier = SP1CudaProverComponents::shrink_verifier();
     let shrink_prover = Arc::new(
-        new_cuda_prover(shrink_verifier.clone(), SHRINK_TRACE_ALLOCATION, num_workers, false, scope.clone())
-            .await,
+        new_cuda_prover(
+            shrink_verifier.clone(),
+            SHRINK_TRACE_ALLOCATION,
+            num_workers,
+            false,
+            scope.clone(),
+        )
+        .await,
     );
 
     let wrap_verifier = SP1CudaProverComponents::wrap_verifier();
     let wrap_prover = Arc::new(
-        new_cuda_prover(wrap_verifier.clone(), WRAP_TRACE_ALLOCATION, num_workers, false, scope.clone())
-            .await,
+        new_cuda_prover(
+            wrap_verifier.clone(),
+            WRAP_TRACE_ALLOCATION,
+            num_workers,
+            false,
+            scope.clone(),
+        )
+        .await,
     );
 
     SP1WorkerBuilder::new()

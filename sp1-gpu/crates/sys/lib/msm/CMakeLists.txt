@@ -7,9 +7,10 @@
 #   types and hipCUB DeviceRadixSort (~2s/MSM at 2^25, correctness-first).
 
 if(NOT USE_HIP)
-    # CUDA: sppark MSM (production performance)
+    # CUDA: sppark MSM (production performance) — G1 and G2
     add_library(msm_objs OBJECT
         bn254_msm_sppark.cu
+        bn254_g2_msm_sppark.cu
     )
     target_link_libraries(msm_objs PRIVATE sp1_gpu_bn254)
     # Add local msm/ dir to include path for msm_compat.cuh and blst_t.hpp
@@ -36,10 +37,14 @@ else()
     # sppark's MSM was tested on HIP and is 1.4-2.4x slower due to unoptimized
     # mont_t.hip field arithmetic. Our custom MSM is faster despite the
     # BUCKET_PAR=128 merge overhead because the field multiply is faster.
+    # G2 MSM on HIP: GPU implementation with block-parallel bucket reduction.
+    # Performance is roughly equivalent to CPU (arkworks) at this point;
+    # further optimization requires tree-parallel reduction.
     add_library(msm_objs OBJECT
         bn254_msm_hip.cu
+        bn254_g2_msm_hip.cu
     )
     target_link_libraries(msm_objs PRIVATE sp1_gpu_bn254)
     target_include_directories(msm_objs PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
-    set_source_files_properties(bn254_msm_hip.cu PROPERTIES LANGUAGE HIP)
+    set_source_files_properties(bn254_msm_hip.cu bn254_g2_msm_hip.cu PROPERTIES LANGUAGE HIP)
 endif()

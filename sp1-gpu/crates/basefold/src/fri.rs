@@ -464,7 +464,6 @@ where
             query_phase_openings_and_proofs.push(opening);
         }
 
-
         Ok(BasefoldProof {
             univariate_messages,
             fri_commitments,

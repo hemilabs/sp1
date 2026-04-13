@@ -594,7 +594,10 @@ impl PlonkProver {
             let o_fr: Vec<Fr> = o_slice.par_iter().map(Fr::from_bn254fr).collect();
             (r_fr, o_fr)
         });
-        eprintln!("[T] 1. Wire BN254Fr→Fr conversion (L+PI+BSB22, R+O deferred): {:?}", t.elapsed());
+        eprintln!(
+            "[T] 1. Wire BN254Fr→Fr conversion (L+PI+BSB22, R+O deferred): {:?}",
+            t.elapsed()
+        );
 
         let srs_canonical = &self.cached.srs_canonical;
         let s1 = &self.cached.s1;
@@ -669,13 +672,25 @@ impl PlonkProver {
                     sp1_gpu_sys::runtime::cuda_malloc(&mut d_s3 as *mut _, byte_sz);
                     sp1_gpu_sys::runtime::cuda_malloc(&mut d_omega as *mut _, byte_sz);
                     sp1_gpu_sys::runtime::cuda_mem_copy_host_to_device(
-                        d_s1, s1_ptr as *const c_void, byte_sz);
+                        d_s1,
+                        s1_ptr as *const c_void,
+                        byte_sz,
+                    );
                     sp1_gpu_sys::runtime::cuda_mem_copy_host_to_device(
-                        d_s2, s2_ptr as *const c_void, byte_sz);
+                        d_s2,
+                        s2_ptr as *const c_void,
+                        byte_sz,
+                    );
                     sp1_gpu_sys::runtime::cuda_mem_copy_host_to_device(
-                        d_s3, s3_ptr as *const c_void, byte_sz);
+                        d_s3,
+                        s3_ptr as *const c_void,
+                        byte_sz,
+                    );
                     sp1_gpu_sys::runtime::cuda_mem_copy_host_to_device(
-                        d_omega, omega_ptr as *const c_void, byte_sz);
+                        d_omega,
+                        omega_ptr as *const c_void,
+                        byte_sz,
+                    );
                 }
                 // Wrap pointers as usize to be Send
                 (d_s1 as usize, d_s2 as usize, d_s3 as usize, d_omega as usize)
@@ -908,8 +923,14 @@ impl PlonkProver {
                 big_log,
             );
 
-            let (mut d_qk_plus_pi_opt, pi_bsb22_cpu_opt, bsb22_coeffs_list, z_c_opt, d_z_opt, commit_z_r2) =
-                if use_gpu_quotient {
+            let (
+                mut d_qk_plus_pi_opt,
+                pi_bsb22_cpu_opt,
+                bsb22_coeffs_list,
+                z_c_opt,
+                d_z_opt,
+                commit_z_r2,
+            ) = if use_gpu_quotient {
                 // ≥20 GiB path: GPU fusion.
                 // Order: PI → BSB22 → Z NTT → GPU fusion → L/R/O NTTs.
                 // Z NTT runs BEFORE GPU fusion so its 4 GiB NTT temp buffer fits.
@@ -918,8 +939,7 @@ impl PlonkProver {
                 let mut bsb22_coeffs_list = Vec::with_capacity(bsb22_polys_fr.len());
                 let mut d_bsb22_coset = Vec::with_capacity(bsb22_polys_fr.len());
                 for p in bsb22_polys_fr.iter() {
-                    let (coeffs, d_evals) =
-                        gpu_ifft_then_coset_fft_to_device(p, lg_n, big_log);
+                    let (coeffs, d_evals) = gpu_ifft_then_coset_fft_to_device(p, lg_n, big_log);
                     bsb22_coeffs_list.push(coeffs);
                     d_bsb22_coset.push(d_evals);
                 }
@@ -928,11 +948,10 @@ impl PlonkProver {
                 // d_z_gp stays alive for Z NTT in R3 (after L/R/O NTTs).
                 let commit_z_inner = {
                     let t = std::time::Instant::now();
-                    let msm = persistent_lag_msm_opt.take()
+                    let msm = persistent_lag_msm_opt
+                        .take()
                         .expect("persistent_lag_msm should be available for Z commit");
-                    let c = msm
-                        .msm_device(d_z_gp as *const c_void, n)
-                        .to_affine();
+                    let c = msm.msm_device(d_z_gp as *const c_void, n).to_affine();
                     drop(msm); // Frees ~3.8 GiB VRAM
                     eprintln!("[T] 5. Z commit (in R2, MSM freed): {:?}", t.elapsed());
                     c
@@ -948,10 +967,7 @@ impl PlonkProver {
                         let qcp = &self.cached.qcp_coset_evals[i];
                         let mut d_qcp: *mut c_void = std::ptr::null_mut();
                         unsafe {
-                            sp1_gpu_sys::runtime::cuda_malloc(
-                                &mut d_qcp as *mut _,
-                                byte_sz_4n,
-                            );
+                            sp1_gpu_sys::runtime::cuda_malloc(&mut d_qcp as *mut _, byte_sz_4n);
                             sp1_gpu_sys::runtime::cuda_mem_copy_host_to_device(
                                 d_qcp,
                                 qcp.as_ptr() as *const c_void,
@@ -991,7 +1007,14 @@ impl PlonkProver {
 
                 eprintln!("[T] 4b. GPU qk+pi fusion: done (pi D2H eliminated)");
 
-                (Some(d_qk_plus_pi), None::<std::thread::JoinHandle<Vec<Fr>>>, bsb22_coeffs_list, Vec::<Fr>::new(), None::<crate::domain::gpu_ntt::DeviceBuffer>, Some(commit_z_inner))
+                (
+                    Some(d_qk_plus_pi),
+                    None::<std::thread::JoinHandle<Vec<Fr>>>,
+                    bsb22_coeffs_list,
+                    Vec::<Fr>::new(),
+                    None::<crate::domain::gpu_ntt::DeviceBuffer>,
+                    Some(commit_z_inner),
+                )
             } else {
                 // <20 GiB path: D2H pi_coset, BSB22 to host, CPU fusion (original path)
                 let mut pi_coset_evals = Vec::with_capacity(big_n);
@@ -1073,7 +1096,9 @@ impl PlonkProver {
                     let mut h = vec![Fr::ZERO; big_n];
                     let err = unsafe {
                         sp1_gpu_sys::runtime::cuda_mem_copy_device_to_host(
-                            h.as_mut_ptr() as *mut c_void, d_qk.ptr, byte_sz_4n,
+                            h.as_mut_ptr() as *mut c_void,
+                            d_qk.ptr,
+                            byte_sz_4n,
                         )
                     };
                     if err != unsafe { sp1_gpu_sys::runtime::CUDA_SUCCESS_CSL } {
@@ -1088,15 +1113,16 @@ impl PlonkProver {
 
             // sppark NTT (CUDA) is fully in-place → d_qk_plus_pi stays on device.
             // RDNA3 NTT (HIP) needs 4 GiB temp → must spill d_qk_plus_pi.
-            let use_device_ntt =
-                !unsafe { sp1_gpu_sys::dft_bn254::bn254_ntt_needs_temp_buffer() };
+            let use_device_ntt = !unsafe { sp1_gpu_sys::dft_bn254::bn254_ntt_needs_temp_buffer() };
 
             // Z NTT: CUDA uses device pointer (saves H2D), HIP uses host (avoids OOM)
             use crate::domain::gpu_ntt::gpu_ifft_then_coset_fft_to_device_from_device;
             let (z_coeffs_r2, d_z_r2) = if use_gpu_quotient {
                 if use_device_ntt && !d_z_gp.is_null() {
                     let r = gpu_ifft_then_coset_fft_to_device_from_device(
-                        d_z_gp as *const c_void, lg_n, big_log,
+                        d_z_gp as *const c_void,
+                        lg_n,
+                        big_log,
                     );
                     unsafe {
                         sp1_gpu_sys::runtime::cuda_free(d_z_gp as *const c_void);
@@ -1107,11 +1133,14 @@ impl PlonkProver {
                     let z_host = if !d_z_gp.is_null() {
                         let byte_sz_n = n * elem_sz;
                         let mut z_h = Vec::with_capacity(n);
-                        unsafe { z_h.set_len(n); }
+                        unsafe {
+                            z_h.set_len(n);
+                        }
                         unsafe {
                             sp1_gpu_sys::runtime::cuda_mem_copy_device_to_host(
                                 z_h.as_mut_ptr() as *mut c_void,
-                                d_z_gp as *const c_void, byte_sz_n,
+                                d_z_gp as *const c_void,
+                                byte_sz_n,
                             );
                             sp1_gpu_sys::runtime::cuda_free(d_z_gp as *const c_void);
                         }
@@ -1145,7 +1174,9 @@ impl PlonkProver {
                     let mut h = vec![Fr::ZERO; big_n];
                     let err = unsafe {
                         sp1_gpu_sys::runtime::cuda_mem_copy_device_to_host(
-                            h.as_mut_ptr() as *mut c_void, d_qk.ptr, byte_sz_4n,
+                            h.as_mut_ptr() as *mut c_void,
+                            d_qk.ptr,
+                            byte_sz_4n,
                         )
                     };
                     if err != unsafe { sp1_gpu_sys::runtime::CUDA_SUCCESS_CSL } {
@@ -1161,27 +1192,39 @@ impl PlonkProver {
             };
             let (l_coeffs_early, d_l_early) = if use_device_ntt && !d_l_upload.is_null() {
                 let r = gpu_ifft_then_coset_fft_to_device_from_device(
-                    d_l_upload as *const c_void, lg_n, big_log,
+                    d_l_upload as *const c_void,
+                    lg_n,
+                    big_log,
                 );
-                unsafe { sp1_gpu_sys::runtime::cuda_free(d_l_upload as *const c_void); }
+                unsafe {
+                    sp1_gpu_sys::runtime::cuda_free(d_l_upload as *const c_void);
+                }
                 r
             } else {
                 gpu_ifft_then_coset_fft_to_device(&l_fr, lg_n, big_log)
             };
             let (r_coeffs_early, d_r_early) = if use_device_ntt && !d_r_upload.is_null() {
                 let r = gpu_ifft_then_coset_fft_to_device_from_device(
-                    d_r_upload as *const c_void, lg_n, big_log,
+                    d_r_upload as *const c_void,
+                    lg_n,
+                    big_log,
                 );
-                unsafe { sp1_gpu_sys::runtime::cuda_free(d_r_upload as *const c_void); }
+                unsafe {
+                    sp1_gpu_sys::runtime::cuda_free(d_r_upload as *const c_void);
+                }
                 r
             } else {
                 gpu_ifft_then_coset_fft_to_device(&r_fr, lg_n, big_log)
             };
             let (o_coeffs_early, d_o_early) = if use_device_ntt && !d_o_upload.is_null() {
                 let r = gpu_ifft_then_coset_fft_to_device_from_device(
-                    d_o_upload as *const c_void, lg_n, big_log,
+                    d_o_upload as *const c_void,
+                    lg_n,
+                    big_log,
                 );
-                unsafe { sp1_gpu_sys::runtime::cuda_free(d_o_upload as *const c_void); }
+                unsafe {
+                    sp1_gpu_sys::runtime::cuda_free(d_o_upload as *const c_void);
+                }
                 r
             } else {
                 gpu_ifft_then_coset_fft_to_device(&o_fr, lg_n, big_log)
@@ -1193,11 +1236,15 @@ impl PlonkProver {
                 unsafe {
                     sp1_gpu_sys::runtime::cuda_malloc(&mut d_ptr as *mut _, byte_sz_4n);
                     sp1_gpu_sys::runtime::cuda_mem_copy_host_to_device(
-                        d_ptr, h.as_ptr() as *const c_void, byte_sz_4n,
+                        d_ptr,
+                        h.as_ptr() as *const c_void,
+                        byte_sz_4n,
                     );
                 }
                 d_qk_plus_pi_opt = Some(crate::domain::gpu_ntt::DeviceBuffer {
-                    ptr: d_ptr, _len: big_n, _bytes: byte_sz_4n,
+                    ptr: d_ptr,
+                    _len: big_n,
+                    _bytes: byte_sz_4n,
                 });
             }
 
@@ -1241,7 +1288,8 @@ impl PlonkProver {
             cz
         } else {
             let t = std::time::Instant::now();
-            let msm = persistent_lag_msm_opt.take()
+            let msm = persistent_lag_msm_opt
+                .take()
                 .expect("persistent_lag_msm should be available for Z commit (CPU path)");
             let c = msm.msm_device(d_z_gp as *const std::ffi::c_void, n).to_affine();
             drop(msm);
@@ -1256,8 +1304,8 @@ impl PlonkProver {
 
         // Join CPU fusion thread if on the CPU fusion path
         #[cfg(feature = "cuda")]
-        let pi_bsb22_cpu = pi_bsb22_cpu_opt
-            .map(|handle| handle.join().expect("CPU fusion thread panicked"));
+        let pi_bsb22_cpu =
+            pi_bsb22_cpu_opt.map(|handle| handle.join().expect("CPU fusion thread panicked"));
 
         // Bind BSB22 + Z, derive alpha
         let t = std::time::Instant::now();
@@ -1310,10 +1358,7 @@ impl PlonkProver {
                 crate::domain::gpu_ntt::free_ntt_buffer();
                 unsafe { sp1_gpu_sys::dft_bn254::bn254_ntt_clear_twiddle_cache() };
                 inv_precompute.join().expect("inverse twiddle precompute failed");
-                eprintln!(
-                    "[T] 7-ntt. L/R/O/Z all done in R2: {:?}",
-                    _t_ntt.elapsed()
-                );
+                eprintln!("[T] 7-ntt. L/R/O/Z all done in R2: {:?}", _t_ntt.elapsed());
 
                 (
                     l_coeffs_early,
@@ -2748,9 +2793,7 @@ impl PlonkProver {
             let ptr = srs_can_ptr;
             let len = srs_can_len;
             Some(std::thread::spawn(move || {
-                let srs = unsafe {
-                    std::slice::from_raw_parts(ptr as *const G1Affine, len)
-                };
+                let srs = unsafe { std::slice::from_raw_parts(ptr as *const G1Affine, len) };
                 crate::g1::PersistentMsm::new(srs)
             }))
         } else {

@@ -146,7 +146,7 @@ func exportGr16PK(dir string, pk *groth16_bn254.ProvingKey) {
 }
 
 // writeG2File writes G2Affine points as LE canonical bytes (128 bytes each).
-// Layout: X.A0 (32 LE) + X.A1 (32 LE) + Y.A0 (32 LE) + Y.A1 (32 LE)
+// Layout per gnark RawBytes(): X.A1 (32 LE) + X.A0 (32 LE) + Y.A1 (32 LE) + Y.A0 (32 LE)
 func writeG2File(path string, points []bn254.G2Affine) {
 	f, err := os.Create(path)
 	if err != nil {

@@ -1172,8 +1172,7 @@ where
         let current_alpha = point[0];
 
         // Use _with_reduction variant to avoid a separate sum_dim kernel dispatch.
-        let mut reduced_output =
-            Tensor::<Ext, TaskScope>::zeros_in([3], backend.clone());
+        let mut reduced_output = Tensor::<Ext, TaskScope>::zeros_in([3], backend.clone());
         let (_raw_evals, next_poly) = fix_and_sum_materialized_round_raw_with_reduction(
             poly,
             current_alpha,
@@ -1214,7 +1213,8 @@ where
     poly = fix_last_variable_materialized_round(poly, point[0]);
 
     // --- Batch D2H of reduced evals and reconstruct uni_polys ---
-    let (uni_polys, _) = replay_and_reconstruct(&saved_reduced_evals, &saved_params, &point, claim, &gpu_claims);
+    let (uni_polys, _) =
+        replay_and_reconstruct(&saved_reduced_evals, &saved_params, &point, claim, &gpu_claims);
 
     // Compute final evaluation
     let eval = uni_polys.last().unwrap().eval_at_point(point[0]);

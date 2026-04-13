@@ -196,6 +196,7 @@ fn mont_pow(base: &[u64; 4], exp: &[u64; 4], p: &[u64; 4], inv: u64, one: &[u64;
 /// BN254 scalar field element in Montgomery form (4 × u64 limbs).
 /// Value represents `a * R mod r` where R = 2^256.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(transparent)]
 pub struct Fr(pub [u64; 4]);
 
 impl Fr {
@@ -391,6 +392,7 @@ impl std::ops::MulAssign for Fr {
 /// BN254 base field element in Montgomery form (4 × u64 limbs).
 /// Value represents `a * R mod P` where R = 2^256.
 #[derive(Clone, Copy, PartialEq, Eq)]
+#[repr(transparent)]
 pub struct Fq(pub [u64; 4]);
 
 impl Fq {
