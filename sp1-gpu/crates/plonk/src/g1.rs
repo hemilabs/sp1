@@ -308,15 +308,59 @@ fn gpu_msm(points: &[G1Affine], scalars: &[crate::fields::Fr]) -> G1Jacobian {
     G1Jacobian::from_bn254(&result)
 }
 
+/// Check if GLV endomorphism is enabled for G1 MSM.
+///
+/// Controlled by `SP1_GPU_GLV` env var:
+/// - "1" forces enabled
+/// - "0" forces disabled
+/// - unset: auto — enabled when total VRAM ≥ 20 GB (fits the 4-G1-context +
+///   G2 + H-poly working set; 9070 XT's 16 GB OOMs with GLV on all 4 G1s
+///   because each context needs ~3.4 GB of GLV working buffers).
+#[cfg(feature = "cuda")]
+fn glv_enabled() -> bool {
+    static GLV: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *GLV.get_or_init(|| {
+        if let Ok(v) = std::env::var("SP1_GPU_GLV") {
+            let on = v != "0";
+            eprintln!("[MSM] GLV endomorphism {} (SP1_GPU_GLV={})",
+                      if on { "enabled" } else { "disabled" }, v);
+            return on;
+        }
+        // Auto-detect based on free VRAM.
+        let mut free: usize = 0;
+        let mut total: usize = 0;
+        let ok = unsafe {
+            sp1_gpu_sys::runtime::cuda_mem_get_info(
+                &mut free as *mut _,
+                &mut total as *mut _,
+            ) == sp1_gpu_sys::runtime::CUDA_SUCCESS_CSL
+        };
+        let enable = ok && total >= 20 * 1024 * 1024 * 1024; // ≥ 20 GiB
+        if ok {
+            eprintln!(
+                "[MSM] GLV auto: total VRAM = {:.1} GB, {}",
+                total as f64 / (1024.0 * 1024.0 * 1024.0),
+                if enable { "enabling GLV" } else { "disabling GLV (needs ≥ 20 GB)" }
+            );
+        } else {
+            eprintln!("[MSM] GLV auto: could not query VRAM, defaulting to enabled");
+        }
+        ok.then_some(enable).unwrap_or(true)
+    })
+}
+
 /// Persistent MSM context with SRS pre-uploaded to GPU.
 /// On NVIDIA (sppark), the SRS points and working buffers are pre-allocated
 /// on the GPU once in new(). Each msm() call only uploads scalars.
-/// On HIP, the invoke path has mysterious ~8× slowdown, so msm() uses the
-/// non-persistent path with host SRS for now.
+///
+/// When GLV is enabled (default, controlled by `SP1_GPU_GLV` env var),
+/// the MSM uses the BN254 endomorphism to halve scalar width from 254 to ~128 bits,
+/// reducing Pippenger windows from 20 to 10 at the cost of doubling the point count.
 #[cfg(feature = "cuda")]
 pub struct PersistentMsm {
     ctx: *mut std::ffi::c_void,
     npoints: usize,
+    use_glv: bool,
 }
 
 #[cfg(feature = "cuda")]
@@ -332,6 +376,7 @@ impl PersistentMsm {
 
     /// Create a persistent MSM context, uploading SRS points to GPU once.
     /// Pre-allocates all working buffers to eliminate per-call hipMalloc overhead.
+    /// GLV endomorphism buffers are lazily allocated on first GLV invoke.
     pub fn new(points: &[G1Affine]) -> Self {
         use crate::BN254G1Affine;
         use std::ffi::c_void;
@@ -352,13 +397,19 @@ impl PersistentMsm {
         if err != unsafe { sp1_gpu_sys::runtime::CUDA_SUCCESS_CSL } {
             panic!("Failed to create persistent MSM context");
         }
-        Self { ctx, npoints: n }
+
+        let use_glv = glv_enabled();
+        Self { ctx, npoints: n, use_glv }
     }
 
     /// Run MSM with pre-uploaded SRS. Only uploads scalars to GPU.
     /// Uses the persistent invoke path with pre-allocated working buffers.
     /// Scalars are passed in Montgomery form; the GPU converts to canonical
     /// form via the mont_to_canonical_kernel (saves ~60ms CPU conversion per call).
+    ///
+    /// When GLV is enabled, dispatches to the GLV-accelerated path which
+    /// decomposes each 254-bit scalar into two ~128-bit halves via the BN254
+    /// endomorphism, halving the number of Pippenger windows (10 vs 20).
     pub fn msm(&self, scalars: &[crate::fields::Fr]) -> G1Jacobian {
         use crate::{BN254Fq, BN254G1Jacobian};
         use std::ffi::c_void;
@@ -372,17 +423,27 @@ impl PersistentMsm {
             z: BN254Fq { limbs: [0; 8] },
         };
 
-        // GPU Montgomery conversion: pass scalars in Montgomery form, GPU converts.
-        // mont=true tells the MSM to run a GPU kernel for Montgomery→canonical conversion.
         let (scalar_ptr, mont_flag) = (scalars.as_ptr() as *const c_void, true);
-        let err = unsafe {
-            sp1_gpu_sys::msm::sp1_bn254_msm_invoke(
-                self.ctx,
-                &mut result as *mut BN254G1Jacobian as *mut c_void,
-                n,
-                scalar_ptr,
-                mont_flag,
-            )
+        let err = if self.use_glv {
+            unsafe {
+                sp1_gpu_sys::msm::sp1_bn254_msm_invoke_glv(
+                    self.ctx,
+                    &mut result as *mut BN254G1Jacobian as *mut c_void,
+                    n,
+                    scalar_ptr,
+                    mont_flag,
+                )
+            }
+        } else {
+            unsafe {
+                sp1_gpu_sys::msm::sp1_bn254_msm_invoke(
+                    self.ctx,
+                    &mut result as *mut BN254G1Jacobian as *mut c_void,
+                    n,
+                    scalar_ptr,
+                    mont_flag,
+                )
+            }
         };
         if err != unsafe { sp1_gpu_sys::runtime::CUDA_SUCCESS_CSL } {
             let msg = if err.message.is_null() {
@@ -411,14 +472,26 @@ impl PersistentMsm {
             z: BN254Fq { limbs: [0; 8] },
         };
 
-        let err = unsafe {
-            sp1_gpu_sys::msm::sp1_bn254_msm_invoke_device(
-                self.ctx,
-                &mut result as *mut BN254G1Jacobian as *mut c_void,
-                n,
-                d_scalars,
-                true, // mont=true: scalars are in Montgomery form
-            )
+        let err = if self.use_glv {
+            unsafe {
+                sp1_gpu_sys::msm::sp1_bn254_msm_invoke_glv_device(
+                    self.ctx,
+                    &mut result as *mut BN254G1Jacobian as *mut c_void,
+                    n,
+                    d_scalars,
+                    true,
+                )
+            }
+        } else {
+            unsafe {
+                sp1_gpu_sys::msm::sp1_bn254_msm_invoke_device(
+                    self.ctx,
+                    &mut result as *mut BN254G1Jacobian as *mut c_void,
+                    n,
+                    d_scalars,
+                    true,
+                )
+            }
         };
         if err != unsafe { sp1_gpu_sys::runtime::CUDA_SUCCESS_CSL } {
             let msg = if err.message.is_null() {
@@ -459,16 +532,30 @@ impl PersistentMsm {
             hot_values.as_ptr() as *const c_void
         };
 
-        let err = unsafe {
-            sp1_gpu_sys::msm::sp1_bn254_msm_invoke_device_depad(
-                self.ctx,
-                &mut result as *mut BN254G1Jacobian as *mut c_void,
-                n,
-                d_scalars,
-                true, // mont=true: scalars are in Montgomery form
-                hot_ptr,
-                hot_values.len() as i32,
-            )
+        let err = if self.use_glv {
+            unsafe {
+                sp1_gpu_sys::msm::sp1_bn254_msm_invoke_glv_device_depad(
+                    self.ctx,
+                    &mut result as *mut BN254G1Jacobian as *mut c_void,
+                    n,
+                    d_scalars,
+                    true,
+                    hot_ptr,
+                    hot_values.len() as i32,
+                )
+            }
+        } else {
+            unsafe {
+                sp1_gpu_sys::msm::sp1_bn254_msm_invoke_device_depad(
+                    self.ctx,
+                    &mut result as *mut BN254G1Jacobian as *mut c_void,
+                    n,
+                    d_scalars,
+                    true,
+                    hot_ptr,
+                    hot_values.len() as i32,
+                )
+            }
         };
         if err != unsafe { sp1_gpu_sys::runtime::CUDA_SUCCESS_CSL } {
             let msg = if err.message.is_null() {
@@ -484,6 +571,8 @@ impl PersistentMsm {
 
     /// MSM with pre-converted canonical BN254Fr scalars (skips to_bn254fr conversion).
     /// Used for binary mask MSMs where scalars are known constants.
+    /// Note: always uses the non-GLV path since scalars are already canonical
+    /// and may not need full 254-bit decomposition.
     pub fn msm_raw(&self, canonical_scalars: &[crate::BN254Fr]) -> G1Jacobian {
         use crate::{BN254Fq, BN254G1Jacobian};
         use std::ffi::c_void;
@@ -497,7 +586,9 @@ impl PersistentMsm {
             z: BN254Fq { limbs: [0; 8] },
         };
 
-        // Use persistent invoke: SRS stays on GPU, only scalars uploaded.
+        // GLV path also works for canonical scalars (mont=false skips conversion).
+        // But msm_raw is used for small binary-mask MSMs where GLV overhead
+        // may not be worthwhile. Use standard path.
         let err = unsafe {
             sp1_gpu_sys::msm::sp1_bn254_msm_invoke(
                 self.ctx,

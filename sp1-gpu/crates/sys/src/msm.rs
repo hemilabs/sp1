@@ -84,6 +84,42 @@ extern "C" {
     pub fn sp1_bn254_msm_destroy(ctx: *mut c_void);
 
     // ========================================================================
+    // GLV-accelerated G1 MSM (endomorphism optimization, HIP)
+    // ========================================================================
+
+    /// GLV-accelerated MSM invoke: decomposes scalars via BN254 endomorphism,
+    /// halving window count from 20 to 10 by splitting 254-bit scalars into
+    /// two ~128-bit halves. Uses pre-expanded 2N endomorphism points on GPU.
+    /// mont: if true, scalars are in Montgomery form (GPU converts internally).
+    pub fn sp1_bn254_msm_invoke_glv(
+        ctx: *mut c_void,
+        result: *mut c_void,
+        npoints: usize,
+        scalars: *const c_void,
+        mont: bool,
+    ) -> CudaRustError;
+
+    /// GLV-accelerated MSM with scalars already in GPU device memory.
+    pub fn sp1_bn254_msm_invoke_glv_device(
+        ctx: *mut c_void,
+        result: *mut c_void,
+        npoints: usize,
+        d_scalars: *const c_void,
+        mont: bool,
+    ) -> CudaRustError;
+
+    /// GLV-accelerated MSM with device scalars + GPU-side depadding.
+    pub fn sp1_bn254_msm_invoke_glv_device_depad(
+        ctx: *mut c_void,
+        result: *mut c_void,
+        npoints: usize,
+        d_scalars: *const c_void,
+        mont: bool,
+        hot_values_host: *const c_void,
+        num_hot: i32,
+    ) -> CudaRustError;
+
+    // ========================================================================
     // G2 MSM (sppark-templated, CUDA-only)
     // ========================================================================
 

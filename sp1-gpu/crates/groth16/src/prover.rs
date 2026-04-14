@@ -12,6 +12,75 @@ use crate::types::{Groth16Proof, Groth16ProvingData, Groth16WitnessData};
 use crate::{BN254Fr, BN254G1Affine, Fr, G1Affine, G1Jacobian};
 use rayon::prelude::*;
 
+/// CPU arkworks G1 MSM for verification (enabled by `GROTH16_G1_VERIFY=1`).
+/// Cross-checks that a GPU G1 MSM result matches the arkworks reference.
+/// Used to validate correctness of GLV endomorphism and other G1 MSM changes.
+#[cfg(feature = "cuda")]
+fn g1_msm_ark_verify(
+    label: &str,
+    bases: &[BN254G1Affine],
+    scalars: &[Fr],
+    gpu_result: &G1Jacobian,
+) {
+    if std::env::var("GROTH16_G1_VERIFY").ok().as_deref() != Some("1") {
+        return;
+    }
+    use ark_bn254::{Fq as ArkFq, Fr as ArkFr, G1Affine as ArkG1Affine, G1Projective as ArkG1Proj};
+    use ark_ec::{AffineRepr, scalar_mul::variable_base::VariableBaseMSM};
+    use ark_ff::BigInt;
+
+    // Convert BN254G1Affine -> ark G1Affine (both store Fq as [u64;4] Montgomery LE).
+    let ark_bases: Vec<ArkG1Affine> = bases
+        .par_iter()
+        .map(|p| {
+            let x_u64: [u64; 4] = unsafe {
+                let ptr = p.x.limbs.as_ptr() as *const u64;
+                [*ptr, *ptr.add(1), *ptr.add(2), *ptr.add(3)]
+            };
+            let y_u64: [u64; 4] = unsafe {
+                let ptr = p.y.limbs.as_ptr() as *const u64;
+                [*ptr, *ptr.add(1), *ptr.add(2), *ptr.add(3)]
+            };
+            if x_u64.iter().all(|&l| l == 0) && y_u64.iter().all(|&l| l == 0) {
+                ArkG1Affine::identity()
+            } else {
+                let x = ArkFq::new_unchecked(BigInt(x_u64));
+                let y = ArkFq::new_unchecked(BigInt(y_u64));
+                ArkG1Affine::new_unchecked(x, y)
+            }
+        })
+        .collect();
+
+    let ark_scalars: Vec<ArkFr> = scalars
+        .par_iter()
+        .map(|s| ArkFr::new_unchecked(BigInt(s.0)))
+        .collect();
+
+    let cpu_result: ArkG1Proj = ArkG1Proj::msm_unchecked(&ark_bases, &ark_scalars);
+    let cpu_affine: ArkG1Affine = cpu_result.into();
+    let cpu_g1 = if cpu_affine.is_zero() {
+        G1Jacobian::INFINITY
+    } else {
+        let (cx, cy) = cpu_affine.xy().unwrap();
+        // Ark stores Fq in Montgomery form via BigInt([u64;4]); our Fq is the same layout.
+        G1Jacobian {
+            x: crate::Fq(cx.0.0),
+            y: crate::Fq(cy.0.0),
+            z: crate::Fq::ONE,
+        }
+    };
+
+    let gpu_aff = gpu_result.to_affine();
+    let cpu_aff = cpu_g1.to_affine();
+    let ok = gpu_aff.x == cpu_aff.x && gpu_aff.y == cpu_aff.y;
+    eprintln!(
+        "[groth16 G1 MSM verify {} N={}] gpu_vs_cpu: {}",
+        label,
+        scalars.len(),
+        if ok { "MATCH" } else { "MISMATCH" }
+    );
+}
+
 /// The GPU Groth16 prover.
 ///
 /// On CUDA builds, `new()` pre-uploads all 5 MSM base-point arrays (4 G1 + 1 G2)
@@ -266,6 +335,8 @@ impl Groth16Prover {
         let ar_msm = self.g1_msm(&self.data.pk_g1_a, &wire_values_a);
         let ar = ar_msm.add(&g1_alpha.to_jacobian()).add(&r_delta);
         eprintln!("[T] 5a. Ar MSM (N={}): {:?}", wire_values_a.len(), t.elapsed());
+        #[cfg(feature = "cuda")]
+        g1_msm_ark_verify("Ar", &self.data.pk_g1_a, &wire_values_a, &ar_msm);
 
         let g2_beta = self.data.pk_g2_beta;
         let g2_delta = self.data.pk_g2_delta;
@@ -307,10 +378,12 @@ impl Groth16Prover {
             let bs1_msm = self.persistent_g1_b.msm(&wire_values_b);
             let bs1 = bs1_msm.add(&g1_beta.to_jacobian()).add(&s_delta);
             eprintln!("[T] 5b. Bs1 MSM (N={}): {:?}", wire_values_b.len(), t.elapsed());
+            g1_msm_ark_verify("Bs1", &self.data.pk_g1_b, &wire_values_b, &bs1_msm);
 
             let t = std::time::Instant::now();
             let krs_msm = self.persistent_g1_k.msm(&filtered_wire_values);
             eprintln!("[T] 5c. Krs MSM (N={}): {:?}", filtered_wire_values.len(), t.elapsed());
+            g1_msm_ark_verify("Krs", &self.data.pk_g1_k, &filtered_wire_values, &krs_msm);
 
             let t = std::time::Instant::now();
             let krs2_msm = match &h_result {
@@ -318,6 +391,9 @@ impl Groth16Prover {
                 HResult::Host(h) => self.persistent_g1_z.msm(&h[..size_h]),
             };
             eprintln!("[T] 5d. Krs2 MSM (N={}): {:?}", size_h, t.elapsed());
+            if let HResult::Host(h) = &h_result {
+                g1_msm_ark_verify("Krs2", &self.data.pk_g1_z, &h[..size_h], &krs2_msm);
+            }
 
             let t_g2 = std::time::Instant::now();
             let bs2_msm = self

@@ -393,6 +393,28 @@ struct hip_msm_context {
     bn254_g1_xyzz_t* d_partial_sums; // [NUM_BUCKETS * BUCKET_PAR] XYZZ accumulators
     bn254_g1_t* d_reduce_partials; // [REDUCE_THREADS] for block-parallel reduction
     bn254_g1_t* d_reduce_suffixes; // [REDUCE_THREADS] for block-parallel reduction
+
+    // GLV buffers (lazily allocated on first GLV invoke).
+    // d_expanded_points: [2*npoints] endomorphism-expanded points.
+    // d_half_scalars: [2*n * GLV_SCALAR_LIMBS] decomposed half-width scalars.
+    // d_glv_signs: [2*n] sign flags from GLV decomposition.
+    // GLV working buffers (sized for 2*n instead of n):
+    bool glv_initialized;
+    bn254_g1_affine_t* d_expanded_points;
+    uint32_t* d_half_scalars;
+    uint8_t* d_glv_signs;
+    // GLV working buffers (oversized for 2n points):
+    uint16_t* d_glv_digits;
+    uint32_t* d_glv_packed;
+    uint8_t* d_glv_carries;
+    uint16_t* d_glv_sorted_digits;
+    uint32_t* d_glv_sorted_packed;
+    void* d_glv_sort_temp;
+    size_t glv_sort_temp_bytes;
+    bn254_g1_xyzz_t* d_glv_partial_sums;
+    bn254_g1_t* d_glv_window_results;
+    bn254_g1_t* d_glv_reduce_partials;
+    bn254_g1_t* d_glv_reduce_suffixes;
 };
 
 static rustCudaError_t alloc_working_buffers(hip_msm_context* ctx, int n) {
@@ -734,8 +756,399 @@ void sp1_bn254_msm_destroy(void* ctx_ptr)
         auto* ctx = reinterpret_cast<hip_msm_context*>(ctx_ptr);
         free_working_buffers(ctx);
         hipFree(ctx->d_points);
+        // Free GLV buffers if allocated
+        if (ctx->glv_initialized) {
+            hipFree(ctx->d_expanded_points);
+            hipFree(ctx->d_half_scalars);
+            hipFree(ctx->d_glv_signs);
+            hipFree(ctx->d_glv_digits);
+            hipFree(ctx->d_glv_packed);
+            hipFree(ctx->d_glv_carries);
+            hipFree(ctx->d_glv_sorted_digits);
+            hipFree(ctx->d_glv_sorted_packed);
+            hipFree(ctx->d_glv_sort_temp);
+            hipFree(ctx->d_glv_partial_sums);
+            hipFree(ctx->d_glv_window_results);
+            hipFree(ctx->d_glv_reduce_partials);
+            hipFree(ctx->d_glv_reduce_suffixes);
+        }
         delete ctx;
     }
+}
+
+// ============================================================
+// GLV-accelerated MSM: halve window count via endomorphism
+// ============================================================
+
+// Lazily allocate GLV buffers and expand points via endomorphism.
+// Called once on first GLV invoke; subsequent calls are no-ops.
+static rustCudaError_t init_glv_buffers(hip_msm_context* ctx) {
+    if (ctx->glv_initialized) return CUDA_SUCCESS_CSL;
+
+    int n = ctx->npoints;
+    int n2 = 2 * n;
+
+    // Expand points: [P_0..P_{n-1}, phi(P_0)..phi(P_{n-1})]
+    CUDA_OK(hipMalloc(&ctx->d_expanded_points, n2 * sizeof(bn254_g1_affine_t)));
+    {
+        int threads = 256;
+        int blocks = (n + threads - 1) / threads;
+        hipLaunchKernelGGL(bn254_msm::endo_expand_kernel,
+            dim3(blocks), dim3(threads), 0, 0,
+            ctx->d_points, ctx->d_expanded_points, n);
+        CUDA_OK(hipGetLastError());
+    }
+
+    // GLV scalar buffers (for 2n half-scalars of GLV_SCALAR_LIMBS each)
+    CUDA_OK(hipMalloc(&ctx->d_half_scalars, (size_t)n2 * GLV_SCALAR_LIMBS * sizeof(uint32_t)));
+    CUDA_OK(hipMalloc(&ctx->d_glv_signs, n2 * sizeof(uint8_t)));
+
+    // Working buffers sized for 2n points
+    CUDA_OK(hipMalloc(&ctx->d_glv_digits, n2 * sizeof(uint16_t)));
+    CUDA_OK(hipMalloc(&ctx->d_glv_packed, n2 * sizeof(uint32_t)));
+    CUDA_OK(hipMalloc(&ctx->d_glv_carries, n2 * sizeof(uint8_t)));
+    CUDA_OK(hipMalloc(&ctx->d_glv_sorted_digits, n2 * sizeof(uint16_t)));
+    CUDA_OK(hipMalloc(&ctx->d_glv_sorted_packed, n2 * sizeof(uint32_t)));
+
+    // hipCUB sort temp for 2n elements
+    ctx->glv_sort_temp_bytes = 0;
+    hipcub::DeviceRadixSort::SortPairs(
+        nullptr, ctx->glv_sort_temp_bytes,
+        ctx->d_glv_digits, ctx->d_glv_sorted_digits,
+        ctx->d_glv_packed, ctx->d_glv_sorted_packed,
+        n2, 0, WINDOW_BITS);
+    CUDA_OK(hipMalloc(&ctx->d_glv_sort_temp, ctx->glv_sort_temp_bytes));
+
+    // Parallel accumulation scratch for 2n points (same NUM_BUCKETS, same BUCKET_PAR)
+    CUDA_OK(hipMalloc(&ctx->d_glv_partial_sums,
+                       (size_t)NUM_BUCKETS * BUCKET_PAR * sizeof(bn254_g1_xyzz_t)));
+
+    // Window results: GLV_NUM_WINDOWS windows
+    CUDA_OK(hipMalloc(&ctx->d_glv_window_results, GLV_NUM_WINDOWS * sizeof(bn254_g1_t)));
+
+    // Block-parallel reduction scratch
+    int reduce_threads = (NUM_BUCKETS - 1 + REDUCE_BLOCK_SIZE - 1) / REDUCE_BLOCK_SIZE;
+    CUDA_OK(hipMalloc(&ctx->d_glv_reduce_partials, reduce_threads * sizeof(bn254_g1_t)));
+    CUDA_OK(hipMalloc(&ctx->d_glv_reduce_suffixes, reduce_threads * sizeof(bn254_g1_t)));
+
+    ctx->glv_initialized = true;
+
+    // VRAM reclaim: once GLV is active, the non-GLV d_points (~960 MB for
+    // 15M points) and d_partial_sums (~67 MB for BUCKET_PAR=128) are dead
+    // — the GLV path exclusively uses d_expanded_points[0..n] (which
+    // already holds a copy of d_points) and d_glv_partial_sums. Freeing
+    // them saves ~1 GB per G1 context, which is critical on 9070 XT
+    // (16 GB VRAM, 4 G1 contexts would otherwise OOM).
+    if (ctx->d_points) {
+        hipFree(ctx->d_points);
+        ctx->d_points = nullptr;
+    }
+    if (ctx->d_partial_sums) {
+        hipFree(ctx->d_partial_sums);
+        ctx->d_partial_sums = nullptr;
+    }
+
+    fprintf(stderr, "[GLV] Initialized: expanded %d points to %d, %d windows (was %d) — freed ~1 GB non-GLV buffers\n",
+            n, n2, GLV_NUM_WINDOWS, NUM_WINDOWS);
+
+    return CUDA_SUCCESS_CSL;
+}
+
+/// GLV-accelerated MSM invoke: decompose scalars via GLV endomorphism,
+/// then run Pippenger with half the windows (10 instead of 20).
+/// Uses pre-expanded endomorphism points (2N) stored on GPU.
+extern "C"
+rustCudaError_t sp1_bn254_msm_invoke_glv(void* ctx_ptr, void* result,
+                                          size_t npoints, const void* scalars, bool mont)
+{
+    auto* ctx = reinterpret_cast<hip_msm_context*>(ctx_ptr);
+    int n = (int)npoints;
+    int n2 = 2 * n;
+    size_t elem32 = sizeof(uint32_t);
+
+    // Lazily initialize GLV buffers (expand points, allocate working buffers)
+    rustCudaError_t glv_err = init_glv_buffers(ctx);
+    if (glv_err.message != CUDA_SUCCESS_CSL.message) return glv_err;
+
+    // GPU timing
+    static int glv_call_count = 0;
+    bool do_timing = (glv_call_count < 2);
+    glv_call_count++;
+
+    hipEvent_t ev_start, ev_upload, ev_glv, ev_windows, ev_combine, ev_end;
+    if (do_timing) {
+        hipEventCreate(&ev_start);
+        hipEventCreate(&ev_upload);
+        hipEventCreate(&ev_glv);
+        hipEventCreate(&ev_windows);
+        hipEventCreate(&ev_combine);
+        hipEventCreate(&ev_end);
+        hipEventRecord(ev_start);
+    }
+
+    // Upload scalars (full 256-bit, will be decomposed on GPU)
+    CUDA_OK(hipMemcpy(ctx->d_scalars, scalars, n * SCALAR_LIMBS * elem32, hipMemcpyHostToDevice));
+
+    if (do_timing) hipEventRecord(ev_upload);
+
+    // Convert from Montgomery form if needed
+    if (mont) {
+        int threads = 256;
+        int blocks = (n + threads - 1) / threads;
+        hipLaunchKernelGGL(mont_to_canonical_kernel,
+            dim3(blocks), dim3(threads), 0, 0, ctx->d_scalars, n);
+        CUDA_OK(hipGetLastError());
+    }
+
+    // GLV scalar decomposition: N canonical scalars -> 2N half-width scalars + signs
+    {
+        int threads = 256;
+        int blocks = (n + threads - 1) / threads;
+        hipLaunchKernelGGL(bn254_msm::glv_decompose_kernel,
+            dim3(blocks), dim3(threads), 0, 0,
+            ctx->d_scalars, ctx->d_half_scalars, ctx->d_glv_signs, n);
+        CUDA_OK(hipGetLastError());
+    }
+
+    if (do_timing) hipEventRecord(ev_glv);
+
+    // Initialize carries for per-window decomposition (2n elements)
+    CUDA_OK(hipMemset(ctx->d_glv_carries, 0, n2 * sizeof(uint8_t)));
+
+    // Process GLV_NUM_WINDOWS windows over 2N half-width scalars
+    for (int w = 0; w < GLV_NUM_WINDOWS; w++) {
+        // Per-window scalar decomposition with GLV sign integration
+        {
+            int threads = 256;
+            int blocks = (n2 + threads - 1) / threads;
+            hipLaunchKernelGGL(bn254_msm::glv_scalar_decompose_packed_kernel,
+                dim3(blocks), dim3(threads), 0, 0,
+                ctx->d_half_scalars, ctx->d_glv_signs,
+                ctx->d_glv_digits, ctx->d_glv_packed, ctx->d_glv_carries,
+                n2, w);
+            CUDA_OK(hipGetLastError());
+        }
+
+        // Reuse msm_one_window with 2n points and the expanded point array
+        msm_one_window(
+            ctx->d_expanded_points,       // 2n expanded points
+            ctx->d_glv_digits,
+            ctx->d_glv_packed,
+            ctx->d_glv_window_results + w,
+            ctx->d_buckets,               // reuse: same NUM_BUCKETS
+            ctx->d_bucket_offsets, ctx->d_bucket_counts,
+            ctx->d_glv_sorted_digits, ctx->d_glv_sorted_packed,
+            ctx->d_glv_sort_temp, ctx->glv_sort_temp_bytes,
+            ctx->d_glv_partial_sums,
+            ctx->d_glv_reduce_partials, ctx->d_glv_reduce_suffixes,
+            n2                            // 2n points
+        );
+    }
+
+    if (do_timing) hipEventRecord(ev_windows);
+
+    // Combine GLV windows (fewer windows = fewer Horner doublings)
+    hipLaunchKernelGGL(bn254_msm::window_combine_kernel,
+        dim3(1), dim3(1), 0, 0,
+        ctx->d_glv_window_results, ctx->d_final_result, GLV_NUM_WINDOWS, WINDOW_BITS);
+    CUDA_OK(hipGetLastError());
+
+    if (do_timing) hipEventRecord(ev_combine);
+
+    // Download result
+    CUDA_OK(hipMemcpy(result, ctx->d_final_result, sizeof(bn254_g1_t), hipMemcpyDeviceToHost));
+
+    if (do_timing) {
+        hipEventRecord(ev_end);
+        hipEventSynchronize(ev_end);
+        float t_upload, t_glv, t_windows, t_combine, t_download;
+        hipEventElapsedTime(&t_upload, ev_start, ev_upload);
+        hipEventElapsedTime(&t_glv, ev_upload, ev_glv);
+        hipEventElapsedTime(&t_windows, ev_glv, ev_windows);
+        hipEventElapsedTime(&t_combine, ev_windows, ev_combine);
+        hipEventElapsedTime(&t_download, ev_combine, ev_end);
+        fprintf(stderr, "[MSM GLV %d] N=%d(2N=%d) upload=%.1fms glv_decompose=%.1fms "
+                "%d_windows=%.1fms combine=%.1fms download=%.1fms total=%.1fms\n",
+                glv_call_count - 1, n, n2, t_upload, t_glv,
+                GLV_NUM_WINDOWS, t_windows, t_combine, t_download,
+                t_upload + t_glv + t_windows + t_combine + t_download);
+        hipEventDestroy(ev_start);
+        hipEventDestroy(ev_upload);
+        hipEventDestroy(ev_glv);
+        hipEventDestroy(ev_windows);
+        hipEventDestroy(ev_combine);
+        hipEventDestroy(ev_end);
+    }
+
+    return CUDA_SUCCESS_CSL;
+}
+
+/// GLV-accelerated MSM with scalars already on GPU device memory.
+extern "C"
+rustCudaError_t sp1_bn254_msm_invoke_glv_device(void* ctx_ptr, void* result,
+                                                  size_t npoints, const void* d_scalars, bool mont)
+{
+    auto* ctx = reinterpret_cast<hip_msm_context*>(ctx_ptr);
+    int n = (int)npoints;
+    int n2 = 2 * n;
+    size_t elem32 = sizeof(uint32_t);
+
+    rustCudaError_t glv_err = init_glv_buffers(ctx);
+    if (glv_err.message != CUDA_SUCCESS_CSL.message) return glv_err;
+
+    // D2D copy scalars
+    CUDA_OK(hipMemcpy(ctx->d_scalars, d_scalars, n * SCALAR_LIMBS * elem32, hipMemcpyDeviceToDevice));
+
+    // Montgomery conversion
+    if (mont) {
+        int threads = 256;
+        int blocks = (n + threads - 1) / threads;
+        hipLaunchKernelGGL(mont_to_canonical_kernel,
+            dim3(blocks), dim3(threads), 0, 0, ctx->d_scalars, n);
+        CUDA_OK(hipGetLastError());
+    }
+
+    // GLV decomposition
+    {
+        int threads = 256;
+        int blocks = (n + threads - 1) / threads;
+        hipLaunchKernelGGL(bn254_msm::glv_decompose_kernel,
+            dim3(blocks), dim3(threads), 0, 0,
+            ctx->d_scalars, ctx->d_half_scalars, ctx->d_glv_signs, n);
+        CUDA_OK(hipGetLastError());
+    }
+
+    // Initialize carries
+    CUDA_OK(hipMemset(ctx->d_glv_carries, 0, n2 * sizeof(uint8_t)));
+
+    // Process GLV windows
+    for (int w = 0; w < GLV_NUM_WINDOWS; w++) {
+        {
+            int threads = 256;
+            int blocks = (n2 + threads - 1) / threads;
+            hipLaunchKernelGGL(bn254_msm::glv_scalar_decompose_packed_kernel,
+                dim3(blocks), dim3(threads), 0, 0,
+                ctx->d_half_scalars, ctx->d_glv_signs,
+                ctx->d_glv_digits, ctx->d_glv_packed, ctx->d_glv_carries,
+                n2, w);
+            CUDA_OK(hipGetLastError());
+        }
+        msm_one_window(
+            ctx->d_expanded_points,
+            ctx->d_glv_digits, ctx->d_glv_packed,
+            ctx->d_glv_window_results + w,
+            ctx->d_buckets,
+            ctx->d_bucket_offsets, ctx->d_bucket_counts,
+            ctx->d_glv_sorted_digits, ctx->d_glv_sorted_packed,
+            ctx->d_glv_sort_temp, ctx->glv_sort_temp_bytes,
+            ctx->d_glv_partial_sums,
+            ctx->d_glv_reduce_partials, ctx->d_glv_reduce_suffixes,
+            n2
+        );
+    }
+
+    // Combine windows
+    hipLaunchKernelGGL(bn254_msm::window_combine_kernel,
+        dim3(1), dim3(1), 0, 0,
+        ctx->d_glv_window_results, ctx->d_final_result, GLV_NUM_WINDOWS, WINDOW_BITS);
+    CUDA_OK(hipGetLastError());
+
+    // Download result
+    CUDA_OK(hipMemcpy(result, ctx->d_final_result, sizeof(bn254_g1_t), hipMemcpyDeviceToHost));
+
+    return CUDA_SUCCESS_CSL;
+}
+
+/// GLV-accelerated MSM with device scalars + GPU-side depadding.
+extern "C"
+rustCudaError_t sp1_bn254_msm_invoke_glv_device_depad(void* ctx_ptr, void* result,
+                                                        size_t npoints, const void* d_scalars, bool mont,
+                                                        const void* hot_values_host, int num_hot)
+{
+    auto* ctx = reinterpret_cast<hip_msm_context*>(ctx_ptr);
+    int n = (int)npoints;
+    int n2 = 2 * n;
+    size_t elem32 = sizeof(uint32_t);
+
+    rustCudaError_t glv_err = init_glv_buffers(ctx);
+    if (glv_err.message != CUDA_SUCCESS_CSL.message) return glv_err;
+
+    // D2D copy scalars
+    CUDA_OK(hipMemcpy(ctx->d_scalars, d_scalars, n * SCALAR_LIMBS * elem32, hipMemcpyDeviceToDevice));
+
+    // GPU-side depadding
+    if (num_hot > 0 && hot_values_host) {
+        uint32_t* d_hot_values = nullptr;
+        size_t hot_bytes = num_hot * SCALAR_LIMBS * elem32;
+        CUDA_OK(hipMalloc(&d_hot_values, hot_bytes));
+        CUDA_OK(hipMemcpy(d_hot_values, hot_values_host, hot_bytes, hipMemcpyHostToDevice));
+        int threads = 256;
+        int blocks = (n + threads - 1) / threads;
+        hipLaunchKernelGGL(bn254_msm::zero_hot_scalars_kernel,
+            dim3(blocks), dim3(threads), 0, 0,
+            ctx->d_scalars, d_hot_values, n, num_hot);
+        CUDA_OK(hipGetLastError());
+        hipFree(d_hot_values);
+    }
+
+    // Montgomery conversion
+    if (mont) {
+        int threads = 256;
+        int blocks = (n + threads - 1) / threads;
+        hipLaunchKernelGGL(mont_to_canonical_kernel,
+            dim3(blocks), dim3(threads), 0, 0, ctx->d_scalars, n);
+        CUDA_OK(hipGetLastError());
+    }
+
+    // GLV decomposition
+    {
+        int threads = 256;
+        int blocks = (n + threads - 1) / threads;
+        hipLaunchKernelGGL(bn254_msm::glv_decompose_kernel,
+            dim3(blocks), dim3(threads), 0, 0,
+            ctx->d_scalars, ctx->d_half_scalars, ctx->d_glv_signs, n);
+        CUDA_OK(hipGetLastError());
+    }
+
+    // Initialize carries
+    CUDA_OK(hipMemset(ctx->d_glv_carries, 0, n2 * sizeof(uint8_t)));
+
+    // Process GLV windows
+    for (int w = 0; w < GLV_NUM_WINDOWS; w++) {
+        {
+            int threads = 256;
+            int blocks = (n2 + threads - 1) / threads;
+            hipLaunchKernelGGL(bn254_msm::glv_scalar_decompose_packed_kernel,
+                dim3(blocks), dim3(threads), 0, 0,
+                ctx->d_half_scalars, ctx->d_glv_signs,
+                ctx->d_glv_digits, ctx->d_glv_packed, ctx->d_glv_carries,
+                n2, w);
+            CUDA_OK(hipGetLastError());
+        }
+        msm_one_window(
+            ctx->d_expanded_points,
+            ctx->d_glv_digits, ctx->d_glv_packed,
+            ctx->d_glv_window_results + w,
+            ctx->d_buckets,
+            ctx->d_bucket_offsets, ctx->d_bucket_counts,
+            ctx->d_glv_sorted_digits, ctx->d_glv_sorted_packed,
+            ctx->d_glv_sort_temp, ctx->glv_sort_temp_bytes,
+            ctx->d_glv_partial_sums,
+            ctx->d_glv_reduce_partials, ctx->d_glv_reduce_suffixes,
+            n2
+        );
+    }
+
+    // Combine windows
+    hipLaunchKernelGGL(bn254_msm::window_combine_kernel,
+        dim3(1), dim3(1), 0, 0,
+        ctx->d_glv_window_results, ctx->d_final_result, GLV_NUM_WINDOWS, WINDOW_BITS);
+    CUDA_OK(hipGetLastError());
+
+    // Download result
+    CUDA_OK(hipMemcpy(result, ctx->d_final_result, sizeof(bn254_g1_t), hipMemcpyDeviceToHost));
+
+    return CUDA_SUCCESS_CSL;
 }
 
 #endif // __HIPCC__

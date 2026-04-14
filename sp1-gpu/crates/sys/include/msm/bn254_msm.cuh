@@ -737,4 +737,155 @@ __global__ void zero_hot_scalars_kernel(
     }
 }
 
+// ================================================================
+// GLV Endomorphism Kernels
+// ================================================================
+// These kernels implement the GLV optimization for BN254 G1 MSM:
+//   Σ k_i·P_i = Σ (k1_i·P_i + k2_i·φ(P_i))
+// where phi(x,y) = (beta*x, y) is the BN254 endomorphism and
+// k = k1 + k2*lambda with |k1|,|k2| < ~2^128.
+
+#include "msm/bn254_glv.cuh"
+
+// GLV configuration: 10 windows for ~129-bit half-scalars
+static constexpr int GLV_NUM_WINDOWS = (bn254_glv::GLV_SCALAR_BITS + WINDOW_BITS - 1) / WINDOW_BITS;
+static constexpr int GLV_SCALAR_LIMBS = bn254_glv::GLV_SCALAR_LIMBS; // 5 u32 limbs
+
+// ================================================================
+// Kernel: Endomorphism point expansion
+// For each input point P_i, compute:
+//   expanded[i]     = P_i
+//   expanded[n + i] = phi(P_i) = (beta * P_i.x, P_i.y)
+// ================================================================
+__global__ void endo_expand_kernel(
+    const bn254_g1_affine_t* __restrict__ points,  // [n] input points
+    bn254_g1_affine_t* __restrict__ expanded,       // [2n] output
+    int n
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+
+    bn254_g1_affine_t p = points[idx];
+
+    // Original point at index idx
+    expanded[idx] = p;
+
+    // Endomorphism point at index n + idx: phi(x,y) = (beta*x, y)
+    bn254_fq_t beta(bn254_glv::GLV_BETA);
+    p.x = p.x * beta;
+    expanded[n + idx] = p;
+}
+
+// ================================================================
+// Kernel: GLV scalar decomposition
+// Converts N canonical 256-bit scalars into 2N 129-bit half-scalars
+// with sign flags, interleaved for the expanded point array.
+//
+// For scalar k at index i:
+//   k = k1 + k2*lambda (mod r)
+//   k1_scalars[i]     = |k1| (5 u32 limbs)
+//   k2_scalars[n + i] = |k2| (5 u32 limbs)
+//   signs[i]          = sign of k1 (XOR'd with point sign later)
+//   signs[n + i]      = sign of k2
+// ================================================================
+__global__ void glv_decompose_kernel(
+    const uint32_t* __restrict__ scalars,     // [n * 8] canonical scalars
+    uint32_t* __restrict__ half_scalars,       // [2n * 5] GLV half-scalars
+    uint8_t* __restrict__ glv_signs,           // [2n] sign flags
+    int n
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+
+    const uint32_t* k = &scalars[idx * SCALAR_LIMBS];
+
+    uint32_t k1[5], k2[5];
+    bool neg1, neg2;
+    bn254_glv::glv_decompose(k, k1, k2, &neg1, &neg2);
+
+    // Store k1 for point index idx
+    uint32_t* k1_out = &half_scalars[idx * GLV_SCALAR_LIMBS];
+    for (int i = 0; i < GLV_SCALAR_LIMBS; i++) k1_out[i] = k1[i];
+    glv_signs[idx] = neg1 ? 1 : 0;
+
+    // Store k2 for point index n + idx (the endomorphism point)
+    uint32_t* k2_out = &half_scalars[(n + idx) * GLV_SCALAR_LIMBS];
+    for (int i = 0; i < GLV_SCALAR_LIMBS; i++) k2_out[i] = k2[i];
+    glv_signs[n + idx] = neg2 ? 1 : 0;
+}
+
+// ================================================================
+// Kernel: GLV scalar decomposition into windows (packed sign)
+// Same as scalar_decompose_packed_kernel but for 129-bit half-scalars
+// (5 u32 limbs instead of 8). Used with GLV_NUM_WINDOWS = 10.
+// ================================================================
+__global__ void glv_scalar_decompose_packed_kernel(
+    const uint32_t* __restrict__ scalars,     // 2n * 5 limbs (GLV half-scalars)
+    const uint8_t* __restrict__ glv_signs,    // 2n sign flags from GLV decomposition
+    uint16_t* __restrict__ digits,             // [2n]
+    uint32_t* __restrict__ packed_indices,     // [2n] with sign in bit 31
+    uint8_t* __restrict__ carries,             // [2n] in/out carry bits
+    int n2,                                    // = 2*n (number of points after expansion)
+    int window_idx
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n2) return;
+
+    const uint32_t* s = &scalars[idx * GLV_SCALAR_LIMBS];
+
+    uint32_t carry = carries[idx];
+    int bit_start = window_idx * WINDOW_BITS;
+
+    // Extract window value from 5-limb scalar
+    int limb_lo = bit_start / 32;
+    int shift = bit_start % 32;
+
+    uint64_t combined = 0;
+    if (limb_lo < GLV_SCALAR_LIMBS) {
+        combined = (uint64_t)s[limb_lo];
+        if (limb_lo + 1 < GLV_SCALAR_LIMBS) {
+            combined |= ((uint64_t)s[limb_lo + 1]) << 32;
+        }
+    }
+    uint32_t raw = (uint32_t)(combined >> shift);
+
+    // Mask to window width; for the last window, mask to available bits
+    int bits_avail = bn254_glv::GLV_SCALAR_BITS - bit_start;
+    if (bits_avail <= 0) {
+        // Beyond scalar range: no new bits, just use carry
+        raw = 0;
+    } else if (bits_avail < WINDOW_BITS) {
+        raw &= (1u << bits_avail) - 1;
+    } else {
+        raw &= (1u << WINDOW_BITS) - 1;
+    }
+
+    raw += carry;
+
+    // Signed decomposition
+    uint32_t half = 1u << (WINDOW_BITS - 1);
+    uint16_t digit;
+    uint32_t sign_bit;
+    uint32_t next_carry;
+    if (raw > half) {
+        digit = (uint16_t)((1u << WINDOW_BITS) - raw);
+        sign_bit = 1u;
+        next_carry = 1u;
+    } else {
+        digit = (uint16_t)raw;
+        sign_bit = 0u;
+        next_carry = 0u;
+    }
+
+    // XOR the window sign with the GLV sign:
+    // If the GLV decomposition produced a negative k1/k2, the point is negated.
+    // If the signed digit decomposition also negates, the two negations cancel.
+    uint32_t glv_sign = glv_signs[idx];
+    sign_bit ^= glv_sign;
+
+    digits[idx] = digit;
+    packed_indices[idx] = ((uint32_t)idx & 0x7FFFFFFFu) | (sign_bit << 31);
+    carries[idx] = (uint8_t)next_carry;
+}
+
 } // namespace bn254_msm
