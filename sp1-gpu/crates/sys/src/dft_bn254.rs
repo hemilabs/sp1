@@ -73,6 +73,16 @@ extern "C" {
         d_temp: *mut c_void,
     ) -> CudaRustError;
 
+    /// Inverse coset NTT with pre-allocated temp buffer.
+    /// d_temp must point to at least 2^lg_domain_size elements of device memory.
+    pub fn batch_coset_iNTT_bn254_with_temp(
+        d_inout: *mut c_void,
+        lg_domain_size: u32,
+        poly_count: u32,
+        stream: CudaStreamHandle,
+        d_temp: *mut c_void,
+    ) -> CudaRustError;
+
     /// Returns true if the NTT implementation needs a separate N-element temp buffer
     /// for transpose stages (RDNA3 four-step NTT). Returns false for in-place NTTs (sppark).
     pub fn bn254_ntt_needs_temp_buffer() -> bool;

@@ -332,17 +332,19 @@ struct bn254_g1_xyzz_t {
         // Total: 7M + 2S
     }
 
-    // Convert XYZZ to Jacobian: Z = ZZZ / ZZ (1 inv + 1 mul)
+    // Convert XYZZ to Jacobian: inversion-free formula (2 Fq muls, 0 inversions).
+    // XYZZ: affine x = X/ZZ, y = Y/ZZZ.  With ZZ=Z^2, ZZZ=Z^3:
+    // Set X'=X*ZZ, Y'=Y*ZZZ, Z'=ZZ.  Then X'/Z'^2 = X*ZZ/ZZ^2 = X/ZZ ✓
+    // and Y'/Z'^3 = Y*ZZZ/ZZ^3 = Y*Z^3/Z^6 = Y/Z^3 = Y/ZZZ ✓.
     __device__ __forceinline__ bn254_g1_t to_jacobian() const {
         bn254_g1_t r;
         if (is_infinity()) {
             r.set_infinity();
             return r;
         }
-        r.X = X;
-        r.Y = Y;
-        // Z = ZZZ / ZZ = ZZZ * ZZ^(-1)
-        r.Z = ZZZ * ZZ.inv();
+        r.X = X * ZZ;
+        r.Y = Y * ZZZ;
+        r.Z = ZZ;
         return r;
     }
 

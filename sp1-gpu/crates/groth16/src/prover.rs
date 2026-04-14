@@ -169,6 +169,31 @@ impl Groth16Prover {
 
                 let h_result = h_handle.join().expect("H polynomial computation panicked");
                 let size_h = n - 1;
+
+                // Pin scalar buffers for DMA-speed H2D uploads (~25 GB/s
+                // pinned vs ~1.7 GB/s unpinned on PCIe 4.0).  The Vecs are
+                // fully built (`.collect()` completed) and only read from
+                // here on, so no reallocation can invalidate the pin.
+                {
+                    use std::ffi::c_void;
+                    let pin = |name: &str, v: &[Fr]| unsafe {
+                        let err = sp1_gpu_sys::runtime::cuda_host_register(
+                            v.as_ptr() as *const c_void,
+                            std::mem::size_of_val(v),
+                        );
+                        if err != sp1_gpu_sys::runtime::CUDA_SUCCESS_CSL {
+                            eprintln!(
+                                "[WARN] cuda_host_register failed for {} ({} bytes)",
+                                name,
+                                std::mem::size_of_val(v),
+                            );
+                        }
+                    };
+                    pin("wire_values_a", &wire_values_a);
+                    pin("wire_values_b", &wire_values_b);
+                    pin("filtered_wire_values", &filtered_wire_values);
+                }
+
                 (wire_values_a, wire_values_b, filtered_wire_values, h_result, size_h)
             })
         };
@@ -411,6 +436,23 @@ impl Groth16Prover {
             (bs2, bs1, krs_msm, krs2_msm)
         });
 
+        // Unpin scalar buffers now that all MSMs have consumed them.
+        #[cfg(feature = "cuda")]
+        {
+            use std::ffi::c_void;
+            unsafe {
+                let _ = sp1_gpu_sys::runtime::cuda_host_unregister(
+                    wire_values_a.as_ptr() as *const c_void,
+                );
+                let _ = sp1_gpu_sys::runtime::cuda_host_unregister(
+                    wire_values_b.as_ptr() as *const c_void,
+                );
+                let _ = sp1_gpu_sys::runtime::cuda_host_unregister(
+                    filtered_wire_values.as_ptr() as *const c_void,
+                );
+            }
+        }
+
         // Krs = krs + krs2 + s*Ar + r*Bs1 + kr*Delta
         let s_ar = g1_scalar_mul(&ar, &s);
         let r_bs1 = g1_scalar_mul(&bs1, &r);
@@ -543,14 +585,23 @@ impl Groth16Prover {
             );
         }
 
-        // Batch 3 iNTTs + 3 coset NTTs
+        // Allocate a single reusable temp buffer for all NTTs (N × 32 bytes = 512 MB
+        // for lg_n=24). This avoids 7 × hipMalloc/hipFree of 512 MB each.
+        let mut d_temp: *mut c_void = std::ptr::null_mut();
+        check_gpu(
+            unsafe { sp1_gpu_sys::runtime::cuda_malloc(&mut d_temp as *mut _, byte_sz) },
+            "cuda_malloc(ntt_temp)",
+        );
+        assert!(!d_temp.is_null(), "GPU H polynomial: ntt temp cuda_malloc returned null");
+
+        // Batch 3 iNTTs + 3 coset NTTs (with shared temp buffer — no per-NTT hipMalloc)
         unsafe {
             check_gpu(
-                sp1_gpu_sys::dft_bn254::batch_iNTT_bn254(d_a, lg_n, 3, stream),
+                sp1_gpu_sys::dft_bn254::batch_iNTT_bn254_with_temp(d_a, lg_n, 3, stream, d_temp),
                 "batch_iNTT(A,B,C)",
             );
             check_gpu(
-                sp1_gpu_sys::dft_bn254::batch_coset_NTT_bn254(d_a, lg_n, 3, stream),
+                sp1_gpu_sys::dft_bn254::batch_coset_NTT_bn254_with_temp(d_a, lg_n, 3, stream, d_temp),
                 "batch_coset_NTT(A,B,C)",
             );
         }
@@ -569,10 +620,13 @@ impl Groth16Prover {
         // Coset iNTT → H in coefficient form, stays on GPU in d_a
         unsafe {
             check_gpu(
-                sp1_gpu_sys::dft_bn254::batch_coset_iNTT_bn254(d_a, lg_n, 1, stream),
+                sp1_gpu_sys::dft_bn254::batch_coset_iNTT_bn254_with_temp(d_a, lg_n, 1, stream, d_temp),
                 "coset_iNTT(H)",
             );
         }
+
+        // Free the NTT temp buffer (no longer needed after all NTTs complete).
+        unsafe { sp1_gpu_sys::runtime::cuda_free(d_temp as *const c_void); }
 
         // Now d_a[0..N] contains H. We need to keep it alive for the Krs2 MSM.
         // "Leak" the 3N buffer from the guard so it's not freed prematurely.

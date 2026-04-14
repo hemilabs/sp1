@@ -613,7 +613,6 @@ static rustCudaError_t run_ntt_four_step(
         d_temp_local = nullptr;
     }
 
-    CUDA_OK(hipStreamSynchronize(stream));
     return CUDA_SUCCESS_CSL;
 }
 
@@ -680,7 +679,6 @@ extern "C" rustCudaError_t batch_iNTT_bn254_with_temp(
             lg_domain_size, true, false, stream, (fr_t*)d_temp);
         if (err.message != CUDA_SUCCESS_CSL.message) return err;
     }
-    CUDA_OK(hipDeviceSynchronize());
     return CUDA_SUCCESS_CSL;
 }
 
@@ -695,7 +693,6 @@ extern "C" rustCudaError_t batch_coset_NTT_bn254_with_temp(
             lg_domain_size, false, true, stream, (fr_t*)d_temp);
         if (err.message != CUDA_SUCCESS_CSL.message) return err;
     }
-    CUDA_OK(hipDeviceSynchronize());
     return CUDA_SUCCESS_CSL;
 }
 
@@ -707,6 +704,20 @@ extern "C" rustCudaError_t batch_coset_iNTT_bn254(
     for (uint32_t p = 0; p < poly_count; p++) {
         rustCudaError_t err = run_ntt_four_step(d_inout + p * domain_size,
             lg_domain_size, true, true, stream);
+        if (err.message != CUDA_SUCCESS_CSL.message) return err;
+    }
+    return CUDA_SUCCESS_CSL;
+}
+
+extern "C" rustCudaError_t batch_coset_iNTT_bn254_with_temp(
+    fr_t* d_inout, uint32_t lg_domain_size, uint32_t poly_count,
+    const hipStream_t stream, void* d_temp
+) {
+    if (lg_domain_size == 0 || poly_count == 0) return CUDA_SUCCESS_CSL;
+    uint32_t domain_size = 1u << lg_domain_size;
+    for (uint32_t p = 0; p < poly_count; p++) {
+        rustCudaError_t err = run_ntt_four_step(d_inout + p * domain_size,
+            lg_domain_size, true, true, stream, (fr_t*)d_temp);
         if (err.message != CUDA_SUCCESS_CSL.message) return err;
     }
     return CUDA_SUCCESS_CSL;

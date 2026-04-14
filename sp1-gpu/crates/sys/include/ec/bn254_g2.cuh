@@ -219,27 +219,20 @@ struct bn254_g2_xyzz_t {
         }
     }
 
-    // To Jacobian: (X, Y, ZZ, ZZZ) -> (X*ZZZ, Y*ZZ*ZZZ, ZZZ/ZZ) — not needed if we
-    // convert once at the end. We just return a Jacobian with Z=ZZZ/ZZ (requires inverse).
-    // For final output it's simpler to go XYZZ -> affine directly:
-    //   (X/ZZ, Y/ZZZ)
+    // Convert XYZZ to Jacobian: inversion-free formula (2 Fq2 muls, 0 inversions).
+    // XYZZ: affine x = X/ZZ, y = Y/ZZZ.  With ZZ=Z^2, ZZZ=Z^3:
+    // Set X'=X*ZZ, Y'=Y*ZZZ, Z'=ZZ.  Then X'/Z'^2 = X*ZZ/ZZ^2 = X/ZZ ✓
+    // and Y'/Z'^3 = Y*ZZZ/ZZ^3 = Y*Z^3/Z^6 = Y/Z^3 = Y/ZZZ ✓.
     __device__ __forceinline__ bn254_g2_t to_jacobian() const {
         if (is_infinity()) {
             bn254_g2_t r;
             r.X.set_to_zero(); r.Y.set_to_zero(); r.Z.set_to_zero();
             return r;
         }
-        // Use (X*ZZZ, Y*ZZZ*ZZ, ZZZ) — but that's not Jacobian. Better: go to affine
-        // and then construct Jacobian. Or we can use the identity:
-        //   XYZZ (X, Y, ZZ, ZZZ) = Jacobian (X/ZZ * ZZZ^2/ZZ^2, Y/ZZZ * (ZZZ/ZZ)^3, ZZZ/ZZ)
-        // = (X*ZZZ^2/ZZ^3, Y*ZZZ^2/ZZ^3, ZZZ/ZZ)  -- messy.
-        // Simplest: go via affine which is ~3 Fq2 muls + 1 Fq2 inverse.
-        bn254_fq2_t ZZ_inv = ZZ.inv();
-        bn254_fq2_t ZZZ_inv = ZZZ.inv();
         bn254_g2_t r;
-        r.X = X * ZZ_inv;       // x = X/ZZ
-        r.Y = Y * ZZZ_inv;      // y = Y/ZZZ
-        r.Z = bn254_fq2_t::one();
+        r.X = X * ZZ;
+        r.Y = Y * ZZZ;
+        r.Z = ZZ;
         return r;
     }
 

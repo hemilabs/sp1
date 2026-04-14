@@ -39,12 +39,14 @@ struct bn254_t {
     __device__ __forceinline__ const uint32_t& operator[](size_t i) const { return data[i]; }
 
     // Comparison: is this >= r?
+    // Branchless: computes data - r and checks carry. No warp divergence.
     __device__ __forceinline__ bool gte_p() const {
-        for (int i = N - 1; i >= 0; i--) {
-            if (data[i] > device::ALT_BN128_r[i]) return true;
-            if (data[i] < device::ALT_BN128_r[i]) return false;
+        uint64_t borrow = 0;
+        for (int i = 0; i < N; i++) {
+            uint64_t diff = (uint64_t)data[i] - device::ALT_BN128_r[i] - borrow;
+            borrow = (diff >> 63) & 1;
         }
-        return true; // equal
+        return borrow == 0; // no borrow means data >= r
     }
 
     // Subtract r
@@ -67,7 +69,7 @@ struct bn254_t {
         }
     }
 
-    // Modular addition
+    // Modular addition (branchless conditional subtraction)
     __device__ __forceinline__ bn254_t operator+(const bn254_t& b) const {
         bn254_t r;
         uint64_t carry = 0;
@@ -76,7 +78,20 @@ struct bn254_t {
             r.data[i] = (uint32_t)sum;
             carry = sum >> 32;
         }
-        if (carry || r.gte_p()) r.sub_p();
+        // Branchless: compute r - r_mod, select if r >= r_mod
+        {
+            uint32_t sub[N];
+            uint64_t borrow = 0;
+            for (int i = 0; i < N; i++) {
+                uint64_t diff = (uint64_t)r.data[i] - device::ALT_BN128_r[i] - borrow;
+                sub[i] = (uint32_t)diff;
+                borrow = (diff >> 63) & 1;
+            }
+            uint32_t do_sub = (carry != 0) | (borrow == 0);
+            for (int i = 0; i < N; i++) {
+                r.data[i] = do_sub ? sub[i] : r.data[i];
+            }
+        }
         return r;
     }
 
@@ -85,7 +100,7 @@ struct bn254_t {
         return *this;
     }
 
-    // Modular subtraction
+    // Modular subtraction (branchless conditional add-r)
     __device__ __forceinline__ bn254_t operator-(const bn254_t& b) const {
         bn254_t r;
         uint64_t borrow = 0;
@@ -94,7 +109,20 @@ struct bn254_t {
             r.data[i] = (uint32_t)diff;
             borrow = (diff >> 63) & 1;
         }
-        if (borrow) r.add_p();
+        // Branchless: compute r + r_mod, select if borrow
+        {
+            uint32_t added[N];
+            uint64_t carry = 0;
+            for (int i = 0; i < N; i++) {
+                uint64_t sum = (uint64_t)r.data[i] + device::ALT_BN128_r[i] + carry;
+                added[i] = (uint32_t)sum;
+                carry = sum >> 32;
+            }
+            uint32_t do_add = (borrow != 0);
+            for (int i = 0; i < N; i++) {
+                r.data[i] = do_add ? added[i] : r.data[i];
+            }
+        }
         return r;
     }
 
@@ -103,16 +131,22 @@ struct bn254_t {
         return *this;
     }
 
-    // Modular negation: -a mod r
+    // Modular negation: -a mod r (branchless)
     __device__ __forceinline__ bn254_t operator-() const {
-        if (is_zero()) return *this;
+        // Compute r - a. If a == 0, result is r but we need 0.
+        // Use branchless: mask with (a != 0) to avoid warp divergence.
         bn254_t r;
         uint64_t borrow = 0;
+        uint32_t nonzero = 0;
         for (int i = 0; i < N; i++) {
+            nonzero |= data[i];
             uint64_t diff = (uint64_t)device::ALT_BN128_r[i] - data[i] - borrow;
             r.data[i] = (uint32_t)diff;
             borrow = (diff >> 63) & 1;
         }
+        // If a was zero, result should be zero (not r)
+        uint32_t mask = (nonzero != 0) ? 0xFFFFFFFFu : 0u;
+        for (int i = 0; i < N; i++) r.data[i] &= mask;
         return r;
     }
 
@@ -174,7 +208,20 @@ struct bn254_t {
         bn254_t r;
         r.data[0] = t0; r.data[1] = t1; r.data[2] = t2; r.data[3] = t3;
         r.data[4] = t4; r.data[5] = t5; r.data[6] = t6; r.data[7] = t7;
-        if (t8 || r.gte_p()) r.sub_p();
+        // Branchless conditional subtraction (same pattern as Fq)
+        {
+            uint32_t sub[N];
+            uint64_t borrow = 0;
+            for (int i = 0; i < N; i++) {
+                uint64_t diff = (uint64_t)r.data[i] - device::ALT_BN128_r[i] - borrow;
+                sub[i] = (uint32_t)diff;
+                borrow = (diff >> 63) & 1;
+            }
+            uint32_t do_sub = (t8 != 0) | (borrow == 0);
+            for (int i = 0; i < N; i++) {
+                r.data[i] = do_sub ? sub[i] : r.data[i];
+            }
+        }
         return r;
     }
 
@@ -240,11 +287,24 @@ struct bn254_t {
 
         bn254_t r;
         for (int i = 0; i < N; i++) r.data[i] = w[N + i];
-        if (w[2 * N] || r.gte_p()) r.sub_p();
+        // Branchless conditional subtraction
+        {
+            uint32_t sub[N];
+            uint64_t borrow = 0;
+            for (int i = 0; i < N; i++) {
+                uint64_t diff = (uint64_t)r.data[i] - device::ALT_BN128_r[i] - borrow;
+                sub[i] = (uint32_t)diff;
+                borrow = (diff >> 63) & 1;
+            }
+            uint32_t do_sub = (w[2 * N] != 0) | (borrow == 0);
+            for (int i = 0; i < N; i++) {
+                r.data[i] = do_sub ? sub[i] : r.data[i];
+            }
+        }
         return r;
     }
 
-    // Double: 2*a
+    // Double: 2*a (branchless conditional subtraction)
     __device__ __forceinline__ bn254_t dbl() const {
         bn254_t r;
         uint64_t carry = 0;
@@ -253,7 +313,20 @@ struct bn254_t {
             r.data[i] = (uint32_t)sum;
             carry = sum >> 32;
         }
-        if (carry || r.gte_p()) r.sub_p();
+        // Branchless conditional subtraction
+        {
+            uint32_t sub[N];
+            uint64_t borrow = 0;
+            for (int i = 0; i < N; i++) {
+                uint64_t diff = (uint64_t)r.data[i] - device::ALT_BN128_r[i] - borrow;
+                sub[i] = (uint32_t)diff;
+                borrow = (diff >> 63) & 1;
+            }
+            uint32_t do_sub = (carry != 0) | (borrow == 0);
+            for (int i = 0; i < N; i++) {
+                r.data[i] = do_sub ? sub[i] : r.data[i];
+            }
+        }
         return r;
     }
 

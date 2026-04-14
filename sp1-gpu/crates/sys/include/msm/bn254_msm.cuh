@@ -400,7 +400,7 @@ __global__ void finalize_counts_kernel(
 // bit of sorted_packed_indices (eliminating separate sorted_signs array).
 // Saves memory bandwidth: 4 bytes/point instead of 4+1 bytes/point.
 // ================================================================
-__launch_bounds__(256, 4)  // 256 threads, min 4 waves/EU for latency hiding
+__launch_bounds__(256, 2)  // 256 threads, 2 blocks/CU: doubles register budget to ~96 VGPRs, avoids scratch spills for XYZZ arithmetic
 __global__ void bucket_accumulate_parallel_packed_kernel(
     const bn254_g1_affine_t* __restrict__ points,
     const uint32_t* __restrict__ sorted_packed_indices,  // sign in high bit
