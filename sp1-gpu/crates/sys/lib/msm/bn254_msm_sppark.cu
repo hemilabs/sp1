@@ -11,6 +11,10 @@
 // MSM compatibility shim: defines CUDA_OK and is_device_ptr
 #include "msm_compat.cuh"
 
+// Keep sppark's full error message (file/line/CUDA error string) so a
+// failing launch surfaces a useful description back to Rust.
+#define TAKE_RESPONSIBILITY_FOR_ERROR_MESSAGE
+
 // Portable BN254 Fq host-side arithmetic (for pippenger's collect() function)
 #include "blst_t.hpp"
 

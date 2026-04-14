@@ -26,21 +26,30 @@ __global__ void g2_mont_to_canonical_kernel(uint32_t* scalars, int n) {
 }
 
 // Same MSM parameters as G1 (scalar decomposition is point-independent)
-// WINDOW_BITS=13 gives the best tradeoff on AMD: 20 windows × 8192 buckets.
-// Larger windows (e.g. 15 bits) slow down the serial reduce phase proportionally
-// to the number of buckets per window (tested: 15 bits = 6.3s vs 13 bits = 3.8s).
+// WINDOW_BITS=13 with signed digits: 20 windows × 4097 signed buckets.
+// Signed digits halve the bucket count vs unsigned (4097 vs 8192), which:
+// - halves the partial_sums buffer (192 MB vs 384 MB)
+// - halves merge kernel work (128 adds/bucket instead of 256)
+// - halves reduce work (4097 buckets instead of 8192)
 static constexpr int G2_WINDOW_BITS = 13;
 static constexpr int G2_NUM_WINDOWS = (254 + G2_WINDOW_BITS - 1) / G2_WINDOW_BITS; // 20
-static constexpr int G2_NUM_BUCKETS = (1 << (G2_WINDOW_BITS - 1)) + 1; // 4097
+static constexpr int G2_NUM_BUCKETS = (1 << (G2_WINDOW_BITS - 1)) + 1; // 4097 (signed: 0..2^(c-1))
 static constexpr int G2_SCALAR_LIMBS = 8;
 
 // ================================================================
-// Kernel: Scalar decomposition (identical to G1 — point-independent)
+// Kernel: Signed scalar decomposition for a single window.
+// Uses signed representation: if digit > 2^(c-1), negate and carry.
+// One thread per scalar. Carry from previous windows is stored in a
+// per-scalar carry array that persists across window invocations.
+//
+// Output: digits[idx] = bucket index (0..2^(c-1))
+//         packed_idx[idx] = point_index | (sign << 31)
 // ================================================================
 __global__ void g2_scalar_decompose_kernel(
     const uint32_t* __restrict__ scalars,
     uint16_t* __restrict__ digits,
     uint32_t* __restrict__ packed_idx,
+    uint8_t* __restrict__ carries,  // persistent carry array [n]
     int n, int window
 ) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -62,14 +71,23 @@ __global__ void g2_scalar_decompose_kernel(
     else
         raw &= (1u << G2_WINDOW_BITS) - 1;
 
-    // For signed decomposition we need carry from previous windows.
-    // Use a simpler unsigned approach for now (no signed digits):
-    // digit = raw, sign = 0, no carry needed.
-    // This means we use 2^c unsigned buckets, which uses slightly more memory
-    // but avoids the multi-window carry propagation complexity.
-    uint16_t digit = (uint16_t)(raw & ((1u << G2_WINDOW_BITS) - 1));
-    packed_idx[idx] = idx; // no sign bit, pure index
-    digits[idx] = digit;
+    // Add carry from previous window
+    raw += carries[idx];
+
+    // Signed decomposition: if digit > 2^(c-1), negate and propagate carry
+    uint32_t half = 1u << (G2_WINDOW_BITS - 1);
+    uint8_t sign = 0;
+    uint8_t new_carry = 0;
+
+    if (raw > half) {
+        raw = (1u << G2_WINDOW_BITS) - raw;
+        sign = 1;
+        new_carry = 1;
+    }
+
+    carries[idx] = new_carry;
+    digits[idx] = (uint16_t)raw;
+    packed_idx[idx] = idx | ((uint32_t)sign << 31);
 }
 
 // ================================================================
@@ -95,13 +113,11 @@ __global__ void g2_bucket_boundaries_kernel(
 // Kernel: Parallel bucket accumulation — Jacobian coordinates.
 // Each thread iterates through its stride-BUCKET_PAR share of the bucket.
 // ================================================================
-// BUCKET_PAR controls how many threads accumulate per bucket (and how many partials
-// the merge kernel must combine). Higher = more parallelism but larger partial_sums
-// buffer (8K buckets × BUCKET_PAR × 192 bytes per Jacobian point).
-//   128 → 192 MB partial buffer, ~12 points/thread/window
-//   256 → 384 MB partial buffer, ~6 points/thread/window — better GPU occupancy
-//          on 7900 XTX/9070 XT but more memory pressure
-static constexpr int G2_BUCKET_PAR = 256;
+// BUCKET_PAR = 128 with signed digits (4097 buckets) gives 524K threads per window.
+// This is the same thread count as the original BUCKET_PAR=256 with unsigned digits
+// (8192 buckets), but the partial_sums buffer is halved (96 MB vs 384 MB) and
+// the merge kernel does 128 serial adds instead of 256.
+static constexpr int G2_BUCKET_PAR = 128;
 
 __global__ void g2_bucket_accumulate_parallel_kernel(
     const bn254_g2_affine_t* __restrict__ points,
@@ -127,14 +143,18 @@ __global__ void g2_bucket_accumulate_parallel_kernel(
         uint32_t count = e - s;
         uint32_t i = par_id;
         if (i < count) {
-            uint32_t pi = sorted_idx[s + i];
+            uint32_t packed = sorted_idx[s + i];
+            uint32_t pi = packed & 0x7FFFFFFFu;
             bn254_g2_affine_t p = points[pi];
+            if (packed >> 31) { p.y = -p.y; } // negate if sign bit set
             if (!p.is_infinity()) acc = bn254_g2_t(p);
             i += G2_BUCKET_PAR;
         }
         for (; i < count; i += G2_BUCKET_PAR) {
-            uint32_t pi = sorted_idx[s + i];
+            uint32_t packed = sorted_idx[s + i];
+            uint32_t pi = packed & 0x7FFFFFFFu;
             bn254_g2_affine_t p = points[pi];
+            if (packed >> 31) { p.y = -p.y; } // negate if sign bit set
             if (!p.is_infinity()) {
                 if (acc.is_infinity()) acc = bn254_g2_t(p);
                 else acc.add_affine_unsafe(p);
@@ -284,7 +304,163 @@ __global__ void g2_combine_windows_kernel(
 }
 
 // ================================================================
-// One-shot G2 MSM entry point
+// Persistent G2 MSM context
+// Holds all device buffers so they can be reused across invocations.
+// Created once with the full PK base-point array (uploaded to GPU on create),
+// then invoke() just uploads fresh scalars and runs the pipeline.
+// Saves ~10 hipMalloc + hipMemcpy per prove call (pt_bytes ≈ 2.3 GB for
+// 15M G2 bases alone; we hold that once instead of freeing per call).
+// ================================================================
+struct hip_g2_msm_context {
+    int npoints = 0;  // max capacity
+    hipStream_t stream;
+
+    bn254_g2_affine_t* d_points = nullptr;
+    uint32_t* d_scalars = nullptr;
+    uint16_t* d_digits = nullptr;
+    uint16_t* d_sorted_digits = nullptr;
+    uint32_t* d_idx = nullptr;
+    uint32_t* d_sorted_idx = nullptr;
+    uint32_t* d_starts = nullptr;
+    uint32_t* d_ends = nullptr;
+    bn254_g2_xyzz_t* d_buckets = nullptr;
+    uint8_t* d_carries = nullptr;
+
+    void* d_sort_temp = nullptr;
+    size_t sort_temp_bytes = 0;
+
+    bn254_g2_t* d_partial_sums = nullptr;
+    bn254_g2_t* d_window_results = nullptr;
+    bn254_g2_t* d_final_result = nullptr;
+    bn254_g2_t* d_local_partials = nullptr;
+    bn254_g2_t* d_local_suffixes = nullptr;
+    int reduce_threads = 0;
+};
+
+static rustCudaError_t g2_ctx_alloc(hip_g2_msm_context* ctx, int n) {
+    ctx->npoints = n;
+    const int num_buckets = G2_NUM_BUCKETS;
+
+    hipStreamCreate(&ctx->stream);
+
+    if (hipMalloc(&ctx->d_points, (size_t)n * sizeof(bn254_g2_affine_t)) != hipSuccess) goto fail;
+    if (hipMalloc(&ctx->d_scalars, (size_t)n * G2_SCALAR_LIMBS * sizeof(uint32_t)) != hipSuccess) goto fail;
+    if (hipMalloc(&ctx->d_digits, (size_t)n * sizeof(uint16_t)) != hipSuccess) goto fail;
+    if (hipMalloc(&ctx->d_sorted_digits, (size_t)n * sizeof(uint16_t)) != hipSuccess) goto fail;
+    if (hipMalloc(&ctx->d_idx, (size_t)n * sizeof(uint32_t)) != hipSuccess) goto fail;
+    if (hipMalloc(&ctx->d_sorted_idx, (size_t)n * sizeof(uint32_t)) != hipSuccess) goto fail;
+    if (hipMalloc(&ctx->d_starts, (size_t)num_buckets * sizeof(uint32_t)) != hipSuccess) goto fail;
+    if (hipMalloc(&ctx->d_ends, (size_t)num_buckets * sizeof(uint32_t)) != hipSuccess) goto fail;
+    if (hipMalloc(&ctx->d_buckets, (size_t)num_buckets * sizeof(bn254_g2_xyzz_t)) != hipSuccess) goto fail;
+    if (hipMalloc(&ctx->d_carries, (size_t)n * sizeof(uint8_t)) != hipSuccess) goto fail;
+
+    // hipCUB sort temp storage (known upfront from bit range + n).
+    ctx->sort_temp_bytes = 0;
+    hipcub::DeviceRadixSort::SortPairs(
+        nullptr, ctx->sort_temp_bytes,
+        ctx->d_digits, ctx->d_sorted_digits,
+        ctx->d_idx, ctx->d_sorted_idx,
+        n, 0, G2_WINDOW_BITS, ctx->stream
+    );
+    if (hipMalloc(&ctx->d_sort_temp, ctx->sort_temp_bytes) != hipSuccess) goto fail;
+
+    if (hipMalloc(&ctx->d_partial_sums, (size_t)num_buckets * G2_BUCKET_PAR * sizeof(bn254_g2_t)) != hipSuccess) goto fail;
+    if (hipMalloc(&ctx->d_window_results, (size_t)G2_NUM_WINDOWS * sizeof(bn254_g2_t)) != hipSuccess) goto fail;
+    if (hipMalloc(&ctx->d_final_result, sizeof(bn254_g2_t)) != hipSuccess) goto fail;
+
+    ctx->reduce_threads = (num_buckets - 1 + G2_REDUCE_BLOCK_SIZE - 1) / G2_REDUCE_BLOCK_SIZE;
+    if (hipMalloc(&ctx->d_local_partials, (size_t)ctx->reduce_threads * sizeof(bn254_g2_t)) != hipSuccess) goto fail;
+    if (hipMalloc(&ctx->d_local_suffixes, (size_t)ctx->reduce_threads * sizeof(bn254_g2_t)) != hipSuccess) goto fail;
+
+    return CUDA_SUCCESS_CSL;
+fail:
+    return rustCudaError_t{.message = "hipMalloc failed in g2_ctx_alloc"};
+}
+
+static void g2_ctx_free(hip_g2_msm_context* ctx) {
+    if (ctx->d_points) hipFree(ctx->d_points);
+    if (ctx->d_scalars) hipFree(ctx->d_scalars);
+    if (ctx->d_digits) hipFree(ctx->d_digits);
+    if (ctx->d_sorted_digits) hipFree(ctx->d_sorted_digits);
+    if (ctx->d_idx) hipFree(ctx->d_idx);
+    if (ctx->d_sorted_idx) hipFree(ctx->d_sorted_idx);
+    if (ctx->d_starts) hipFree(ctx->d_starts);
+    if (ctx->d_ends) hipFree(ctx->d_ends);
+    if (ctx->d_buckets) hipFree(ctx->d_buckets);
+    if (ctx->d_carries) hipFree(ctx->d_carries);
+    if (ctx->d_sort_temp) hipFree(ctx->d_sort_temp);
+    if (ctx->d_partial_sums) hipFree(ctx->d_partial_sums);
+    if (ctx->d_window_results) hipFree(ctx->d_window_results);
+    if (ctx->d_final_result) hipFree(ctx->d_final_result);
+    if (ctx->d_local_partials) hipFree(ctx->d_local_partials);
+    if (ctx->d_local_suffixes) hipFree(ctx->d_local_suffixes);
+    hipStreamDestroy(ctx->stream);
+}
+
+// Runs the G2 MSM pipeline using an existing context. Assumes scalars are
+// already in ctx->d_scalars (canonical form).
+static void g2_run_pipeline(hip_g2_msm_context* ctx, int n, void* result_ptr) {
+    const int num_buckets = G2_NUM_BUCKETS;
+    hipStream_t stream = ctx->stream;
+
+    // Reset per-scalar carries for signed-digit decomposition.
+    hipMemsetAsync(ctx->d_carries, 0, (size_t)n * sizeof(uint8_t), stream);
+
+    int threads = 256;
+    int blocks_n = (n + threads - 1) / threads;
+    int total_par_threads = num_buckets * G2_BUCKET_PAR;
+    int blocks_par = (total_par_threads + threads - 1) / threads;
+    int blocks_b = (num_buckets + threads - 1) / threads;
+    int blocks_reduce = (ctx->reduce_threads + threads - 1) / threads;
+
+    for (int w = 0; w < G2_NUM_WINDOWS; w++) {
+        g2_scalar_decompose_kernel<<<blocks_n, threads, 0, stream>>>(
+            ctx->d_scalars, ctx->d_digits, ctx->d_idx, ctx->d_carries, n, w
+        );
+
+        hipcub::DeviceRadixSort::SortPairs(
+            ctx->d_sort_temp, ctx->sort_temp_bytes,
+            ctx->d_digits, ctx->d_sorted_digits,
+            ctx->d_idx, ctx->d_sorted_idx,
+            n, 0, G2_WINDOW_BITS, stream
+        );
+
+        hipMemsetAsync(ctx->d_starts, 0xFF, (size_t)num_buckets * sizeof(uint32_t), stream);
+        hipMemsetAsync(ctx->d_ends, 0, (size_t)num_buckets * sizeof(uint32_t), stream);
+        g2_bucket_boundaries_kernel<<<blocks_n, threads, 0, stream>>>(
+            ctx->d_sorted_digits, ctx->d_starts, ctx->d_ends, n
+        );
+
+        g2_bucket_accumulate_parallel_kernel<<<blocks_par, threads, 0, stream>>>(
+            ctx->d_points, ctx->d_sorted_idx, ctx->d_starts, ctx->d_ends,
+            ctx->d_partial_sums, num_buckets
+        );
+
+        g2_merge_partial_sums_kernel<<<blocks_b, threads, 0, stream>>>(
+            ctx->d_partial_sums, ctx->d_buckets, num_buckets
+        );
+
+        g2_reduce_phase1_kernel<<<blocks_reduce, threads, 0, stream>>>(
+            ctx->d_buckets, ctx->d_local_partials, ctx->d_local_suffixes, num_buckets
+        );
+        g2_reduce_phase2_kernel<<<1, 1, 0, stream>>>(
+            ctx->d_local_partials, ctx->d_local_suffixes, &ctx->d_window_results[w],
+            ctx->reduce_threads, num_buckets
+        );
+    }
+
+    g2_combine_windows_kernel<<<1, 1, 0, stream>>>(
+        ctx->d_window_results, ctx->d_final_result, G2_NUM_WINDOWS, G2_WINDOW_BITS
+    );
+
+    hipMemcpyAsync(result_ptr, ctx->d_final_result, sizeof(bn254_g2_t),
+                   hipMemcpyDeviceToHost, stream);
+    hipStreamSynchronize(stream);
+}
+
+// ================================================================
+// One-shot G2 MSM entry point (unchanged API; now implemented in terms of
+// a temporary persistent context so the pipeline code lives in one place).
 // ================================================================
 extern "C"
 rustCudaError_t sp1_bn254_g2_msm(
@@ -301,169 +477,101 @@ rustCudaError_t sp1_bn254_g2_msm(
     }
 
     const int n = (int)npoints;
-    const bn254_g2_affine_t* h_points = (const bn254_g2_affine_t*)points_ptr;
-    const uint32_t* h_scalars = (const uint32_t*)scalars_ptr;
+    hip_g2_msm_context ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    rustCudaError_t err = g2_ctx_alloc(&ctx, n);
+    if (err.message != CUDA_SUCCESS_CSL.message) {
+        g2_ctx_free(&ctx);
+        return err;
+    }
 
-    hipError_t err;
-    hipStream_t stream;
-    hipStreamCreate(&stream);
-
-    // Allocate device memory
-    bn254_g2_affine_t* d_points = nullptr;
-    uint32_t* d_scalars = nullptr;
-    uint16_t* d_digits = nullptr;
-    uint16_t* d_sorted_digits = nullptr;
-    uint32_t* d_idx = nullptr;
-    uint32_t* d_sorted_idx = nullptr;
-    uint32_t* d_starts = nullptr;
-    uint32_t* d_ends = nullptr;
-    bn254_g2_xyzz_t* d_buckets = nullptr;
-
-    size_t pt_bytes = n * sizeof(bn254_g2_affine_t);
-    size_t sc_bytes = n * G2_SCALAR_LIMBS * sizeof(uint32_t);
-    int num_buckets = (1 << G2_WINDOW_BITS); // unsigned: 0..2^c-1
-
-    hipMalloc(&d_points, pt_bytes);
-    hipMalloc(&d_scalars, sc_bytes);
-    hipMalloc(&d_digits, n * sizeof(uint16_t));
-    hipMalloc(&d_sorted_digits, n * sizeof(uint16_t));
-    hipMalloc(&d_idx, n * sizeof(uint32_t));
-    hipMalloc(&d_sorted_idx, n * sizeof(uint32_t));
-    hipMalloc(&d_starts, num_buckets * sizeof(uint32_t));
-    hipMalloc(&d_ends, num_buckets * sizeof(uint32_t));
-    hipMalloc(&d_buckets, num_buckets * sizeof(bn254_g2_xyzz_t));
-
-    // Upload points and scalars
-    hipMemcpyAsync(d_points, h_points, pt_bytes, hipMemcpyHostToDevice, stream);
-    hipMemcpyAsync(d_scalars, h_scalars, sc_bytes, hipMemcpyHostToDevice, stream);
-    hipStreamSynchronize(stream);
-
-    // Montgomery → canonical if needed
+    hipMemcpyAsync(ctx.d_points, points_ptr,
+                   (size_t)n * sizeof(bn254_g2_affine_t),
+                   hipMemcpyHostToDevice, ctx.stream);
+    hipMemcpyAsync(ctx.d_scalars, scalars_ptr,
+                   (size_t)n * G2_SCALAR_LIMBS * sizeof(uint32_t),
+                   hipMemcpyHostToDevice, ctx.stream);
     if (mont) {
         int thr = 256;
         int blk = (n + thr - 1) / thr;
-        g2_mont_to_canonical_kernel<<<blk, thr, 0, stream>>>(d_scalars, n);
-        hipStreamSynchronize(stream);
+        g2_mont_to_canonical_kernel<<<blk, thr, 0, ctx.stream>>>(ctx.d_scalars, n);
     }
 
-    // hipCUB sort temp buffer
-    size_t sort_temp_bytes = 0;
-    hipcub::DeviceRadixSort::SortPairs(
-        nullptr, sort_temp_bytes,
-        d_digits, d_sorted_digits,
-        d_idx, d_sorted_idx,
-        n, 0, G2_WINDOW_BITS, stream
-    );
-    void* d_sort_temp = nullptr;
-    hipMalloc(&d_sort_temp, sort_temp_bytes);
-
-    // Device buffers for parallel reduction
-    bn254_g2_t* d_partial_sums = nullptr;
-    bn254_g2_t* d_window_results = nullptr;
-    bn254_g2_t* d_final_result = nullptr;
-    int reduce_threads = (num_buckets - 1 + G2_REDUCE_BLOCK_SIZE - 1) / G2_REDUCE_BLOCK_SIZE;
-    bn254_g2_t* d_local_partials = nullptr;
-    bn254_g2_t* d_local_suffixes = nullptr;
-
-    hipMalloc(&d_partial_sums, (size_t)num_buckets * G2_BUCKET_PAR * sizeof(bn254_g2_t));
-    hipMalloc(&d_window_results, G2_NUM_WINDOWS * sizeof(bn254_g2_t));
-    hipMalloc(&d_final_result, sizeof(bn254_g2_t));
-    hipMalloc(&d_local_partials, reduce_threads * sizeof(bn254_g2_t));
-    hipMalloc(&d_local_suffixes, reduce_threads * sizeof(bn254_g2_t));
-
-    int threads = 256;
-    int blocks_n = (n + threads - 1) / threads;
-    int total_par_threads = num_buckets * G2_BUCKET_PAR;
-    int blocks_par = (total_par_threads + threads - 1) / threads;
-    int blocks_b = (num_buckets + threads - 1) / threads;
-    int blocks_reduce = (reduce_threads + threads - 1) / threads;
-
-    for (int w = 0; w < G2_NUM_WINDOWS; w++) {
-        // 1. Decompose scalars for this window
-        g2_scalar_decompose_kernel<<<blocks_n, threads, 0, stream>>>(
-            d_scalars, d_digits, d_idx, n, w
-        );
-
-        // 2. Sort by digit
-        hipcub::DeviceRadixSort::SortPairs(
-            d_sort_temp, sort_temp_bytes,
-            d_digits, d_sorted_digits,
-            d_idx, d_sorted_idx,
-            n, 0, G2_WINDOW_BITS, stream
-        );
-
-        // 3. Find bucket boundaries
-        hipMemsetAsync(d_starts, 0xFF, num_buckets * sizeof(uint32_t), stream);
-        hipMemsetAsync(d_ends, 0, num_buckets * sizeof(uint32_t), stream);
-        g2_bucket_boundaries_kernel<<<blocks_n, threads, 0, stream>>>(
-            d_sorted_digits, d_starts, d_ends, n
-        );
-
-        // 4. Parallel bucket accumulation (BUCKET_PAR threads per bucket)
-        g2_bucket_accumulate_parallel_kernel<<<blocks_par, threads, 0, stream>>>(
-            d_points, d_sorted_idx, d_starts, d_ends, d_partial_sums, num_buckets
-        );
-
-        // 5. Merge partial sums → XYZZ buckets
-        g2_merge_partial_sums_kernel<<<blocks_b, threads, 0, stream>>>(
-            d_partial_sums, d_buckets, num_buckets
-        );
-
-        // 6. Block-parallel bucket reduction (Phase 1 + Phase 2, XYZZ coords)
-        g2_reduce_phase1_kernel<<<blocks_reduce, threads, 0, stream>>>(
-            d_buckets, d_local_partials, d_local_suffixes, num_buckets
-        );
-        g2_reduce_phase2_kernel<<<1, 1, 0, stream>>>(
-            d_local_partials, d_local_suffixes, &d_window_results[w],
-            reduce_threads, num_buckets
-        );
-    }
-    hipStreamSynchronize(stream);
-
-    // 7. Combine windows via Horner's method
-    g2_combine_windows_kernel<<<1, 1, 0, stream>>>(
-        d_window_results, d_final_result, G2_NUM_WINDOWS, G2_WINDOW_BITS
-    );
-    hipStreamSynchronize(stream);
-
-    // Download result
-    hipMemcpy(result_ptr, d_final_result, sizeof(bn254_g2_t), hipMemcpyDeviceToHost);
-
-    hipFree(d_partial_sums);
-    hipFree(d_window_results);
-    hipFree(d_final_result);
-    hipFree(d_local_partials);
-    hipFree(d_local_suffixes);
-
-    // Cleanup
-    hipFree(d_points);
-    hipFree(d_scalars);
-    hipFree(d_digits);
-    hipFree(d_sorted_digits);
-    hipFree(d_idx);
-    hipFree(d_sorted_idx);
-    hipFree(d_starts);
-    hipFree(d_ends);
-    hipFree(d_buckets);
-    hipFree(d_sort_temp);
-    hipStreamDestroy(stream);
-
+    g2_run_pipeline(&ctx, n, result_ptr);
+    g2_ctx_free(&ctx);
     return CUDA_SUCCESS_CSL;
 }
 
-// Persistent context stubs (not yet implemented for HIP G2)
+// ================================================================
+// Persistent context API — create once per PK, reuse across proofs.
+// ================================================================
 extern "C"
-rustCudaError_t sp1_bn254_g2_msm_create(void** ctx, const void*, size_t, size_t) {
-    *ctx = nullptr;
-    return rustCudaError_t{.message = "G2 persistent MSM not yet implemented on HIP"};
+rustCudaError_t sp1_bn254_g2_msm_create(
+    void** ctx_out,
+    const void* points,
+    size_t npoints,
+    size_t ffi_affine_sz
+) {
+    auto* ctx = new hip_g2_msm_context();
+    memset(ctx, 0, sizeof(*ctx));
+
+    rustCudaError_t err = g2_ctx_alloc(ctx, (int)npoints);
+    if (err.message != CUDA_SUCCESS_CSL.message) {
+        g2_ctx_free(ctx);
+        delete ctx;
+        return err;
+    }
+
+    // Upload base points once — they never change between proofs.
+    if (hipMemcpy(ctx->d_points, points,
+                  (size_t)npoints * sizeof(bn254_g2_affine_t),
+                  hipMemcpyHostToDevice) != hipSuccess) {
+        g2_ctx_free(ctx);
+        delete ctx;
+        return rustCudaError_t{.message = "hipMemcpy failed in g2_msm_create"};
+    }
+
+    *ctx_out = reinterpret_cast<void*>(ctx);
+    return CUDA_SUCCESS_CSL;
 }
 
 extern "C"
-rustCudaError_t sp1_bn254_g2_msm_invoke(void*, void*, size_t, const void*, bool) {
-    return rustCudaError_t{.message = "G2 persistent MSM not yet implemented on HIP"};
+rustCudaError_t sp1_bn254_g2_msm_invoke(
+    void* ctx_ptr,
+    void* result,
+    size_t npoints,
+    const void* scalars,
+    bool mont
+) {
+    auto* ctx = reinterpret_cast<hip_g2_msm_context*>(ctx_ptr);
+    const int n = (int)npoints;
+    if (n > ctx->npoints) {
+        return rustCudaError_t{.message = "g2_msm_invoke: npoints exceeds context capacity"};
+    }
+
+    // Upload scalars to pre-allocated buffer.
+    if (hipMemcpyAsync(ctx->d_scalars, scalars,
+                       (size_t)n * G2_SCALAR_LIMBS * sizeof(uint32_t),
+                       hipMemcpyHostToDevice, ctx->stream) != hipSuccess) {
+        return rustCudaError_t{.message = "hipMemcpyAsync failed in g2_msm_invoke"};
+    }
+
+    if (mont) {
+        int thr = 256;
+        int blk = (n + thr - 1) / thr;
+        g2_mont_to_canonical_kernel<<<blk, thr, 0, ctx->stream>>>(ctx->d_scalars, n);
+    }
+
+    g2_run_pipeline(ctx, n, result);
+    return CUDA_SUCCESS_CSL;
 }
 
 extern "C"
-void sp1_bn254_g2_msm_destroy(void*) {}
+void sp1_bn254_g2_msm_destroy(void* ctx_ptr) {
+    if (!ctx_ptr) return;
+    auto* ctx = reinterpret_cast<hip_g2_msm_context*>(ctx_ptr);
+    g2_ctx_free(ctx);
+    delete ctx;
+}
 
 #endif // __HIPCC__

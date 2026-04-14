@@ -7,7 +7,7 @@
 
 use crate::g2::g2_msm_ark;
 #[cfg(feature = "cuda")]
-use crate::g2::g2_msm_gpu;
+use crate::g2::{g2_msm_gpu, PersistentG2Msm};
 use crate::types::{Groth16Proof, Groth16ProvingData, Groth16WitnessData};
 use crate::{BN254Fr, BN254G1Affine, Fr, G1Affine, G1Jacobian};
 use rayon::prelude::*;
@@ -27,6 +27,11 @@ pub struct Groth16Prover {
     persistent_g1_k: sp1_gpu_plonk::g1::PersistentMsm,
     #[cfg(feature = "cuda")]
     persistent_g1_z: sp1_gpu_plonk::g1::PersistentMsm,
+    /// Pre-uploaded G2 SRS context for the Bs2 MSM. `None` on backends that
+    /// don't implement the persistent G2 API — callers fall back to the
+    /// one-shot `g2_msm_gpu` (or arkworks CPU) path.
+    #[cfg(feature = "cuda")]
+    persistent_g2_b: Option<PersistentG2Msm>,
 }
 
 impl Groth16Prover {
@@ -50,6 +55,38 @@ impl Groth16Prover {
             eprintln!("[groth16] Pre-uploaded 4 G1 SRS to GPU: {:?}", t.elapsed());
             (pa, pb, pk, pz)
         };
+        // Pre-upload G2 B SRS via the persistent context. This is only
+        // enabled on HIP, where we own the full G2 MSM implementation.
+        //
+        // On CUDA the persistent G2 API is provided by sppark but creating
+        // a g2_msm_context_t there conflicts with sppark's G1 gpu_t
+        // singleton and causes subsequent G1 invokes to fail with
+        // "BN254 MSM invoke failed". The CUDA path keeps using the one-
+        // shot g2_msm_gpu (which re-creates/destroys a temporary context
+        // per call but doesn't hit the conflict).
+        #[cfg(feature = "cuda")]
+        let persistent_g2_b = {
+            let backend_is_hip = std::env::var("SP1_GPU_BACKEND")
+                .ok()
+                .map(|v| {
+                    let v = v.to_lowercase();
+                    v == "hip" || v == "rocm" || v == "amd"
+                })
+                .unwrap_or(false);
+            if backend_is_hip {
+                let t = std::time::Instant::now();
+                let p = PersistentG2Msm::new(&data.pk_g2_b);
+                if p.is_some() {
+                    eprintln!("[groth16] Pre-uploaded G2 SRS to GPU: {:?}", t.elapsed());
+                } else {
+                    eprintln!("[groth16] Persistent G2 MSM unavailable, using one-shot g2_msm_gpu");
+                }
+                p
+            } else {
+                eprintln!("[groth16] Skipping persistent G2 MSM on CUDA (sppark gpu_t conflict)");
+                None
+            }
+        };
         Self {
             data,
             #[cfg(feature = "cuda")]
@@ -60,6 +97,8 @@ impl Groth16Prover {
             persistent_g1_k,
             #[cfg(feature = "cuda")]
             persistent_g1_z,
+            #[cfg(feature = "cuda")]
+            persistent_g2_b,
         }
     }
 
@@ -210,8 +249,35 @@ impl Groth16Prover {
         let g2_b = &self.data.pk_g2_b;
         let t_g2_start = std::time::Instant::now();
 
+        // GPU builds: the G2-overlap strategy is runtime-dispatched by
+        // SP1_GPU_BACKEND because the two backends behave very differently.
+        //
+        // - CUDA (sppark): sppark has a real multi-stream `gpu_t` pipeline.
+        //   Overlapping G2 with the G1 MSMs via std::thread::scope lets the
+        //   device execute them concurrently, hiding G2 behind Bs1/Krs/Krs2
+        //   (1.65 s prove on RTX 4090). Running sequentially on CUDA also
+        //   triggers a sppark pippenger kernel-launch error (code=-9) after
+        //   the first G1 invoke, so overlap is also the only mode that
+        //   currently compiles and runs.
+        //
+        // - HIP (custom MSM): every MSM synchronously blocks on its own
+        //   hipStream before returning. Spawning G2 on a worker thread
+        //   while G1 MSMs run on main thrashes the single HIP queue, and
+        //   Krs MSM balloons from ~0.9 s to 40+ s. Sequential execution is
+        //   strictly better. Also, on HIP we have a real persistent G2 MSM
+        //   context that avoids the per-call point upload.
         #[cfg(feature = "cuda")]
-        let (bs2, bs1, krs_msm, krs2_msm) = {
+        let use_sequential_g2 = std::env::var("SP1_GPU_BACKEND")
+            .ok()
+            .map(|v| {
+                let v = v.to_lowercase();
+                v == "hip" || v == "rocm" || v == "amd"
+            })
+            .unwrap_or(false);
+
+        #[cfg(feature = "cuda")]
+        let (bs2, bs1, krs_msm, krs2_msm) = if use_sequential_g2 {
+            // HIP path — sequential.
             let t = std::time::Instant::now();
             let bs1_msm = self.persistent_g1_b.msm(&wire_values_b);
             let bs1 = bs1_msm.add(&g1_beta.to_jacobian()).add(&s_delta);
@@ -222,38 +288,84 @@ impl Groth16Prover {
             eprintln!("[T] 5c. Krs MSM (N={}): {:?}", filtered_wire_values.len(), t.elapsed());
 
             let t = std::time::Instant::now();
-            // Krs2 MSM: if H is on GPU (DeviceH), use msm_device to skip the
-            // D2H + H2D round-trip. H's device pointer (d_a) already contains
-            // the coefficients in Montgomery form (sppark's msm_device with
-            // mont=true handles the conversion on-GPU).
             let krs2_msm = match &h_result {
-                HResult::Device(dh) => {
-                    self.persistent_g1_z.msm_device(dh.ptr, size_h)
-                }
-                HResult::Host(h) => {
-                    self.persistent_g1_z.msm(&h[..size_h])
-                }
+                HResult::Device(dh) => self.persistent_g1_z.msm_device(dh.ptr, size_h),
+                HResult::Host(h) => self.persistent_g1_z.msm(&h[..size_h]),
             };
             eprintln!("[T] 5d. Krs2 MSM (N={}): {:?}", size_h, t.elapsed());
 
-            // G2 MSM: try GPU first (CUDA), fall back to CPU (HIP or GPU error).
-            let t = std::time::Instant::now();
-            let bs2_msm = g2_msm_gpu(g2_b, &wire_values_b).unwrap_or_else(|| {
-                eprintln!("[groth16] GPU G2 MSM not available, falling back to arkworks CPU");
-                g2_msm_ark(&self.data.pk_g2_b_ark, &wire_values_b)
-            });
+            let t_g2 = std::time::Instant::now();
+            let bs2_msm = self
+                .persistent_g2_b
+                .as_ref()
+                .and_then(|ctx| ctx.msm(&wire_values_b))
+                .or_else(|| g2_msm_gpu(g2_b, &wire_values_b))
+                .unwrap_or_else(|| g2_msm_ark(&self.data.pk_g2_b_ark, &wire_values_b));
+            if std::env::var("GROTH16_G2_VERIFY").ok().as_deref() == Some("1") {
+                let cpu = g2_msm_ark(&self.data.pk_g2_b_ark, &wire_values_b);
+                let gpu_aff = bs2_msm.to_affine();
+                let cpu_aff = cpu.to_affine();
+                let ok = gpu_aff.x.c0 == cpu_aff.x.c0
+                    && gpu_aff.x.c1 == cpu_aff.x.c1
+                    && gpu_aff.y.c0 == cpu_aff.y.c0
+                    && gpu_aff.y.c1 == cpu_aff.y.c1;
+                eprintln!(
+                    "[groth16 G2 MSM verify N={}] gpu_vs_cpu: {}",
+                    wire_values_b.len(),
+                    if ok { "MATCH" } else { "MISMATCH" }
+                );
+            }
             let s_bytes = s.to_le_bytes();
             let mut s_arr = [0u8; 32];
             s_arr.copy_from_slice(&s_bytes);
             let s_g2_delta = g2_delta.to_jacobian().scalar_mul(&s_arr);
             let bs2 = bs2_msm.add(&s_g2_delta).add(&g2_beta.to_jacobian());
             eprintln!(
-                "[T] 6. G2 MSM (GPU, N={}): total={:?}",
+                "[T] 6. G2 MSM (GPU, N={}): {:?} (since prove start: {:?})",
                 wire_values_b.len(),
-                t.elapsed(),
+                t_g2.elapsed(),
+                t_g2_start.elapsed(),
             );
-            let _ = t_g2_start;
             (bs2, bs1, krs_msm, krs2_msm)
+        } else {
+            // CUDA path — overlap G2 with G1 MSMs via thread::scope.
+            std::thread::scope(|scope| {
+                let g2_handle = scope.spawn(|| {
+                    let bs2_msm = g2_msm_gpu(g2_b, &wire_values_b)
+                        .unwrap_or_else(|| g2_msm_ark(&self.data.pk_g2_b_ark, &wire_values_b));
+                    let s_bytes = s.to_le_bytes();
+                    let mut s_arr = [0u8; 32];
+                    s_arr.copy_from_slice(&s_bytes);
+                    let s_g2_delta = g2_delta.to_jacobian().scalar_mul(&s_arr);
+                    bs2_msm.add(&s_g2_delta).add(&g2_beta.to_jacobian())
+                });
+
+                let t = std::time::Instant::now();
+                let bs1_msm = self.persistent_g1_b.msm(&wire_values_b);
+                let bs1 = bs1_msm.add(&g1_beta.to_jacobian()).add(&s_delta);
+                eprintln!("[T] 5b. Bs1 MSM (N={}): {:?}", wire_values_b.len(), t.elapsed());
+
+                let t = std::time::Instant::now();
+                let krs_msm = self.persistent_g1_k.msm(&filtered_wire_values);
+                eprintln!("[T] 5c. Krs MSM (N={}): {:?}", filtered_wire_values.len(), t.elapsed());
+
+                let t = std::time::Instant::now();
+                let krs2_msm = match &h_result {
+                    HResult::Device(dh) => self.persistent_g1_z.msm_device(dh.ptr, size_h),
+                    HResult::Host(h) => self.persistent_g1_z.msm(&h[..size_h]),
+                };
+                eprintln!("[T] 5d. Krs2 MSM (N={}): {:?}", size_h, t.elapsed());
+
+                let t_join = std::time::Instant::now();
+                let bs2 = g2_handle.join().expect("G2 MSM thread panicked");
+                eprintln!(
+                    "[T] 6. G2 MSM (GPU, N={}): total={:?}, join_wait={:?}",
+                    wire_values_b.len(),
+                    t_g2_start.elapsed(),
+                    t_join.elapsed(),
+                );
+                (bs2, bs1, krs_msm, krs2_msm)
+            })
         };
 
         #[cfg(not(feature = "cuda"))]
@@ -388,9 +500,11 @@ impl Groth16Prover {
         }
 
         // Allocate GPU buffer for all 3 polynomials (3N elements).
-        // We allocate 3N but only the first N (d_a) contains H after computation.
-        // The remaining 2N (d_b, d_c) is freed after the pointwise kernel;
-        // we reallocate to return exactly N elements for the Krs2 MSM.
+        // Tried pre-allocating this at prover creation time; on CUDA+sppark
+        // the 1.5 GB reservation starved sppark's internal MSM pool and made
+        // G1 invokes fail, and on HIP the savings were below measurement
+        // noise (caching allocator already makes repeated 1.5 GB mallocs
+        // effectively free). Keep the per-call malloc.
         let mut d_buf: *mut c_void = std::ptr::null_mut();
         check_gpu(
             unsafe { sp1_gpu_sys::runtime::cuda_malloc(&mut d_buf as *mut _, 3 * byte_sz) },
@@ -398,7 +512,7 @@ impl Groth16Prover {
         );
         assert!(!d_buf.is_null(), "GPU H polynomial: cuda_malloc returned null");
 
-        // RAII guard for the 3N buffer (freed after NTTs + pointwise)
+        // RAII guard for the 3N buffer (freed after MSM completes via DeviceH).
         struct GpuGuard(*mut c_void);
         impl Drop for GpuGuard {
             fn drop(&mut self) {
@@ -464,7 +578,10 @@ impl Groth16Prover {
         // "Leak" the 3N buffer from the guard so it's not freed prematurely.
         // The DeviceH struct takes ownership and frees on Drop (after MSM completes).
         std::mem::forget(guard_3n);
-        DeviceH { ptr: d_buf, _byte_sz: 3 * byte_sz }
+        DeviceH {
+            ptr: d_buf,
+            _byte_sz: 3 * byte_sz,
+        }
     }
 
     /// CPU fallback H polynomial computation.

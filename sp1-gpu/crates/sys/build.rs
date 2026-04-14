@@ -218,6 +218,86 @@ fn select_gpu_backend() -> Option<GpuBackend> {
     None
 }
 
+/// Resolve the CUDA toolkit root directory, trying sources in order:
+/// 1. `CUDA_PATH` env var
+/// 2. `CUDACXX` env var (path to nvcc → its grandparent)
+/// 3. `nvcc` on PATH (via `which`)
+/// 4. `/usr/local/cuda/bin/nvcc`'s resolved symlink target grandparent
+/// 5. `/usr/local/cuda` as a last-resort default
+///
+/// Used for BOTH setting `CMAKE_CUDA_COMPILER` (so CMake compiles against the
+/// matching headers) and setting the Rust `link-search` path (so we link the
+/// matching `libcudart`). Keeping these in sync avoids the `cudaDeviceProp`
+/// struct ABI mismatch that silently corrupts `multiProcessorCount` when
+/// CMake uses CUDA 13 nvcc but Rust links 12's libcudart (or vice versa).
+fn resolve_cuda_toolkit_path() -> String {
+    if let Ok(v) = env::var("CUDA_PATH") {
+        if !v.is_empty() {
+            return v;
+        }
+    }
+    if let Ok(cudacxx) = env::var("CUDACXX") {
+        if let Some(root) = std::path::Path::new(&cudacxx)
+            .parent()
+            .and_then(|p| p.parent())
+        {
+            return root.to_string_lossy().into_owned();
+        }
+    }
+    if let Ok(output) = std::process::Command::new("which").arg("nvcc").output() {
+        if output.status.success() {
+            if let Ok(path) = String::from_utf8(output.stdout) {
+                let path = path.trim();
+                if !path.is_empty() {
+                    if let Some(root) =
+                        std::path::Path::new(path).parent().and_then(|p| p.parent())
+                    {
+                        return root.to_string_lossy().into_owned();
+                    }
+                }
+            }
+        }
+    }
+    // No env hints — search /usr/local/cuda-*. Prefer higher major versions
+    // because CUDA 12.x ptxas rejects the G2 MSM `accumulate` kernel's
+    // register count, while CUDA 13.x compiles the same code fine. When a
+    // distribution ships multiple toolkits side-by-side, we want the newer
+    // one even if `/usr/local/cuda` symlinks to the older one.
+    if let Ok(entries) = std::fs::read_dir("/usr/local") {
+        let mut candidates: Vec<(u32, u32, String)> = entries
+            .filter_map(|e| e.ok())
+            .filter_map(|entry| {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                let rest = name.strip_prefix("cuda-")?;
+                let mut parts = rest.split('.');
+                let major: u32 = parts.next()?.parse().ok()?;
+                let minor: u32 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+                let root = format!("/usr/local/{}", name);
+                if std::path::Path::new(&format!("{root}/bin/nvcc")).exists() {
+                    Some((major, minor, root))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        // Newest first (by major, then minor)
+        candidates.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.cmp(&a.1)));
+        if let Some((_, _, root)) = candidates.into_iter().next() {
+            return root;
+        }
+    }
+    // Last resort — follow whatever /usr/local/cuda points at.
+    let default_nvcc = std::path::Path::new("/usr/local/cuda/bin/nvcc");
+    if default_nvcc.exists() {
+        if let Ok(resolved) = default_nvcc.canonicalize() {
+            if let Some(root) = resolved.parent().and_then(|p| p.parent()) {
+                return root.to_string_lossy().into_owned();
+            }
+        }
+    }
+    "/usr/local/cuda".to_string()
+}
+
 fn main() {
     // Directives for tracking changes in folders
     println!("cargo:rerun-if-changed=include/");
@@ -229,6 +309,8 @@ fn main() {
     println!("cargo:rerun-if-env-changed=OPT_LEVEL");
     println!("cargo:rerun-if-env-changed=DEBUG");
     println!("cargo:rerun-if-env-changed=CUDA_ARCHS");
+    println!("cargo:rerun-if-env-changed=CUDA_PATH");
+    println!("cargo:rerun-if-env-changed=CUDACXX");
     println!("cargo:rerun-if-env-changed=PROFILE_DEBUG_DATA");
 
     // The crate directory.
@@ -333,6 +415,21 @@ fn main() {
             if let Ok(cuda_archs) = env::var("CUDA_ARCHS") {
                 cmake_config.define("CUDA_ARCHS", &cuda_archs);
             }
+
+            // CRITICAL: pin CMake's CUDA compiler to the same toolkit that
+            // we'll link libcudart from. The `cudaDeviceProp` struct layout
+            // changed between CUDA 12 and CUDA 13; if CMake compiles against
+            // 13 headers but we link 12's libcudart (or vice versa),
+            // `cudaGetDeviceProperties` returns garbage for
+            // `multiProcessorCount` and sppark's MSM launches die with
+            // `cudaErrorInvalidConfiguration` (grid_size = sm_count/3 = 0).
+            // We deliberately resolve the toolkit the same way the link
+            // search path logic below resolves it, so both sides agree.
+            let resolved = resolve_cuda_toolkit_path();
+            let nvcc_path = format!("{resolved}/bin/nvcc");
+            if std::path::Path::new(&nvcc_path).exists() {
+                cmake_config.define("CMAKE_CUDA_COMPILER", &nvcc_path);
+            }
         }
     }
 
@@ -393,23 +490,14 @@ fn main() {
         GpuBackend::Cuda => {
             // Add CUDA library search paths.
             // IMPORTANT: must match the CUDA version used by nvcc to avoid
-            // cudaDeviceProp ABI mismatch (struct layout changed between CUDA 12 and 13).
-            let cuda_path = env::var("CUDA_PATH").unwrap_or_else(|_| {
-                // Auto-detect from nvcc location: /usr/local/cuda-13.1/bin/nvcc -> /usr/local/cuda-13.1
-                if let Ok(output) = std::process::Command::new("which").arg("nvcc").output() {
-                    if let Ok(path) = String::from_utf8(output.stdout) {
-                        let path = path.trim();
-                        if let Some(cuda_root) =
-                            std::path::Path::new(path).parent().and_then(|p| p.parent())
-                        {
-                            return cuda_root.to_string_lossy().into_owned();
-                        }
-                    }
-                }
-                "/usr/local/cuda".to_string()
-            });
+            // cudaDeviceProp ABI mismatch (struct layout changed between
+            // CUDA 12 and 13). `resolve_cuda_toolkit_path` is also used when
+            // configuring CMake above, so the two sides stay in sync.
+            let cuda_path = resolve_cuda_toolkit_path();
             println!("cargo:rustc-link-search=native={cuda_path}/lib64");
             println!("cargo:rustc-link-search=native={cuda_path}/lib");
+            // CUDA 13+ places libraries under targets/<triple>/lib
+            println!("cargo:rustc-link-search=native={cuda_path}/targets/x86_64-linux/lib");
 
             // Link CUDA runtime libraries
             println!("cargo:rustc-link-lib=cudart");

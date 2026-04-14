@@ -29,7 +29,7 @@ fn main() {
 
     println!("Calling GPU g2_msm with N={n}...");
     let t = std::time::Instant::now();
-    let gpu = g2_msm_gpu(&bases, &scalars);
+    let gpu = g2_msm_gpu(&bases, &scalars).expect("GPU g2_msm returned None");
     println!("GPU result: is_inf={} ({:?})", gpu.is_infinity(), t.elapsed());
 
     let ark_bases: Vec<ark_bn254::G2Affine> =

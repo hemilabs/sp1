@@ -219,6 +219,91 @@ pub fn g2_msm_gpu(bases: &[G2Affine], scalars: &[Fr]) -> Option<G2Jacobian> {
     Some(result)
 }
 
+/// Persistent G2 MSM context — one-time SRS upload, per-proof scalar upload.
+///
+/// Mirrors `sp1_gpu_plonk::g1::PersistentMsm` but for the G2 MSM. The context
+/// owns a large GPU allocation (for 15M G2 bases ≈ 2.3 GB) and several working
+/// buffers, all sized for the SRS capacity and reused across prove calls. This
+/// eliminates the ~6s per-call point upload and ~10 hipMallocs that the one-
+/// shot `g2_msm_gpu` pays on every invocation.
+#[cfg(feature = "cuda")]
+pub struct PersistentG2Msm {
+    ctx: *mut std::ffi::c_void,
+    npoints: usize,
+}
+
+#[cfg(feature = "cuda")]
+unsafe impl Send for PersistentG2Msm {}
+#[cfg(feature = "cuda")]
+unsafe impl Sync for PersistentG2Msm {}
+
+#[cfg(feature = "cuda")]
+impl PersistentG2Msm {
+    /// Create a persistent G2 MSM context, uploading SRS points to GPU once.
+    /// Returns `None` if the GPU G2 kernel is not available (e.g., when the
+    /// backend doesn't implement the persistent API).
+    pub fn new(points: &[G2Affine]) -> Option<Self> {
+        use std::ffi::c_void;
+
+        let n = points.len();
+        if n == 0 {
+            return None;
+        }
+
+        let mut ctx: *mut c_void = std::ptr::null_mut();
+        let err = unsafe {
+            sp1_gpu_sys::msm::sp1_bn254_g2_msm_create(
+                &mut ctx as *mut _,
+                points.as_ptr() as *const c_void,
+                n,
+                std::mem::size_of::<G2Affine>(),
+            )
+        };
+        if err != unsafe { sp1_gpu_sys::runtime::CUDA_SUCCESS_CSL } {
+            return None;
+        }
+        Some(Self { ctx, npoints: n })
+    }
+
+    /// Run a G2 MSM against the pre-uploaded SRS. `scalars.len()` must be
+    /// ≤ the context capacity. Scalars are passed in Montgomery form; the
+    /// GPU converts to canonical form inside the invoke.
+    pub fn msm(&self, scalars: &[Fr]) -> Option<G2Jacobian> {
+        use std::ffi::c_void;
+
+        let n = scalars.len();
+        assert!(n <= self.npoints, "G2 MSM scalar count exceeds context capacity");
+        if n == 0 {
+            return Some(G2Jacobian::INFINITY);
+        }
+
+        let mut result = G2Jacobian::INFINITY;
+        let err = unsafe {
+            sp1_gpu_sys::msm::sp1_bn254_g2_msm_invoke(
+                self.ctx,
+                &mut result as *mut G2Jacobian as *mut c_void,
+                n,
+                scalars.as_ptr() as *const c_void,
+                true,
+            )
+        };
+        if err != unsafe { sp1_gpu_sys::runtime::CUDA_SUCCESS_CSL } {
+            return None;
+        }
+        Some(result)
+    }
+}
+
+#[cfg(feature = "cuda")]
+impl Drop for PersistentG2Msm {
+    fn drop(&mut self) {
+        if !self.ctx.is_null() {
+            unsafe { sp1_gpu_sys::msm::sp1_bn254_g2_msm_destroy(self.ctx) };
+            self.ctx = std::ptr::null_mut();
+        }
+    }
+}
+
 /// G2 MSM against pre-converted arkworks bases.
 /// This is the fast path — it skips the ~6s base conversion that `g2_msm`
 /// would otherwise do on every call.
