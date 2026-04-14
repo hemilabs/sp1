@@ -806,6 +806,13 @@ void sp1_bn254_glv_pool_free() {
 struct hip_g1_glv_pool {
     int alloc_n;   // base point count; buffers sized for 2 * alloc_n
 
+    // Input scalars (sized for N, since the raw input is still 254-bit
+    // scalars before GLV decomposition). Shared across contexts so only
+    // one copy lives resident — saves ~1.4 GB on 9070 XT where 4
+    // per-context d_scalars (480 MB each) pushed GLV over the 16 GB
+    // VRAM ceiling.
+    uint32_t* d_scalars;                // N × SCALAR_LIMBS × u32 (32 B/scalar)
+
     // Scalar buffers (sized for 2N):
     uint32_t* d_half_scalars;           // 2N × GLV_SCALAR_LIMBS × u32  (40N bytes)
     uint8_t*  d_glv_signs;              // 2N × u8
@@ -827,6 +834,7 @@ static hip_g1_glv_pool* g_glv_pool = nullptr;
 
 static void glv_pool_free() {
     if (!g_glv_pool) return;
+    hipFree(g_glv_pool->d_scalars);
     hipFree(g_glv_pool->d_half_scalars);
     hipFree(g_glv_pool->d_glv_signs);
     hipFree(g_glv_pool->d_glv_digits);
@@ -856,6 +864,13 @@ static rustCudaError_t glv_pool_ensure(int max_n) {
     memset(pool, 0, sizeof(*pool));
     pool->alloc_n = max_n;
     int n2 = 2 * max_n;
+
+    // Raw input scalars (N × 32 B). Shared across contexts — only one
+    // MSM runs at a time so a single scratch serves all 4 G1 contexts.
+    // Replaces per-context d_scalars for the GLV path (the non-GLV path
+    // still uses per-context d_scalars). Saves ~1.4 GB on 9070 XT.
+    CUDA_OK(hipMalloc(&pool->d_scalars,
+                       (size_t)max_n * SCALAR_LIMBS * sizeof(uint32_t)));
 
     CUDA_OK(hipMalloc(&pool->d_half_scalars,
                        (size_t)n2 * GLV_SCALAR_LIMBS * sizeof(uint32_t)));
@@ -944,9 +959,18 @@ static rustCudaError_t init_glv_buffers(hip_msm_context* ctx) {
         hipFree(ctx->d_partial_sums);
         ctx->d_partial_sums = nullptr;
     }
+    // d_scalars (N × 32 B ≈ 480 MB per context) is now also covered by
+    // the shared pool's d_scalars (sized for max_n across all contexts).
+    // Freeing it here saves another ~1.4 GB total across the 4 G1
+    // contexts, pushing 9070 XT under its 16 GB GLV budget.
+    if (ctx->d_scalars) {
+        hipFree(ctx->d_scalars);
+        ctx->d_scalars = nullptr;
+    }
 
     fprintf(stderr, "[GLV] ctx initialized: expanded %d points to %d, %d windows "
-                    "(was %d) — per-ctx glv footprint = 2N × 64 B (expanded points)\n",
+                    "(was %d) — per-ctx glv footprint = 2N × 64 B (expanded points); "
+                    "freed per-ctx d_points + d_partial_sums + d_scalars (~1.5 GB)\n",
             n, n2, GLV_NUM_WINDOWS, NUM_WINDOWS);
 
     return CUDA_SUCCESS_CSL;
@@ -984,8 +1008,13 @@ rustCudaError_t sp1_bn254_msm_invoke_glv(void* ctx_ptr, void* result,
         hipEventRecord(ev_start);
     }
 
-    // Upload scalars (full 256-bit, will be decomposed on GPU)
-    CUDA_OK(hipMemcpy(ctx->d_scalars, scalars, n * SCALAR_LIMBS * elem32, hipMemcpyHostToDevice));
+    // Shared pool provides scratch d_scalars and the downstream
+    // d_half_scalars / d_glv_* buffers.
+    auto* gp = g_glv_pool;
+
+    // Upload scalars into the shared pool buffer (full 256-bit; will be
+    // decomposed on GPU).
+    CUDA_OK(hipMemcpy(gp->d_scalars, scalars, n * SCALAR_LIMBS * elem32, hipMemcpyHostToDevice));
 
     if (do_timing) hipEventRecord(ev_upload);
 
@@ -994,19 +1023,17 @@ rustCudaError_t sp1_bn254_msm_invoke_glv(void* ctx_ptr, void* result,
         int threads = 256;
         int blocks = (n + threads - 1) / threads;
         hipLaunchKernelGGL(mont_to_canonical_kernel,
-            dim3(blocks), dim3(threads), 0, 0, ctx->d_scalars, n);
+            dim3(blocks), dim3(threads), 0, 0, gp->d_scalars, n);
         CUDA_OK(hipGetLastError());
     }
 
     // GLV scalar decomposition: N canonical scalars -> 2N half-width scalars + signs
-    // (writes into the shared working-buffer pool)
-    auto* gp = g_glv_pool;  // pool was ensured by init_glv_buffers
     {
         int threads = 256;
         int blocks = (n + threads - 1) / threads;
         hipLaunchKernelGGL(bn254_msm::glv_decompose_kernel,
             dim3(blocks), dim3(threads), 0, 0,
-            ctx->d_scalars, gp->d_half_scalars, gp->d_glv_signs, n);
+            gp->d_scalars, gp->d_half_scalars, gp->d_glv_signs, n);
         CUDA_OK(hipGetLastError());
     }
 
@@ -1096,26 +1123,27 @@ rustCudaError_t sp1_bn254_msm_invoke_glv_device(void* ctx_ptr, void* result,
     rustCudaError_t glv_err = init_glv_buffers(ctx);
     if (glv_err.message != CUDA_SUCCESS_CSL.message) return glv_err;
 
-    // D2D copy scalars
-    CUDA_OK(hipMemcpy(ctx->d_scalars, d_scalars, n * SCALAR_LIMBS * elem32, hipMemcpyDeviceToDevice));
+    auto* gp = g_glv_pool;
+
+    // D2D copy scalars into shared pool buffer
+    CUDA_OK(hipMemcpy(gp->d_scalars, d_scalars, n * SCALAR_LIMBS * elem32, hipMemcpyDeviceToDevice));
 
     // Montgomery conversion
     if (mont) {
         int threads = 256;
         int blocks = (n + threads - 1) / threads;
         hipLaunchKernelGGL(mont_to_canonical_kernel,
-            dim3(blocks), dim3(threads), 0, 0, ctx->d_scalars, n);
+            dim3(blocks), dim3(threads), 0, 0, gp->d_scalars, n);
         CUDA_OK(hipGetLastError());
     }
 
     // GLV decomposition (writes into shared pool)
-    auto* gp = g_glv_pool;
     {
         int threads = 256;
         int blocks = (n + threads - 1) / threads;
         hipLaunchKernelGGL(bn254_msm::glv_decompose_kernel,
             dim3(blocks), dim3(threads), 0, 0,
-            ctx->d_scalars, gp->d_half_scalars, gp->d_glv_signs, n);
+            gp->d_scalars, gp->d_half_scalars, gp->d_glv_signs, n);
         CUDA_OK(hipGetLastError());
     }
 
@@ -1174,8 +1202,10 @@ rustCudaError_t sp1_bn254_msm_invoke_glv_device_depad(void* ctx_ptr, void* resul
     rustCudaError_t glv_err = init_glv_buffers(ctx);
     if (glv_err.message != CUDA_SUCCESS_CSL.message) return glv_err;
 
-    // D2D copy scalars
-    CUDA_OK(hipMemcpy(ctx->d_scalars, d_scalars, n * SCALAR_LIMBS * elem32, hipMemcpyDeviceToDevice));
+    auto* gp = g_glv_pool;
+
+    // D2D copy scalars into shared pool buffer
+    CUDA_OK(hipMemcpy(gp->d_scalars, d_scalars, n * SCALAR_LIMBS * elem32, hipMemcpyDeviceToDevice));
 
     // GPU-side depadding
     if (num_hot > 0 && hot_values_host) {
@@ -1187,7 +1217,7 @@ rustCudaError_t sp1_bn254_msm_invoke_glv_device_depad(void* ctx_ptr, void* resul
         int blocks = (n + threads - 1) / threads;
         hipLaunchKernelGGL(bn254_msm::zero_hot_scalars_kernel,
             dim3(blocks), dim3(threads), 0, 0,
-            ctx->d_scalars, d_hot_values, n, num_hot);
+            gp->d_scalars, d_hot_values, n, num_hot);
         CUDA_OK(hipGetLastError());
         hipFree(d_hot_values);
     }
@@ -1197,18 +1227,17 @@ rustCudaError_t sp1_bn254_msm_invoke_glv_device_depad(void* ctx_ptr, void* resul
         int threads = 256;
         int blocks = (n + threads - 1) / threads;
         hipLaunchKernelGGL(mont_to_canonical_kernel,
-            dim3(blocks), dim3(threads), 0, 0, ctx->d_scalars, n);
+            dim3(blocks), dim3(threads), 0, 0, gp->d_scalars, n);
         CUDA_OK(hipGetLastError());
     }
 
     // GLV decomposition (writes into shared pool)
-    auto* gp = g_glv_pool;
     {
         int threads = 256;
         int blocks = (n + threads - 1) / threads;
         hipLaunchKernelGGL(bn254_msm::glv_decompose_kernel,
             dim3(blocks), dim3(threads), 0, 0,
-            ctx->d_scalars, gp->d_half_scalars, gp->d_glv_signs, n);
+            gp->d_scalars, gp->d_half_scalars, gp->d_glv_signs, n);
         CUDA_OK(hipGetLastError());
     }
 

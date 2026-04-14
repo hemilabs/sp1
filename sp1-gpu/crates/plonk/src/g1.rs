@@ -351,13 +351,14 @@ fn glv_enabled() -> bool {
                 &mut total as *mut _,
             ) == sp1_gpu_sys::runtime::CUDA_SUCCESS_CSL
         };
-        // Even with shared working-buffer pool, 9070 XT (16 GB visible ≈
-        // 15.9 GB) OOMs during the 3rd/4th G1 context's d_expanded_points
-        // alloc. The bottleneck is the sum of: 4 × expanded points
-        // (~7.7 GB), 4 × d_scalars (~1.9 GB), pool (~1.35 GB), G2 SRS
-        // (~1.9 GB), H-poly 3N (~1.5 GB), ROCm overhead (~1-2 GB) ≈ 16 GB.
-        // Keep threshold at 20 GB so 7900 XTX (24 GB) stays GLV-on and
-        // 9070 XT reliably falls back to non-GLV.
+        // VRAM math says 9070 XT (15.9 GB) should fit GLV after the
+        // shared pool (incl. d_scalars) refactor. Empirically it does
+        // not: Ar/Bs1 succeed but Krs slows by ~750ms (allocator
+        // pressure) and Krs2 OOMs during d_expanded_points alloc. Likely
+        // ROCm allocator fragmentation — 4 contiguous ~2 GB blocks plus
+        // the 1.5 GB pool, 1.9 GB G2, and 1.5 GB H buffer is right at the
+        // 16 GB ceiling. Keep threshold at 20 GB so 7900 XTX stays GLV-on
+        // and 9070 XT falls back cleanly.
         let enable = ok && total >= 20 * 1024 * 1024 * 1024; // ≥ 20 GiB
         if ok {
             eprintln!(
