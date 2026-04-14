@@ -119,6 +119,24 @@ extern "C" {
         num_hot: i32,
     ) -> CudaRustError;
 
+    /// Pre-size the process-global GLV working-buffer pool for up to `max_n`
+    /// base points (i.e. the largest N across all G1 PersistentMsm contexts).
+    ///
+    /// This is an optional optimization — if never called, the pool is lazily
+    /// allocated on first GLV invoke and grown on-demand. Calling it up-front
+    /// from `PersistentMsm::new` once all 4 G1 contexts are known avoids
+    /// mid-prove `hipMalloc` churn.
+    ///
+    /// All GLV contexts share this single ~1.45 GB buffer since MSM calls
+    /// are serialized by the Rust caller during a Groth16 prove.
+    ///
+    /// HIP only; the CUDA (sppark) MSM path does not use this pool.
+    pub fn sp1_bn254_glv_pool_reserve(max_n: usize) -> CudaRustError;
+
+    /// Explicitly release the shared GLV pool. Normally unnecessary (OK to
+    /// leak at process exit), but useful for tests and long-running daemons.
+    pub fn sp1_bn254_glv_pool_free();
+
     // ========================================================================
     // G2 MSM (sppark-templated, CUDA-only)
     // ========================================================================

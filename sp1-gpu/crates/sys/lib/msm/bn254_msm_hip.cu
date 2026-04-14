@@ -394,27 +394,21 @@ struct hip_msm_context {
     bn254_g1_t* d_reduce_partials; // [REDUCE_THREADS] for block-parallel reduction
     bn254_g1_t* d_reduce_suffixes; // [REDUCE_THREADS] for block-parallel reduction
 
-    // GLV buffers (lazily allocated on first GLV invoke).
-    // d_expanded_points: [2*npoints] endomorphism-expanded points.
-    // d_half_scalars: [2*n * GLV_SCALAR_LIMBS] decomposed half-width scalars.
-    // d_glv_signs: [2*n] sign flags from GLV decomposition.
-    // GLV working buffers (sized for 2*n instead of n):
+    // GLV per-context state (lazily allocated on first GLV invoke).
+    //
+    // All *working* buffers (half_scalars, glv_digits, glv_packed, sort temp,
+    // partial_sums, etc.) live in a process-global `hip_g1_glv_pool` — they
+    // are large (~1.45 GB for N=16.8M) but only needed for the duration of a
+    // single MSM call, so sharing them across the 4 G1 contexts saves ~5.8 GB
+    // on the 9070 XT (16 GB VRAM).
+    //
+    // Per-context state that MUST stay separate:
+    //   d_expanded_points: [2*npoints] endomorphism-expanded SRS (each ctx
+    //                      has its own distinct SRS; sized 12.7M..16.8M).
+    //   d_glv_window_results: [GLV_NUM_WINDOWS] per-call output (tiny).
     bool glv_initialized;
     bn254_g1_affine_t* d_expanded_points;
-    uint32_t* d_half_scalars;
-    uint8_t* d_glv_signs;
-    // GLV working buffers (oversized for 2n points):
-    uint16_t* d_glv_digits;
-    uint32_t* d_glv_packed;
-    uint8_t* d_glv_carries;
-    uint16_t* d_glv_sorted_digits;
-    uint32_t* d_glv_sorted_packed;
-    void* d_glv_sort_temp;
-    size_t glv_sort_temp_bytes;
-    bn254_g1_xyzz_t* d_glv_partial_sums;
     bn254_g1_t* d_glv_window_results;
-    bn254_g1_t* d_glv_reduce_partials;
-    bn254_g1_t* d_glv_reduce_suffixes;
 };
 
 static rustCudaError_t alloc_working_buffers(hip_msm_context* ctx, int n) {
@@ -755,41 +749,174 @@ void sp1_bn254_msm_destroy(void* ctx_ptr)
     if (ctx_ptr) {
         auto* ctx = reinterpret_cast<hip_msm_context*>(ctx_ptr);
         free_working_buffers(ctx);
-        hipFree(ctx->d_points);
-        // Free GLV buffers if allocated
+        if (ctx->d_points) hipFree(ctx->d_points);
+        // Free per-context GLV state only. The shared working-buffer pool
+        // (`g_glv_pool`) is process-global and deliberately *not* freed here
+        // — it will be reused by subsequent Groth16 proves and is released
+        // explicitly via `sp1_bn254_glv_pool_free` (or at process exit).
         if (ctx->glv_initialized) {
             hipFree(ctx->d_expanded_points);
-            hipFree(ctx->d_half_scalars);
-            hipFree(ctx->d_glv_signs);
-            hipFree(ctx->d_glv_digits);
-            hipFree(ctx->d_glv_packed);
-            hipFree(ctx->d_glv_carries);
-            hipFree(ctx->d_glv_sorted_digits);
-            hipFree(ctx->d_glv_sorted_packed);
-            hipFree(ctx->d_glv_sort_temp);
-            hipFree(ctx->d_glv_partial_sums);
             hipFree(ctx->d_glv_window_results);
-            hipFree(ctx->d_glv_reduce_partials);
-            hipFree(ctx->d_glv_reduce_suffixes);
         }
         delete ctx;
     }
+}
+
+// Explicit FFI to pre-size the shared GLV pool up-front. Called by the Rust
+// side from PersistentMsm::new() once we know the max N across all 4 G1
+// contexts, to avoid mid-prove reallocation churn.
+
+// Forward declarations — pool helpers defined below.
+static rustCudaError_t glv_pool_ensure(int max_n);
+static void glv_pool_free();
+
+extern "C"
+rustCudaError_t sp1_bn254_glv_pool_reserve(size_t max_n) {
+    if (max_n == 0) return CUDA_SUCCESS_CSL;
+    return glv_pool_ensure((int)max_n);
+}
+
+// Explicit FFI to release the shared GLV pool (rarely needed — OK to leak at
+// process exit, but exposed for tests / long-running daemons).
+extern "C"
+void sp1_bn254_glv_pool_free() {
+    glv_pool_free();
 }
 
 // ============================================================
 // GLV-accelerated MSM: halve window count via endomorphism
 // ============================================================
 
-// Lazily allocate GLV buffers and expand points via endomorphism.
-// Called once on first GLV invoke; subsequent calls are no-ops.
+// ------------------------------------------------------------
+// Shared GLV working-buffer pool
+// ------------------------------------------------------------
+//
+// The GLV path needs ~1.45 GB of scratch buffers (half_scalars, glv_digits,
+// glv_packed, sort temp, partial_sums, …) that are only live during a single
+// MSM invocation. In a Groth16 prove we run 4 G1 MSMs strictly sequentially
+// (Ar → Bs1 → Krs → Krs2), so a single process-global pool sized for the
+// largest context can serve all of them. This reclaims ~5.8 GB on 9070 XT
+// (16 GB VRAM) vs the per-context layout and is what makes GLV fit.
+//
+// Thread-safety: the Rust caller serializes all G1 MSM invocations on the
+// same device (the HIP Groth16 path uses sequential G1 MSMs — see
+// groth16/src/prover.rs `use_sequential_g2`). We therefore do not take a
+// lock when using the pool. The one-time growth in `glv_pool_ensure` is
+// also invoked from the serialized prove() path.
+struct hip_g1_glv_pool {
+    int alloc_n;   // base point count; buffers sized for 2 * alloc_n
+
+    // Scalar buffers (sized for 2N):
+    uint32_t* d_half_scalars;           // 2N × GLV_SCALAR_LIMBS × u32  (40N bytes)
+    uint8_t*  d_glv_signs;              // 2N × u8
+    uint16_t* d_glv_digits;             // 2N × u16
+    uint32_t* d_glv_packed;             // 2N × u32
+    uint8_t*  d_glv_carries;            // 2N × u8
+    uint16_t* d_glv_sorted_digits;      // 2N × u16
+    uint32_t* d_glv_sorted_packed;      // 2N × u32
+    void*     d_glv_sort_temp;          // hipCUB radix sort temp
+    size_t    glv_sort_temp_bytes;
+
+    // Fixed-size scratch (independent of N):
+    bn254_g1_xyzz_t* d_glv_partial_sums;     // NUM_BUCKETS × BUCKET_PAR
+    bn254_g1_t*      d_glv_reduce_partials;  // REDUCE_THREADS
+    bn254_g1_t*      d_glv_reduce_suffixes;  // REDUCE_THREADS
+};
+
+static hip_g1_glv_pool* g_glv_pool = nullptr;
+
+static void glv_pool_free() {
+    if (!g_glv_pool) return;
+    hipFree(g_glv_pool->d_half_scalars);
+    hipFree(g_glv_pool->d_glv_signs);
+    hipFree(g_glv_pool->d_glv_digits);
+    hipFree(g_glv_pool->d_glv_packed);
+    hipFree(g_glv_pool->d_glv_carries);
+    hipFree(g_glv_pool->d_glv_sorted_digits);
+    hipFree(g_glv_pool->d_glv_sorted_packed);
+    hipFree(g_glv_pool->d_glv_sort_temp);
+    hipFree(g_glv_pool->d_glv_partial_sums);
+    hipFree(g_glv_pool->d_glv_reduce_partials);
+    hipFree(g_glv_pool->d_glv_reduce_suffixes);
+    delete g_glv_pool;
+    g_glv_pool = nullptr;
+}
+
+// Lazily allocate or grow the global GLV working-buffer pool so it can serve
+// any context with base point count <= max_n. If the pool already exists and
+// is at least as large as requested, this is a cheap no-op.
+static rustCudaError_t glv_pool_ensure(int max_n) {
+    if (g_glv_pool && g_glv_pool->alloc_n >= max_n) {
+        return CUDA_SUCCESS_CSL;
+    }
+    // Free the old pool (if any) and reallocate larger.
+    glv_pool_free();
+
+    auto* pool = new hip_g1_glv_pool();
+    memset(pool, 0, sizeof(*pool));
+    pool->alloc_n = max_n;
+    int n2 = 2 * max_n;
+
+    CUDA_OK(hipMalloc(&pool->d_half_scalars,
+                       (size_t)n2 * GLV_SCALAR_LIMBS * sizeof(uint32_t)));
+    CUDA_OK(hipMalloc(&pool->d_glv_signs, (size_t)n2 * sizeof(uint8_t)));
+    CUDA_OK(hipMalloc(&pool->d_glv_digits, (size_t)n2 * sizeof(uint16_t)));
+    CUDA_OK(hipMalloc(&pool->d_glv_packed, (size_t)n2 * sizeof(uint32_t)));
+    CUDA_OK(hipMalloc(&pool->d_glv_carries, (size_t)n2 * sizeof(uint8_t)));
+    CUDA_OK(hipMalloc(&pool->d_glv_sorted_digits, (size_t)n2 * sizeof(uint16_t)));
+    CUDA_OK(hipMalloc(&pool->d_glv_sorted_packed, (size_t)n2 * sizeof(uint32_t)));
+
+    // hipCUB sort temp for up to 2*max_n elements.
+    pool->glv_sort_temp_bytes = 0;
+    hipcub::DeviceRadixSort::SortPairs(
+        nullptr, pool->glv_sort_temp_bytes,
+        pool->d_glv_digits, pool->d_glv_sorted_digits,
+        pool->d_glv_packed, pool->d_glv_sorted_packed,
+        n2, 0, WINDOW_BITS);
+    CUDA_OK(hipMalloc(&pool->d_glv_sort_temp, pool->glv_sort_temp_bytes));
+
+    // Parallel accumulation scratch (NUM_BUCKETS × BUCKET_PAR XYZZ points).
+    CUDA_OK(hipMalloc(&pool->d_glv_partial_sums,
+                       (size_t)NUM_BUCKETS * BUCKET_PAR * sizeof(bn254_g1_xyzz_t)));
+
+    // Block-parallel reduction scratch.
+    int reduce_threads = (NUM_BUCKETS - 1 + REDUCE_BLOCK_SIZE - 1) / REDUCE_BLOCK_SIZE;
+    CUDA_OK(hipMalloc(&pool->d_glv_reduce_partials, reduce_threads * sizeof(bn254_g1_t)));
+    CUDA_OK(hipMalloc(&pool->d_glv_reduce_suffixes, reduce_threads * sizeof(bn254_g1_t)));
+
+    g_glv_pool = pool;
+
+    size_t total_mb =
+        ((size_t)n2 * GLV_SCALAR_LIMBS * sizeof(uint32_t)
+         + (size_t)n2 * (sizeof(uint8_t) + sizeof(uint16_t) + sizeof(uint32_t)
+                         + sizeof(uint8_t) + sizeof(uint16_t) + sizeof(uint32_t))
+         + pool->glv_sort_temp_bytes
+         + (size_t)NUM_BUCKETS * BUCKET_PAR * sizeof(bn254_g1_xyzz_t)
+         + 2 * (size_t)reduce_threads * sizeof(bn254_g1_t))
+        / (1024 * 1024);
+    fprintf(stderr,
+            "[GLV pool] allocated shared working buffers for max N=%d (2N=%d), "
+            "total ~%zu MB (sort_temp=%zu MB)\n",
+            max_n, n2, total_mb, pool->glv_sort_temp_bytes / (1024 * 1024));
+    return CUDA_SUCCESS_CSL;
+}
+
+// Lazily expand points for this context and ensure the shared pool is big
+// enough. Per-context we only keep d_expanded_points (2N points, 64 B each —
+// unavoidable because each ctx has a different SRS) and the tiny window
+// result array; the large working buffers live in the shared pool.
 static rustCudaError_t init_glv_buffers(hip_msm_context* ctx) {
     if (ctx->glv_initialized) return CUDA_SUCCESS_CSL;
 
     int n = ctx->npoints;
     int n2 = 2 * n;
 
-    // Expand points: [P_0..P_{n-1}, phi(P_0)..phi(P_{n-1})]
-    CUDA_OK(hipMalloc(&ctx->d_expanded_points, n2 * sizeof(bn254_g1_affine_t)));
+    // Make sure the shared working-buffer pool is sized for this context.
+    rustCudaError_t err = glv_pool_ensure(n);
+    if (err.message != CUDA_SUCCESS_CSL.message) return err;
+
+    // Expand points into this context's own [P_0..P_{n-1}, phi(P_0)..phi(P_{n-1})].
+    CUDA_OK(hipMalloc(&ctx->d_expanded_points, (size_t)n2 * sizeof(bn254_g1_affine_t)));
     {
         int threads = 256;
         int blocks = (n + threads - 1) / threads;
@@ -799,46 +926,16 @@ static rustCudaError_t init_glv_buffers(hip_msm_context* ctx) {
         CUDA_OK(hipGetLastError());
     }
 
-    // GLV scalar buffers (for 2n half-scalars of GLV_SCALAR_LIMBS each)
-    CUDA_OK(hipMalloc(&ctx->d_half_scalars, (size_t)n2 * GLV_SCALAR_LIMBS * sizeof(uint32_t)));
-    CUDA_OK(hipMalloc(&ctx->d_glv_signs, n2 * sizeof(uint8_t)));
-
-    // Working buffers sized for 2n points
-    CUDA_OK(hipMalloc(&ctx->d_glv_digits, n2 * sizeof(uint16_t)));
-    CUDA_OK(hipMalloc(&ctx->d_glv_packed, n2 * sizeof(uint32_t)));
-    CUDA_OK(hipMalloc(&ctx->d_glv_carries, n2 * sizeof(uint8_t)));
-    CUDA_OK(hipMalloc(&ctx->d_glv_sorted_digits, n2 * sizeof(uint16_t)));
-    CUDA_OK(hipMalloc(&ctx->d_glv_sorted_packed, n2 * sizeof(uint32_t)));
-
-    // hipCUB sort temp for 2n elements
-    ctx->glv_sort_temp_bytes = 0;
-    hipcub::DeviceRadixSort::SortPairs(
-        nullptr, ctx->glv_sort_temp_bytes,
-        ctx->d_glv_digits, ctx->d_glv_sorted_digits,
-        ctx->d_glv_packed, ctx->d_glv_sorted_packed,
-        n2, 0, WINDOW_BITS);
-    CUDA_OK(hipMalloc(&ctx->d_glv_sort_temp, ctx->glv_sort_temp_bytes));
-
-    // Parallel accumulation scratch for 2n points (same NUM_BUCKETS, same BUCKET_PAR)
-    CUDA_OK(hipMalloc(&ctx->d_glv_partial_sums,
-                       (size_t)NUM_BUCKETS * BUCKET_PAR * sizeof(bn254_g1_xyzz_t)));
-
-    // Window results: GLV_NUM_WINDOWS windows
+    // Per-context window results (GLV_NUM_WINDOWS windows, tiny).
     CUDA_OK(hipMalloc(&ctx->d_glv_window_results, GLV_NUM_WINDOWS * sizeof(bn254_g1_t)));
-
-    // Block-parallel reduction scratch
-    int reduce_threads = (NUM_BUCKETS - 1 + REDUCE_BLOCK_SIZE - 1) / REDUCE_BLOCK_SIZE;
-    CUDA_OK(hipMalloc(&ctx->d_glv_reduce_partials, reduce_threads * sizeof(bn254_g1_t)));
-    CUDA_OK(hipMalloc(&ctx->d_glv_reduce_suffixes, reduce_threads * sizeof(bn254_g1_t)));
 
     ctx->glv_initialized = true;
 
     // VRAM reclaim: once GLV is active, the non-GLV d_points (~960 MB for
-    // 15M points) and d_partial_sums (~67 MB for BUCKET_PAR=128) are dead
-    // — the GLV path exclusively uses d_expanded_points[0..n] (which
-    // already holds a copy of d_points) and d_glv_partial_sums. Freeing
-    // them saves ~1 GB per G1 context, which is critical on 9070 XT
-    // (16 GB VRAM, 4 G1 contexts would otherwise OOM).
+    // 15M points) and d_partial_sums (~67 MB) are dead — the GLV path
+    // exclusively uses d_expanded_points[0..n] (which already holds a copy
+    // of d_points) and pool->d_glv_partial_sums. Freeing them saves ~1 GB
+    // per G1 context.
     if (ctx->d_points) {
         hipFree(ctx->d_points);
         ctx->d_points = nullptr;
@@ -848,7 +945,8 @@ static rustCudaError_t init_glv_buffers(hip_msm_context* ctx) {
         ctx->d_partial_sums = nullptr;
     }
 
-    fprintf(stderr, "[GLV] Initialized: expanded %d points to %d, %d windows (was %d) — freed ~1 GB non-GLV buffers\n",
+    fprintf(stderr, "[GLV] ctx initialized: expanded %d points to %d, %d windows "
+                    "(was %d) — per-ctx glv footprint = 2N × 64 B (expanded points)\n",
             n, n2, GLV_NUM_WINDOWS, NUM_WINDOWS);
 
     return CUDA_SUCCESS_CSL;
@@ -901,19 +999,21 @@ rustCudaError_t sp1_bn254_msm_invoke_glv(void* ctx_ptr, void* result,
     }
 
     // GLV scalar decomposition: N canonical scalars -> 2N half-width scalars + signs
+    // (writes into the shared working-buffer pool)
+    auto* gp = g_glv_pool;  // pool was ensured by init_glv_buffers
     {
         int threads = 256;
         int blocks = (n + threads - 1) / threads;
         hipLaunchKernelGGL(bn254_msm::glv_decompose_kernel,
             dim3(blocks), dim3(threads), 0, 0,
-            ctx->d_scalars, ctx->d_half_scalars, ctx->d_glv_signs, n);
+            ctx->d_scalars, gp->d_half_scalars, gp->d_glv_signs, n);
         CUDA_OK(hipGetLastError());
     }
 
     if (do_timing) hipEventRecord(ev_glv);
 
     // Initialize carries for per-window decomposition (2n elements)
-    CUDA_OK(hipMemset(ctx->d_glv_carries, 0, n2 * sizeof(uint8_t)));
+    CUDA_OK(hipMemset(gp->d_glv_carries, 0, n2 * sizeof(uint8_t)));
 
     // Process GLV_NUM_WINDOWS windows over 2N half-width scalars
     for (int w = 0; w < GLV_NUM_WINDOWS; w++) {
@@ -923,24 +1023,24 @@ rustCudaError_t sp1_bn254_msm_invoke_glv(void* ctx_ptr, void* result,
             int blocks = (n2 + threads - 1) / threads;
             hipLaunchKernelGGL(bn254_msm::glv_scalar_decompose_packed_kernel,
                 dim3(blocks), dim3(threads), 0, 0,
-                ctx->d_half_scalars, ctx->d_glv_signs,
-                ctx->d_glv_digits, ctx->d_glv_packed, ctx->d_glv_carries,
+                gp->d_half_scalars, gp->d_glv_signs,
+                gp->d_glv_digits, gp->d_glv_packed, gp->d_glv_carries,
                 n2, w);
             CUDA_OK(hipGetLastError());
         }
 
         // Reuse msm_one_window with 2n points and the expanded point array
         msm_one_window(
-            ctx->d_expanded_points,       // 2n expanded points
-            ctx->d_glv_digits,
-            ctx->d_glv_packed,
+            ctx->d_expanded_points,       // 2n expanded points (per-ctx)
+            gp->d_glv_digits,
+            gp->d_glv_packed,
             ctx->d_glv_window_results + w,
-            ctx->d_buckets,               // reuse: same NUM_BUCKETS
+            ctx->d_buckets,               // per-ctx: small (NUM_BUCKETS)
             ctx->d_bucket_offsets, ctx->d_bucket_counts,
-            ctx->d_glv_sorted_digits, ctx->d_glv_sorted_packed,
-            ctx->d_glv_sort_temp, ctx->glv_sort_temp_bytes,
-            ctx->d_glv_partial_sums,
-            ctx->d_glv_reduce_partials, ctx->d_glv_reduce_suffixes,
+            gp->d_glv_sorted_digits, gp->d_glv_sorted_packed,
+            gp->d_glv_sort_temp, gp->glv_sort_temp_bytes,
+            gp->d_glv_partial_sums,
+            gp->d_glv_reduce_partials, gp->d_glv_reduce_suffixes,
             n2                            // 2n points
         );
     }
@@ -1008,18 +1108,19 @@ rustCudaError_t sp1_bn254_msm_invoke_glv_device(void* ctx_ptr, void* result,
         CUDA_OK(hipGetLastError());
     }
 
-    // GLV decomposition
+    // GLV decomposition (writes into shared pool)
+    auto* gp = g_glv_pool;
     {
         int threads = 256;
         int blocks = (n + threads - 1) / threads;
         hipLaunchKernelGGL(bn254_msm::glv_decompose_kernel,
             dim3(blocks), dim3(threads), 0, 0,
-            ctx->d_scalars, ctx->d_half_scalars, ctx->d_glv_signs, n);
+            ctx->d_scalars, gp->d_half_scalars, gp->d_glv_signs, n);
         CUDA_OK(hipGetLastError());
     }
 
     // Initialize carries
-    CUDA_OK(hipMemset(ctx->d_glv_carries, 0, n2 * sizeof(uint8_t)));
+    CUDA_OK(hipMemset(gp->d_glv_carries, 0, n2 * sizeof(uint8_t)));
 
     // Process GLV windows
     for (int w = 0; w < GLV_NUM_WINDOWS; w++) {
@@ -1028,21 +1129,21 @@ rustCudaError_t sp1_bn254_msm_invoke_glv_device(void* ctx_ptr, void* result,
             int blocks = (n2 + threads - 1) / threads;
             hipLaunchKernelGGL(bn254_msm::glv_scalar_decompose_packed_kernel,
                 dim3(blocks), dim3(threads), 0, 0,
-                ctx->d_half_scalars, ctx->d_glv_signs,
-                ctx->d_glv_digits, ctx->d_glv_packed, ctx->d_glv_carries,
+                gp->d_half_scalars, gp->d_glv_signs,
+                gp->d_glv_digits, gp->d_glv_packed, gp->d_glv_carries,
                 n2, w);
             CUDA_OK(hipGetLastError());
         }
         msm_one_window(
             ctx->d_expanded_points,
-            ctx->d_glv_digits, ctx->d_glv_packed,
+            gp->d_glv_digits, gp->d_glv_packed,
             ctx->d_glv_window_results + w,
             ctx->d_buckets,
             ctx->d_bucket_offsets, ctx->d_bucket_counts,
-            ctx->d_glv_sorted_digits, ctx->d_glv_sorted_packed,
-            ctx->d_glv_sort_temp, ctx->glv_sort_temp_bytes,
-            ctx->d_glv_partial_sums,
-            ctx->d_glv_reduce_partials, ctx->d_glv_reduce_suffixes,
+            gp->d_glv_sorted_digits, gp->d_glv_sorted_packed,
+            gp->d_glv_sort_temp, gp->glv_sort_temp_bytes,
+            gp->d_glv_partial_sums,
+            gp->d_glv_reduce_partials, gp->d_glv_reduce_suffixes,
             n2
         );
     }
@@ -1100,18 +1201,19 @@ rustCudaError_t sp1_bn254_msm_invoke_glv_device_depad(void* ctx_ptr, void* resul
         CUDA_OK(hipGetLastError());
     }
 
-    // GLV decomposition
+    // GLV decomposition (writes into shared pool)
+    auto* gp = g_glv_pool;
     {
         int threads = 256;
         int blocks = (n + threads - 1) / threads;
         hipLaunchKernelGGL(bn254_msm::glv_decompose_kernel,
             dim3(blocks), dim3(threads), 0, 0,
-            ctx->d_scalars, ctx->d_half_scalars, ctx->d_glv_signs, n);
+            ctx->d_scalars, gp->d_half_scalars, gp->d_glv_signs, n);
         CUDA_OK(hipGetLastError());
     }
 
     // Initialize carries
-    CUDA_OK(hipMemset(ctx->d_glv_carries, 0, n2 * sizeof(uint8_t)));
+    CUDA_OK(hipMemset(gp->d_glv_carries, 0, n2 * sizeof(uint8_t)));
 
     // Process GLV windows
     for (int w = 0; w < GLV_NUM_WINDOWS; w++) {
@@ -1120,21 +1222,21 @@ rustCudaError_t sp1_bn254_msm_invoke_glv_device_depad(void* ctx_ptr, void* resul
             int blocks = (n2 + threads - 1) / threads;
             hipLaunchKernelGGL(bn254_msm::glv_scalar_decompose_packed_kernel,
                 dim3(blocks), dim3(threads), 0, 0,
-                ctx->d_half_scalars, ctx->d_glv_signs,
-                ctx->d_glv_digits, ctx->d_glv_packed, ctx->d_glv_carries,
+                gp->d_half_scalars, gp->d_glv_signs,
+                gp->d_glv_digits, gp->d_glv_packed, gp->d_glv_carries,
                 n2, w);
             CUDA_OK(hipGetLastError());
         }
         msm_one_window(
             ctx->d_expanded_points,
-            ctx->d_glv_digits, ctx->d_glv_packed,
+            gp->d_glv_digits, gp->d_glv_packed,
             ctx->d_glv_window_results + w,
             ctx->d_buckets,
             ctx->d_bucket_offsets, ctx->d_bucket_counts,
-            ctx->d_glv_sorted_digits, ctx->d_glv_sorted_packed,
-            ctx->d_glv_sort_temp, ctx->glv_sort_temp_bytes,
-            ctx->d_glv_partial_sums,
-            ctx->d_glv_reduce_partials, ctx->d_glv_reduce_suffixes,
+            gp->d_glv_sorted_digits, gp->d_glv_sorted_packed,
+            gp->d_glv_sort_temp, gp->glv_sort_temp_bytes,
+            gp->d_glv_partial_sums,
+            gp->d_glv_reduce_partials, gp->d_glv_reduce_suffixes,
             n2
         );
     }

@@ -117,6 +117,19 @@ impl Groth16Prover {
             let g1_b = to_g1(&data.pk_g1_b);
             let g1_k = to_g1(&data.pk_g1_k);
             let g1_z = to_g1(&data.pk_g1_z);
+            // Pre-reserve the shared GLV pool to the max-of-all-contexts size,
+            // so subsequent per-context `init_glv_buffers` calls all reuse the
+            // pre-allocated buffers instead of growing (which would transiently
+            // hold old+new pools on 9070 XT and OOM).
+            {
+                let max_n = g1_a.len().max(g1_b.len()).max(g1_k.len()).max(g1_z.len());
+                let err = unsafe {
+                    sp1_gpu_sys::msm::sp1_bn254_glv_pool_reserve(max_n)
+                };
+                if err != unsafe { sp1_gpu_sys::runtime::CUDA_SUCCESS_CSL } {
+                    eprintln!("[groth16] WARN: glv_pool_reserve({}) failed; continuing", max_n);
+                }
+            }
             let pa = sp1_gpu_plonk::g1::PersistentMsm::new(&g1_a);
             let pb = sp1_gpu_plonk::g1::PersistentMsm::new(&g1_b);
             let pk = sp1_gpu_plonk::g1::PersistentMsm::new(&g1_k);

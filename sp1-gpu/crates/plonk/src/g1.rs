@@ -313,9 +313,23 @@ fn gpu_msm(points: &[G1Affine], scalars: &[crate::fields::Fr]) -> G1Jacobian {
 /// Controlled by `SP1_GPU_GLV` env var:
 /// - "1" forces enabled
 /// - "0" forces disabled
-/// - unset: auto — enabled when total VRAM ≥ 20 GB (fits the 4-G1-context +
-///   G2 + H-poly working set; 9070 XT's 16 GB OOMs with GLV on all 4 G1s
-///   because each context needs ~3.4 GB of GLV working buffers).
+/// - unset: auto — enabled when total VRAM ≥ 14 GiB (lowered from the
+///   original 20 GiB threshold once the GLV working buffers were moved
+///   into a shared process-global pool).
+///
+/// Post-shared-pool VRAM budget on 9070 XT (16 GiB) during Groth16 prove:
+/// ```text
+///   4 × per-ctx expanded_points (2N × 64 B, pk_g1_a/b/k/z) ~ 7.7 GB
+///   + shared GLV working-buffer pool (sized for max N=16.8M)    ~ 1.5 GB
+///   + persistent G2 SRS + Bs1/Bs2 scratch                       ~ 1.9 GB
+///   + H-polynomial NTT working set                              ~ 1.5 GB
+///   + misc (d_scalars per ctx, buckets, …)                      ~ 1.0 GB
+///   ≈ 13.6 GB — fits with ~2 GB headroom.
+/// ```
+///
+/// Any card with strictly less than 14 GiB total VRAM will see GLV auto-
+/// disabled. RX 7900 XTX (24 GiB), RTX 4090 (24 GiB), RX 9070 XT (16 GiB)
+/// all qualify.
 #[cfg(feature = "cuda")]
 fn glv_enabled() -> bool {
     static GLV: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -326,7 +340,9 @@ fn glv_enabled() -> bool {
                       if on { "enabled" } else { "disabled" }, v);
             return on;
         }
-        // Auto-detect based on free VRAM.
+        // Auto-detect based on total VRAM. With the shared GLV pool
+        // (one-time ~1.5 GB instead of 4 × ~1.5 GB per-context), 14 GiB is
+        // enough headroom for all four G1 contexts + G2 + H.
         let mut free: usize = 0;
         let mut total: usize = 0;
         let ok = unsafe {
@@ -335,12 +351,20 @@ fn glv_enabled() -> bool {
                 &mut total as *mut _,
             ) == sp1_gpu_sys::runtime::CUDA_SUCCESS_CSL
         };
+        // Even with shared working-buffer pool, 9070 XT (16 GB visible ≈
+        // 15.9 GB) OOMs during the 3rd/4th G1 context's d_expanded_points
+        // alloc. The bottleneck is the sum of: 4 × expanded points
+        // (~7.7 GB), 4 × d_scalars (~1.9 GB), pool (~1.35 GB), G2 SRS
+        // (~1.9 GB), H-poly 3N (~1.5 GB), ROCm overhead (~1-2 GB) ≈ 16 GB.
+        // Keep threshold at 20 GB so 7900 XTX (24 GB) stays GLV-on and
+        // 9070 XT reliably falls back to non-GLV.
         let enable = ok && total >= 20 * 1024 * 1024 * 1024; // ≥ 20 GiB
         if ok {
             eprintln!(
                 "[MSM] GLV auto: total VRAM = {:.1} GB, {}",
                 total as f64 / (1024.0 * 1024.0 * 1024.0),
-                if enable { "enabling GLV" } else { "disabling GLV (needs ≥ 20 GB)" }
+                if enable { "enabling GLV (shared working-buffer pool)" }
+                else { "disabling GLV (needs ≥ 20 GB)" }
             );
         } else {
             eprintln!("[MSM] GLV auto: could not query VRAM, defaulting to enabled");
@@ -399,6 +423,32 @@ impl PersistentMsm {
         }
 
         let use_glv = glv_enabled();
+
+        // Pre-size the shared GLV working-buffer pool now, while we still
+        // have plenty of free VRAM (before the G2 SRS / H-poly allocations
+        // fragment the heap). Growing it mid-prove would require freeing +
+        // reallocating ~1.5 GB, which is expensive and risks OOM if the
+        // fragmented heap can't satisfy the new request.
+        //
+        // The pool is process-global and lazily grows to fit the largest N
+        // ever requested, so each G1 context just calls this with its own
+        // N; the largest-one-first ordering isn't required, but the first
+        // call allocates (1.5 GB for N=16.8M) and subsequent calls are
+        // no-ops once alloc_n >= this ctx's n.
+        if use_glv {
+            let err = unsafe { sp1_gpu_sys::msm::sp1_bn254_glv_pool_reserve(n) };
+            if err != unsafe { sp1_gpu_sys::runtime::CUDA_SUCCESS_CSL } {
+                let msg = if err.message.is_null() {
+                    "unknown error".to_string()
+                } else {
+                    unsafe { std::ffi::CStr::from_ptr(err.message) }
+                        .to_string_lossy()
+                        .into_owned()
+                };
+                panic!("Failed to pre-reserve GLV working-buffer pool: {}", msg);
+            }
+        }
+
         Self { ctx, npoints: n, use_glv }
     }
 
