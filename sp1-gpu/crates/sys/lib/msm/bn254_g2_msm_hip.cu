@@ -151,15 +151,21 @@ __global__ void g2_bucket_accumulate_parallel_kernel(
             uint32_t packed = sorted_idx[s + i];
             uint32_t pi = packed & 0x7FFFFFFFu;
             bn254_g2_affine_t p = points[pi];
-            if (packed >> 31) { p.y = -p.y; } // negate if sign bit set
+            if (packed >> 31) { p.y = -p.y; }
             if (!p.is_infinity()) acc.from_affine(p);
             i += G2_BUCKET_PAR;
         }
+        // NOTE: double-buffered prefetch was tested here (mirroring G1's
+        // pattern) but regressed by ~150ms on 7900 XTX. The extra 128B
+        // `next_p` local variable pushes XYZZ<Fq2> register usage past the
+        // spill threshold. G2 affine is 2× larger than G1 (128B vs 64B),
+        // so the prefetch buffer's VGPR cost is higher. The compiler already
+        // does reasonable scheduling without explicit prefetch on G2.
         for (; i < count; i += G2_BUCKET_PAR) {
             uint32_t packed = sorted_idx[s + i];
             uint32_t pi = packed & 0x7FFFFFFFu;
             bn254_g2_affine_t p = points[pi];
-            if (packed >> 31) { p.y = -p.y; } // negate if sign bit set
+            if (packed >> 31) { p.y = -p.y; }
             if (!p.is_infinity()) {
                 if (acc.is_infinity()) acc.from_affine(p);
                 else acc.add_affine_unsafe(p);
