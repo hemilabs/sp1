@@ -327,4 +327,30 @@ struct bn254_g2_xyzz_t {
         ZZZ = ZZZ * PPP;
         return *this;
     }
+
+    // Mixed XYZZ + affine addition (7M + 2S in Fq2 = 23 Fq muls) —
+    // unsafe variant (assumes this != infinity, p != infinity, P != ±Q).
+    // Used inside MSM bucket accumulation after the first point is stored.
+    // Saves 1 Fq2 sqr (= 2 Fq muls) per point vs the Jacobian
+    // `add_affine_unsafe` at bn254_g2.cuh:104-118 (which is 7M + 3S in Fq2).
+    __device__ __forceinline__ void add_affine_unsafe(const bn254_g2_affine_t& p) {
+        bn254_fq2_t U2 = p.x * ZZ;          // 1M
+        bn254_fq2_t S2 = p.y * ZZZ;         // 1M
+
+        bn254_fq2_t H = U2 - X;             // U2 - X
+        bn254_fq2_t R = S2 - Y;             // S2 - Y
+
+        bn254_fq2_t H_sq = H.sqr();         // 1S
+        bn254_fq2_t H_cu = H_sq * H;        // 1M
+        bn254_fq2_t V = X * H_sq;           // 1M
+
+        bn254_fq2_t R_sq = R.sqr();         // 1S
+        X = R_sq - H_cu - V.dbl();          // R^2 - H^3 - 2V
+
+        Y = R * (V - X) - Y * H_cu;         // 2M
+
+        ZZZ = ZZZ * H_cu;                   // 1M — update ZZZ before ZZ
+        ZZ = ZZ * H_sq;                     // 1M (H_sq still live)
+        // Total: 7M + 2S in Fq2
+    }
 };

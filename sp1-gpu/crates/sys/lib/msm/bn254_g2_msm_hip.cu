@@ -123,9 +123,15 @@ __global__ void g2_bucket_accumulate_parallel_kernel(
     const uint32_t* __restrict__ sorted_idx,
     const uint32_t* __restrict__ starts,
     const uint32_t* __restrict__ ends,
-    bn254_g2_t* __restrict__ partial_sums,
+    bn254_g2_xyzz_t* __restrict__ partial_sums,
     int num_buckets
 ) {
+    // Accumulate in XYZZ coordinates (vs Jacobian previously). Saves 1
+    // Fq2 squaring per `add_affine_unsafe` (Jac 7M+3S = 23 Fq muls vs
+    // XYZZ 7M+2S = 21 Fq muls, ~8% faster per add). Also eliminates the
+    // Jacobian→XYZZ conversion that the merge kernel previously did.
+    // Buffer cost: XYZZ is 4 Fq2 (256B) vs Jacobian 3 Fq2 (192B) =
+    // 33% larger partial_sums (~134 MB vs ~100 MB for BUCKET_PAR=128).
     int flat_id = blockIdx.x * blockDim.x + threadIdx.x;
     int bid = flat_id / G2_BUCKET_PAR;
     int par_id = flat_id % G2_BUCKET_PAR;
@@ -135,7 +141,7 @@ __global__ void g2_bucket_accumulate_parallel_kernel(
     uint32_t s = starts[bid];
     uint32_t e = ends[bid];
 
-    bn254_g2_t acc;
+    bn254_g2_xyzz_t acc;
     acc.set_infinity();
 
     if (s < e && s != UINT32_MAX && bid > 0) {
@@ -146,7 +152,7 @@ __global__ void g2_bucket_accumulate_parallel_kernel(
             uint32_t pi = packed & 0x7FFFFFFFu;
             bn254_g2_affine_t p = points[pi];
             if (packed >> 31) { p.y = -p.y; } // negate if sign bit set
-            if (!p.is_infinity()) acc = bn254_g2_t(p);
+            if (!p.is_infinity()) acc.from_affine(p);
             i += G2_BUCKET_PAR;
         }
         for (; i < count; i += G2_BUCKET_PAR) {
@@ -155,7 +161,7 @@ __global__ void g2_bucket_accumulate_parallel_kernel(
             bn254_g2_affine_t p = points[pi];
             if (packed >> 31) { p.y = -p.y; } // negate if sign bit set
             if (!p.is_infinity()) {
-                if (acc.is_infinity()) acc = bn254_g2_t(p);
+                if (acc.is_infinity()) acc.from_affine(p);
                 else acc.add_affine_unsafe(p);
             }
         }
@@ -169,28 +175,26 @@ __global__ void g2_bucket_accumulate_parallel_kernel(
 }
 
 // ================================================================
-// Kernel: Merge Jacobian partial sums within each bucket → XYZZ buckets.
-// Reads Jacobian partial sums, merges them in Jacobian, converts to XYZZ
-// at the end. Reduce phase works in XYZZ without per-bucket conversion.
+// Kernel: Merge XYZZ partial sums within each bucket → XYZZ buckets.
+// Fully XYZZ end-to-end: no Jacobian/XYZZ coordinate conversion.
+// XYZZ += XYZZ is 12M + 2S in Fq2 (vs Jacobian 12M + 4S).
 // ================================================================
 __global__ void g2_merge_partial_sums_kernel(
-    const bn254_g2_t* __restrict__ partial_sums,
+    const bn254_g2_xyzz_t* __restrict__ partial_sums,
     bn254_g2_xyzz_t* __restrict__ buckets_xyzz,
     int num_buckets
 ) {
     int bid = blockIdx.x * blockDim.x + threadIdx.x;
     if (bid >= num_buckets) return;
 
-    bn254_g2_t acc;
+    bn254_g2_xyzz_t acc;
     acc.set_infinity();
     // Read transposed layout: adjacent buckets are adjacent in memory for each j.
     for (int j = 0; j < G2_BUCKET_PAR; j++) {
-        const bn254_g2_t& ps = partial_sums[(size_t)j * num_buckets + bid];
+        const bn254_g2_xyzz_t& ps = partial_sums[(size_t)j * num_buckets + bid];
         if (!ps.is_infinity()) acc += ps;
     }
-    bn254_g2_xyzz_t out;
-    out.from_jacobian(acc);
-    buckets_xyzz[bid] = out;
+    buckets_xyzz[bid] = acc;
 }
 
 // ================================================================
@@ -328,7 +332,7 @@ struct hip_g2_msm_context {
     void* d_sort_temp = nullptr;
     size_t sort_temp_bytes = 0;
 
-    bn254_g2_t* d_partial_sums = nullptr;
+    bn254_g2_xyzz_t* d_partial_sums = nullptr;
     bn254_g2_t* d_window_results = nullptr;
     bn254_g2_t* d_final_result = nullptr;
     bn254_g2_t* d_local_partials = nullptr;
@@ -363,7 +367,7 @@ static rustCudaError_t g2_ctx_alloc(hip_g2_msm_context* ctx, int n) {
     );
     if (hipMalloc(&ctx->d_sort_temp, ctx->sort_temp_bytes) != hipSuccess) goto fail;
 
-    if (hipMalloc(&ctx->d_partial_sums, (size_t)num_buckets * G2_BUCKET_PAR * sizeof(bn254_g2_t)) != hipSuccess) goto fail;
+    if (hipMalloc(&ctx->d_partial_sums, (size_t)num_buckets * G2_BUCKET_PAR * sizeof(bn254_g2_xyzz_t)) != hipSuccess) goto fail;
     if (hipMalloc(&ctx->d_window_results, (size_t)G2_NUM_WINDOWS * sizeof(bn254_g2_t)) != hipSuccess) goto fail;
     if (hipMalloc(&ctx->d_final_result, sizeof(bn254_g2_t)) != hipSuccess) goto fail;
 
