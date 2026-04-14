@@ -285,7 +285,8 @@ __global__ void bucket_accumulate_parallel_kernel(
     if (bucket_id >= num_buckets) return;
 
     if (bucket_id == 0) {
-        partial_sums[(size_t)bucket_id * BUCKET_PAR + par_id].set_infinity();
+        // Transposed layout: [par_id][bucket_id]
+        partial_sums[(size_t)par_id * num_buckets + bucket_id].set_infinity();
         return;
     }
 
@@ -311,7 +312,8 @@ __global__ void bucket_accumulate_parallel_kernel(
         accum.add_affine_unsafe(p);
     }
 
-    partial_sums[(size_t)bucket_id * BUCKET_PAR + par_id] = accum;
+    // Transposed layout: [par_id][bucket_id] — see packed-kernel comment below.
+    partial_sums[(size_t)par_id * num_buckets + bucket_id] = accum;
 }
 
 // ================================================================
@@ -422,7 +424,8 @@ __global__ void bucket_accumulate_parallel_packed_kernel(
     if (bucket_id >= num_buckets) return;
 
     if (bucket_id == 0) {
-        partial_sums[(size_t)bucket_id * BUCKET_PAR + par_id].set_infinity();
+        // Transposed layout: [par_id][bucket_id]
+        partial_sums[(size_t)par_id * num_buckets + bucket_id].set_infinity();
         return;
     }
 
@@ -480,13 +483,21 @@ __global__ void bucket_accumulate_parallel_packed_kernel(
         }
     }
 
-    partial_sums[(size_t)bucket_id * BUCKET_PAR + par_id] = accum;
+    // Transposed layout: partial_sums[par_id * num_buckets + bucket_id].
+    // This makes merge kernel reads coalesced: adjacent threads (consecutive
+    // bucket_id) read adjacent memory positions. Previously the layout was
+    // [bucket][par] which made merge reads stride-BUCKET_PAR (16 KB
+    // apart) — completely uncoalesced. Accumulate kernel writes become
+    // uncoalesced (par_id varies within a wave), but accumulate is
+    // bandwidth-bound on the random SRS point reads, not the partial
+    // writes, so this is the right tradeoff. Mirrors the G2 layout.
+    partial_sums[(size_t)par_id * num_buckets + bucket_id] = accum;
 }
 
 // ================================================================
 // Kernel 2c: Merge partial sums from parallel accumulation
 // Reduces BUCKET_PAR partial sums per bucket into a single result.
-// One thread per bucket, each merging 32 partial Jacobian points.
+// One thread per bucket, each merging BUCKET_PAR partial XYZZ points.
 // ================================================================
 __global__ void bucket_merge_kernel(
     const bn254_g1_xyzz_t* __restrict__ partial_sums,
@@ -498,13 +509,13 @@ __global__ void bucket_merge_kernel(
 
     // Merge XYZZ partial sums using XYZZ addition (11M+2S vs Jacobian's 12M+4S).
     // Stay in XYZZ coordinates — no Fq inversion needed per bucket.
-    // Previously converted to Jacobian here (4097 Fq inversions per window × 20 windows
-    // = 81,940 inversions = ~50ms wasted). Now eliminated entirely.
+    // Read transposed layout [par][bucket]: consecutive threads (adjacent
+    // bucket_id) read adjacent memory → coalesced.
     bn254_g1_xyzz_t accum;
     accum.set_infinity();
 
     for (int i = 0; i < BUCKET_PAR; i++) {
-        const bn254_g1_xyzz_t& partial = partial_sums[(size_t)bucket_id * BUCKET_PAR + i];
+        const bn254_g1_xyzz_t& partial = partial_sums[(size_t)i * num_buckets + bucket_id];
         if (!partial.is_infinity()) {
             accum += partial;
         }
