@@ -260,6 +260,12 @@ __global__ void bucket_accumulate_kernel(
 //
 // Each thread processes every BUCKET_PAR-th point in its bucket.
 // Output: partial_sums[num_buckets * BUCKET_PAR] — partial Jacobian sums
+//
+// BUCKET_PAR=128 is well-tuned for RDNA3 (gfx1100, 96 CUs → 16x
+// oversubscribed @ 4097*128=524K threads). Tested BUCKET_PAR=64: it
+// caused a 3.5× regression on 7900 XTX (6.9s → 22.8s) and 7× on G2
+// MSM — each thread processes more points sequentially which hurts
+// latency hiding despite identical total work. Keep at 128.
 // ================================================================
 static constexpr int BUCKET_PAR = 128;
 

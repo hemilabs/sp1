@@ -113,10 +113,9 @@ __global__ void g2_bucket_boundaries_kernel(
 // Kernel: Parallel bucket accumulation — Jacobian coordinates.
 // Each thread iterates through its stride-BUCKET_PAR share of the bucket.
 // ================================================================
-// BUCKET_PAR = 128 with signed digits (4097 buckets) gives 524K threads per window.
-// This is the same thread count as the original BUCKET_PAR=256 with unsigned digits
-// (8192 buckets), but the partial_sums buffer is halved (96 MB vs 384 MB) and
-// the merge kernel does 128 serial adds instead of 256.
+// BUCKET_PAR = 128 for G2: tested 64, caused 7× regression (2.5s → 17s G2
+// MSM on 7900 XTX). Fewer parallel threads per bucket means each thread
+// processes more points serially, losing latency-hiding opportunities.
 static constexpr int G2_BUCKET_PAR = 128;
 
 __global__ void g2_bucket_accumulate_parallel_kernel(
