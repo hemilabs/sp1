@@ -91,12 +91,21 @@ extern "C" {
     /// halving window count from 20 to 10 by splitting 254-bit scalars into
     /// two ~128-bit halves. Uses pre-expanded 2N endomorphism points on GPU.
     /// mont: if true, scalars are in Montgomery form (GPU converts internally).
+    /// GLV-accelerated MSM with optional DMA/compute overlap.
+    ///
+    /// If `next_scalars` is non-null and `next_n > 0`, starts an async H2D
+    /// upload of the NEXT MSM's scalars on a dedicated SDMA stream while
+    /// the current MSM's compute finishes. The next invoke call picks up
+    /// the pre-uploaded scalars and skips its synchronous hipMemcpy,
+    /// hiding ~130-160ms per MSM.
     pub fn sp1_bn254_msm_invoke_glv(
         ctx: *mut c_void,
         result: *mut c_void,
         npoints: usize,
         scalars: *const c_void,
         mont: bool,
+        next_scalars: *const c_void,
+        next_n: usize,
     ) -> CudaRustError;
 
     /// GLV-accelerated MSM with scalars already in GPU device memory.

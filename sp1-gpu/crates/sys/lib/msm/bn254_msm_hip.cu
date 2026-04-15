@@ -811,7 +811,16 @@ struct hip_g1_glv_pool {
     // one copy lives resident — saves ~1.4 GB on 9070 XT where 4
     // per-context d_scalars (480 MB each) pushed GLV over the 16 GB
     // VRAM ceiling.
-    uint32_t* d_scalars;                // N × SCALAR_LIMBS × u32 (32 B/scalar)
+    //
+    // Double-buffered for DMA/compute overlap: while the compute engine
+    // processes scalars from d_scalars[cur_buf], the SDMA engine can
+    // upload the NEXT MSM's scalars into d_scalars[1-cur_buf] on a
+    // separate copy_stream. This hides ~130-160ms of H2D per MSM.
+    uint32_t* d_scalars[2];             // N × SCALAR_LIMBS × u32 (32 B/scalar) × 2
+    int       cur_buf;                  // 0 or 1: which d_scalars buffer is "current"
+    bool      next_upload_pending;      // true if an async upload is in flight
+    hipStream_t copy_stream;            // dedicated SDMA stream for async uploads
+    hipEvent_t  upload_done;            // signaled when async upload completes
 
     // Scalar buffers (sized for 2N):
     uint32_t* d_half_scalars;           // 2N × GLV_SCALAR_LIMBS × u32  (40N bytes)
@@ -834,7 +843,10 @@ static hip_g1_glv_pool* g_glv_pool = nullptr;
 
 static void glv_pool_free() {
     if (!g_glv_pool) return;
-    hipFree(g_glv_pool->d_scalars);
+    hipFree(g_glv_pool->d_scalars[0]);
+    hipFree(g_glv_pool->d_scalars[1]);
+    if (g_glv_pool->copy_stream) hipStreamDestroy(g_glv_pool->copy_stream);
+    if (g_glv_pool->upload_done) hipEventDestroy(g_glv_pool->upload_done);
     hipFree(g_glv_pool->d_half_scalars);
     hipFree(g_glv_pool->d_glv_signs);
     hipFree(g_glv_pool->d_glv_digits);
@@ -879,7 +891,7 @@ rustCudaError_t sp1_bn254_glv_pool_get_scalar_buffers(sp1_bn254_glv_scalar_buffe
         return rustCudaError_t{.message = "G1 GLV pool not reserved"};
     }
     out->alloc_n = g_glv_pool->alloc_n;
-    out->d_scalars = (void*)g_glv_pool->d_scalars;
+    out->d_scalars = (void*)g_glv_pool->d_scalars[g_glv_pool->cur_buf];
     out->d_half_scalars = (void*)g_glv_pool->d_half_scalars;
     out->d_glv_signs = (void*)g_glv_pool->d_glv_signs;
     out->d_glv_digits = (void*)g_glv_pool->d_glv_digits;
@@ -905,14 +917,22 @@ static rustCudaError_t glv_pool_ensure(int max_n) {
     auto* pool = new hip_g1_glv_pool();
     memset(pool, 0, sizeof(*pool));
     pool->alloc_n = max_n;
+    pool->cur_buf = 0;
+    pool->next_upload_pending = false;
     int n2 = 2 * max_n;
 
-    // Raw input scalars (N × 32 B). Shared across contexts — only one
-    // MSM runs at a time so a single scratch serves all 4 G1 contexts.
-    // Replaces per-context d_scalars for the GLV path (the non-GLV path
-    // still uses per-context d_scalars). Saves ~1.4 GB on 9070 XT.
-    CUDA_OK(hipMalloc(&pool->d_scalars,
-                       (size_t)max_n * SCALAR_LIMBS * sizeof(uint32_t)));
+    // Raw input scalars (N × 32 B) — double-buffered for DMA/compute
+    // overlap. While compute processes d_scalars[cur_buf], the SDMA
+    // engine can upload the next MSM's scalars into d_scalars[1-cur_buf]
+    // on copy_stream, hiding ~130-160ms per MSM.
+    size_t scalar_buf_bytes = (size_t)max_n * SCALAR_LIMBS * sizeof(uint32_t);
+    CUDA_OK(hipMalloc(&pool->d_scalars[0], scalar_buf_bytes));
+    CUDA_OK(hipMalloc(&pool->d_scalars[1], scalar_buf_bytes));
+
+    // Dedicated SDMA stream for async scalar uploads (non-blocking so
+    // it doesn't serialize against the default compute stream).
+    CUDA_OK(hipStreamCreateWithFlags(&pool->copy_stream, hipStreamNonBlocking));
+    CUDA_OK(hipEventCreateWithFlags(&pool->upload_done, hipEventDisableTiming));
 
     CUDA_OK(hipMalloc(&pool->d_half_scalars,
                        (size_t)n2 * GLV_SCALAR_LIMBS * sizeof(uint32_t)));
@@ -944,7 +964,8 @@ static rustCudaError_t glv_pool_ensure(int max_n) {
     g_glv_pool = pool;
 
     size_t total_mb =
-        ((size_t)n2 * GLV_SCALAR_LIMBS * sizeof(uint32_t)
+        (2 * scalar_buf_bytes  // double-buffered d_scalars
+         + (size_t)n2 * GLV_SCALAR_LIMBS * sizeof(uint32_t)
          + (size_t)n2 * (sizeof(uint8_t) + sizeof(uint16_t) + sizeof(uint32_t)
                          + sizeof(uint8_t) + sizeof(uint16_t) + sizeof(uint32_t))
          + pool->glv_sort_temp_bytes
@@ -1018,12 +1039,23 @@ static rustCudaError_t init_glv_buffers(hip_msm_context* ctx) {
     return CUDA_SUCCESS_CSL;
 }
 
-/// GLV-accelerated MSM invoke: decompose scalars via GLV endomorphism,
-/// then run Pippenger with half the windows (10 instead of 20).
+/// GLV-accelerated MSM invoke with optional DMA/compute overlap.
+///
+/// Core G1 MSM entry point. Decomposes scalars via GLV endomorphism,
+/// then runs Pippenger with half the windows (10 instead of 20).
 /// Uses pre-expanded endomorphism points (2N) stored on GPU.
+///
+/// DMA overlap (next_scalars != nullptr):
+///   After all compute kernels are enqueued but BEFORE waiting for them,
+///   starts an async H2D upload of the NEXT MSM's scalars on a dedicated
+///   SDMA copy_stream. The SDMA engine runs in parallel with the compute
+///   engine, hiding ~130-160ms of scalar upload behind the ~600ms of
+///   window compute. The next invoke call picks up the pre-uploaded
+///   scalars and skips its synchronous hipMemcpy.
 extern "C"
 rustCudaError_t sp1_bn254_msm_invoke_glv(void* ctx_ptr, void* result,
-                                          size_t npoints, const void* scalars, bool mont)
+                                          size_t npoints, const void* scalars, bool mont,
+                                          const void* next_scalars, size_t next_n)
 {
     auto* ctx = reinterpret_cast<hip_msm_context*>(ctx_ptr);
     int n = (int)npoints;
@@ -1054,9 +1086,20 @@ rustCudaError_t sp1_bn254_msm_invoke_glv(void* ctx_ptr, void* result,
     // d_half_scalars / d_glv_* buffers.
     auto* gp = g_glv_pool;
 
-    // Upload scalars into the shared pool buffer (full 256-bit; will be
-    // decomposed on GPU).
-    CUDA_OK(hipMemcpy(gp->d_scalars, scalars, n * SCALAR_LIMBS * elem32, hipMemcpyHostToDevice));
+    // Determine which d_scalars buffer to use for THIS MSM.
+    uint32_t* my_scalars = gp->d_scalars[gp->cur_buf];
+
+    // If a previous invoke pre-uploaded our scalars via DMA overlap,
+    // just wait for that upload to complete (typically already done).
+    // Otherwise, do a synchronous H2D copy.
+    if (gp->next_upload_pending) {
+        CUDA_OK(hipEventSynchronize(gp->upload_done));
+        gp->next_upload_pending = false;
+        // Scalars are already in d_scalars[cur_buf] — skip hipMemcpy.
+    } else {
+        // Normal synchronous upload (first MSM or fallback).
+        CUDA_OK(hipMemcpy(my_scalars, scalars, n * SCALAR_LIMBS * elem32, hipMemcpyHostToDevice));
+    }
 
     if (do_timing) hipEventRecord(ev_upload);
 
@@ -1065,7 +1108,7 @@ rustCudaError_t sp1_bn254_msm_invoke_glv(void* ctx_ptr, void* result,
         int threads = 256;
         int blocks = (n + threads - 1) / threads;
         hipLaunchKernelGGL(mont_to_canonical_kernel,
-            dim3(blocks), dim3(threads), 0, 0, gp->d_scalars, n);
+            dim3(blocks), dim3(threads), 0, 0, my_scalars, n);
         CUDA_OK(hipGetLastError());
     }
 
@@ -1075,7 +1118,7 @@ rustCudaError_t sp1_bn254_msm_invoke_glv(void* ctx_ptr, void* result,
         int blocks = (n + threads - 1) / threads;
         hipLaunchKernelGGL(bn254_msm::glv_decompose_kernel,
             dim3(blocks), dim3(threads), 0, 0,
-            gp->d_scalars, gp->d_half_scalars, gp->d_glv_signs, n);
+            my_scalars, gp->d_half_scalars, gp->d_glv_signs, n);
         CUDA_OK(hipGetLastError());
     }
 
@@ -1124,7 +1167,24 @@ rustCudaError_t sp1_bn254_msm_invoke_glv(void* ctx_ptr, void* result,
 
     if (do_timing) hipEventRecord(ev_combine);
 
-    // Download result
+    // --- DMA/compute overlap: start uploading NEXT MSM's scalars ---
+    // All compute kernels are enqueued on the default stream (stream 0).
+    // We start the next upload on copy_stream (SDMA engine) BEFORE
+    // waiting for compute to finish. The SDMA engine runs independently
+    // from the compute engine, so the upload overlaps with the tail end
+    // of window processing + combine + result download.
+    if (next_scalars && next_n > 0 && (int)next_n <= gp->alloc_n) {
+        int next_buf = 1 - gp->cur_buf;  // upload into the OTHER buffer
+        hipMemcpyAsync(gp->d_scalars[next_buf], next_scalars,
+                       next_n * SCALAR_LIMBS * elem32,
+                       hipMemcpyHostToDevice, gp->copy_stream);
+        hipEventRecord(gp->upload_done, gp->copy_stream);
+        gp->cur_buf = next_buf;  // next invoke will use this buffer
+        gp->next_upload_pending = true;
+    }
+
+    // Download result (implicit sync on default stream — compute is done
+    // after this returns, but copy_stream may still be uploading).
     CUDA_OK(hipMemcpy(result, ctx->d_final_result, sizeof(bn254_g1_t), hipMemcpyDeviceToHost));
 
     if (do_timing) {
@@ -1137,10 +1197,11 @@ rustCudaError_t sp1_bn254_msm_invoke_glv(void* ctx_ptr, void* result,
         hipEventElapsedTime(&t_combine, ev_windows, ev_combine);
         hipEventElapsedTime(&t_download, ev_combine, ev_end);
         fprintf(stderr, "[MSM GLV %d] N=%d(2N=%d) upload=%.1fms glv_decompose=%.1fms "
-                "%d_windows=%.1fms combine=%.1fms download=%.1fms total=%.1fms\n",
+                "%d_windows=%.1fms combine=%.1fms download=%.1fms total=%.1fms%s\n",
                 glv_call_count - 1, n, n2, t_upload, t_glv,
                 GLV_NUM_WINDOWS, t_windows, t_combine, t_download,
-                t_upload + t_glv + t_windows + t_combine + t_download);
+                t_upload + t_glv + t_windows + t_combine + t_download,
+                gp->next_upload_pending ? " [next upload started]" : "");
         hipEventDestroy(ev_start);
         hipEventDestroy(ev_upload);
         hipEventDestroy(ev_glv);
@@ -1167,15 +1228,23 @@ rustCudaError_t sp1_bn254_msm_invoke_glv_device(void* ctx_ptr, void* result,
 
     auto* gp = g_glv_pool;
 
-    // D2D copy scalars into shared pool buffer
-    CUDA_OK(hipMemcpy(gp->d_scalars, d_scalars, n * SCALAR_LIMBS * elem32, hipMemcpyDeviceToDevice));
+    // If there's a pending DMA upload from a prior invoke, cancel it —
+    // the device-scalar path provides its own data.
+    if (gp->next_upload_pending) {
+        hipEventSynchronize(gp->upload_done);
+        gp->next_upload_pending = false;
+    }
+
+    // D2D copy scalars into shared pool buffer (use current buffer)
+    uint32_t* my_scalars = gp->d_scalars[gp->cur_buf];
+    CUDA_OK(hipMemcpy(my_scalars, d_scalars, n * SCALAR_LIMBS * elem32, hipMemcpyDeviceToDevice));
 
     // Montgomery conversion
     if (mont) {
         int threads = 256;
         int blocks = (n + threads - 1) / threads;
         hipLaunchKernelGGL(mont_to_canonical_kernel,
-            dim3(blocks), dim3(threads), 0, 0, gp->d_scalars, n);
+            dim3(blocks), dim3(threads), 0, 0, my_scalars, n);
         CUDA_OK(hipGetLastError());
     }
 
@@ -1185,7 +1254,7 @@ rustCudaError_t sp1_bn254_msm_invoke_glv_device(void* ctx_ptr, void* result,
         int blocks = (n + threads - 1) / threads;
         hipLaunchKernelGGL(bn254_msm::glv_decompose_kernel,
             dim3(blocks), dim3(threads), 0, 0,
-            gp->d_scalars, gp->d_half_scalars, gp->d_glv_signs, n);
+            my_scalars, gp->d_half_scalars, gp->d_glv_signs, n);
         CUDA_OK(hipGetLastError());
     }
 
@@ -1246,8 +1315,15 @@ rustCudaError_t sp1_bn254_msm_invoke_glv_device_depad(void* ctx_ptr, void* resul
 
     auto* gp = g_glv_pool;
 
-    // D2D copy scalars into shared pool buffer
-    CUDA_OK(hipMemcpy(gp->d_scalars, d_scalars, n * SCALAR_LIMBS * elem32, hipMemcpyDeviceToDevice));
+    // If there's a pending DMA upload from a prior invoke, cancel it.
+    if (gp->next_upload_pending) {
+        hipEventSynchronize(gp->upload_done);
+        gp->next_upload_pending = false;
+    }
+
+    // D2D copy scalars into shared pool buffer (use current buffer)
+    uint32_t* my_scalars = gp->d_scalars[gp->cur_buf];
+    CUDA_OK(hipMemcpy(my_scalars, d_scalars, n * SCALAR_LIMBS * elem32, hipMemcpyDeviceToDevice));
 
     // GPU-side depadding
     if (num_hot > 0 && hot_values_host) {
@@ -1259,7 +1335,7 @@ rustCudaError_t sp1_bn254_msm_invoke_glv_device_depad(void* ctx_ptr, void* resul
         int blocks = (n + threads - 1) / threads;
         hipLaunchKernelGGL(bn254_msm::zero_hot_scalars_kernel,
             dim3(blocks), dim3(threads), 0, 0,
-            gp->d_scalars, d_hot_values, n, num_hot);
+            my_scalars, d_hot_values, n, num_hot);
         CUDA_OK(hipGetLastError());
         hipFree(d_hot_values);
     }
@@ -1269,7 +1345,7 @@ rustCudaError_t sp1_bn254_msm_invoke_glv_device_depad(void* ctx_ptr, void* resul
         int threads = 256;
         int blocks = (n + threads - 1) / threads;
         hipLaunchKernelGGL(mont_to_canonical_kernel,
-            dim3(blocks), dim3(threads), 0, 0, gp->d_scalars, n);
+            dim3(blocks), dim3(threads), 0, 0, my_scalars, n);
         CUDA_OK(hipGetLastError());
     }
 
@@ -1279,7 +1355,7 @@ rustCudaError_t sp1_bn254_msm_invoke_glv_device_depad(void* ctx_ptr, void* resul
         int blocks = (n + threads - 1) / threads;
         hipLaunchKernelGGL(bn254_msm::glv_decompose_kernel,
             dim3(blocks), dim3(threads), 0, 0,
-            gp->d_scalars, gp->d_half_scalars, gp->d_glv_signs, n);
+            my_scalars, gp->d_half_scalars, gp->d_glv_signs, n);
         CUDA_OK(hipGetLastError());
     }
 

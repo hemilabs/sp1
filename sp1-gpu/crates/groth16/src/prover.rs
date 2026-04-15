@@ -334,16 +334,6 @@ impl Groth16Prover {
         // singleton can't handle concurrent mult_pippenger invocations.
         let t = std::time::Instant::now();
 
-        // Ar = MSM(G1.A, wireValuesA) + Alpha + r*Delta
-        #[cfg(feature = "cuda")]
-        let ar_msm = self.persistent_g1_a.msm(&wire_values_a);
-        #[cfg(not(feature = "cuda"))]
-        let ar_msm = self.g1_msm(&self.data.pk_g1_a, &wire_values_a);
-        let ar = ar_msm.add(&g1_alpha.to_jacobian()).add(&r_delta);
-        eprintln!("[T] 5a. Ar MSM (N={}): {:?}", wire_values_a.len(), t.elapsed());
-        #[cfg(feature = "cuda")]
-        g1_msm_ark_verify("Ar", &self.data.pk_g1_a, &wire_values_a, &ar_msm);
-
         let g2_beta = self.data.pk_g2_beta;
         let g2_delta = self.data.pk_g2_delta;
         let g2_b_ark = &self.data.pk_g2_b_ark;
@@ -378,20 +368,50 @@ impl Groth16Prover {
             .unwrap_or(false);
 
         #[cfg(feature = "cuda")]
-        let (bs2, bs1, krs_msm, krs2_msm) = if use_sequential_g2 {
-            // HIP path — sequential.
+        let (ar, bs2, bs1, krs_msm, krs2_msm) = if use_sequential_g2 {
+            // HIP path — sequential with DMA/compute overlap.
+            //
+            // Each msm_with_next(scalars, Some(next_scalars)) starts an async
+            // H2D upload of next_scalars on the SDMA engine while the current
+            // MSM's compute finishes. The next MSM picks up the pre-uploaded
+            // scalars and skips its synchronous hipMemcpy, saving ~130-160ms
+            // per overlapped upload (3 of 4 MSMs benefit).
+
+            // Ar: first MSM — no prior compute to overlap with.
+            // Pre-upload Bs1 scalars during Ar compute.
+            let ar_msm = self.persistent_g1_a.msm_with_next(
+                &wire_values_a,
+                Some(&wire_values_b),
+            );
+            let ar = ar_msm.add(&g1_alpha.to_jacobian()).add(&r_delta);
+            eprintln!("[T] 5a. Ar MSM (N={}, pipelined next): {:?}", wire_values_a.len(), t.elapsed());
+            g1_msm_ark_verify("Ar", &self.data.pk_g1_a, &wire_values_a, &ar_msm);
+
             let t = std::time::Instant::now();
-            let bs1_msm = self.persistent_g1_b.msm(&wire_values_b);
+            // Bs1: scalars pre-uploaded during Ar. Pre-upload Krs scalars.
+            let bs1_msm = self.persistent_g1_b.msm_with_next(
+                &wire_values_b,
+                Some(&filtered_wire_values),
+            );
             let bs1 = bs1_msm.add(&g1_beta.to_jacobian()).add(&s_delta);
             eprintln!("[T] 5b. Bs1 MSM (N={}): {:?}", wire_values_b.len(), t.elapsed());
             g1_msm_ark_verify("Bs1", &self.data.pk_g1_b, &wire_values_b, &bs1_msm);
 
             let t = std::time::Instant::now();
-            let krs_msm = self.persistent_g1_k.msm(&filtered_wire_values);
+            // Krs: scalars pre-uploaded during Bs1. Pre-upload Krs2 if host.
+            let krs2_next = match &h_result {
+                HResult::Host(h) => Some(&h[..size_h]),
+                HResult::Device(_) => None,  // device path doesn't use host upload
+            };
+            let krs_msm = self.persistent_g1_k.msm_with_next(
+                &filtered_wire_values,
+                krs2_next,
+            );
             eprintln!("[T] 5c. Krs MSM (N={}): {:?}", filtered_wire_values.len(), t.elapsed());
             g1_msm_ark_verify("Krs", &self.data.pk_g1_k, &filtered_wire_values, &krs_msm);
 
             let t = std::time::Instant::now();
+            // Krs2: scalars pre-uploaded during Krs (if host). No next.
             let krs2_msm = match &h_result {
                 HResult::Device(dh) => self.persistent_g1_z.msm_device(dh.ptr, size_h),
                 HResult::Host(h) => self.persistent_g1_z.msm(&h[..size_h]),
@@ -433,9 +453,14 @@ impl Groth16Prover {
                 t_g2.elapsed(),
                 t_g2_start.elapsed(),
             );
-            (bs2, bs1, krs_msm, krs2_msm)
+            (ar, bs2, bs1, krs_msm, krs2_msm)
         } else {
             // CUDA path — overlap G2 with G1 MSMs via thread::scope.
+            // Compute Ar before the scope (no DMA overlap on CUDA — sppark
+            // handles its own internal pipelining).
+            let ar_msm = self.persistent_g1_a.msm(&wire_values_a);
+            let ar = ar_msm.add(&g1_alpha.to_jacobian()).add(&r_delta);
+            eprintln!("[T] 5a. Ar MSM (N={}): {:?}", wire_values_a.len(), t.elapsed());
             std::thread::scope(|scope| {
                 let g2_handle = scope.spawn(|| {
                     let bs2_msm = g2_msm_gpu(g2_b, &wire_values_b)
@@ -471,7 +496,7 @@ impl Groth16Prover {
                     t_g2_start.elapsed(),
                     t_join.elapsed(),
                 );
-                (bs2, bs1, krs_msm, krs2_msm)
+                (ar, bs2, bs1, krs_msm, krs2_msm)
             })
         };
 
