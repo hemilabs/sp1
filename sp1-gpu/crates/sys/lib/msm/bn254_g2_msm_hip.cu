@@ -16,6 +16,7 @@
 #include "ec/bn254_g2.cuh"
 #include "fields/bn254_t.cuh"
 #include "runtime/exception.cuh"
+#include "msm/bn254_g2_glv.cuh"
 
 // Local scalar conversion kernel (can't link across TUs with HIP device stubs)
 __global__ void g2_mont_to_canonical_kernel(uint32_t* scalars, int n) {
@@ -575,10 +576,450 @@ rustCudaError_t sp1_bn254_g2_msm_invoke(
     return CUDA_SUCCESS_CSL;
 }
 
+// ================================================================
+// GLV-accelerated G2 MSM (endomorphism: halves window count)
+// ================================================================
+//
+// psi((x.c0, x.c1), (y.c0, y.c1)) = ((beta * x.c0, beta * x.c1), (y.c0, y.c1))
+// where beta is the G1 cube-root-of-unity in Fq. For G2 this is just 2 Fq
+// muls per point (multiply each Fq2 limb by beta). Matches arkworks
+// ark-bn254 g2.rs GLVConfig.
+//
+// Kernels below mirror the G1 GLV path in bn254_msm_hip.cu; the only
+// differences are (a) Fq2 point type, (b) different lattice constants
+// (see include/msm/bn254_g2_glv.cuh), and (c) per-G2-context scratch.
+
+// Endomorphism point expansion: expanded[i]=P, expanded[n+i]=psi(P).
+__global__ void g2_endo_expand_kernel(
+    const bn254_g2_affine_t* __restrict__ points,
+    bn254_g2_affine_t* __restrict__ expanded,
+    int n
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+    bn254_g2_affine_t p = points[idx];
+    expanded[idx] = p;
+    // psi(P): multiply both Fq limbs of x by beta (beta is in Fq, not Fq2).
+    bn254_fq_t beta(bn254_glv::GLV_BETA);
+    p.x.c0 = p.x.c0 * beta;
+    p.x.c1 = p.x.c1 * beta;
+    expanded[n + idx] = p;
+}
+
+// GLV scalar decomposition: N canonical 256-bit scalars -> 2N 129-bit
+// half-scalars + per-scalar sign flags. Layout:
+//   half_scalars[i]     = |k1_i| (5 u32 limbs)   sign = signs[i]
+//   half_scalars[n + i] = |k2_i|                 sign = signs[n + i]
+__global__ void g2_glv_decompose_kernel(
+    const uint32_t* __restrict__ scalars,       // [n * 8] canonical
+    uint32_t* __restrict__ half_scalars,        // [2n * 5]
+    uint8_t*  __restrict__ glv_signs,           // [2n]
+    int n
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+
+    const uint32_t* k = &scalars[idx * G2_SCALAR_LIMBS];
+
+    uint32_t k1[bn254_g2_glv::GLV_SCALAR_LIMBS];
+    uint32_t k2[bn254_g2_glv::GLV_SCALAR_LIMBS];
+    bool neg1, neg2;
+    bn254_g2_glv::glv_decompose_g2(k, k1, k2, &neg1, &neg2);
+
+    uint32_t* k1_out = &half_scalars[idx * bn254_g2_glv::GLV_SCALAR_LIMBS];
+    for (int i = 0; i < bn254_g2_glv::GLV_SCALAR_LIMBS; i++) k1_out[i] = k1[i];
+    glv_signs[idx] = neg1 ? 1 : 0;
+
+    uint32_t* k2_out = &half_scalars[(n + idx) * bn254_g2_glv::GLV_SCALAR_LIMBS];
+    for (int i = 0; i < bn254_g2_glv::GLV_SCALAR_LIMBS; i++) k2_out[i] = k2[i];
+    glv_signs[n + idx] = neg2 ? 1 : 0;
+}
+
+// Per-window signed-digit decomposition over 2N half-scalars (5 limbs each).
+// Writes sign-XORed packed indices (sign in bit 31) so the existing parallel
+// bucket accumulator can process points as-is. Mirrors the G1 glv_scalar_
+// decompose_packed_kernel (see include/msm/bn254_msm.cuh).
+__global__ void g2_glv_scalar_decompose_packed_kernel(
+    const uint32_t* __restrict__ half_scalars,  // [n2 * 5]
+    const uint8_t*  __restrict__ glv_signs,     // [n2]
+    uint16_t* __restrict__ digits,              // [n2]
+    uint32_t* __restrict__ packed_indices,      // [n2] with sign in bit 31
+    uint8_t*  __restrict__ carries,             // [n2] persistent
+    int n2,
+    int window_idx
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n2) return;
+
+    const uint32_t* s = &half_scalars[idx * bn254_g2_glv::GLV_SCALAR_LIMBS];
+
+    uint32_t carry = carries[idx];
+    int bit_start = window_idx * G2_WINDOW_BITS;
+
+    int limb_lo = bit_start / 32;
+    int shift = bit_start % 32;
+
+    uint64_t combined = 0;
+    if (limb_lo < bn254_g2_glv::GLV_SCALAR_LIMBS) {
+        combined = (uint64_t)s[limb_lo];
+        if (limb_lo + 1 < bn254_g2_glv::GLV_SCALAR_LIMBS) {
+            combined |= ((uint64_t)s[limb_lo + 1]) << 32;
+        }
+    }
+    uint32_t raw = (uint32_t)(combined >> shift);
+
+    int bits_avail = bn254_g2_glv::GLV_SCALAR_BITS - bit_start;
+    if (bits_avail <= 0) {
+        raw = 0;
+    } else if (bits_avail < G2_WINDOW_BITS) {
+        raw &= (1u << bits_avail) - 1;
+    } else {
+        raw &= (1u << G2_WINDOW_BITS) - 1;
+    }
+
+    raw += carry;
+
+    uint32_t half = 1u << (G2_WINDOW_BITS - 1);
+    uint16_t digit;
+    uint32_t sign_bit;
+    uint32_t next_carry;
+    if (raw > half) {
+        digit = (uint16_t)((1u << G2_WINDOW_BITS) - raw);
+        sign_bit = 1u;
+        next_carry = 1u;
+    } else {
+        digit = (uint16_t)raw;
+        sign_bit = 0u;
+        next_carry = 0u;
+    }
+
+    // XOR with the GLV sign so a negative k1/k2 flips the point.
+    uint32_t glv_sign = glv_signs[idx];
+    sign_bit ^= glv_sign;
+
+    digits[idx] = digit;
+    packed_indices[idx] = ((uint32_t)idx & 0x7FFFFFFFu) | (sign_bit << 31);
+    carries[idx] = (uint8_t)next_carry;
+}
+
+// ------------------------------------------------------------
+// GLV configuration constants (same width as G1: 10 windows for 129-bit half-scalars)
+// ------------------------------------------------------------
+static constexpr int G2_GLV_NUM_WINDOWS =
+    (bn254_g2_glv::GLV_SCALAR_BITS + G2_WINDOW_BITS - 1) / G2_WINDOW_BITS; // 10
+
+// ------------------------------------------------------------
+// Shared-with-G1 GLV working buffers
+// ------------------------------------------------------------
+//
+// The scalar-path buffers (d_scalars, d_half_scalars, d_glv_signs/digits/
+// packed/carries/sorted_*, d_glv_sort_temp) are point-type-independent, so
+// they can be shared with the G1 GLV pool that bn254_msm_hip.cu owns. This
+// avoids a ~1.5 GB duplicate allocation on 7900 XTX where the four G1
+// expanded-point buffers already dominate VRAM. All MSMs are serialized on
+// the HIP path (see `use_sequential_g2` in groth16 prover.rs), so there's
+// no race between G1 and G2 invokes using the same scratch.
+//
+// The G1 pool is reserved via `sp1_bn254_glv_pool_reserve(max_n_over_all_
+// G1_contexts)` in PersistentMsm::new; we reserve it for max(G1, G2) so the
+// buffers are large enough for both.
+
+struct sp1_bn254_glv_scalar_buffers {
+    int alloc_n;
+    void* d_scalars;
+    void* d_half_scalars;
+    void* d_glv_signs;
+    void* d_glv_digits;
+    void* d_glv_packed;
+    void* d_glv_carries;
+    void* d_glv_sorted_digits;
+    void* d_glv_sorted_packed;
+    void* d_glv_sort_temp;
+    size_t glv_sort_temp_bytes;
+};
+extern "C" rustCudaError_t sp1_bn254_glv_pool_get_scalar_buffers(
+    sp1_bn254_glv_scalar_buffers* out);
+extern "C" rustCudaError_t sp1_bn254_glv_pool_reserve(size_t max_n);
+
+// ------------------------------------------------------------
+// Per-context GLV state: expanded points (2N) and window results.
+// ------------------------------------------------------------
+struct hip_g2_glv_ctx_state {
+    bool initialized = false;
+    bn254_g2_affine_t* d_expanded_points = nullptr;  // [2n]
+    bn254_g2_t*        d_glv_window_results = nullptr; // [G2_GLV_NUM_WINDOWS]
+};
+
+// Associate GLV state with a context lazily on first GLV invoke. We keep
+// it in a small map keyed by context pointer so we don't modify the
+// `hip_g2_msm_context` layout (avoiding ABI ripple through the non-GLV
+// path which is also exercised from `g2_msm`).
+#include <mutex>
+#include <unordered_map>
+static std::mutex g_g2_glv_state_mu;
+static std::unordered_map<void*, hip_g2_glv_ctx_state>* g_g2_glv_state = nullptr;
+
+static hip_g2_glv_ctx_state* g2_glv_state_for(hip_g2_msm_context* ctx) {
+    std::lock_guard<std::mutex> lk(g_g2_glv_state_mu);
+    if (!g_g2_glv_state) {
+        g_g2_glv_state = new std::unordered_map<void*, hip_g2_glv_ctx_state>();
+    }
+    return &(*g_g2_glv_state)[(void*)ctx];
+}
+
+static void g2_glv_state_free(hip_g2_msm_context* ctx) {
+    std::lock_guard<std::mutex> lk(g_g2_glv_state_mu);
+    if (!g_g2_glv_state) return;
+    auto it = g_g2_glv_state->find((void*)ctx);
+    if (it == g_g2_glv_state->end()) return;
+    if (it->second.d_expanded_points) hipFree(it->second.d_expanded_points);
+    if (it->second.d_glv_window_results) hipFree(it->second.d_glv_window_results);
+    g_g2_glv_state->erase(it);
+}
+
+// Lazy per-ctx init: expand points and ensure the G1 pool is sized to cover
+// G2 too (since we reuse its scalar buffers).
+static rustCudaError_t g2_glv_init_ctx(hip_g2_msm_context* ctx) {
+    auto* st = g2_glv_state_for(ctx);
+    if (st->initialized) return CUDA_SUCCESS_CSL;
+
+    int n = ctx->npoints;
+    int n2 = 2 * n;
+
+    // Ensure the G1 GLV pool is at least as large as this G2 context.
+    // Rust's PersistentG2Msm::new already calls this with n, but if a later
+    // G1 pool has been resized smaller (it won't — pool only grows), we're
+    // still safe.
+    rustCudaError_t err = sp1_bn254_glv_pool_reserve((size_t)n);
+    if (err.message != CUDA_SUCCESS_CSL.message) return err;
+
+    // Confirm the buffers exist now.
+    sp1_bn254_glv_scalar_buffers bufs{};
+    err = sp1_bn254_glv_pool_get_scalar_buffers(&bufs);
+    if (err.message != CUDA_SUCCESS_CSL.message) return err;
+
+    if (hipMalloc(&st->d_expanded_points,
+                  (size_t)n2 * sizeof(bn254_g2_affine_t)) != hipSuccess) {
+        return rustCudaError_t{.message = "hipMalloc failed: g2 d_expanded_points"};
+    }
+    {
+        int threads = 256;
+        int blocks = (n + threads - 1) / threads;
+        g2_endo_expand_kernel<<<blocks, threads, 0, ctx->stream>>>(
+            ctx->d_points, st->d_expanded_points, n
+        );
+    }
+
+    if (hipMalloc(&st->d_glv_window_results,
+                  (size_t)G2_GLV_NUM_WINDOWS * sizeof(bn254_g2_t)) != hipSuccess) {
+        return rustCudaError_t{.message = "hipMalloc failed: g2 d_glv_window_results"};
+    }
+
+    st->initialized = true;
+
+    // Reclaim VRAM now that GLV is active:
+    //   * d_points (2N * 128 B replaces it inside d_expanded_points which
+    //     already stored a copy of the original points in the lower half)
+    //   * d_scalars (shared pool takes over)
+    //   * d_partial_sums (unused by GLV — G2 GLV reuses ctx->d_partial_sums
+    //     but we would double-count. We keep this per-ctx since G2 only has
+    //     one context; freeing is a micro-save (~35 MB) and complicates the
+    //     non-GLV fallback if ever needed. So leave it alone.)
+    if (ctx->d_points) {
+        hipFree(ctx->d_points);
+        ctx->d_points = nullptr;
+    }
+    if (ctx->d_scalars) {
+        hipFree(ctx->d_scalars);
+        ctx->d_scalars = nullptr;
+    }
+
+    fprintf(stderr,
+            "[G2 GLV] ctx initialized: expanded %d points to %d, %d windows "
+            "(was %d); freed per-ctx d_points + d_scalars\n",
+            n, n2, G2_GLV_NUM_WINDOWS, G2_NUM_WINDOWS);
+    return CUDA_SUCCESS_CSL;
+}
+
+// Runs the GLV G2 MSM pipeline using the G1 pool's scalar buffers + per-ctx
+// expanded points. Scalars already uploaded into bufs.d_scalars (canonical).
+static void g2_glv_run_pipeline(hip_g2_msm_context* ctx,
+                                hip_g2_glv_ctx_state* st,
+                                const sp1_bn254_glv_scalar_buffers& bufs,
+                                int n, void* result_ptr) {
+    const int num_buckets = G2_NUM_BUCKETS;
+    hipStream_t stream = ctx->stream;
+
+    int n2 = 2 * n;
+
+    int threads = 256;
+    int blocks_n = (n + threads - 1) / threads;
+    int blocks_n2 = (n2 + threads - 1) / threads;
+    int total_par_threads = num_buckets * G2_BUCKET_PAR;
+    int blocks_par = (total_par_threads + threads - 1) / threads;
+    int blocks_b = (num_buckets + threads - 1) / threads;
+    int blocks_reduce = (ctx->reduce_threads + threads - 1) / threads;
+
+    auto* d_scalars = (uint32_t*)bufs.d_scalars;
+    auto* d_half_scalars = (uint32_t*)bufs.d_half_scalars;
+    auto* d_signs = (uint8_t*)bufs.d_glv_signs;
+    auto* d_digits = (uint16_t*)bufs.d_glv_digits;
+    auto* d_packed = (uint32_t*)bufs.d_glv_packed;
+    auto* d_carries = (uint8_t*)bufs.d_glv_carries;
+    auto* d_sorted_digits = (uint16_t*)bufs.d_glv_sorted_digits;
+    auto* d_sorted_packed = (uint32_t*)bufs.d_glv_sorted_packed;
+
+    // GLV scalar decomposition: N canonical -> 2N half-scalars + signs
+    g2_glv_decompose_kernel<<<blocks_n, threads, 0, stream>>>(
+        d_scalars, d_half_scalars, d_signs, n
+    );
+
+    // Reset per-element carries (2n elements).
+    hipMemsetAsync(d_carries, 0, (size_t)n2 * sizeof(uint8_t), stream);
+
+    for (int w = 0; w < G2_GLV_NUM_WINDOWS; w++) {
+        g2_glv_scalar_decompose_packed_kernel<<<blocks_n2, threads, 0, stream>>>(
+            d_half_scalars, d_signs,
+            d_digits, d_packed, d_carries,
+            n2, w
+        );
+
+        hipcub::DeviceRadixSort::SortPairs(
+            bufs.d_glv_sort_temp, bufs.glv_sort_temp_bytes,
+            d_digits, d_sorted_digits,
+            d_packed, d_sorted_packed,
+            n2, 0, G2_WINDOW_BITS, stream
+        );
+
+        hipMemsetAsync(ctx->d_starts, 0xFF, (size_t)num_buckets * sizeof(uint32_t), stream);
+        hipMemsetAsync(ctx->d_ends, 0, (size_t)num_buckets * sizeof(uint32_t), stream);
+        g2_bucket_boundaries_kernel<<<blocks_n2, threads, 0, stream>>>(
+            d_sorted_digits, ctx->d_starts, ctx->d_ends, n2
+        );
+
+        g2_bucket_accumulate_parallel_kernel<<<blocks_par, threads, 0, stream>>>(
+            st->d_expanded_points, d_sorted_packed,
+            ctx->d_starts, ctx->d_ends,
+            ctx->d_partial_sums, num_buckets
+        );
+
+        g2_merge_partial_sums_kernel<<<blocks_b, threads, 0, stream>>>(
+            ctx->d_partial_sums, ctx->d_buckets, num_buckets
+        );
+
+        g2_reduce_phase1_kernel<<<blocks_reduce, threads, 0, stream>>>(
+            ctx->d_buckets, ctx->d_local_partials, ctx->d_local_suffixes, num_buckets
+        );
+        g2_reduce_phase2_kernel<<<1, 1, 0, stream>>>(
+            ctx->d_local_partials, ctx->d_local_suffixes,
+            &st->d_glv_window_results[w], ctx->reduce_threads, num_buckets
+        );
+    }
+
+    g2_combine_windows_kernel<<<1, 1, 0, stream>>>(
+        st->d_glv_window_results, ctx->d_final_result, G2_GLV_NUM_WINDOWS, G2_WINDOW_BITS
+    );
+
+    hipMemcpyAsync(result_ptr, ctx->d_final_result, sizeof(bn254_g2_t),
+                   hipMemcpyDeviceToHost, stream);
+    hipStreamSynchronize(stream);
+}
+
+// FFI: GLV-accelerated persistent G2 MSM invoke. Scalars in Montgomery form.
+extern "C"
+rustCudaError_t sp1_bn254_g2_msm_invoke_glv(
+    void* ctx_ptr,
+    void* result,
+    size_t npoints,
+    const void* scalars,
+    bool mont
+) {
+    auto* ctx = reinterpret_cast<hip_g2_msm_context*>(ctx_ptr);
+    const int n = (int)npoints;
+    if (n > ctx->npoints) {
+        return rustCudaError_t{.message = "g2_msm_invoke_glv: npoints exceeds context capacity"};
+    }
+
+    rustCudaError_t err = g2_glv_init_ctx(ctx);
+    if (err.message != CUDA_SUCCESS_CSL.message) return err;
+
+    auto* st = g2_glv_state_for(ctx);
+
+    sp1_bn254_glv_scalar_buffers bufs{};
+    err = sp1_bn254_glv_pool_get_scalar_buffers(&bufs);
+    if (err.message != CUDA_SUCCESS_CSL.message) return err;
+
+    // Timing on the first 2 calls only.
+    static int glv_call_count = 0;
+    bool do_timing = (glv_call_count < 2);
+    glv_call_count++;
+
+    hipEvent_t ev_start, ev_upload, ev_pipeline, ev_end;
+    if (do_timing) {
+        hipEventCreate(&ev_start);
+        hipEventCreate(&ev_upload);
+        hipEventCreate(&ev_pipeline);
+        hipEventCreate(&ev_end);
+        hipEventRecord(ev_start, ctx->stream);
+    }
+
+    if (hipMemcpyAsync(bufs.d_scalars, scalars,
+                       (size_t)n * G2_SCALAR_LIMBS * sizeof(uint32_t),
+                       hipMemcpyHostToDevice, ctx->stream) != hipSuccess) {
+        return rustCudaError_t{.message = "hipMemcpyAsync failed in g2_msm_invoke_glv"};
+    }
+
+    if (mont) {
+        int thr = 256;
+        int blk = (n + thr - 1) / thr;
+        g2_mont_to_canonical_kernel<<<blk, thr, 0, ctx->stream>>>(
+            (uint32_t*)bufs.d_scalars, n);
+    }
+
+    if (do_timing) hipEventRecord(ev_upload, ctx->stream);
+
+    g2_glv_run_pipeline(ctx, st, bufs, n, result);
+
+    if (do_timing) {
+        hipEventRecord(ev_pipeline, ctx->stream);
+        hipEventRecord(ev_end, ctx->stream);
+        hipEventSynchronize(ev_end);
+        float t_upload, t_pipeline;
+        hipEventElapsedTime(&t_upload, ev_start, ev_upload);
+        hipEventElapsedTime(&t_pipeline, ev_upload, ev_pipeline);
+        fprintf(stderr, "[G2 MSM GLV %d] N=%d(2N=%d) upload=%.1fms "
+                        "%d_windows+pipeline=%.1fms total=%.1fms\n",
+                glv_call_count - 1, n, 2 * n, t_upload,
+                G2_GLV_NUM_WINDOWS, t_pipeline, t_upload + t_pipeline);
+        hipEventDestroy(ev_start);
+        hipEventDestroy(ev_upload);
+        hipEventDestroy(ev_pipeline);
+        hipEventDestroy(ev_end);
+    }
+
+    return CUDA_SUCCESS_CSL;
+}
+
+// FFI: pre-size the shared GLV pool (G1 + G2 share the scalar buffers).
+// Delegates to the G1 pool reserve since that's where the buffers actually live.
+extern "C"
+rustCudaError_t sp1_bn254_g2_glv_pool_reserve(size_t max_n) {
+    if (max_n == 0) return CUDA_SUCCESS_CSL;
+    return sp1_bn254_glv_pool_reserve(max_n);
+}
+
+extern "C"
+void sp1_bn254_g2_glv_pool_free() {
+    // No-op: the shared buffers are owned by the G1 pool; freeing them via
+    // sp1_bn254_glv_pool_free is the caller's responsibility.
+}
+
 extern "C"
 void sp1_bn254_g2_msm_destroy(void* ctx_ptr) {
     if (!ctx_ptr) return;
     auto* ctx = reinterpret_cast<hip_g2_msm_context*>(ctx_ptr);
+    // Tear down any GLV per-ctx state first (expanded points + window results).
+    g2_glv_state_free(ctx);
     g2_ctx_free(ctx);
     delete ctx;
 }

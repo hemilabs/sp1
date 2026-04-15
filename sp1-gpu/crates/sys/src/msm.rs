@@ -179,4 +179,28 @@ extern "C" {
 
     /// Destroy a persistent G2 MSM context.
     pub fn sp1_bn254_g2_msm_destroy(ctx: *mut c_void);
+
+    // ========================================================================
+    // GLV-accelerated G2 MSM (endomorphism optimization, HIP)
+    // ========================================================================
+
+    /// GLV-accelerated G2 MSM invoke: decomposes each 254-bit scalar into two
+    /// ~128-bit halves via the G2 endomorphism psi(x, y) = (beta·x, y) in Fq2.
+    /// Halves window count from 20 to 10 at the cost of doubling the point
+    /// count (2N pre-expanded G2 affine points). Requires ~3.8 GB extra VRAM
+    /// for the expanded SRS at N=15M.
+    pub fn sp1_bn254_g2_msm_invoke_glv(
+        ctx: *mut c_void,
+        result: *mut c_void,
+        npoints: usize,
+        scalars: *const c_void,
+        mont: bool,
+    ) -> CudaRustError;
+
+    /// Pre-size the shared G2 GLV working-buffer pool for up to `max_n`
+    /// base points. Optional — pool is lazily grown otherwise.
+    pub fn sp1_bn254_g2_glv_pool_reserve(max_n: usize) -> CudaRustError;
+
+    /// Release the shared G2 GLV pool.
+    pub fn sp1_bn254_g2_glv_pool_free();
 }

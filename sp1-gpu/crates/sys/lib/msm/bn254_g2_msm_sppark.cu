@@ -151,3 +151,20 @@ void sp1_bn254_g2_msm_destroy(void* ctx)
         delete reinterpret_cast<g2_msm_context_t*>(ctx);
     }
 }
+
+// ----------------------------------------------------------------
+// GLV stubs for CUDA: G2 GLV is HIP-only. Symbols must resolve at link
+// time so the shared Rust extern block compiles on both backends.
+// ----------------------------------------------------------------
+extern "C"
+rustCudaError_t sp1_bn254_g2_msm_invoke_glv(void*, void*, size_t, const void*, bool) {
+    return rustCudaError_t{.message = "G2 GLV MSM not implemented on CUDA"};
+}
+
+extern "C"
+rustCudaError_t sp1_bn254_g2_glv_pool_reserve(size_t) {
+    return CUDA_SUCCESS_CSL;
+}
+
+extern "C"
+void sp1_bn254_g2_glv_pool_free() {}

@@ -230,6 +230,51 @@ pub fn g2_msm_gpu(bases: &[G2Affine], scalars: &[Fr]) -> Option<G2Jacobian> {
 pub struct PersistentG2Msm {
     ctx: *mut std::ffi::c_void,
     npoints: usize,
+    use_glv: bool,
+}
+
+/// Whether to use the GLV-accelerated G2 MSM path. Mirrors the G1 GLV
+/// auto-detect logic: requires a card with plenty of VRAM (≥ 20 GiB) since
+/// we need to hold the expanded SRS (2N G2 affine = 3.8 GB for N=15M) in
+/// addition to the G1 GLV expansion (~7.7 GB) and the H-polynomial buffers.
+///
+/// Override with `SP1_GPU_G2_GLV=1` / `=0`.
+#[cfg(feature = "cuda")]
+fn g2_glv_enabled() -> bool {
+    static GLV: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *GLV.get_or_init(|| {
+        if let Ok(v) = std::env::var("SP1_GPU_G2_GLV") {
+            let on = v != "0";
+            eprintln!(
+                "[G2 MSM] GLV endomorphism {} (SP1_GPU_G2_GLV={})",
+                if on { "enabled" } else { "disabled" },
+                v
+            );
+            return on;
+        }
+        let mut free: usize = 0;
+        let mut total: usize = 0;
+        let ok = unsafe {
+            sp1_gpu_sys::runtime::cuda_mem_get_info(
+                &mut free as *mut _,
+                &mut total as *mut _,
+            ) == sp1_gpu_sys::runtime::CUDA_SUCCESS_CSL
+        };
+        // Same threshold as G1 GLV — 20 GB puts 7900 XTX in the "on" bucket
+        // and 9070 XT safely below it (the G2 expanded SRS pushes 9070 XT
+        // well past its 16 GB budget once G1 GLV is also active).
+        let enable = ok && total >= 20 * 1024 * 1024 * 1024;
+        if ok {
+            eprintln!(
+                "[G2 MSM] GLV auto: total VRAM = {:.1} GB, {}",
+                total as f64 / (1024.0 * 1024.0 * 1024.0),
+                if enable { "enabling G2 GLV" } else { "disabling G2 GLV (needs ≥ 20 GB)" }
+            );
+        } else {
+            eprintln!("[G2 MSM] GLV auto: could not query VRAM, defaulting to disabled");
+        }
+        ok.then_some(enable).unwrap_or(false)
+    })
 }
 
 #[cfg(feature = "cuda")]
@@ -262,7 +307,27 @@ impl PersistentG2Msm {
         if err != unsafe { sp1_gpu_sys::runtime::CUDA_SUCCESS_CSL } {
             return None;
         }
-        Some(Self { ctx, npoints: n })
+
+        let use_glv = g2_glv_enabled();
+        if use_glv {
+            // Pre-size the shared G2 GLV working-buffer pool so the expand
+            // step inside the first invoke doesn't have to grow it. There
+            // is currently only a single G2 context in the Groth16 pipeline
+            // (pk_g2_b), so this allocation is a one-time cost.
+            let err = unsafe { sp1_gpu_sys::msm::sp1_bn254_g2_glv_pool_reserve(n) };
+            if err != unsafe { sp1_gpu_sys::runtime::CUDA_SUCCESS_CSL } {
+                let msg = if err.message.is_null() {
+                    "unknown error".to_string()
+                } else {
+                    unsafe { std::ffi::CStr::from_ptr(err.message) }
+                        .to_string_lossy()
+                        .into_owned()
+                };
+                eprintln!("[G2 MSM] WARN: g2_glv_pool_reserve({}) failed: {}; continuing", n, msg);
+            }
+        }
+
+        Some(Self { ctx, npoints: n, use_glv })
     }
 
     /// Run a G2 MSM against the pre-uploaded SRS. `scalars.len()` must be
@@ -278,14 +343,26 @@ impl PersistentG2Msm {
         }
 
         let mut result = G2Jacobian::INFINITY;
-        let err = unsafe {
-            sp1_gpu_sys::msm::sp1_bn254_g2_msm_invoke(
-                self.ctx,
-                &mut result as *mut G2Jacobian as *mut c_void,
-                n,
-                scalars.as_ptr() as *const c_void,
-                true,
-            )
+        let err = if self.use_glv {
+            unsafe {
+                sp1_gpu_sys::msm::sp1_bn254_g2_msm_invoke_glv(
+                    self.ctx,
+                    &mut result as *mut G2Jacobian as *mut c_void,
+                    n,
+                    scalars.as_ptr() as *const c_void,
+                    true,
+                )
+            }
+        } else {
+            unsafe {
+                sp1_gpu_sys::msm::sp1_bn254_g2_msm_invoke(
+                    self.ctx,
+                    &mut result as *mut G2Jacobian as *mut c_void,
+                    n,
+                    scalars.as_ptr() as *const c_void,
+                    true,
+                )
+            }
         };
         if err != unsafe { sp1_gpu_sys::runtime::CUDA_SUCCESS_CSL } {
             return None;
