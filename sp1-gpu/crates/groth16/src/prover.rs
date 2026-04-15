@@ -95,6 +95,12 @@ pub struct Groth16Prover {
     /// one-shot `g2_msm_gpu` (or arkworks CPU) path.
     #[cfg(feature = "cuda")]
     persistent_g2_b: Option<PersistentG2Msm>,
+    /// Pre-computed filter indices for wire values (computed once at init,
+    /// reused every prove). Replaces per-prove enumerate+filter+collect
+    /// which has 600ms variance due to branch prediction and CPU load.
+    a_indices: Vec<usize>,
+    b_indices: Vec<usize>,
+    k_indices: Vec<usize>,
 }
 
 impl Groth16Prover {
@@ -161,6 +167,37 @@ impl Groth16Prover {
                 None
             }
         };
+        // Pre-compute filter indices so prove() can do a simple gather
+        // instead of enumerate+filter+collect (which has 600ms variance).
+        let a_indices: Vec<usize> = (0..data.infinity_a.len())
+            .filter(|&i| !data.infinity_a[i])
+            .collect();
+        let b_indices: Vec<usize> = (0..data.infinity_b.len())
+            .filter(|&i| !data.infinity_b[i])
+            .collect();
+        let k_indices: Vec<usize> = {
+            let nb_public = data.nb_public;
+            let n_private = if data.infinity_a.len() > nb_public {
+                data.infinity_a.len() - nb_public
+            } else {
+                0
+            };
+            if data.k_wire_filter.is_empty() {
+                (nb_public..nb_public + n_private).collect()
+            } else {
+                let remove_set: std::collections::HashSet<usize> =
+                    data.k_wire_filter.iter().copied().collect();
+                (0..n_private)
+                    .filter(|i| !remove_set.contains(&(i + nb_public)))
+                    .map(|i| i + nb_public)
+                    .collect()
+            }
+        };
+        eprintln!(
+            "[groth16] Pre-computed filter indices: A={}, B={}, K={}",
+            a_indices.len(), b_indices.len(), k_indices.len()
+        );
+
         Self {
             data,
             #[cfg(feature = "cuda")]
@@ -173,6 +210,9 @@ impl Groth16Prover {
             persistent_g1_z,
             #[cfg(feature = "cuda")]
             persistent_g2_b,
+            a_indices,
+            b_indices,
+            k_indices,
         }
     }
 
@@ -209,37 +249,13 @@ impl Groth16Prover {
                     self.compute_h(&witness.solution_a, &witness.solution_b, &witness.solution_c)
                 });
 
-                // CPU: filter wire values
-                let wire_values_a: Vec<Fr> = wv
-                    .iter()
-                    .enumerate()
-                    .filter(|(i, _)| !self.data.infinity_a[*i])
-                    .map(|(_, v)| *v)
-                    .collect();
-
-                let wire_values_b: Vec<Fr> = wv
-                    .iter()
-                    .enumerate()
-                    .filter(|(i, _)| !self.data.infinity_b[*i])
-                    .map(|(_, v)| *v)
-                    .collect();
-
-                let filtered_wire_values: Vec<Fr> = {
-                    let nb_public = self.data.nb_public;
-                    let private_wires = &wv[nb_public..];
-                    if self.data.k_wire_filter.is_empty() {
-                        private_wires.to_vec()
-                    } else {
-                        let remove_set: std::collections::HashSet<usize> =
-                            self.data.k_wire_filter.iter().copied().collect();
-                        private_wires
-                            .iter()
-                            .enumerate()
-                            .filter(|(i, _)| !remove_set.contains(&(i + nb_public)))
-                            .map(|(_, v)| *v)
-                            .collect()
-                    }
-                };
+                // CPU: gather wire values using pre-computed indices.
+                // This replaces enumerate+filter+collect (which had 600ms
+                // variance due to branch prediction + CPU load) with a
+                // simple indexed gather (~80ms, deterministic).
+                let wire_values_a: Vec<Fr> = self.a_indices.iter().map(|&i| wv[i]).collect();
+                let wire_values_b: Vec<Fr> = self.b_indices.iter().map(|&i| wv[i]).collect();
+                let filtered_wire_values: Vec<Fr> = self.k_indices.iter().map(|&i| wv[i]).collect();
 
                 let h_result = h_handle.join().expect("H polynomial computation panicked");
                 let size_h = n - 1;
@@ -274,34 +290,9 @@ impl Groth16Prover {
 
         #[cfg(not(feature = "cuda"))]
         let (wire_values_a, wire_values_b, filtered_wire_values, h_result, size_h) = {
-            let wire_values_a: Vec<Fr> = wv
-                .iter()
-                .enumerate()
-                .filter(|(i, _)| !self.data.infinity_a[*i])
-                .map(|(_, v)| *v)
-                .collect();
-            let wire_values_b: Vec<Fr> = wv
-                .iter()
-                .enumerate()
-                .filter(|(i, _)| !self.data.infinity_b[*i])
-                .map(|(_, v)| *v)
-                .collect();
-            let filtered_wire_values: Vec<Fr> = {
-                let nb_public = self.data.nb_public;
-                let private_wires = &wv[nb_public..];
-                if self.data.k_wire_filter.is_empty() {
-                    private_wires.to_vec()
-                } else {
-                    let remove_set: std::collections::HashSet<usize> =
-                        self.data.k_wire_filter.iter().copied().collect();
-                    private_wires
-                        .iter()
-                        .enumerate()
-                        .filter(|(i, _)| !remove_set.contains(&(i + nb_public)))
-                        .map(|(_, v)| *v)
-                        .collect()
-                }
-            };
+            let wire_values_a: Vec<Fr> = self.a_indices.iter().map(|&i| wv[i]).collect();
+            let wire_values_b: Vec<Fr> = self.b_indices.iter().map(|&i| wv[i]).collect();
+            let filtered_wire_values: Vec<Fr> = self.k_indices.iter().map(|&i| wv[i]).collect();
             let h_result =
                 self.compute_h(&witness.solution_a, &witness.solution_b, &witness.solution_c);
             let size_h = n - 1;
