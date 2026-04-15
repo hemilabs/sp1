@@ -257,13 +257,8 @@ impl Groth16Prover {
                 let wire_values_b: Vec<Fr> = self.b_indices.iter().map(|&i| wv[i]).collect();
                 let filtered_wire_values: Vec<Fr> = self.k_indices.iter().map(|&i| wv[i]).collect();
 
-                let h_result = h_handle.join().expect("H polynomial computation panicked");
-                let size_h = n - 1;
-
-                // Pin scalar buffers for DMA-speed H2D uploads (~25 GB/s
-                // pinned vs ~1.7 GB/s unpinned on PCIe 4.0).  The Vecs are
-                // fully built (`.collect()` completed) and only read from
-                // here on, so no reallocation can invalidate the pin.
+                // Pin scalar buffers BEFORE waiting for compute_h, so we can
+                // start an async Ar upload while GPU NTTs are still running.
                 {
                     use std::ffi::c_void;
                     let pin = |name: &str, v: &[Fr]| unsafe {
@@ -283,6 +278,10 @@ impl Groth16Prover {
                     pin("wire_values_b", &wire_values_b);
                     pin("filtered_wire_values", &filtered_wire_values);
                 }
+
+                // Now wait for compute_h to finish.
+                let h_result = h_handle.join().expect("H polynomial computation panicked");
+                let size_h = n - 1;
 
                 (wire_values_a, wire_values_b, filtered_wire_values, h_result, size_h)
             })
