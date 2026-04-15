@@ -307,6 +307,53 @@ struct bn254_g1_xyzz_t {
         ZZZ = bn254_fq_t::one();
     }
 
+    // Sign-aware mixed XYZZ + affine addition (7M + 2S).
+    // Logically equivalent to: if (sign) p.y = -p.y; add_affine_unsafe(p);
+    // but folds the per-point Fq negate into the R = S2 - Y computation,
+    // saving one full 8-limb Fq subtraction per point.
+    //
+    // When sign==1, we want to add (p.x, -p.y). That only affects S2:
+    //   S2' = -p.y * ZZZ = -S2
+    //   R'  = S2' - Y = -S2 - Y = -(S2 + Y)
+    // S2/p.y are NOT used anywhere else in the formula (Y_term2 = Y*H_cu
+    // uses the accumulator's Y, not p.y), so this is the only change.
+    __device__ __forceinline__ void add_affine_unsafe_signed(const bn254_g1_affine_t& p, uint32_t sign) {
+        // Pair A: U2 = p.x*ZZ and S2 = p.y*ZZZ (independent)
+        bn254_fq_t U2, S2;
+        bn254_fq_mul_pair(p.x, ZZ, U2, p.y, ZZZ, S2);
+
+        bn254_fq_t H = U2 - X;                 // U2 - X
+        // R = sign ? -(S2 + Y) : (S2 - Y).
+        // Original pattern was: (cond) full Fq negate of p.y (8-limb sub from P),
+        // then always compute S2 - Y. Total: ~1 conditional negate + 1 sub.
+        // New pattern: fold the sign into R directly — only 1 Fq add-or-sub
+        // followed by 1 conditional Fq negate (of R when sign==1). The
+        // divergence profile is identical to the original (same branch), so
+        // net savings: one full 8-limb Fq negate per sign-bit point.
+        bn254_fq_t R = sign ? -(S2 + Y) : (S2 - Y);
+
+        bn254_fq_t H_sq = H.sqr();             // H^2        (1S)
+
+        // Pair B: H_cu = H_sq*H and V = X*H_sq (independent)
+        bn254_fq_t H_cu, V;
+        bn254_fq_mul_pair(H_sq, H, H_cu, X, H_sq, V);
+
+        bn254_fq_t R_sq = R.sqr();             // R^2        (1S)
+        X = R_sq - H_cu - V.dbl();             // R^2 - H^3 - 2V
+
+        // Pair C: Y_term1 = R*(V-X) and Y_term2 = Y*H_cu (independent)
+        bn254_fq_t Y_term1, Y_term2;
+        bn254_fq_t V_minus_X = V - X;
+        bn254_fq_mul_pair(R, V_minus_X, Y_term1, Y, H_cu, Y_term2);
+        Y = Y_term1 - Y_term2;
+
+        // Pair D: new_ZZZ = ZZZ*H_cu and new_ZZ = ZZ*H_sq (independent)
+        bn254_fq_t new_ZZZ, new_ZZ;
+        bn254_fq_mul_pair(ZZZ, H_cu, new_ZZZ, ZZ, H_sq, new_ZZ);
+        ZZZ = new_ZZZ;
+        ZZ = new_ZZ;
+    }
+
     // Mixed XYZZ + affine addition (7M + 2S)
     // Assumes: this is NOT infinity, p is NOT infinity, P != ±Q
     // Safe for MSM bucket accumulation after first point.

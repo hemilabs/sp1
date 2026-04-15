@@ -308,8 +308,7 @@ __global__ void bucket_accumulate_parallel_kernel(
     for (; i < count; i += BUCKET_PAR) {
         uint32_t pt_idx = sorted_indices[offset + i];
         bn254_g1_affine_t p = points[pt_idx];
-        if (sorted_signs[offset + i]) p.y = -p.y;
-        accum.add_affine_unsafe(p);
+        accum.add_affine_unsafe_signed(p, sorted_signs[offset + i]);
     }
 
     // Transposed layout: [par_id][bucket_id] — see packed-kernel comment below.
@@ -471,8 +470,7 @@ __global__ void bucket_accumulate_parallel_packed_kernel(
             }
 
             // Process current point
-            if (packed >> 31) p.y = -p.y;
-            accum.add_affine_unsafe(p);
+            accum.add_affine_unsafe_signed(p, packed >> 31);
 
             if (!has_next) break;
 
