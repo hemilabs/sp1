@@ -338,3 +338,113 @@ struct bn254_fq_t {
         return !(*this == b);
     }
 };
+
+// -----------------------------------------------------------------------------
+// Paired Montgomery multiplication: compute r1 = a1*b1*R^{-1} and
+// r2 = a2*b2*R^{-1} simultaneously, with every CIOS MAC of mul#1 interleaved
+// with the corresponding MAC of mul#2.
+//
+// Motivation: on RDNA3 HIP, v_mad_u64_u32 has a 4-cycle dependent-issue latency
+// but a 1-cycle throughput. The single-mul CIOS has a strict carry chain (each
+// MAC consumes the previous MAC's high-half), so ~75% of issue slots are lost
+// to s_delay_alu bubbles. Interleaving two INDEPENDENT muls gives the compiler
+// enough ILP to fill those bubbles — expected 25-35% speedup on multiply-bound
+// kernels (e.g. G1 bucket accumulate for Groth16 MSM).
+//
+// Result must be byte-identical to running the two single muls separately.
+// -----------------------------------------------------------------------------
+__device__ __forceinline__ void bn254_fq_mul_pair(
+    const bn254_fq_t& a1, const bn254_fq_t& b1, bn254_fq_t& r1,
+    const bn254_fq_t& a2, const bn254_fq_t& b2, bn254_fq_t& r2
+) {
+    const uint32_t m0 = device::ALT_BN128_M0;
+    const uint32_t* p = device::ALT_BN128_P;
+
+    // Two parallel CIOS state machines. _A suffix is mul#1, _B is mul#2.
+    uint32_t A0=0,A1=0,A2=0,A3=0,A4=0,A5=0,A6=0,A7=0,A8=0;
+    uint32_t B0=0,B1=0,B2=0,B3=0,B4=0,B5=0,B6=0,B7=0,B8=0;
+
+    #define FQ_CIOS_ROUND_PAIR(aiA, aiB) do { \
+        uint64_t accA, accB; uint32_t cA, cB; uint32_t mA, mB; \
+        /* --- Multiply phase: interleaved limbs 0..7 --- */ \
+        accA = (uint64_t)(aiA) * b1.data[0] + A0;        A0 = (uint32_t)accA; cA = (uint32_t)(accA >> 32); \
+        accB = (uint64_t)(aiB) * b2.data[0] + B0;        B0 = (uint32_t)accB; cB = (uint32_t)(accB >> 32); \
+        accA = (uint64_t)(aiA) * b1.data[1] + A1 + cA;   A1 = (uint32_t)accA; cA = (uint32_t)(accA >> 32); \
+        accB = (uint64_t)(aiB) * b2.data[1] + B1 + cB;   B1 = (uint32_t)accB; cB = (uint32_t)(accB >> 32); \
+        accA = (uint64_t)(aiA) * b1.data[2] + A2 + cA;   A2 = (uint32_t)accA; cA = (uint32_t)(accA >> 32); \
+        accB = (uint64_t)(aiB) * b2.data[2] + B2 + cB;   B2 = (uint32_t)accB; cB = (uint32_t)(accB >> 32); \
+        accA = (uint64_t)(aiA) * b1.data[3] + A3 + cA;   A3 = (uint32_t)accA; cA = (uint32_t)(accA >> 32); \
+        accB = (uint64_t)(aiB) * b2.data[3] + B3 + cB;   B3 = (uint32_t)accB; cB = (uint32_t)(accB >> 32); \
+        accA = (uint64_t)(aiA) * b1.data[4] + A4 + cA;   A4 = (uint32_t)accA; cA = (uint32_t)(accA >> 32); \
+        accB = (uint64_t)(aiB) * b2.data[4] + B4 + cB;   B4 = (uint32_t)accB; cB = (uint32_t)(accB >> 32); \
+        accA = (uint64_t)(aiA) * b1.data[5] + A5 + cA;   A5 = (uint32_t)accA; cA = (uint32_t)(accA >> 32); \
+        accB = (uint64_t)(aiB) * b2.data[5] + B5 + cB;   B5 = (uint32_t)accB; cB = (uint32_t)(accB >> 32); \
+        accA = (uint64_t)(aiA) * b1.data[6] + A6 + cA;   A6 = (uint32_t)accA; cA = (uint32_t)(accA >> 32); \
+        accB = (uint64_t)(aiB) * b2.data[6] + B6 + cB;   B6 = (uint32_t)accB; cB = (uint32_t)(accB >> 32); \
+        accA = (uint64_t)(aiA) * b1.data[7] + A7 + cA;   A7 = (uint32_t)accA; cA = (uint32_t)(accA >> 32); \
+        accB = (uint64_t)(aiB) * b2.data[7] + B7 + cB;   B7 = (uint32_t)accB; cB = (uint32_t)(accB >> 32); \
+        A8 += cA; \
+        B8 += cB; \
+        /* --- Reduction phase: m = t0*m0, then reduce with shift --- */ \
+        mA = A0 * m0; \
+        mB = B0 * m0; \
+        accA = (uint64_t)mA * p[0] + A0;                 cA = (uint32_t)(accA >> 32); \
+        accB = (uint64_t)mB * p[0] + B0;                 cB = (uint32_t)(accB >> 32); \
+        accA = (uint64_t)mA * p[1] + A1 + cA;            A0 = (uint32_t)accA; cA = (uint32_t)(accA >> 32); \
+        accB = (uint64_t)mB * p[1] + B1 + cB;            B0 = (uint32_t)accB; cB = (uint32_t)(accB >> 32); \
+        accA = (uint64_t)mA * p[2] + A2 + cA;            A1 = (uint32_t)accA; cA = (uint32_t)(accA >> 32); \
+        accB = (uint64_t)mB * p[2] + B2 + cB;            B1 = (uint32_t)accB; cB = (uint32_t)(accB >> 32); \
+        accA = (uint64_t)mA * p[3] + A3 + cA;            A2 = (uint32_t)accA; cA = (uint32_t)(accA >> 32); \
+        accB = (uint64_t)mB * p[3] + B3 + cB;            B2 = (uint32_t)accB; cB = (uint32_t)(accB >> 32); \
+        accA = (uint64_t)mA * p[4] + A4 + cA;            A3 = (uint32_t)accA; cA = (uint32_t)(accA >> 32); \
+        accB = (uint64_t)mB * p[4] + B4 + cB;            B3 = (uint32_t)accB; cB = (uint32_t)(accB >> 32); \
+        accA = (uint64_t)mA * p[5] + A5 + cA;            A4 = (uint32_t)accA; cA = (uint32_t)(accA >> 32); \
+        accB = (uint64_t)mB * p[5] + B5 + cB;            B4 = (uint32_t)accB; cB = (uint32_t)(accB >> 32); \
+        accA = (uint64_t)mA * p[6] + A6 + cA;            A5 = (uint32_t)accA; cA = (uint32_t)(accA >> 32); \
+        accB = (uint64_t)mB * p[6] + B6 + cB;            B5 = (uint32_t)accB; cB = (uint32_t)(accB >> 32); \
+        accA = (uint64_t)mA * p[7] + A7 + cA;            A6 = (uint32_t)accA; cA = (uint32_t)(accA >> 32); \
+        accB = (uint64_t)mB * p[7] + B7 + cB;            B6 = (uint32_t)accB; cB = (uint32_t)(accB >> 32); \
+        A7 = A8 + cA; A8 = 0; \
+        B7 = B8 + cB; B8 = 0; \
+    } while(0)
+
+    FQ_CIOS_ROUND_PAIR(a1.data[0], a2.data[0]);
+    FQ_CIOS_ROUND_PAIR(a1.data[1], a2.data[1]);
+    FQ_CIOS_ROUND_PAIR(a1.data[2], a2.data[2]);
+    FQ_CIOS_ROUND_PAIR(a1.data[3], a2.data[3]);
+    FQ_CIOS_ROUND_PAIR(a1.data[4], a2.data[4]);
+    FQ_CIOS_ROUND_PAIR(a1.data[5], a2.data[5]);
+    FQ_CIOS_ROUND_PAIR(a1.data[6], a2.data[6]);
+    FQ_CIOS_ROUND_PAIR(a1.data[7], a2.data[7]);
+
+    #undef FQ_CIOS_ROUND_PAIR
+
+    // Write results before final reduction.
+    r1.data[0] = A0; r1.data[1] = A1; r1.data[2] = A2; r1.data[3] = A3;
+    r1.data[4] = A4; r1.data[5] = A5; r1.data[6] = A6; r1.data[7] = A7;
+    r2.data[0] = B0; r2.data[1] = B1; r2.data[2] = B2; r2.data[3] = B3;
+    r2.data[4] = B4; r2.data[5] = B5; r2.data[6] = B6; r2.data[7] = B7;
+
+    // Final reduction: branchless conditional subtract of P for each result.
+    // Interleaved across r1 and r2 to keep the compiler's ILP window wide.
+    // Exactly mirrors operator*:196-209 (including the t8 overflow check).
+    {
+        uint32_t subA[bn254_fq_t::N];
+        uint32_t subB[bn254_fq_t::N];
+        uint64_t borrowA = 0, borrowB = 0;
+        for (int i = 0; i < bn254_fq_t::N; i++) {
+            uint64_t diffA = (uint64_t)r1.data[i] - device::ALT_BN128_P[i] - borrowA;
+            uint64_t diffB = (uint64_t)r2.data[i] - device::ALT_BN128_P[i] - borrowB;
+            subA[i] = (uint32_t)diffA;
+            subB[i] = (uint32_t)diffB;
+            borrowA = (diffA >> 63) & 1;
+            borrowB = (diffB >> 63) & 1;
+        }
+        uint32_t do_subA = (A8 != 0) | (borrowA == 0);
+        uint32_t do_subB = (B8 != 0) | (borrowB == 0);
+        for (int i = 0; i < bn254_fq_t::N; i++) {
+            r1.data[i] = do_subA ? subA[i] : r1.data[i];
+            r2.data[i] = do_subB ? subB[i] : r2.data[i];
+        }
+    }
+}

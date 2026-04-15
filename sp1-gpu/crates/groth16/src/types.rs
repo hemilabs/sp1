@@ -271,10 +271,7 @@ impl Groth16WitnessData {
         // Pre-convert wire_values from canonical BN254Fr to Montgomery Fr at load
         // time. This moves ~350ms of per-proof CPU work to the one-time load path.
         let wire_values_raw = load_fr_elements(&dir.join("wire_values.bin"))?;
-        let wire_values: Vec<Fr> = wire_values_raw
-            .par_iter()
-            .map(Fr::from_bn254fr)
-            .collect();
+        let wire_values: Vec<Fr> = wire_values_raw.par_iter().map(Fr::from_bn254fr).collect();
         drop(wire_values_raw);
         let solution_a = load_fr_elements(&dir.join("solution_a.bin"))?;
         let solution_b = load_fr_elements(&dir.join("solution_b.bin"))?;

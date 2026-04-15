@@ -26,7 +26,7 @@ fn g1_msm_ark_verify(
         return;
     }
     use ark_bn254::{Fq as ArkFq, Fr as ArkFr, G1Affine as ArkG1Affine, G1Projective as ArkG1Proj};
-    use ark_ec::{AffineRepr, scalar_mul::variable_base::VariableBaseMSM};
+    use ark_ec::{scalar_mul::variable_base::VariableBaseMSM, AffineRepr};
     use ark_ff::BigInt;
 
     // Convert BN254G1Affine -> ark G1Affine (both store Fq as [u64;4] Montgomery LE).
@@ -51,10 +51,8 @@ fn g1_msm_ark_verify(
         })
         .collect();
 
-    let ark_scalars: Vec<ArkFr> = scalars
-        .par_iter()
-        .map(|s| ArkFr::new_unchecked(BigInt(s.0)))
-        .collect();
+    let ark_scalars: Vec<ArkFr> =
+        scalars.par_iter().map(|s| ArkFr::new_unchecked(BigInt(s.0))).collect();
 
     let cpu_result: ArkG1Proj = ArkG1Proj::msm_unchecked(&ark_bases, &ark_scalars);
     let cpu_affine: ArkG1Affine = cpu_result.into();
@@ -63,11 +61,7 @@ fn g1_msm_ark_verify(
     } else {
         let (cx, cy) = cpu_affine.xy().unwrap();
         // Ark stores Fq in Montgomery form via BigInt([u64;4]); our Fq is the same layout.
-        G1Jacobian {
-            x: crate::Fq(cx.0.0),
-            y: crate::Fq(cy.0.0),
-            z: crate::Fq::ONE,
-        }
+        G1Jacobian { x: crate::Fq(cx.0 .0), y: crate::Fq(cy.0 .0), z: crate::Fq::ONE }
     };
 
     let gpu_aff = gpu_result.to_affine();
@@ -123,9 +117,7 @@ impl Groth16Prover {
             // hold old+new pools on 9070 XT and OOM).
             {
                 let max_n = g1_a.len().max(g1_b.len()).max(g1_k.len()).max(g1_z.len());
-                let err = unsafe {
-                    sp1_gpu_sys::msm::sp1_bn254_glv_pool_reserve(max_n)
-                };
+                let err = unsafe { sp1_gpu_sys::msm::sp1_bn254_glv_pool_reserve(max_n) };
                 if err != unsafe { sp1_gpu_sys::runtime::CUDA_SUCCESS_CSL } {
                     eprintln!("[groth16] WARN: glv_pool_reserve({}) failed; continuing", max_n);
                 }
@@ -310,7 +302,8 @@ impl Groth16Prover {
                         .collect()
                 }
             };
-            let h_result = self.compute_h(&witness.solution_a, &witness.solution_b, &witness.solution_c);
+            let h_result =
+                self.compute_h(&witness.solution_a, &witness.solution_b, &witness.solution_c);
             let size_h = n - 1;
             (wire_values_a, wire_values_b, filtered_wire_values, h_result, size_h)
         };
@@ -531,13 +524,13 @@ impl Groth16Prover {
             use std::ffi::c_void;
             unsafe {
                 let _ = sp1_gpu_sys::runtime::cuda_host_unregister(
-                    wire_values_a.as_ptr() as *const c_void,
+                    wire_values_a.as_ptr() as *const c_void
                 );
                 let _ = sp1_gpu_sys::runtime::cuda_host_unregister(
-                    wire_values_b.as_ptr() as *const c_void,
+                    wire_values_b.as_ptr() as *const c_void
                 );
                 let _ = sp1_gpu_sys::runtime::cuda_host_unregister(
-                    filtered_wire_values.as_ptr() as *const c_void,
+                    filtered_wire_values.as_ptr() as *const c_void
                 );
             }
         }
@@ -648,7 +641,9 @@ impl Groth16Prover {
         impl Drop for GpuGuard {
             fn drop(&mut self) {
                 if !self.0.is_null() {
-                    unsafe { sp1_gpu_sys::runtime::cuda_free(self.0 as *const c_void); }
+                    unsafe {
+                        sp1_gpu_sys::runtime::cuda_free(self.0 as *const c_void);
+                    }
                 }
             }
         }
@@ -690,7 +685,9 @@ impl Groth16Prover {
                 "batch_iNTT(A,B,C)",
             );
             check_gpu(
-                sp1_gpu_sys::dft_bn254::batch_coset_NTT_bn254_with_temp(d_a, lg_n, 3, stream, d_temp),
+                sp1_gpu_sys::dft_bn254::batch_coset_NTT_bn254_with_temp(
+                    d_a, lg_n, 3, stream, d_temp,
+                ),
                 "batch_coset_NTT(A,B,C)",
             );
         }
@@ -701,30 +698,34 @@ impl Groth16Prover {
         let den = (g_n - Fr::ONE).inv();
         unsafe {
             sp1_gpu_sys::plonk::bn254_h_poly_pointwise(
-                d_a, d_b as *const c_void, d_c as *const c_void,
-                &den as *const Fr as *const c_void, n,
+                d_a,
+                d_b as *const c_void,
+                d_c as *const c_void,
+                &den as *const Fr as *const c_void,
+                n,
             );
         }
 
         // Coset iNTT → H in coefficient form, stays on GPU in d_a
         unsafe {
             check_gpu(
-                sp1_gpu_sys::dft_bn254::batch_coset_iNTT_bn254_with_temp(d_a, lg_n, 1, stream, d_temp),
+                sp1_gpu_sys::dft_bn254::batch_coset_iNTT_bn254_with_temp(
+                    d_a, lg_n, 1, stream, d_temp,
+                ),
                 "coset_iNTT(H)",
             );
         }
 
         // Free the NTT temp buffer (no longer needed after all NTTs complete).
-        unsafe { sp1_gpu_sys::runtime::cuda_free(d_temp as *const c_void); }
+        unsafe {
+            sp1_gpu_sys::runtime::cuda_free(d_temp as *const c_void);
+        }
 
         // Now d_a[0..N] contains H. We need to keep it alive for the Krs2 MSM.
         // "Leak" the 3N buffer from the guard so it's not freed prematurely.
         // The DeviceH struct takes ownership and frees on Drop (after MSM completes).
         std::mem::forget(guard_3n);
-        DeviceH {
-            ptr: d_buf,
-            _byte_sz: 3 * byte_sz,
-        }
+        DeviceH { ptr: d_buf, _byte_sz: 3 * byte_sz }
     }
 
     /// CPU fallback H polynomial computation.
@@ -800,7 +801,9 @@ unsafe impl Send for DeviceH {}
 impl Drop for DeviceH {
     fn drop(&mut self) {
         if !self.ptr.is_null() {
-            unsafe { sp1_gpu_sys::runtime::cuda_free(self.ptr as *const std::ffi::c_void); }
+            unsafe {
+                sp1_gpu_sys::runtime::cuda_free(self.ptr as *const std::ffi::c_void);
+            }
             self.ptr = std::ptr::null_mut();
         }
     }

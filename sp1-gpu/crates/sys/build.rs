@@ -237,10 +237,7 @@ fn resolve_cuda_toolkit_path() -> String {
         }
     }
     if let Ok(cudacxx) = env::var("CUDACXX") {
-        if let Some(root) = std::path::Path::new(&cudacxx)
-            .parent()
-            .and_then(|p| p.parent())
-        {
+        if let Some(root) = std::path::Path::new(&cudacxx).parent().and_then(|p| p.parent()) {
             return root.to_string_lossy().into_owned();
         }
     }
@@ -249,8 +246,7 @@ fn resolve_cuda_toolkit_path() -> String {
             if let Ok(path) = String::from_utf8(output.stdout) {
                 let path = path.trim();
                 if !path.is_empty() {
-                    if let Some(root) =
-                        std::path::Path::new(path).parent().and_then(|p| p.parent())
+                    if let Some(root) = std::path::Path::new(path).parent().and_then(|p| p.parent())
                     {
                         return root.to_string_lossy().into_owned();
                     }

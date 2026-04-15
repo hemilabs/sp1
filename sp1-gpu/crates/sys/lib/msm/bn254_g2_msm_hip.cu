@@ -884,8 +884,11 @@ static void g2_glv_run_pipeline(hip_g2_msm_context* ctx,
             n2, w
         );
 
+        // hipcub::DeviceRadixSort::SortPairs requires a non-const lvalue
+        // reference for temp_storage_bytes; bufs is const so copy locally.
+        size_t sort_tmp_bytes = bufs.glv_sort_temp_bytes;
         hipcub::DeviceRadixSort::SortPairs(
-            bufs.d_glv_sort_temp, bufs.glv_sort_temp_bytes,
+            bufs.d_glv_sort_temp, sort_tmp_bytes,
             d_digits, d_sorted_digits,
             d_packed, d_sorted_packed,
             n2, 0, G2_WINDOW_BITS, stream

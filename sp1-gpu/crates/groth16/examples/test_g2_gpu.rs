@@ -11,8 +11,7 @@ fn main() {
         // Load from an export dir written by the Go exporter (used by the main bench)
         let export_dir = args[2].clone();
         let n: usize = args[1].parse().unwrap();
-        let pd =
-            sp1_gpu_groth16::types::Groth16ProvingData::load(&export_dir).expect("load PK");
+        let pd = sp1_gpu_groth16::types::Groth16ProvingData::load(&export_dir).expect("load PK");
         let mut bases: Vec<G2Affine> = pd.pk_g2_b.into_iter().take(n).collect();
         while bases.len() < n {
             bases.push(G2Affine::INFINITY);
@@ -32,8 +31,7 @@ fn main() {
     let gpu = g2_msm_gpu(&bases, &scalars).expect("GPU g2_msm returned None");
     println!("GPU result: is_inf={} ({:?})", gpu.is_infinity(), t.elapsed());
 
-    let ark_bases: Vec<ark_bn254::G2Affine> =
-        sp1_gpu_groth16::g2::g2_affine_to_ark_batch(&bases);
+    let ark_bases: Vec<ark_bn254::G2Affine> = sp1_gpu_groth16::g2::g2_affine_to_ark_batch(&bases);
     let t = std::time::Instant::now();
     let cpu = g2_msm_ark(&ark_bases, &scalars);
     println!("CPU result: is_inf={} ({:?})", cpu.is_infinity(), t.elapsed());

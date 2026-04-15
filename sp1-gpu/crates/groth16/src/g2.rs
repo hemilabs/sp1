@@ -255,10 +255,8 @@ fn g2_glv_enabled() -> bool {
         let mut free: usize = 0;
         let mut total: usize = 0;
         let ok = unsafe {
-            sp1_gpu_sys::runtime::cuda_mem_get_info(
-                &mut free as *mut _,
-                &mut total as *mut _,
-            ) == sp1_gpu_sys::runtime::CUDA_SUCCESS_CSL
+            sp1_gpu_sys::runtime::cuda_mem_get_info(&mut free as *mut _, &mut total as *mut _)
+                == sp1_gpu_sys::runtime::CUDA_SUCCESS_CSL
         };
         // Same threshold as G1 GLV — 20 GB puts 7900 XTX in the "on" bucket
         // and 9070 XT safely below it (the G2 expanded SRS pushes 9070 XT
@@ -319,9 +317,7 @@ impl PersistentG2Msm {
                 let msg = if err.message.is_null() {
                     "unknown error".to_string()
                 } else {
-                    unsafe { std::ffi::CStr::from_ptr(err.message) }
-                        .to_string_lossy()
-                        .into_owned()
+                    unsafe { std::ffi::CStr::from_ptr(err.message) }.to_string_lossy().into_owned()
                 };
                 eprintln!("[G2 MSM] WARN: g2_glv_pool_reserve({}) failed: {}; continuing", n, msg);
             }
@@ -395,10 +391,8 @@ pub fn g2_msm_ark(ark_bases: &[ark_bn254::G2Affine], scalars: &[Fr]) -> G2Jacobi
 
     // Zero-cost scalar conversion — both use Montgomery form with the same
     // BN254 Fr modulus, so the limb representation is byte-identical.
-    let ark_scalars: Vec<ArkFr> = scalars
-        .par_iter()
-        .map(|s| ArkFr::new_unchecked(ark_ff::BigInt(s.0)))
-        .collect();
+    let ark_scalars: Vec<ArkFr> =
+        scalars.par_iter().map(|s| ArkFr::new_unchecked(ark_ff::BigInt(s.0))).collect();
 
     let result: ArkG2Proj = ArkG2Proj::msm_unchecked(ark_bases, &ark_scalars);
     ark_to_g2_jacobian(&result)
@@ -454,10 +448,8 @@ pub fn g2_msm(bases: &[G2Affine], scalars: &[Fr]) -> G2Jacobian {
             .collect();
 
         // Convert scalars. ark Fr's from_le_bytes_mod_order parses canonical LE bytes.
-        let ark_scalars: Vec<ArkFr> = scalars
-            .par_iter()
-            .map(|s| ArkFr::from_le_bytes_mod_order(&s.to_le_bytes()))
-            .collect();
+        let ark_scalars: Vec<ArkFr> =
+            scalars.par_iter().map(|s| ArkFr::from_le_bytes_mod_order(&s.to_le_bytes())).collect();
 
         let result: ArkG2Proj = ArkG2Proj::msm_unchecked(&ark_bases, &ark_scalars);
         ark_to_g2_jacobian(&result)

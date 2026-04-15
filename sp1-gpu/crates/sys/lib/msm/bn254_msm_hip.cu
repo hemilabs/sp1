@@ -850,6 +850,48 @@ static void glv_pool_free() {
     g_glv_pool = nullptr;
 }
 
+// Accessor used by the G2 GLV path to share scalar-only buffers with the G1
+// pool (d_scalars, d_half_scalars, d_glv_signs, d_glv_digits, d_glv_packed,
+// d_glv_carries, d_glv_sorted_digits, d_glv_sorted_packed, d_glv_sort_temp).
+// All of these are independent of the point type, so sharing across G1/G2
+// avoids a ~1.5 GB duplicate allocation on 7900 XTX. Returns nullptrs if
+// the pool hasn't been reserved yet.
+extern "C"
+struct sp1_bn254_glv_scalar_buffers {
+    int alloc_n;
+    void* d_scalars;
+    void* d_half_scalars;
+    void* d_glv_signs;
+    void* d_glv_digits;
+    void* d_glv_packed;
+    void* d_glv_carries;
+    void* d_glv_sorted_digits;
+    void* d_glv_sorted_packed;
+    void* d_glv_sort_temp;
+    size_t glv_sort_temp_bytes;
+};
+
+extern "C"
+rustCudaError_t sp1_bn254_glv_pool_get_scalar_buffers(sp1_bn254_glv_scalar_buffers* out) {
+    if (!out) return rustCudaError_t{.message = "null out pointer"};
+    if (!g_glv_pool) {
+        memset(out, 0, sizeof(*out));
+        return rustCudaError_t{.message = "G1 GLV pool not reserved"};
+    }
+    out->alloc_n = g_glv_pool->alloc_n;
+    out->d_scalars = (void*)g_glv_pool->d_scalars;
+    out->d_half_scalars = (void*)g_glv_pool->d_half_scalars;
+    out->d_glv_signs = (void*)g_glv_pool->d_glv_signs;
+    out->d_glv_digits = (void*)g_glv_pool->d_glv_digits;
+    out->d_glv_packed = (void*)g_glv_pool->d_glv_packed;
+    out->d_glv_carries = (void*)g_glv_pool->d_glv_carries;
+    out->d_glv_sorted_digits = (void*)g_glv_pool->d_glv_sorted_digits;
+    out->d_glv_sorted_packed = (void*)g_glv_pool->d_glv_sorted_packed;
+    out->d_glv_sort_temp = g_glv_pool->d_glv_sort_temp;
+    out->glv_sort_temp_bytes = g_glv_pool->glv_sort_temp_bytes;
+    return CUDA_SUCCESS_CSL;
+}
+
 // Lazily allocate or grow the global GLV working-buffer pool so it can serve
 // any context with base point count <= max_n. If the pool already exists and
 // is at least as large as requested, this is a cheap no-op.

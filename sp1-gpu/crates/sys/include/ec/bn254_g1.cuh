@@ -311,25 +311,34 @@ struct bn254_g1_xyzz_t {
     // Assumes: this is NOT infinity, p is NOT infinity, P != ±Q
     // Safe for MSM bucket accumulation after first point.
     __device__ __forceinline__ void add_affine_unsafe(const bn254_g1_affine_t& p) {
-        bn254_fq_t U2 = p.x * ZZ;              // x2 * ZZ    (1M)
-        bn254_fq_t S2 = p.y * ZZZ;             // y2 * ZZZ   (1M)
+        // Pair A: U2 = p.x*ZZ and S2 = p.y*ZZZ (independent)
+        bn254_fq_t U2, S2;
+        bn254_fq_mul_pair(p.x, ZZ, U2, p.y, ZZZ, S2);
 
         bn254_fq_t H = U2 - X;                 // U2 - X
         bn254_fq_t R = S2 - Y;                 // S2 - Y
 
         bn254_fq_t H_sq = H.sqr();             // H^2        (1S)
-        bn254_fq_t H_cu = H_sq * H;            // H^3        (1M)
-        bn254_fq_t V = X * H_sq;               // X * H^2    (1M)
+
+        // Pair B: H_cu = H_sq*H and V = X*H_sq (independent)
+        bn254_fq_t H_cu, V;
+        bn254_fq_mul_pair(H_sq, H, H_cu, X, H_sq, V);
 
         bn254_fq_t R_sq = R.sqr();             // R^2        (1S)
         X = R_sq - H_cu - V.dbl();             // R^2 - H^3 - 2V
 
-        Y = R * (V - X) - Y * H_cu;            // R(V-X3) - Y*H^3  (2M)
+        // Pair C: Y_term1 = R*(V-X) and Y_term2 = Y*H_cu (independent)
+        bn254_fq_t Y_term1, Y_term2;
+        bn254_fq_t V_minus_X = V - X;
+        bn254_fq_mul_pair(R, V_minus_X, Y_term1, Y, H_cu, Y_term2);
+        Y = Y_term1 - Y_term2;
 
-        ZZZ = ZZZ * H_cu;                      // ZZZ * H^3  (1M) -- MUST update before ZZ!
-        ZZ = ZZ * H_sq;                         // ZZ * H^2   (1M) -- but H_sq already consumed
-        // Note: ZZ uses H_sq which is still valid (not overwritten).
-        // Total: 7M + 2S
+        // Pair D: new_ZZZ = ZZZ*H_cu and new_ZZ = ZZ*H_sq (independent)
+        bn254_fq_t new_ZZZ, new_ZZ;
+        bn254_fq_mul_pair(ZZZ, H_cu, new_ZZZ, ZZ, H_sq, new_ZZ);
+        ZZZ = new_ZZZ;
+        ZZ = new_ZZ;
+        // Total: 4 paired muls (= 8 muls) + 2 squarings = 8M + 2S
     }
 
     // Convert XYZZ to Jacobian: inversion-free formula (2 Fq muls, 0 inversions).
