@@ -21,9 +21,18 @@ struct bn254_fq_t {
     static constexpr int N = 8;
     uint32_t data[N]; // 256-bit field element in Montgomery form
 
+    // =========================================================================
+    // sppark mont_t compatibility: type traits and aliases
+    // Required by xyzz_t<>, jacobian_t<>, Affine_t<>, pippenger.cuh templates.
+    // =========================================================================
+    using mem_t = bn254_fq_t;
+    static const uint32_t degree = 1;
+    static const size_t nbits = 254;
+    static constexpr size_t __host__ __device__ bit_length() { return 254; }
+
     __host__ __device__ constexpr bn254_fq_t() : data{0} {}
 
-    __device__ __forceinline__ bn254_fq_t(const uint32_t* src) {
+    __host__ __device__ __forceinline__ bn254_fq_t(const uint32_t* src) {
         for (int i = 0; i < N; i++) data[i] = src[i];
     }
 
@@ -42,12 +51,32 @@ struct bn254_fq_t {
         return true;
     }
 
-    __device__ __forceinline__ uint32_t& operator[](size_t i) { return data[i]; }
-    __device__ __forceinline__ const uint32_t& operator[](size_t i) const { return data[i]; }
+    // Two-arg is_zero: returns true if both *this and a are all-zero.
+    // Used by Affine_t::is_inf() and xyzz_t::is_inf() to check (X|Y)==0.
+    __host__ __device__ __forceinline__ bool is_zero(const bn254_fq_t& a) const {
+        uint32_t is_z = data[0] | a.data[0];
+        for (int i = 1; i < N; i++)
+            is_z |= data[i] | a.data[i];
+        return is_z == 0;
+    }
+
+    __host__ __device__ __forceinline__ uint32_t& operator[](size_t i) { return data[i]; }
+    __host__ __device__ __forceinline__ const uint32_t& operator[](size_t i) const { return data[i]; }
+
+    // Pointer-to-limbs conversions (used by jacobian_t::operator== for
+    // field element comparison via pointer access).
+    __host__ __device__ __forceinline__ operator const uint32_t*() const { return data; }
+    __host__ __device__ __forceinline__ operator uint32_t*()             { return data; }
+    __host__ __device__ __forceinline__ constexpr size_t len() const     { return N; }
+
+    // Store limbs to external array.
+    __host__ __device__ __forceinline__ void store(uint32_t* p) const {
+        for (int i = 0; i < N; i++) p[i] = data[i];
+    }
 
     // Comparison: is this >= P (base field modulus)?
     // Branchless: computes data - P and checks carry. No warp divergence.
-    __device__ __forceinline__ bool gte_p() const {
+    __host__ __device__ __forceinline__ bool gte_p() const {
         uint64_t borrow = 0;
         for (int i = 0; i < N; i++) {
             uint64_t diff = (uint64_t)data[i] - device::ALT_BN128_P[i] - borrow;
@@ -57,7 +86,7 @@ struct bn254_fq_t {
     }
 
     // Subtract P
-    __device__ __forceinline__ void sub_p() {
+    __host__ __device__ __forceinline__ void sub_p() {
         uint64_t borrow = 0;
         for (int i = 0; i < N; i++) {
             uint64_t diff = (uint64_t)data[i] - device::ALT_BN128_P[i] - borrow;
@@ -67,7 +96,7 @@ struct bn254_fq_t {
     }
 
     // Add P
-    __device__ __forceinline__ void add_p() {
+    __host__ __device__ __forceinline__ void add_p() {
         uint64_t carry = 0;
         for (int i = 0; i < N; i++) {
             uint64_t sum = (uint64_t)data[i] + device::ALT_BN128_P[i] + carry;
@@ -77,7 +106,7 @@ struct bn254_fq_t {
     }
 
     // Modular addition (branchless conditional subtraction)
-    __device__ __forceinline__ bn254_fq_t operator+(const bn254_fq_t& b) const {
+    __host__ __device__ __forceinline__ bn254_fq_t operator+(const bn254_fq_t& b) const {
         bn254_fq_t r;
         uint64_t carry = 0;
         for (int i = 0; i < N; i++) {
@@ -102,13 +131,13 @@ struct bn254_fq_t {
         return r;
     }
 
-    __device__ __forceinline__ bn254_fq_t& operator+=(const bn254_fq_t& b) {
+    __host__ __device__ __forceinline__ bn254_fq_t& operator+=(const bn254_fq_t& b) {
         *this = *this + b;
         return *this;
     }
 
     // Modular subtraction (branchless conditional add-P)
-    __device__ __forceinline__ bn254_fq_t operator-(const bn254_fq_t& b) const {
+    __host__ __device__ __forceinline__ bn254_fq_t operator-(const bn254_fq_t& b) const {
         bn254_fq_t r;
         uint64_t borrow = 0;
         for (int i = 0; i < N; i++) {
@@ -133,7 +162,7 @@ struct bn254_fq_t {
         return r;
     }
 
-    __device__ __forceinline__ bn254_fq_t& operator-=(const bn254_fq_t& b) {
+    __host__ __device__ __forceinline__ bn254_fq_t& operator-=(const bn254_fq_t& b) {
         *this = *this - b;
         return *this;
     }
@@ -142,7 +171,7 @@ struct bn254_fq_t {
     // Fully-unrolled CIOS with fused shift: the reduction step writes to t[j-1]
     // instead of t[j], eliminating the separate shift loop (saves ~120 instructions).
     // M0 = ALT_BN128_M0 = -P^{-1} mod 2^32 = 0xe4866389
-    __device__ __forceinline__ bn254_fq_t operator*(const bn254_fq_t& b) const {
+    __host__ __device__ __noinline__ bn254_fq_t operator*(const bn254_fq_t& b) const {
         const uint32_t m0 = device::ALT_BN128_M0;
         const uint32_t* p = device::ALT_BN128_P;
 
@@ -210,7 +239,7 @@ struct bn254_fq_t {
         return r;
     }
 
-    __device__ __forceinline__ bn254_fq_t& operator*=(const bn254_fq_t& b) {
+    __host__ __device__ __forceinline__ bn254_fq_t& operator*=(const bn254_fq_t& b) {
         *this = *this * b;
         return *this;
     }
@@ -221,12 +250,12 @@ struct bn254_fq_t {
     // Although schoolbook squaring uses only 36 muls vs 64 for generic mul,
     // the w[17] array spills ~17 VGPRs to VRAM scratch at ~100+ cycle latency
     // each, making it slower than the spill-free CIOS multiplication path.
-    __device__ __forceinline__ bn254_fq_t sqr() const {
+    __host__ __device__ __forceinline__ bn254_fq_t sqr() const {
         return *this * *this;
     }
 
     // Modular negation: -a mod P (branchless)
-    __device__ __forceinline__ bn254_fq_t operator-() const {
+    __host__ __device__ __forceinline__ bn254_fq_t operator-() const {
         // Compute P - a. If a == 0, result is P but we need 0.
         // Use branchless: mask with (a != 0) to avoid warp divergence.
         bn254_fq_t r;
@@ -245,7 +274,7 @@ struct bn254_fq_t {
     }
 
     // Double: 2*a (cheaper than add with self due to no second operand load)
-    __device__ __forceinline__ bn254_fq_t dbl() const {
+    __host__ __device__ __forceinline__ bn254_fq_t dbl() const {
         bn254_fq_t r;
         uint64_t carry = 0;
         for (int i = 0; i < N; i++) {
@@ -271,39 +300,38 @@ struct bn254_fq_t {
     }
 
     // Multiply by small constant (2, 3, 4, 8)
-    __device__ __forceinline__ bn254_fq_t mul2() const { return dbl(); }
-    __device__ __forceinline__ bn254_fq_t mul3() const { return dbl() + *this; }
-    __device__ __forceinline__ bn254_fq_t mul4() const { return dbl().dbl(); }
-    __device__ __forceinline__ bn254_fq_t mul8() const { return dbl().dbl().dbl(); }
+    __host__ __device__ __forceinline__ bn254_fq_t mul2() const { return dbl(); }
+    __host__ __device__ __forceinline__ bn254_fq_t mul3() const { return dbl() + *this; }
+    __host__ __device__ __forceinline__ bn254_fq_t mul4() const { return dbl().dbl(); }
+    __host__ __device__ __forceinline__ bn254_fq_t mul8() const { return dbl().dbl().dbl(); }
 
     // Convert from canonical to Montgomery form: a -> a*R mod P
-    __device__ __forceinline__ void to_montgomery() {
+    __host__ __device__ __forceinline__ void to_montgomery() {
         bn254_fq_t rr(device::ALT_BN128_RR);
         *this = *this * rr;
     }
 
     // Convert from Montgomery to canonical form: a*R -> a
-    __device__ __forceinline__ void from_montgomery() {
+    __host__ __device__ __forceinline__ void from_montgomery() {
         bn254_fq_t one_canonical(1, 0, 0, 0, 0, 0, 0, 0);
         *this = *this * one_canonical;
     }
 
     // Montgomery form of 1 (R mod P)
-    static __device__ __forceinline__ bn254_fq_t one() {
+    static __host__ __device__ __forceinline__ bn254_fq_t one() {
         return bn254_fq_t(device::ALT_BN128_one);
     }
 
-    static __device__ __forceinline__ bn254_fq_t zero() {
-        bn254_fq_t r;
-        r.set_to_zero();
-        return r;
-    }
+    // zero() — set to zero in-place.
+    // Used by sppark's EC types: xyzz_t::inf(), jacobian_t::inf().
+    // Note: the default constructor bn254_fq_t() also produces a zero element.
+    __host__ __device__ __forceinline__ void zero() { set_to_zero(); }
 
     // Modular inverse: a^{-1} mod P via Fermat's little theorem
     // Computes a^{P-2} mod P using left-to-right binary method.
     // P-2 = 0x30644e72e131a029 b85045b68181585d 97816a916871ca8d 3c208c16d87cfd45
     // Cost: ~253 squarings + ~127 multiplications (~380 field muls total)
-    __device__ __forceinline__ bn254_fq_t inv() const {
+    __host__ __device__ __forceinline__ bn254_fq_t inv() const {
         // P-2 in little-endian 32-bit limbs
         const uint32_t exp[N] = {
             0xd87cfd45, 0x3c208c16, 0x6871ca8d, 0x97816a91,
@@ -327,15 +355,177 @@ struct bn254_fq_t {
     }
 
     // Equality
-    __device__ __forceinline__ bool operator==(const bn254_fq_t& b) const {
+    __host__ __device__ __forceinline__ bool operator==(const bn254_fq_t& b) const {
         for (int i = 0; i < N; i++) {
             if (data[i] != b.data[i]) return false;
         }
         return true;
     }
 
-    __device__ __forceinline__ bool operator!=(const bn254_fq_t& b) const {
+    __host__ __device__ __forceinline__ bool operator!=(const bn254_fq_t& b) const {
         return !(*this == b);
+    }
+
+    // =========================================================================
+    // sppark mont_t compatibility: additional methods
+    // Required by xyzz_t, jacobian_t, Affine_t EC templates and pippenger.cuh.
+    // =========================================================================
+
+    // one(int or_zero) — returns ONE if or_zero==0, else ZERO.
+    // Used by xyzz_t/jacobian_t constructors: field_t::one(is_inf).
+    static __host__ __device__ __forceinline__ bn254_fq_t one(int or_zero) {
+        bn254_fq_t ret;
+        if (or_zero) {
+            ret.set_to_zero();
+        } else {
+            ret = one();
+        }
+        return ret;
+    }
+
+    // cneg(bool flag) — conditional negate: if flag && *this!=0, set *this = P - *this.
+    // Used by Affine_t::cneg, xyzz_t::cneg, and add_unsafe for subtraction.
+    __host__ __device__ __forceinline__ bn254_fq_t& cneg(bool flag) {
+        uint32_t tmp[N], is_z = data[0];
+        uint64_t borrow = 0;
+        for (int i = 0; i < N; i++) {
+            uint64_t diff = (uint64_t)device::ALT_BN128_P[i] - data[i] - borrow;
+            tmp[i] = (uint32_t)diff;
+            borrow = (diff >> 63) & 1;
+            if (i > 0) is_z |= data[i];
+        }
+        bool do_neg = flag & (is_z != 0);
+        for (int i = 0; i < N; i++)
+            data[i] = do_neg ? tmp[i] : data[i];
+        return *this;
+    }
+    // Static cneg (copy then negate).
+    static __host__ __device__ __forceinline__ bn254_fq_t cneg(bn254_fq_t a, bool flag) {
+        return a.cneg(flag);
+    }
+
+    // csel(a, b, sel_a) — conditional select: return a if sel_a!=0, else b.
+    // Used by xyzz_t::uadd for branchless point selection.
+    static __host__ __device__ __forceinline__ bn254_fq_t csel(
+            const bn254_fq_t& a, const bn254_fq_t& b, int sel_a) {
+        bn254_fq_t ret;
+        for (int i = 0; i < N; i++)
+            ret.data[i] = sel_a ? a.data[i] : b.data[i];
+        return ret;
+    }
+
+    // czero(a, set_z) — conditional zero: return 0 if set_z!=0, else a.
+    // Used by xyzz_t::uadd for branchless infinity handling.
+    friend __host__ __device__ __forceinline__ bn254_fq_t czero(
+            const bn254_fq_t& a, int set_z) {
+        bn254_fq_t ret;
+        for (int i = 0; i < N; i++)
+            ret.data[i] = set_z ? 0 : a.data[i];
+        return ret;
+    }
+
+    // operator^(int p) — raise to constant power. p==2 is squaring.
+    // Used throughout xyzz_t EC formulas: P^2, R^2, M^2, U^2, etc.
+    friend __host__ __device__ __forceinline__ bn254_fq_t operator^(bn254_fq_t a, int p) {
+        if (p == 2) return a * a;
+        // General constant power (p >= 2), unrolled at compile time
+        bn254_fq_t s = a;
+        if ((p & 1) == 0) {
+            do { s = s * s; p >>= 1; } while ((p & 1) == 0);
+            a = s;
+        }
+        for (p >>= 1; p; p >>= 1) {
+            s = s * s;
+            if (p & 1) a *= s;
+        }
+        return a;
+    }
+    __host__ __device__ __forceinline__ bn254_fq_t& operator^=(int p) {
+        *this = *this ^ p;
+        return *this;
+    }
+
+    // operator^(uint32_t p) — raise to variable power.
+    // Used by pippenger integrate for bucket reduction.
+    friend __host__ __device__ __forceinline__ bn254_fq_t operator^(bn254_fq_t a, uint32_t p) {
+        bn254_fq_t s = a;
+        a = csel(a, one(), p & 1);
+        while (p >>= 1) {
+            s = s * s;
+            if (p & 1) a *= s;
+        }
+        return a;
+    }
+    __host__ __device__ __forceinline__ bn254_fq_t& operator^=(uint32_t p) {
+        *this = *this ^ p;
+        return *this;
+    }
+
+    // operator<<(unsigned l) — modular left-shift (repeated doubling).
+    // Used by xyzz_t::dbl and uadd: `U = p2.Y << 1`.
+    friend __host__ __device__ __forceinline__ bn254_fq_t operator<<(bn254_fq_t a, unsigned l) {
+        while (l--) {
+            uint64_t carry = 0;
+            for (int i = 0; i < N; i++) {
+                uint64_t sum = (uint64_t)a.data[i] + a.data[i] + carry;
+                a.data[i] = (uint32_t)sum;
+                carry = sum >> 32;
+            }
+            // Branchless conditional subtract P
+            uint32_t sub[N];
+            uint64_t borrow = 0;
+            for (int i = 0; i < N; i++) {
+                uint64_t diff = (uint64_t)a.data[i] - device::ALT_BN128_P[i] - borrow;
+                sub[i] = (uint32_t)diff;
+                borrow = (diff >> 63) & 1;
+            }
+            uint32_t do_sub = (carry != 0) | (borrow == 0);
+            for (int i = 0; i < N; i++)
+                a.data[i] = do_sub ? sub[i] : a.data[i];
+        }
+        return a;
+    }
+    __host__ __device__ __forceinline__ bn254_fq_t& operator<<=(unsigned l) {
+        *this = *this << l;
+        return *this;
+    }
+
+    // operator>>(unsigned r) — modular right-shift (division by 2).
+    // Adds P if odd, then shifts right.
+    friend __host__ __device__ __forceinline__ bn254_fq_t operator>>(bn254_fq_t a, unsigned r) {
+        while (r--) {
+            uint32_t tmp[N + 1];
+            tmp[N] = 0 - (a.data[0] & 1);
+            for (int i = 0; i < N; i++)
+                tmp[i] = device::ALT_BN128_P[i] & tmp[N];
+            uint64_t carry = 0;
+            for (int i = 0; i < N; i++) {
+                uint64_t sum = (uint64_t)tmp[i] + a.data[i] + carry;
+                tmp[i] = (uint32_t)sum;
+                carry = sum >> 32;
+            }
+            // For N%32==0 (BN254 is 256 bits), capture top carry
+            tmp[N] = (uint32_t)carry;
+            // Funnel-shift right by 1
+            for (int i = 0; i < N - 1; i++)
+                a.data[i] = (tmp[i] >> 1) | (tmp[i + 1] << 31);
+            a.data[N - 1] = (tmp[N - 1] >> 1) | (tmp[N] << 31);
+        }
+        return a;
+    }
+    __host__ __device__ __forceinline__ bn254_fq_t& operator>>=(unsigned r) {
+        *this = *this >> r;
+        return *this;
+    }
+
+    // reciprocal() — modular inverse via Fermat's little theorem.
+    // Used by jacobian_t host-side affine conversion: `1/Z`.
+    __host__ __device__ __forceinline__ bn254_fq_t reciprocal() const { return inv(); }
+    friend __host__ __device__ __forceinline__ bn254_fq_t operator/(int one_val, const bn254_fq_t& a) {
+        return a.reciprocal();
+    }
+    friend __host__ __device__ __forceinline__ bn254_fq_t operator/(const bn254_fq_t& a, const bn254_fq_t& b) {
+        return a * b.reciprocal();
     }
 };
 
@@ -353,7 +543,7 @@ struct bn254_fq_t {
 //
 // Result must be byte-identical to running the two single muls separately.
 // -----------------------------------------------------------------------------
-__device__ __forceinline__ void bn254_fq_mul_pair(
+__device__ __noinline__ void bn254_fq_mul_pair(
     const bn254_fq_t& a1, const bn254_fq_t& b1, bn254_fq_t& r1,
     const bn254_fq_t& a2, const bn254_fq_t& b2, bn254_fq_t& r2
 ) {
