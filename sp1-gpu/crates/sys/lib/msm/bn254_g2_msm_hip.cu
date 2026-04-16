@@ -119,6 +119,7 @@ __global__ void g2_bucket_boundaries_kernel(
 // processes more points serially, losing latency-hiding opportunities.
 static constexpr int G2_BUCKET_PAR = 128;
 
+__launch_bounds__(256, 1)  // G2 XYZZ is 256B (2x G1), needs ~128 VGPRs; 1 block/CU avoids spills
 __global__ void g2_bucket_accumulate_parallel_kernel(
     const bn254_g2_affine_t* __restrict__ points,
     const uint32_t* __restrict__ sorted_idx,
