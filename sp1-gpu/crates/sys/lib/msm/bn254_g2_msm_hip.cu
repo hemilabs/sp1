@@ -248,50 +248,112 @@ __global__ void g2_reduce_phase1_kernel(
 }
 
 // ================================================================
-// Block-parallel bucket reduction — Phase 2 (merge)
-// Single-thread: merges ~64 local results from Phase 1 into the window result.
-// Each iteration does count×tail via double-and-add (count≤64, ≤6 doublings).
-// ~64 iterations with ~20 EC ops each = ~1280 ops vs 4097 in the original.
+// Block-parallel bucket reduction — Phase 2 (merge), PARALLEL
+// Parallelized Hillis-Steele prefix scan of local_suffixes + tree reduction.
+// See bucket_reduce_phase2_kernel in bn254_msm.cuh for the derivation.
+//
+// Launched with blockDim.x = G2_REDUCE_PHASE2_TPB (≥ num_threads). Threads
+// in excess of num_threads contribute identity (infinity) elements.
 // ================================================================
+static constexpr int G2_REDUCE_PHASE2_TPB = 64;
+
 __global__ void g2_reduce_phase2_kernel(
     const bn254_g2_t* __restrict__ local_partials,
     const bn254_g2_t* __restrict__ local_suffixes,
     bn254_g2_t* __restrict__ result,
     int num_threads, int num_buckets
 ) {
-    if (threadIdx.x != 0 || blockIdx.x != 0) return;
+    // HIP disallows initialization of __shared__ variables, so allocate as
+    // raw byte buffers and reinterpret. bn254_g2_t is trivially copyable.
+    __shared__ __align__(16) char lds_scan_raw[G2_REDUCE_PHASE2_TPB * sizeof(bn254_g2_t)];
+    __shared__ __align__(16) char lds_scan_tmp_raw[G2_REDUCE_PHASE2_TPB * sizeof(bn254_g2_t)];
+    __shared__ __align__(16) char lds_contrib_raw[G2_REDUCE_PHASE2_TPB * sizeof(bn254_g2_t)];
+    bn254_g2_t* lds_scan = reinterpret_cast<bn254_g2_t*>(lds_scan_raw);
+    bn254_g2_t* lds_scan_tmp = reinterpret_cast<bn254_g2_t*>(lds_scan_tmp_raw);
+    bn254_g2_t* lds_contrib = reinterpret_cast<bn254_g2_t*>(lds_contrib_raw);
 
-    bn254_g2_t total;
-    total.set_infinity();
-    bn254_g2_t tail;
-    tail.set_infinity();
+    int t = threadIdx.x;
 
-    for (int t = 0; t < num_threads; t++) {
-        total += local_partials[t];
+    // --- Load local_partials[t] and local_suffixes[t] (infinity if out of range) ---
+    bn254_g2_t my_partial;
+    bn254_g2_t my_suffix;
+    if (t < num_threads) {
+        my_partial = local_partials[t];
+        my_suffix = local_suffixes[t];
+    } else {
+        my_partial.set_infinity();
+        my_suffix.set_infinity();
+    }
+    lds_scan[t] = my_suffix;
+    __syncthreads();
 
-        if (!tail.is_infinity()) {
-            int hi = num_buckets - t * G2_REDUCE_BLOCK_SIZE;
-            int lo = hi - G2_REDUCE_BLOCK_SIZE;
-            if (lo < 1) lo = 1;
-            int count = hi - lo;
-
-            // count × tail via double-and-add
-            bn254_g2_t scaled;
-            scaled.set_infinity();
-            bn254_g2_t base = tail;
-            int c = count;
-            while (c > 0) {
-                if (c & 1) scaled += base;
-                base = base.dbl();
-                c >>= 1;
+    // --- Hillis-Steele inclusive prefix scan on suffixes ---
+    bn254_g2_t* src = lds_scan;
+    bn254_g2_t* dst = lds_scan_tmp;
+    for (int offset = 1; offset < G2_REDUCE_PHASE2_TPB; offset <<= 1) {
+        bn254_g2_t cur = src[t];
+        if (t >= offset) {
+            bn254_g2_t prev = src[t - offset];
+            if (!prev.is_infinity()) {
+                if (cur.is_infinity()) cur = prev;
+                else cur += prev;
             }
-            total += scaled;
         }
+        dst[t] = cur;
+        __syncthreads();
+        bn254_g2_t* tmp = src; src = dst; dst = tmp;
+    }
+    // tail_t = exclusive prefix = src[t-1] if t>0 else infinity.
+    bn254_g2_t tail;
+    if (t == 0) tail.set_infinity();
+    else tail = src[t - 1];
 
-        tail += local_suffixes[t];
+    // --- Per-thread contribution: local_partials[t] + count_t * tail_t ---
+    bn254_g2_t contrib = my_partial;
+    if (t < num_threads && !tail.is_infinity()) {
+        int hi = num_buckets - t * G2_REDUCE_BLOCK_SIZE;
+        int lo = hi - G2_REDUCE_BLOCK_SIZE;
+        if (lo < 1) lo = 1;
+        int count = hi - lo;
+        bn254_g2_t scaled;
+        scaled.set_infinity();
+        bn254_g2_t base = tail;
+        int c = count;
+        while (c > 0) {
+            if (c & 1) {
+                if (scaled.is_infinity()) scaled = base;
+                else scaled += base;
+            }
+            c >>= 1;
+            if (c > 0) base = base.dbl();
+        }
+        if (!scaled.is_infinity()) {
+            if (contrib.is_infinity()) contrib = scaled;
+            else contrib += scaled;
+        }
+    }
+    lds_contrib[t] = contrib;
+    __syncthreads();
+
+    // --- Tree reduction ---
+    for (int stride = G2_REDUCE_PHASE2_TPB >> 1; stride > 0; stride >>= 1) {
+        if (t < stride) {
+            bn254_g2_t a = lds_contrib[t];
+            bn254_g2_t b = lds_contrib[t + stride];
+            if (b.is_infinity()) {
+                // keep a
+            } else if (a.is_infinity()) {
+                a = b;
+            } else {
+                a += b;
+            }
+            lds_contrib[t] = a;
+        }
+        __syncthreads();
     }
 
-    *result = total;
+    // --- Write result ---
+    if (t == 0) *result = lds_contrib[0];
 }
 
 // ================================================================
@@ -454,7 +516,7 @@ static void g2_run_pipeline(hip_g2_msm_context* ctx, int n, void* result_ptr) {
         g2_reduce_phase1_kernel<<<blocks_reduce, threads, 0, stream>>>(
             ctx->d_buckets, ctx->d_local_partials, ctx->d_local_suffixes, num_buckets
         );
-        g2_reduce_phase2_kernel<<<1, 1, 0, stream>>>(
+        g2_reduce_phase2_kernel<<<1, G2_REDUCE_PHASE2_TPB, 0, stream>>>(
             ctx->d_local_partials, ctx->d_local_suffixes, &ctx->d_window_results[w],
             ctx->reduce_threads, num_buckets
         );
@@ -914,7 +976,7 @@ static void g2_glv_run_pipeline(hip_g2_msm_context* ctx,
         g2_reduce_phase1_kernel<<<blocks_reduce, threads, 0, stream>>>(
             ctx->d_buckets, ctx->d_local_partials, ctx->d_local_suffixes, num_buckets
         );
-        g2_reduce_phase2_kernel<<<1, 1, 0, stream>>>(
+        g2_reduce_phase2_kernel<<<1, G2_REDUCE_PHASE2_TPB, 0, stream>>>(
             ctx->d_local_partials, ctx->d_local_suffixes,
             &st->d_glv_window_results[w], ctx->reduce_threads, num_buckets
         );

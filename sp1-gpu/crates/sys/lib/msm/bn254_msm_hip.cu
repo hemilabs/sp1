@@ -174,9 +174,11 @@ static rustCudaError_t msm_one_window(
                 d_buckets, d_reduce_partials, d_reduce_suffixes, NUM_BUCKETS);
             CUDA_OK(hipGetLastError());
         }
-        // Phase 2: merge (sequential over ~256 blocks, much faster than 16K)
+        // Phase 2: parallel merge (Hillis-Steele prefix scan + tree reduction)
+        static_assert(REDUCE_PHASE2_TPB >= REDUCE_THREADS,
+                      "REDUCE_PHASE2_TPB must be >= REDUCE_THREADS for phase2 kernel");
         hipLaunchKernelGGL(bucket_reduce_phase2_kernel,
-            dim3(1), dim3(1), 0, 0,
+            dim3(1), dim3(REDUCE_PHASE2_TPB), 0, 0,
             d_reduce_partials, d_reduce_suffixes, d_window_result,
             REDUCE_THREADS, NUM_BUCKETS);
         CUDA_OK(hipGetLastError());

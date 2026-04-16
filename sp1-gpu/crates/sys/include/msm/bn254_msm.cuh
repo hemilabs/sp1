@@ -609,19 +609,33 @@ __global__ void bucket_reduce_phase1_kernel(
 }
 
 // ================================================================
-// Kernel 3c: Block-Parallel Bucket Reduction — Phase 2 (Merge)
+// Kernel 3c: Block-Parallel Bucket Reduction — Phase 2 (Merge), PARALLEL
 // Merges the local results from Phase 1 into the final window result.
 //
-// The correction for thread t is: count_t × tail_t additions,
-// where tail_t = sum of local_suffixes[0..t-1] (suffix sums from higher blocks).
-// count_t = number of buckets in thread t's block.
+// Algorithm (the sequential version computes):
+//   tail_0 = 0
+//   for t in 0..num_threads:
+//     total += local_partials[t] + count_t * tail_t
+//     tail_{t+1} = tail_t + local_suffixes[t]
 //
-// Since count_t is small (≤ REDUCE_BLOCK_SIZE = 64), we use double-and-add
-// (6 doublings + a few additions) for the EC scalar multiplication.
+// Equivalent closed form:
+//   total = sum_t (local_partials[t] + count_t * tail_t)
+//   where tail_t = exclusive prefix sum of local_suffixes[0..t).
 //
-// This kernel is sequential over ~256 threads but each iteration is cheap
-// (~20 EC operations), giving ~5120 total ops vs 32768 in the original.
+// Parallel implementation: launch with blockDim.x = REDUCE_PHASE2_TPB (e.g. 64):
+//   1. Each thread t loads local_partials[t], local_suffixes[t] into LDS.
+//   2. Hillis-Steele inclusive prefix scan over local_suffixes (log2 steps).
+//      tail_t = inclusive[t-1], where inclusive[-1] := infinity.
+//   3. Each thread computes per-block contrib = local_partials[t] + count_t*tail_t
+//      using double-and-add (count ≤ REDUCE_BLOCK_SIZE, so ≤ 6 doublings).
+//   4. Tree reduction to sum all contributions.
+//   5. Thread 0 writes result.
+//
+// Threads in excess of num_threads contribute identity (infinity) elements.
+// REDUCE_PHASE2_TPB must be ≥ max num_threads (currently 64 for NUM_BUCKETS=4097).
 // ================================================================
+static constexpr int REDUCE_PHASE2_TPB = 64;
+
 __global__ void bucket_reduce_phase2_kernel(
     const bn254_g1_t* __restrict__ local_partials,
     const bn254_g1_t* __restrict__ local_suffixes,
@@ -629,44 +643,107 @@ __global__ void bucket_reduce_phase2_kernel(
     int num_threads,
     int num_buckets
 ) {
-    if (threadIdx.x != 0 || blockIdx.x != 0) return;
+    // HIP disallows initialization of __shared__ variables, so allocate as
+    // raw byte buffers and reinterpret. bn254_g1_t is trivially copyable.
+    __shared__ __align__(16) char lds_scan_raw[REDUCE_PHASE2_TPB * sizeof(bn254_g1_t)];
+    __shared__ __align__(16) char lds_scan_tmp_raw[REDUCE_PHASE2_TPB * sizeof(bn254_g1_t)];
+    __shared__ __align__(16) char lds_contrib_raw[REDUCE_PHASE2_TPB * sizeof(bn254_g1_t)];
+    bn254_g1_t* lds_scan = reinterpret_cast<bn254_g1_t*>(lds_scan_raw);
+    bn254_g1_t* lds_scan_tmp = reinterpret_cast<bn254_g1_t*>(lds_scan_tmp_raw);
+    bn254_g1_t* lds_contrib = reinterpret_cast<bn254_g1_t*>(lds_contrib_raw);
 
-    bn254_g1_t total;
-    total.set_infinity();
-    bn254_g1_t tail;  // running prefix sum of suffix values from higher blocks
-    tail.set_infinity();
+    int t = threadIdx.x;
 
-    for (int t = 0; t < num_threads; t++) {
-        // Add this block's local partial sum
-        total += local_partials[t];
+    // --- Step 1: load local_partials[t] and local_suffixes[t] (or infinity) ---
+    bn254_g1_t my_partial;
+    bn254_g1_t my_suffix;
+    if (t < num_threads) {
+        my_partial = local_partials[t];
+        my_suffix = local_suffixes[t];
+    } else {
+        my_partial.set_infinity();
+        my_suffix.set_infinity();
+    }
+    lds_scan[t] = my_suffix;
+    __syncthreads();
 
-        // Correction: tail (sum from higher blocks) was the running sum
-        // entering this block. It should have been added to partial for
-        // each of count iterations in this block.
-        if (!tail.is_infinity()) {
-            int hi = num_buckets - t * REDUCE_BLOCK_SIZE;
-            int lo = hi - REDUCE_BLOCK_SIZE;
-            if (lo < 1) lo = 1;
-            int count = hi - lo;
-
-            // count × tail via double-and-add (count ≤ 64, so ≤ 6 doublings)
-            bn254_g1_t scaled;
-            scaled.set_infinity();
-            bn254_g1_t base = tail;
-            int c = count;
-            while (c > 0) {
-                if (c & 1) scaled += base;
-                base = base.dbl();
-                c >>= 1;
+    // --- Step 2: Hillis-Steele inclusive prefix sum on lds_scan ---
+    // After step k, lds_scan[t] = sum of suffixes[max(0, t-2^k+1)..t].
+    // Use double-buffered ping-pong to avoid read/write hazards.
+    bn254_g1_t* src = lds_scan;
+    bn254_g1_t* dst = lds_scan_tmp;
+    for (int offset = 1; offset < REDUCE_PHASE2_TPB; offset <<= 1) {
+        bn254_g1_t cur = src[t];
+        if (t >= offset) {
+            bn254_g1_t prev = src[t - offset];
+            if (!prev.is_infinity()) {
+                if (cur.is_infinity()) cur = prev;
+                else cur += prev;
             }
-            total += scaled;
         }
-
-        // Update tail for next block
-        tail += local_suffixes[t];
+        dst[t] = cur;
+        __syncthreads();
+        bn254_g1_t* tmp = src; src = dst; dst = tmp;
+    }
+    // Now src[t] = inclusive prefix sum of suffixes[0..t].
+    // tail_t (exclusive prefix) = src[t-1] for t>0, else infinity.
+    bn254_g1_t tail;
+    if (t == 0) {
+        tail.set_infinity();
+    } else {
+        tail = src[t - 1];
     }
 
-    *result = total;
+    // --- Step 3: compute per-thread contribution ---
+    //   contrib_t = local_partials[t] + count_t * tail_t
+    bn254_g1_t contrib = my_partial;
+    if (t < num_threads && !tail.is_infinity()) {
+        int hi = num_buckets - t * REDUCE_BLOCK_SIZE;
+        int lo = hi - REDUCE_BLOCK_SIZE;
+        if (lo < 1) lo = 1;
+        int count = hi - lo;  // typically REDUCE_BLOCK_SIZE, possibly smaller for last block
+        // count × tail via double-and-add (count ≤ REDUCE_BLOCK_SIZE)
+        bn254_g1_t scaled;
+        scaled.set_infinity();
+        bn254_g1_t base = tail;
+        int c = count;
+        while (c > 0) {
+            if (c & 1) {
+                if (scaled.is_infinity()) scaled = base;
+                else scaled += base;
+            }
+            c >>= 1;
+            if (c > 0) base = base.dbl();
+        }
+        if (!scaled.is_infinity()) {
+            if (contrib.is_infinity()) contrib = scaled;
+            else contrib += scaled;
+        }
+    }
+    lds_contrib[t] = contrib;
+    __syncthreads();
+
+    // --- Step 4: tree reduction over lds_contrib ---
+    for (int stride = REDUCE_PHASE2_TPB >> 1; stride > 0; stride >>= 1) {
+        if (t < stride) {
+            bn254_g1_t a = lds_contrib[t];
+            bn254_g1_t b = lds_contrib[t + stride];
+            if (b.is_infinity()) {
+                // a unchanged
+            } else if (a.is_infinity()) {
+                a = b;
+            } else {
+                a += b;
+            }
+            lds_contrib[t] = a;
+        }
+        __syncthreads();
+    }
+
+    // --- Step 5: write result ---
+    if (t == 0) {
+        *result = lds_contrib[0];
+    }
 }
 
 // ================================================================
