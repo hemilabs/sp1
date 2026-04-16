@@ -336,8 +336,11 @@ fn glv_enabled() -> bool {
     *GLV.get_or_init(|| {
         if let Ok(v) = std::env::var("SP1_GPU_GLV") {
             let on = v != "0";
-            eprintln!("[MSM] GLV endomorphism {} (SP1_GPU_GLV={})",
-                      if on { "enabled" } else { "disabled" }, v);
+            eprintln!(
+                "[MSM] GLV endomorphism {} (SP1_GPU_GLV={})",
+                if on { "enabled" } else { "disabled" },
+                v
+            );
             return on;
         }
         // Auto-detect based on total VRAM. With the shared GLV pool
@@ -346,10 +349,8 @@ fn glv_enabled() -> bool {
         let mut free: usize = 0;
         let mut total: usize = 0;
         let ok = unsafe {
-            sp1_gpu_sys::runtime::cuda_mem_get_info(
-                &mut free as *mut _,
-                &mut total as *mut _,
-            ) == sp1_gpu_sys::runtime::CUDA_SUCCESS_CSL
+            sp1_gpu_sys::runtime::cuda_mem_get_info(&mut free as *mut _, &mut total as *mut _)
+                == sp1_gpu_sys::runtime::CUDA_SUCCESS_CSL
         };
         // VRAM math says 9070 XT (15.9 GB) should fit GLV after the
         // shared pool (incl. d_scalars) refactor. Empirically it does
@@ -364,8 +365,11 @@ fn glv_enabled() -> bool {
             eprintln!(
                 "[MSM] GLV auto: total VRAM = {:.1} GB, {}",
                 total as f64 / (1024.0 * 1024.0 * 1024.0),
-                if enable { "enabling GLV (shared working-buffer pool)" }
-                else { "disabling GLV (needs ≥ 20 GB)" }
+                if enable {
+                    "enabling GLV (shared working-buffer pool)"
+                } else {
+                    "disabling GLV (needs ≥ 20 GB)"
+                }
             );
         } else {
             eprintln!("[MSM] GLV auto: could not query VRAM, defaulting to enabled");
@@ -442,9 +446,7 @@ impl PersistentMsm {
                 let msg = if err.message.is_null() {
                     "unknown error".to_string()
                 } else {
-                    unsafe { std::ffi::CStr::from_ptr(err.message) }
-                        .to_string_lossy()
-                        .into_owned()
+                    unsafe { std::ffi::CStr::from_ptr(err.message) }.to_string_lossy().into_owned()
                 };
                 panic!("Failed to pre-reserve GLV working-buffer pool: {}", msg);
             }
@@ -463,6 +465,40 @@ impl PersistentMsm {
     /// endomorphism, halving the number of Pippenger windows (10 vs 20).
     pub fn msm(&self, scalars: &[crate::fields::Fr]) -> G1Jacobian {
         self.msm_with_next(scalars, None)
+    }
+
+    /// Kick off an async H2D upload of this MSM's scalars using the shared
+    /// GLV pool's SDMA copy_stream, so the scalar upload overlaps with any
+    /// compute already running on the default stream (typically the H
+    /// polynomial NTT kernels). The next `msm` / `msm_with_next` call on any
+    /// G1 context that uses the shared GLV pool picks up the pre-uploaded
+    /// scalars and skips its synchronous hipMemcpy (~130-160 ms hidden).
+    ///
+    /// This must be called from the **same host thread** that will invoke
+    /// the subsequent MSM. Cross-thread HIP ops serialize on RDNA3 and
+    /// regress timing badly — see `feedback_hip_cross_thread_gpu_ops.md`.
+    ///
+    /// Only meaningful on the GLV path (HIP/AMD). On the non-GLV / sppark
+    /// path this is a no-op because the scalar upload happens inside
+    /// sppark's own multi-stream pipeline.
+    pub fn preupload_scalars(&self, scalars: &[crate::fields::Fr]) {
+        if !self.use_glv {
+            return;
+        }
+        use std::ffi::c_void;
+        let n = scalars.len();
+        assert!(n <= self.npoints);
+        let err = unsafe {
+            sp1_gpu_sys::msm::sp1_bn254_msm_preupload_scalars(scalars.as_ptr() as *const c_void, n)
+        };
+        if err != unsafe { sp1_gpu_sys::runtime::CUDA_SUCCESS_CSL } {
+            let msg = if err.message.is_null() {
+                "unknown error".to_string()
+            } else {
+                unsafe { std::ffi::CStr::from_ptr(err.message) }.to_string_lossy().into_owned()
+            };
+            eprintln!("[WARN] preupload_scalars failed: {msg} — skipping overlap");
+        }
     }
 
     /// Run MSM with optional DMA/compute overlap for the NEXT MSM's scalars.

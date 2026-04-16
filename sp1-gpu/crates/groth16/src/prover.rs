@@ -169,12 +169,10 @@ impl Groth16Prover {
         };
         // Pre-compute filter indices so prove() can do a simple gather
         // instead of enumerate+filter+collect (which has 600ms variance).
-        let a_indices: Vec<usize> = (0..data.infinity_a.len())
-            .filter(|&i| !data.infinity_a[i])
-            .collect();
-        let b_indices: Vec<usize> = (0..data.infinity_b.len())
-            .filter(|&i| !data.infinity_b[i])
-            .collect();
+        let a_indices: Vec<usize> =
+            (0..data.infinity_a.len()).filter(|&i| !data.infinity_a[i]).collect();
+        let b_indices: Vec<usize> =
+            (0..data.infinity_b.len()).filter(|&i| !data.infinity_b[i]).collect();
         let k_indices: Vec<usize> = {
             let nb_public = data.nb_public;
             let n_private = if data.infinity_a.len() > nb_public {
@@ -195,7 +193,9 @@ impl Groth16Prover {
         };
         eprintln!(
             "[groth16] Pre-computed filter indices: A={}, B={}, K={}",
-            a_indices.len(), b_indices.len(), k_indices.len()
+            a_indices.len(),
+            b_indices.len(),
+            k_indices.len()
         );
 
         Self {
@@ -244,47 +244,115 @@ impl Groth16Prover {
 
         #[cfg(feature = "cuda")]
         let (wire_values_a, wire_values_b, filtered_wire_values, h_result, size_h) = {
-            std::thread::scope(|scope| {
-                let h_handle = scope.spawn(|| {
-                    self.compute_h(&witness.solution_a, &witness.solution_b, &witness.solution_c)
-                });
+            // Strategy to overlap the Ar MSM scalar upload with the H polynomial
+            // NTT kernels:
+            //   1. Gather + pin wire_values_a up-front on the main thread.
+            //   2. Spawn compute_h on a worker; pass it a reference to
+            //      wire_values_a so it can issue an async hipMemcpyAsync for
+            //      those scalars from *inside* compute_h_gpu (on the same host
+            //      thread that drives the NTT kernels) right after the NTT
+            //      kernels are enqueued.  The SDMA engine runs concurrently
+            //      with the NTT compute on RDNA3, so the Ar upload (~130 ms)
+            //      is hidden behind the tail of the NTT batch.
+            //   3. Meanwhile the main thread gathers wire_values_b and the
+            //      filtered wire values in parallel with the spawn's CPU
+            //      BN254Fr→Fr conversion, preserving the prior CPU/CPU overlap.
+            //   4. When Ar MSM is later invoked, it finds its scalars already
+            //      resident in the GLV pool's double-buffer and skips the
+            //      synchronous H2D copy.
+            //
+            // All GPU ops happen on the spawn thread — this matters because
+            // HIP serialises cross-thread GPU calls (see
+            // feedback_hip_cross_thread_gpu_ops.md), so moving the preupload
+            // onto the spawn thread (rather than issuing it from main) is
+            // essential to avoid a ~3 s regression.
+            let t_gather = std::time::Instant::now();
+            let wire_values_a: Vec<Fr> = self.a_indices.par_iter().map(|&i| wv[i]).collect();
+            eprintln!("[T] 2a. Wire gather Ar: {:?}", t_gather.elapsed());
 
-                // CPU: gather wire values using pre-computed indices.
-                // This replaces enumerate+filter+collect (which had 600ms
-                // variance due to branch prediction + CPU load) with a
-                // simple indexed gather (~80ms, deterministic).
-                let wire_values_a: Vec<Fr> = self.a_indices.iter().map(|&i| wv[i]).collect();
-                let wire_values_b: Vec<Fr> = self.b_indices.iter().map(|&i| wv[i]).collect();
-                let filtered_wire_values: Vec<Fr> = self.k_indices.iter().map(|&i| wv[i]).collect();
-
-                // Pin scalar buffers BEFORE waiting for compute_h, so we can
-                // start an async Ar upload while GPU NTTs are still running.
-                {
-                    use std::ffi::c_void;
-                    let pin = |name: &str, v: &[Fr]| unsafe {
-                        let err = sp1_gpu_sys::runtime::cuda_host_register(
-                            v.as_ptr() as *const c_void,
-                            std::mem::size_of_val(v),
+            // Pin wire_values_a so the upcoming SDMA copy uses real DMA.
+            {
+                use std::ffi::c_void;
+                unsafe {
+                    let err = sp1_gpu_sys::runtime::cuda_host_register(
+                        wire_values_a.as_ptr() as *const c_void,
+                        std::mem::size_of_val(wire_values_a.as_slice()),
+                    );
+                    if err != sp1_gpu_sys::runtime::CUDA_SUCCESS_CSL {
+                        eprintln!(
+                            "[WARN] cuda_host_register failed for wire_values_a ({} bytes)",
+                            std::mem::size_of_val(wire_values_a.as_slice()),
                         );
-                        if err != sp1_gpu_sys::runtime::CUDA_SUCCESS_CSL {
-                            eprintln!(
-                                "[WARN] cuda_host_register failed for {} ({} bytes)",
-                                name,
+                    }
+                }
+            }
+
+            // SAFETY: we pass the pointer as usize + len into the spawn
+            // thread (usize is Send) so that Rust's borrow checker doesn't
+            // prevent moving wire_values_a out of the scope when it returns.
+            // The Vec stays alive for the entire scope (it's the very value
+            // we move out of the return tuple), and the spawn thread
+            // completes before the scope's result expression is evaluated,
+            // so the pointer is valid for the duration of use inside
+            // compute_h_gpu.
+            let wva_ptr_usize = wire_values_a.as_ptr() as usize;
+            let wva_len = wire_values_a.len();
+            let (wire_values_b, filtered_wire_values, h_result, size_h) =
+                std::thread::scope(|scope| {
+                    let h_handle = scope.spawn(move || {
+                        // Reconstruct the scalar slice from the raw ptr inside
+                        // the spawn; the outer Vec<Fr> owns the storage.
+                        let ar_slice = unsafe {
+                            std::slice::from_raw_parts(wva_ptr_usize as *const Fr, wva_len)
+                        };
+                        self.compute_h(
+                            &witness.solution_a,
+                            &witness.solution_b,
+                            &witness.solution_c,
+                            Some(ar_slice),
+                        )
+                    });
+
+                    // CPU: gather the remaining two wire-value vectors while
+                    // compute_h runs its BN254Fr→Fr conversion + NTT kernels.
+                    let wire_values_b: Vec<Fr> =
+                        self.b_indices.par_iter().map(|&i| wv[i]).collect();
+                    let filtered_wire_values: Vec<Fr> =
+                        self.k_indices.par_iter().map(|&i| wv[i]).collect();
+
+                    // Pin Bs1 / Krs scalars BEFORE joining compute_h so the
+                    // subsequent msm_with_next DMA uploads benefit from pinning.
+                    // (These pins happen on the main thread but the only GPU
+                    // op is hipHostRegister, not a compute-stream op; the HIP
+                    // runtime handles host-register concurrently with the
+                    // spawn thread's NTT kernels without the cross-thread lock
+                    // penalty that afflicts compute-stream ops.)
+                    {
+                        use std::ffi::c_void;
+                        let pin = |name: &str, v: &[Fr]| unsafe {
+                            let err = sp1_gpu_sys::runtime::cuda_host_register(
+                                v.as_ptr() as *const c_void,
                                 std::mem::size_of_val(v),
                             );
-                        }
-                    };
-                    pin("wire_values_a", &wire_values_a);
-                    pin("wire_values_b", &wire_values_b);
-                    pin("filtered_wire_values", &filtered_wire_values);
-                }
+                            if err != sp1_gpu_sys::runtime::CUDA_SUCCESS_CSL {
+                                eprintln!(
+                                    "[WARN] cuda_host_register failed for {} ({} bytes)",
+                                    name,
+                                    std::mem::size_of_val(v),
+                                );
+                            }
+                        };
+                        pin("wire_values_b", &wire_values_b);
+                        pin("filtered_wire_values", &filtered_wire_values);
+                    }
 
-                // Now wait for compute_h to finish.
-                let h_result = h_handle.join().expect("H polynomial computation panicked");
-                let size_h = n - 1;
+                    // Wait for compute_h to finish (NTTs + preupload enqueued).
+                    let h_result = h_handle.join().expect("H polynomial computation panicked");
+                    let size_h = n - 1;
 
-                (wire_values_a, wire_values_b, filtered_wire_values, h_result, size_h)
-            })
+                    (wire_values_b, filtered_wire_values, h_result, size_h)
+                });
+            (wire_values_a, wire_values_b, filtered_wire_values, h_result, size_h)
         };
 
         #[cfg(not(feature = "cuda"))]
@@ -369,20 +437,19 @@ impl Groth16Prover {
 
             // Ar: first MSM — no prior compute to overlap with.
             // Pre-upload Bs1 scalars during Ar compute.
-            let ar_msm = self.persistent_g1_a.msm_with_next(
-                &wire_values_a,
-                Some(&wire_values_b),
-            );
+            let ar_msm = self.persistent_g1_a.msm_with_next(&wire_values_a, Some(&wire_values_b));
             let ar = ar_msm.add(&g1_alpha.to_jacobian()).add(&r_delta);
-            eprintln!("[T] 5a. Ar MSM (N={}, pipelined next): {:?}", wire_values_a.len(), t.elapsed());
+            eprintln!(
+                "[T] 5a. Ar MSM (N={}, pipelined next): {:?}",
+                wire_values_a.len(),
+                t.elapsed()
+            );
             g1_msm_ark_verify("Ar", &self.data.pk_g1_a, &wire_values_a, &ar_msm);
 
             let t = std::time::Instant::now();
             // Bs1: scalars pre-uploaded during Ar. Pre-upload Krs scalars.
-            let bs1_msm = self.persistent_g1_b.msm_with_next(
-                &wire_values_b,
-                Some(&filtered_wire_values),
-            );
+            let bs1_msm =
+                self.persistent_g1_b.msm_with_next(&wire_values_b, Some(&filtered_wire_values));
             let bs1 = bs1_msm.add(&g1_beta.to_jacobian()).add(&s_delta);
             eprintln!("[T] 5b. Bs1 MSM (N={}): {:?}", wire_values_b.len(), t.elapsed());
             g1_msm_ark_verify("Bs1", &self.data.pk_g1_b, &wire_values_b, &bs1_msm);
@@ -391,12 +458,9 @@ impl Groth16Prover {
             // Krs: scalars pre-uploaded during Bs1. Pre-upload Krs2 if host.
             let krs2_next = match &h_result {
                 HResult::Host(h) => Some(&h[..size_h]),
-                HResult::Device(_) => None,  // device path doesn't use host upload
+                HResult::Device(_) => None, // device path doesn't use host upload
             };
-            let krs_msm = self.persistent_g1_k.msm_with_next(
-                &filtered_wire_values,
-                krs2_next,
-            );
+            let krs_msm = self.persistent_g1_k.msm_with_next(&filtered_wire_values, krs2_next);
             eprintln!("[T] 5c. Krs MSM (N={}): {:?}", filtered_wire_values.len(), t.elapsed());
             g1_msm_ark_verify("Krs", &self.data.pk_g1_k, &filtered_wire_values, &krs_msm);
 
@@ -581,6 +645,7 @@ impl Groth16Prover {
         solution_a: &[BN254Fr],
         solution_b: &[BN254Fr],
         solution_c: &[BN254Fr],
+        #[cfg(feature = "cuda")] ar_preupload_scalars: Option<&[Fr]>,
     ) -> HResult {
         let n = self.data.domain_size;
 
@@ -605,7 +670,7 @@ impl Groth16Prover {
 
         #[cfg(feature = "cuda")]
         {
-            HResult::Device(self.compute_h_gpu(&mut a, &mut b, &mut c))
+            HResult::Device(self.compute_h_gpu(&mut a, &mut b, &mut c, ar_preupload_scalars))
         }
         #[cfg(not(feature = "cuda"))]
         {
@@ -617,8 +682,25 @@ impl Groth16Prover {
     /// H coefficients so the Krs2 MSM can consume them without a D2H/H2D round-trip.
     ///
     /// The returned `DeviceH` owns the GPU allocation and frees it on Drop.
+    ///
+    /// `ar_preupload_scalars` (HIP GLV only): if provided, after the NTT kernels
+    /// are enqueued on the default compute stream, we kick off an async H2D
+    /// upload of these scalars onto the GLV pool's copy_stream (SDMA). The
+    /// SDMA engine runs in parallel with the NTT kernels, so the Ar MSM
+    /// scalar upload is hidden behind the tail of the H polynomial compute
+    /// (~130 ms saved off the subsequent Ar MSM). The preupload is issued
+    /// from the same host thread that drives compute_h_gpu — calling into
+    /// HIP from a different thread than the one running the NTTs would
+    /// trigger the cross-thread context lock described in
+    /// feedback_hip_cross_thread_gpu_ops.md.
     #[cfg(feature = "cuda")]
-    fn compute_h_gpu(&self, a: &mut [Fr], b: &mut [Fr], c: &mut [Fr]) -> DeviceH {
+    fn compute_h_gpu(
+        &self,
+        a: &mut [Fr],
+        b: &mut [Fr],
+        c: &mut [Fr],
+        ar_preupload_scalars: Option<&[Fr]>,
+    ) -> DeviceH {
         use std::ffi::c_void;
         let n = self.data.domain_size;
         let lg_n = self.data.lg_domain_size;
@@ -705,6 +787,40 @@ impl Groth16Prover {
                 ),
                 "batch_coset_NTT(A,B,C)",
             );
+        }
+
+        // DMA/compute overlap: now that the iNTT and coset_NTT kernel
+        // batches are queued on the default compute stream, kick off an
+        // async H2D upload of the Ar MSM scalars on the shared GLV pool's
+        // copy_stream. The SDMA engine runs in parallel with the NTT
+        // kernels so the upload (~130 ms) finishes while the NTTs are
+        // still running; the subsequent Ar MSM invoke picks up the
+        // pre-uploaded scalars and skips its synchronous hipMemcpy.
+        //
+        // Safety: this call must be on the same host thread that drives
+        // compute_h_gpu — HIP serialises GPU calls across threads (see
+        // feedback_hip_cross_thread_gpu_ops.md). Because we are already
+        // on that thread here, and all GPU ops are enqueued in order,
+        // the SDMA copy and the NTT compute are properly scheduled by
+        // the HIP runtime.
+        if let Some(ar_scalars) = ar_preupload_scalars {
+            use std::ffi::c_void;
+            let err = unsafe {
+                sp1_gpu_sys::msm::sp1_bn254_msm_preupload_scalars(
+                    ar_scalars.as_ptr() as *const c_void,
+                    ar_scalars.len(),
+                )
+            };
+            if err != unsafe { sp1_gpu_sys::runtime::CUDA_SUCCESS_CSL } {
+                let msg = if err.message.is_null() {
+                    "unknown error".to_string()
+                } else {
+                    unsafe { std::ffi::CStr::from_ptr(err.message) }.to_string_lossy().into_owned()
+                };
+                eprintln!(
+                    "[WARN] Ar MSM scalar preupload failed: {msg} — MSM will upload synchronously"
+                );
+            }
         }
 
         // Pointwise: a[i] = (a[i]*b[i] - c[i]) * den

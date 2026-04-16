@@ -128,6 +128,21 @@ extern "C" {
         num_hot: i32,
     ) -> CudaRustError;
 
+    /// Kick off an async H2D upload of the next MSM's scalars on the GLV
+    /// pool's dedicated SDMA copy_stream. The next `sp1_bn254_msm_invoke_glv`
+    /// call picks up the pre-uploaded scalars and skips its synchronous
+    /// hipMemcpy. Safe to call from the same host thread that will later
+    /// invoke the MSM; avoid cross-thread use.
+    ///
+    /// Intended for the *first* MSM in a proof (which has no prior compute
+    /// to overlap with) — overlaps the upload with the H polynomial NTT
+    /// kernels that run on the default compute stream.
+    ///
+    /// Requires the shared GLV pool to be reserved (either via
+    /// `sp1_bn254_glv_pool_reserve` or after the first GLV invoke).
+    pub fn sp1_bn254_msm_preupload_scalars(scalars: *const c_void, npoints: usize)
+        -> CudaRustError;
+
     /// Pre-size the process-global GLV working-buffer pool for up to `max_n`
     /// base points (i.e. the largest N across all G1 PersistentMsm contexts).
     ///

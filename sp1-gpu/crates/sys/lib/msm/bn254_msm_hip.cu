@@ -904,6 +904,49 @@ rustCudaError_t sp1_bn254_glv_pool_get_scalar_buffers(sp1_bn254_glv_scalar_buffe
     return CUDA_SUCCESS_CSL;
 }
 
+/// Kick off an async H2D upload of scalars for the first MSM invocation.
+///
+/// Intended use: before launching compute_h (which enqueues NTT kernels on
+/// the default compute stream), call this to start copying Ar MSM scalars
+/// onto the GLV pool's copy_stream (SDMA). The SDMA engine runs independently
+/// from the compute engine on RDNA3, so the upload overlaps with the tail of
+/// the NTT kernels and the first MSM invoke picks up the pre-uploaded scalars
+/// and skips its synchronous hipMemcpy.
+///
+/// This mirrors the DMA/compute overlap already used by `invoke_glv`'s
+/// `next_scalars` parameter, but exposes it to the Rust caller for the
+/// *first* MSM (which has no prior compute to overlap with).
+///
+/// Requires: the shared GLV pool to be initialised (e.g. via
+/// `sp1_bn254_glv_pool_reserve` in `PersistentMsm::new`).
+extern "C"
+rustCudaError_t sp1_bn254_msm_preupload_scalars(
+    const void* scalars, size_t npoints
+) {
+    if (!g_glv_pool) {
+        return rustCudaError_t{.message = "GLV pool not reserved — call sp1_bn254_glv_pool_reserve first"};
+    }
+    auto* gp = g_glv_pool;
+    if ((int)npoints > gp->alloc_n) {
+        return rustCudaError_t{.message = "preupload npoints > pool alloc_n"};
+    }
+    // If a previous preupload is still pending, wait for it first so we
+    // don't overwrite its target buffer.
+    if (gp->next_upload_pending) {
+        CUDA_OK(hipEventSynchronize(gp->upload_done));
+        gp->next_upload_pending = false;
+    }
+    // Upload into the CURRENT buffer. This means the very next MSM
+    // invoke (which uses cur_buf) will find its scalars already present.
+    int buf = gp->cur_buf;
+    size_t bytes = (size_t)npoints * SCALAR_LIMBS * sizeof(uint32_t);
+    CUDA_OK(hipMemcpyAsync(gp->d_scalars[buf], scalars, bytes,
+                           hipMemcpyHostToDevice, gp->copy_stream));
+    CUDA_OK(hipEventRecord(gp->upload_done, gp->copy_stream));
+    gp->next_upload_pending = true;
+    return CUDA_SUCCESS_CSL;
+}
+
 // Lazily allocate or grow the global GLV working-buffer pool so it can serve
 // any context with base point count <= max_n. If the pool already exists and
 // is at least as large as requested, this is a cheap no-op.
