@@ -369,6 +369,9 @@ fn main() {
     // Export compile commands for clangd IDE support
     cmake_config.define("CMAKE_EXPORT_COMPILE_COMMANDS", "ON");
 
+    // Register the hip_backend cfg so Rust's check-cfg doesn't warn on usage.
+    println!("cargo:rustc-check-cfg=cfg(hip_backend)");
+
     match backend {
         GpuBackend::Hip => {
             println!("cargo:warning=Building with HIP/ROCm backend for AMD GPUs");

@@ -146,13 +146,21 @@ impl Groth16Prover {
         // per call but doesn't hit the conflict).
         #[cfg(feature = "cuda")]
         let persistent_g2_b = {
+            // Default to compile-time backend detection (HIP-built crates use
+            // the persistent G2 path; CUDA-built crates skip it because of
+            // sppark's gpu_t singleton conflict). Env var SP1_GPU_BACKEND
+            // overrides for testing.
             let backend_is_hip = std::env::var("SP1_GPU_BACKEND")
                 .ok()
                 .map(|v| {
                     let v = v.to_lowercase();
-                    v == "hip" || v == "rocm" || v == "amd"
+                    match v.as_str() {
+                        "hip" | "rocm" | "amd" => true,
+                        "cuda" | "nvidia" => false,
+                        _ => sp1_gpu_sys::is_hip_backend(),
+                    }
                 })
-                .unwrap_or(false);
+                .unwrap_or(sp1_gpu_sys::is_hip_backend());
             if backend_is_hip {
                 let t = std::time::Instant::now();
                 let p = PersistentG2Msm::new(&data.pk_g2_b);
@@ -416,14 +424,25 @@ impl Groth16Prover {
         //   Krs MSM balloons from ~0.9 s to 40+ s. Sequential execution is
         //   strictly better. Also, on HIP we have a real persistent G2 MSM
         //   context that avoids the per-call point upload.
+        // Default to HIP-optimal sequential G2 when compiled against HIP,
+        // since thread::scope overlap thrashes the single HIP command queue
+        // (G2 contends with G1 MSMs, ballooning Bs1/Krs from ~350ms to 1.2-2.5s
+        // and G2 from ~1.3s to ~3.7s — see benchmark in PR description).
+        // Env var SP1_GPU_BACKEND can explicitly override: "cuda" forces
+        // thread::scope (for sppark multi-stream pipelines); "hip"/"rocm"/"amd"
+        // forces sequential.
         #[cfg(feature = "cuda")]
         let use_sequential_g2 = std::env::var("SP1_GPU_BACKEND")
             .ok()
             .map(|v| {
                 let v = v.to_lowercase();
-                v == "hip" || v == "rocm" || v == "amd"
+                match v.as_str() {
+                    "hip" | "rocm" | "amd" => true,
+                    "cuda" | "nvidia" => false,
+                    _ => sp1_gpu_sys::is_hip_backend(),
+                }
             })
-            .unwrap_or(false);
+            .unwrap_or(sp1_gpu_sys::is_hip_backend());
 
         #[cfg(feature = "cuda")]
         let (ar, bs2, bs1, krs_msm, krs2_msm) = if use_sequential_g2 {
