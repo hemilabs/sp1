@@ -217,6 +217,29 @@ pub struct Groth16Prover {
     h_host_b: std::sync::Mutex<Vec<Fr>>,
     #[cfg(not(feature = "cuda"))]
     h_host_c: std::sync::Mutex<Vec<Fr>>,
+    /// Pre-allocated GPU NTT temp buffer (N × 32 bytes = 512MB for lg_n=24).
+    /// Eliminates ~25ms hipFree per prove (the caching allocator makes hipMalloc
+    /// near-free, but hipFree triggers an implicit device sync).
+    /// Raw pointer — freed in Drop; Send/Sync safe because only accessed
+    /// from compute_h_gpu which runs single-threaded.
+    #[cfg(feature = "cuda")]
+    d_ntt_temp: *mut std::ffi::c_void,
+}
+
+// Raw pointer d_ntt_temp needs explicit Send/Sync.
+unsafe impl Send for Groth16Prover {}
+unsafe impl Sync for Groth16Prover {}
+
+#[cfg(feature = "cuda")]
+impl Drop for Groth16Prover {
+    fn drop(&mut self) {
+        if !self.d_ntt_temp.is_null() {
+            unsafe {
+                sp1_gpu_sys::runtime::cuda_free(self.d_ntt_temp as *const std::ffi::c_void);
+            }
+            self.d_ntt_temp = std::ptr::null_mut();
+        }
+    }
 }
 
 impl Groth16Prover {
@@ -370,6 +393,8 @@ impl Groth16Prover {
             )
         };
 
+        let domain_size = data.domain_size;
+
         Self {
             data,
             #[cfg(feature = "cuda")]
@@ -403,6 +428,18 @@ impl Groth16Prover {
             h_host_b,
             #[cfg(not(feature = "cuda"))]
             h_host_c,
+            #[cfg(feature = "cuda")]
+            d_ntt_temp: {
+                let byte_sz = domain_size * std::mem::size_of::<Fr>();
+                let mut ptr: *mut std::ffi::c_void = std::ptr::null_mut();
+                let err = unsafe {
+                    sp1_gpu_sys::runtime::cuda_malloc(&mut ptr as *mut _, byte_sz)
+                };
+                if err != unsafe { sp1_gpu_sys::runtime::CUDA_SUCCESS_CSL } || ptr.is_null() {
+                    eprintln!("[groth16] WARN: pre-alloc d_ntt_temp failed; will alloc per-prove");
+                }
+                ptr
+            },
         }
     }
 
@@ -808,29 +845,17 @@ impl Groth16Prover {
 
         #[cfg(feature = "cuda")]
         {
-            // Use pre-allocated, pre-pinned host buffers. Eliminates ~510ms
-            // per-prove from page-fault overhead of fresh 1.5GB allocation,
-            // AND improves H2D throughput (pinned DMA vs pageable).
-            // The tail beyond solution_a.len() stays zero from init (the
-            // circuit's constraint count is constant).
-            let a = self.pinned_h_a.as_mut_slice();
-            let b = self.pinned_h_b.as_mut_slice();
-            let c = self.pinned_h_c.as_mut_slice();
-
-            a[..solution_a.len()]
-                .par_iter_mut()
-                .zip(solution_a.par_iter())
-                .for_each(|(dst, src)| *dst = Fr::from_bn254fr(src));
-            b[..solution_b.len()]
-                .par_iter_mut()
-                .zip(solution_b.par_iter())
-                .for_each(|(dst, src)| *dst = Fr::from_bn254fr(src));
-            c[..solution_c.len()]
-                .par_iter_mut()
-                .zip(solution_c.par_iter())
-                .for_each(|(dst, src)| *dst = Fr::from_bn254fr(src));
-
-            HResult::Device(self.compute_h_gpu(a, b, c, ar_preupload_scalars))
+            // Pass solution slices directly to compute_h_gpu which
+            // interleaves CPU memcpy into pinned buffers with async H2D
+            // uploads. This overlaps the CPU copy of B/C with the SDMA
+            // transfer of A (and C's copy with B's transfer), saving
+            // ~10-15ms from the H2D pipeline.
+            HResult::Device(self.compute_h_gpu(
+                solution_a,
+                solution_b,
+                solution_c,
+                ar_preupload_scalars,
+            ))
         }
         #[cfg(not(feature = "cuda"))]
         {
@@ -877,9 +902,9 @@ impl Groth16Prover {
     #[cfg(feature = "cuda")]
     fn compute_h_gpu(
         &self,
-        a: &mut [Fr],
-        b: &mut [Fr],
-        c: &mut [Fr],
+        solution_a: &[BN254Fr],
+        solution_b: &[BN254Fr],
+        solution_c: &[BN254Fr],
         ar_preupload_scalars: Option<&[Fr]>,
     ) -> DeviceH {
         use std::ffi::c_void;
@@ -931,30 +956,85 @@ impl Groth16Prover {
         let d_b = unsafe { (d_buf as *mut u8).add(byte_sz) as *mut c_void };
         let d_c = unsafe { (d_buf as *mut u8).add(2 * byte_sz) as *mut c_void };
 
-        // Upload A, B, C
+        // Interleaved async H2D uploads: copy each polynomial into its
+        // pre-pinned host buffer, then immediately queue an async H2D
+        // transfer on a dedicated copy_stream. The CPU memcpy of B/C
+        // overlaps with the SDMA transfer of A/B, saving ~10-15ms.
+        //
+        // All operations happen on the SAME host thread (no cross-thread
+        // GPU ops) to avoid HIP context lock serialisation.
+        //
+        // Raw memcpy: BN254Fr (8×u32, canonical LE) and Fr (4×u64,
+        // Montgomery) have the same 32-byte layout. We skip the CPU
+        // Montgomery conversion and instead upload canonical data to GPU,
+        // where a ~1ms kernel converts all 3×N elements to Montgomery form.
+        // SAFETY: BN254Fr and Fr are both 32 bytes, #[repr(C)].
+        let mut copy_stream = sp1_gpu_sys::runtime::CudaStreamHandle(std::ptr::null_mut());
+        check_gpu(
+            unsafe { sp1_gpu_sys::runtime::cuda_stream_create(&mut copy_stream) },
+            "cuda_stream_create(copy_stream)",
+        );
+
+        // Helper: raw-copy solution into pinned buffer, then async H2D.
+        let copy_and_upload = |solution: &[BN254Fr],
+                               pinned: &PinnedBuf,
+                               d_dst: *mut c_void,
+                               label: &str| {
+            let buf = pinned.as_mut_slice();
+            unsafe {
+                let src = std::slice::from_raw_parts(
+                    solution.as_ptr() as *const Fr,
+                    solution.len(),
+                );
+                buf[..solution.len()].copy_from_slice(src);
+            }
+            // Tail beyond solution.len() stays zero from PinnedBuf init.
+            unsafe {
+                check_gpu(
+                    sp1_gpu_sys::runtime::cuda_mem_copy_host_to_device_async(
+                        d_dst,
+                        buf.as_ptr() as *const c_void,
+                        byte_sz,
+                        copy_stream,
+                    ),
+                    label,
+                );
+            }
+        };
+
+        copy_and_upload(solution_a, &self.pinned_h_a, d_a, "async H2D(A)");
+        copy_and_upload(solution_b, &self.pinned_h_b, d_b, "async H2D(B)");
+        copy_and_upload(solution_c, &self.pinned_h_c, d_c, "async H2D(C)");
+
+        // Wait for all 3 async uploads to complete before proceeding to
+        // GPU kernels on the default stream.
+        check_gpu(
+            unsafe { sp1_gpu_sys::runtime::cuda_stream_synchronize(copy_stream) },
+            "stream_sync(copy_stream)",
+        );
         unsafe {
-            check_gpu(
-                sp1_gpu_sys::runtime::cuda_mem_copy_host_to_device(d_a, a.as_ptr() as _, byte_sz),
-                "H2D(A)",
-            );
-            check_gpu(
-                sp1_gpu_sys::runtime::cuda_mem_copy_host_to_device(d_b, b.as_ptr() as _, byte_sz),
-                "H2D(B)",
-            );
-            check_gpu(
-                sp1_gpu_sys::runtime::cuda_mem_copy_host_to_device(d_c, c.as_ptr() as _, byte_sz),
-                "H2D(C)",
-            );
+            sp1_gpu_sys::runtime::cuda_stream_destroy(copy_stream);
         }
 
-        // Allocate a single reusable temp buffer for all NTTs (N × 32 bytes = 512 MB
-        // for lg_n=24). This avoids 7 × hipMalloc/hipFree of 512 MB each.
-        let mut d_temp: *mut c_void = std::ptr::null_mut();
-        check_gpu(
-            unsafe { sp1_gpu_sys::runtime::cuda_malloc(&mut d_temp as *mut _, byte_sz) },
-            "cuda_malloc(ntt_temp)",
-        );
-        assert!(!d_temp.is_null(), "GPU H polynomial: ntt temp cuda_malloc returned null");
+        // Convert all 3×N elements from canonical LE to Montgomery form on GPU.
+        // This replaces ~78ms of CPU rayon Montgomery multiplication with ~1ms
+        // of GPU compute (48M elements × 1 Montgomery mul each).
+        unsafe {
+            sp1_gpu_sys::plonk::bn254_canonical_to_mont(d_a, 3 * n);
+        }
+
+        // Use pre-allocated NTT temp buffer (or fallback to per-prove alloc).
+        let d_temp = if !self.d_ntt_temp.is_null() {
+            self.d_ntt_temp
+        } else {
+            let mut ptr: *mut c_void = std::ptr::null_mut();
+            check_gpu(
+                unsafe { sp1_gpu_sys::runtime::cuda_malloc(&mut ptr as *mut _, byte_sz) },
+                "cuda_malloc(ntt_temp_fallback)",
+            );
+            assert!(!ptr.is_null());
+            ptr
+        };
 
         // Fused 3× (iNTT + coset NTT): eliminates 3 redundant memory passes
         // by combining the N^{-1} scale (iNTT epilogue) and coset pre-multiply
@@ -1026,9 +1106,9 @@ impl Groth16Prover {
             );
         }
 
-        // Free the NTT temp buffer (no longer needed after all NTTs complete).
-        unsafe {
-            sp1_gpu_sys::runtime::cuda_free(d_temp as *const c_void);
+        // Only free the NTT temp if it was a fallback allocation (not pre-allocated).
+        if self.d_ntt_temp.is_null() {
+            unsafe { sp1_gpu_sys::runtime::cuda_free(d_temp as *const c_void); }
         }
 
         // Now d_a[0..N] contains H. We need to keep it alive for the Krs2 MSM.
