@@ -83,6 +83,19 @@ extern "C" {
         d_temp: *mut c_void,
     ) -> CudaRustError;
 
+    /// Fused iNTT + coset NTT: replaces separate batch_iNTT + batch_coset_NTT calls.
+    /// For each polynomial, runs iNTT (without N^{-1} scale), then a single fused
+    /// scale*coset_mul kernel, then forward NTT (without coset pre-multiply).
+    /// Saves one memory pass per polynomial (~17ms * poly_count at N=16M).
+    /// d_temp must point to at least 2^lg_domain_size elements of device memory.
+    pub fn batch_iNTT_coset_NTT_fused_bn254_with_temp(
+        d_inout: *mut c_void,
+        lg_domain_size: u32,
+        poly_count: u32,
+        stream: CudaStreamHandle,
+        d_temp: *mut c_void,
+    ) -> CudaRustError;
+
     /// Returns true if the NTT implementation needs a separate N-element temp buffer
     /// for transpose stages (RDNA3 four-step NTT). Returns false for in-place NTTs (sppark).
     pub fn bn254_ntt_needs_temp_buffer() -> bool;

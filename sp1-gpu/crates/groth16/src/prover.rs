@@ -12,6 +12,93 @@ use crate::types::{Groth16Proof, Groth16ProvingData, Groth16WitnessData};
 use crate::{BN254Fr, BN254G1Affine, Fr, G1Affine, G1Jacobian};
 use rayon::prelude::*;
 
+/// A pre-pinned host buffer for wire-value gather. Wraps a `Vec<Fr>` that
+/// is registered with the GPU runtime (hipHostRegister / cudaHostRegister)
+/// at construction so DMA copies avoid TLB shootdown overhead.
+///
+/// The buffer is unpinned and freed on Drop.
+///
+/// SAFETY: `PinnedBuf` is `Send + Sync`. The `Sync` impl is safe because
+/// the mutable accessor (`as_mut_slice`) takes `&self` but is only called
+/// from `prove()`, which is never invoked concurrently. The `&self`
+/// signature is required because `Groth16Prover.prove()` takes `&self` and
+/// the spawned thread inside `prove()` captures `&self` (requiring `Sync`),
+/// but the spawned thread never accesses the pinned buffers.
+#[cfg(feature = "cuda")]
+struct PinnedBuf {
+    ptr: *mut Fr,
+    len: usize,
+    cap: usize,
+}
+
+#[cfg(feature = "cuda")]
+unsafe impl Send for PinnedBuf {}
+#[cfg(feature = "cuda")]
+unsafe impl Sync for PinnedBuf {}
+
+#[cfg(feature = "cuda")]
+impl PinnedBuf {
+    /// Allocate a zeroed buffer of `len` elements and pin it for DMA.
+    fn new(len: usize) -> Self {
+        let mut v = vec![Fr::ZERO; len];
+        let ptr = v.as_mut_ptr();
+        let cap = v.capacity();
+        unsafe {
+            let err = sp1_gpu_sys::runtime::cuda_host_register(
+                ptr as *const std::ffi::c_void,
+                len * std::mem::size_of::<Fr>(),
+            );
+            if err != sp1_gpu_sys::runtime::CUDA_SUCCESS_CSL {
+                eprintln!(
+                    "[WARN] PinnedBuf: cuda_host_register failed for {} bytes",
+                    len * std::mem::size_of::<Fr>(),
+                );
+            }
+        }
+        // Leak the Vec; PinnedBuf owns the allocation via raw ptr.
+        std::mem::forget(v);
+        Self { ptr, len, cap }
+    }
+
+    /// Get a shared slice (for MSM scalar reads).
+    fn as_slice(&self) -> &[Fr] {
+        unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
+    }
+
+    /// Get a mutable slice (for wire-value scatter in `prove()`).
+    ///
+    /// SAFETY: caller must ensure no concurrent access. This is upheld by
+    /// the `prove()` call pattern (single-threaded writes, spawned thread
+    /// does not touch pinned buffers).
+    #[allow(clippy::mut_from_ref)]
+    fn as_mut_slice(&self) -> &mut [Fr] {
+        unsafe { std::slice::from_raw_parts_mut(self.ptr, self.len) }
+    }
+
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    fn as_ptr(&self) -> *const Fr {
+        self.ptr
+    }
+}
+
+#[cfg(feature = "cuda")]
+impl Drop for PinnedBuf {
+    fn drop(&mut self) {
+        if !self.ptr.is_null() {
+            unsafe {
+                let _ =
+                    sp1_gpu_sys::runtime::cuda_host_unregister(self.ptr as *const std::ffi::c_void);
+                // Reconstruct the Vec to free the allocation.
+                drop(Vec::from_raw_parts(self.ptr, self.len, self.cap));
+            }
+            self.ptr = std::ptr::null_mut();
+        }
+    }
+}
+
 /// CPU arkworks G1 MSM for verification (enabled by `GROTH16_G1_VERIFY=1`).
 /// Cross-checks that a GPU G1 MSM result matches the arkworks reference.
 /// Used to validate correctness of GLV endomorphism and other G1 MSM changes.
@@ -101,6 +188,17 @@ pub struct Groth16Prover {
     a_indices: Vec<usize>,
     b_indices: Vec<usize>,
     k_indices: Vec<usize>,
+    /// Pre-allocated, pre-pinned host buffers for wire-value gather.
+    /// Allocated once in `new()` at the exact size of each index array,
+    /// then pinned via `cuda_host_register` so that subsequent MSM scalar
+    /// uploads use DMA without per-prove TLB shootdown costs.
+    /// Reused across `prove()` calls; unpinned + freed in `Drop`.
+    #[cfg(feature = "cuda")]
+    pinned_a: PinnedBuf,
+    #[cfg(feature = "cuda")]
+    pinned_b: PinnedBuf,
+    #[cfg(feature = "cuda")]
+    pinned_k: PinnedBuf,
 }
 
 impl Groth16Prover {
@@ -206,6 +304,25 @@ impl Groth16Prover {
             k_indices.len()
         );
 
+        // Pre-allocate and pin host buffers for wire-value gather.
+        // These stay pinned for the lifetime of the prover, eliminating
+        // per-prove hipHostRegister/hipHostUnregister (~60-80ms total).
+        #[cfg(feature = "cuda")]
+        let (pinned_a, pinned_b, pinned_k) = {
+            let t = std::time::Instant::now();
+            let pa = PinnedBuf::new(a_indices.len());
+            let pb = PinnedBuf::new(b_indices.len());
+            let pk = PinnedBuf::new(k_indices.len());
+            eprintln!(
+                "[groth16] Pre-pinned wire buffers: A={}MB, B={}MB, K={}MB: {:?}",
+                a_indices.len() * 32 / (1024 * 1024),
+                b_indices.len() * 32 / (1024 * 1024),
+                k_indices.len() * 32 / (1024 * 1024),
+                t.elapsed()
+            );
+            (pa, pb, pk)
+        };
+
         Self {
             data,
             #[cfg(feature = "cuda")]
@@ -221,6 +338,12 @@ impl Groth16Prover {
             a_indices,
             b_indices,
             k_indices,
+            #[cfg(feature = "cuda")]
+            pinned_a,
+            #[cfg(feature = "cuda")]
+            pinned_b,
+            #[cfg(feature = "cuda")]
+            pinned_k,
         }
     }
 
@@ -251,117 +374,82 @@ impl Groth16Prover {
         let wv = &witness.wire_values;
 
         #[cfg(feature = "cuda")]
-        let (wire_values_a, wire_values_b, filtered_wire_values, h_result, size_h) = {
+        let (h_result, size_h) = {
             // Strategy to overlap the Ar MSM scalar upload with the H polynomial
             // NTT kernels:
-            //   1. Gather + pin wire_values_a up-front on the main thread.
-            //   2. Spawn compute_h on a worker; pass it a reference to
-            //      wire_values_a so it can issue an async hipMemcpyAsync for
-            //      those scalars from *inside* compute_h_gpu (on the same host
-            //      thread that drives the NTT kernels) right after the NTT
-            //      kernels are enqueued.  The SDMA engine runs concurrently
-            //      with the NTT compute on RDNA3, so the Ar upload (~130 ms)
-            //      is hidden behind the tail of the NTT batch.
-            //   3. Meanwhile the main thread gathers wire_values_b and the
-            //      filtered wire values in parallel with the spawn's CPU
-            //      BN254Fr→Fr conversion, preserving the prior CPU/CPU overlap.
+            //   1. Scatter wire_values_a into pre-pinned buffer on main thread.
+            //   2. Spawn compute_h on a worker; pass it a pointer to the
+            //      pre-pinned buffer so it can issue an async hipMemcpyAsync
+            //      for those scalars from *inside* compute_h_gpu (on the same
+            //      host thread that drives the NTT kernels). The SDMA engine
+            //      runs concurrently with the NTT compute on RDNA3.
+            //   3. Meanwhile the main thread scatters wire_values_b and
+            //      filtered_wire_values into their pre-pinned buffers.
             //   4. When Ar MSM is later invoked, it finds its scalars already
-            //      resident in the GLV pool's double-buffer and skips the
-            //      synchronous H2D copy.
+            //      resident in the GLV pool's double-buffer.
             //
-            // All GPU ops happen on the spawn thread — this matters because
-            // HIP serialises cross-thread GPU calls (see
-            // feedback_hip_cross_thread_gpu_ops.md), so moving the preupload
-            // onto the spawn thread (rather than issuing it from main) is
-            // essential to avoid a ~3 s regression.
+            // All GPU ops happen on the spawn thread — HIP serialises
+            // cross-thread GPU calls.
+            //
+            // The pre-pinned buffers eliminate per-prove hipHostRegister /
+            // hipHostUnregister calls (~60-80ms of TLB shootdown overhead).
             let t_gather = std::time::Instant::now();
-            let wire_values_a: Vec<Fr> = self.a_indices.par_iter().map(|&i| wv[i]).collect();
-            eprintln!("[T] 2a. Wire gather Ar: {:?}", t_gather.elapsed());
-
-            // Pin wire_values_a so the upcoming SDMA copy uses real DMA.
             {
-                use std::ffi::c_void;
-                unsafe {
-                    let err = sp1_gpu_sys::runtime::cuda_host_register(
-                        wire_values_a.as_ptr() as *const c_void,
-                        std::mem::size_of_val(wire_values_a.as_slice()),
-                    );
-                    if err != sp1_gpu_sys::runtime::CUDA_SUCCESS_CSL {
-                        eprintln!(
-                            "[WARN] cuda_host_register failed for wire_values_a ({} bytes)",
-                            std::mem::size_of_val(wire_values_a.as_slice()),
-                        );
-                    }
-                }
+                let buf = self.pinned_a.as_mut_slice();
+                buf.par_iter_mut()
+                    .zip(self.a_indices.par_iter())
+                    .for_each(|(dst, &i)| *dst = wv[i]);
             }
+            eprintln!("[T] 2a. Wire scatter Ar (pre-pinned): {:?}", t_gather.elapsed());
 
-            // SAFETY: we pass the pointer as usize + len into the spawn
-            // thread (usize is Send) so that Rust's borrow checker doesn't
-            // prevent moving wire_values_a out of the scope when it returns.
-            // The Vec stays alive for the entire scope (it's the very value
-            // we move out of the return tuple), and the spawn thread
-            // completes before the scope's result expression is evaluated,
-            // so the pointer is valid for the duration of use inside
-            // compute_h_gpu.
-            let wva_ptr_usize = wire_values_a.as_ptr() as usize;
-            let wva_len = wire_values_a.len();
-            let (wire_values_b, filtered_wire_values, h_result, size_h) =
-                std::thread::scope(|scope| {
-                    let h_handle = scope.spawn(move || {
-                        // Reconstruct the scalar slice from the raw ptr inside
-                        // the spawn; the outer Vec<Fr> owns the storage.
-                        let ar_slice = unsafe {
-                            std::slice::from_raw_parts(wva_ptr_usize as *const Fr, wva_len)
-                        };
-                        self.compute_h(
-                            &witness.solution_a,
-                            &witness.solution_b,
-                            &witness.solution_c,
-                            Some(ar_slice),
-                        )
-                    });
-
-                    // CPU: gather the remaining two wire-value vectors while
-                    // compute_h runs its BN254Fr→Fr conversion + NTT kernels.
-                    let wire_values_b: Vec<Fr> =
-                        self.b_indices.par_iter().map(|&i| wv[i]).collect();
-                    let filtered_wire_values: Vec<Fr> =
-                        self.k_indices.par_iter().map(|&i| wv[i]).collect();
-
-                    // Pin Bs1 / Krs scalars BEFORE joining compute_h so the
-                    // subsequent msm_with_next DMA uploads benefit from pinning.
-                    // (These pins happen on the main thread but the only GPU
-                    // op is hipHostRegister, not a compute-stream op; the HIP
-                    // runtime handles host-register concurrently with the
-                    // spawn thread's NTT kernels without the cross-thread lock
-                    // penalty that afflicts compute-stream ops.)
-                    {
-                        use std::ffi::c_void;
-                        let pin = |name: &str, v: &[Fr]| unsafe {
-                            let err = sp1_gpu_sys::runtime::cuda_host_register(
-                                v.as_ptr() as *const c_void,
-                                std::mem::size_of_val(v),
-                            );
-                            if err != sp1_gpu_sys::runtime::CUDA_SUCCESS_CSL {
-                                eprintln!(
-                                    "[WARN] cuda_host_register failed for {} ({} bytes)",
-                                    name,
-                                    std::mem::size_of_val(v),
-                                );
-                            }
-                        };
-                        pin("wire_values_b", &wire_values_b);
-                        pin("filtered_wire_values", &filtered_wire_values);
-                    }
-
-                    // Wait for compute_h to finish (NTTs + preupload enqueued).
-                    let h_result = h_handle.join().expect("H polynomial computation panicked");
-                    let size_h = n - 1;
-
-                    (wire_values_b, filtered_wire_values, h_result, size_h)
+            // Pass the pre-pinned buffer pointer as usize into the spawn
+            // thread (usize is Send). The PinnedBuf owns the storage and
+            // outlives the scope.
+            let wva_ptr_usize = self.pinned_a.as_ptr() as usize;
+            let wva_len = self.pinned_a.len();
+            let (h_result, size_h) = std::thread::scope(|scope| {
+                let h_handle = scope.spawn(move || {
+                    let ar_slice =
+                        unsafe { std::slice::from_raw_parts(wva_ptr_usize as *const Fr, wva_len) };
+                    self.compute_h(
+                        &witness.solution_a,
+                        &witness.solution_b,
+                        &witness.solution_c,
+                        Some(ar_slice),
+                    )
                 });
-            (wire_values_a, wire_values_b, filtered_wire_values, h_result, size_h)
+
+                // CPU: scatter the remaining two wire-value vectors into
+                // pre-pinned buffers while compute_h runs.
+                {
+                    let buf = self.pinned_b.as_mut_slice();
+                    buf.par_iter_mut()
+                        .zip(self.b_indices.par_iter())
+                        .for_each(|(dst, &i)| *dst = wv[i]);
+                }
+                {
+                    let buf = self.pinned_k.as_mut_slice();
+                    buf.par_iter_mut()
+                        .zip(self.k_indices.par_iter())
+                        .for_each(|(dst, &i)| *dst = wv[i]);
+                }
+
+                // Wait for compute_h to finish (NTTs + preupload enqueued).
+                let h_result = h_handle.join().expect("H polynomial computation panicked");
+                let size_h = n - 1;
+
+                (h_result, size_h)
+            });
+            (h_result, size_h)
         };
+
+        // On CUDA, wire_values are in pre-pinned buffers; bind local refs.
+        #[cfg(feature = "cuda")]
+        let wire_values_a = self.pinned_a.as_slice();
+        #[cfg(feature = "cuda")]
+        let wire_values_b = self.pinned_b.as_slice();
+        #[cfg(feature = "cuda")]
+        let filtered_wire_values = self.pinned_k.as_slice();
 
         #[cfg(not(feature = "cuda"))]
         let (wire_values_a, wire_values_b, filtered_wire_values, h_result, size_h) = {
@@ -616,22 +704,8 @@ impl Groth16Prover {
             (bs2, bs1, krs_msm, krs2_msm)
         });
 
-        // Unpin scalar buffers now that all MSMs have consumed them.
-        #[cfg(feature = "cuda")]
-        {
-            use std::ffi::c_void;
-            unsafe {
-                let _ = sp1_gpu_sys::runtime::cuda_host_unregister(
-                    wire_values_a.as_ptr() as *const c_void
-                );
-                let _ = sp1_gpu_sys::runtime::cuda_host_unregister(
-                    wire_values_b.as_ptr() as *const c_void
-                );
-                let _ = sp1_gpu_sys::runtime::cuda_host_unregister(
-                    filtered_wire_values.as_ptr() as *const c_void
-                );
-            }
-        }
+        // (Pre-pinned buffers stay pinned for the lifetime of the prover —
+        // no per-prove unpin needed.)
 
         // Krs = krs + krs2 + s*Ar + r*Bs1 + kr*Delta
         let s_ar = g1_scalar_mul(&ar, &s);
@@ -794,17 +868,15 @@ impl Groth16Prover {
         );
         assert!(!d_temp.is_null(), "GPU H polynomial: ntt temp cuda_malloc returned null");
 
-        // Batch 3 iNTTs + 3 coset NTTs (with shared temp buffer — no per-NTT hipMalloc)
+        // Fused 3× (iNTT + coset NTT): eliminates 3 redundant memory passes
+        // by combining the N^{-1} scale (iNTT epilogue) and coset pre-multiply
+        // (coset NTT prologue) into a single kernel per polynomial.
         unsafe {
             check_gpu(
-                sp1_gpu_sys::dft_bn254::batch_iNTT_bn254_with_temp(d_a, lg_n, 3, stream, d_temp),
-                "batch_iNTT(A,B,C)",
-            );
-            check_gpu(
-                sp1_gpu_sys::dft_bn254::batch_coset_NTT_bn254_with_temp(
+                sp1_gpu_sys::dft_bn254::batch_iNTT_coset_NTT_fused_bn254_with_temp(
                     d_a, lg_n, 3, stream, d_temp,
                 ),
-                "batch_coset_NTT(A,B,C)",
+                "batch_iNTT_coset_NTT_fused(A,B,C)",
             );
         }
 

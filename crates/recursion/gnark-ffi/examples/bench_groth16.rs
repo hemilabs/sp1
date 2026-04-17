@@ -31,34 +31,19 @@ use sp1_recursion_gnark_ffi::Groth16Bn254Proof;
 #[cfg(feature = "native")]
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    let default_build_dir = dirs::home_dir()
-        .expect("no home dir")
-        .join(".sp1/circuits/groth16/v6.0.0");
-    let build_dir: PathBuf = args
-        .get(1)
-        .map(PathBuf::from)
-        .unwrap_or(default_build_dir);
-    let iterations: usize = args
-        .get(2)
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(3);
+    let default_build_dir =
+        dirs::home_dir().expect("no home dir").join(".sp1/circuits/groth16/v6.0.0");
+    let build_dir: PathBuf = args.get(1).map(PathBuf::from).unwrap_or(default_build_dir);
+    let iterations: usize = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(3);
 
     println!("=== Groth16 Prover Benchmark ===");
     println!("build_dir:   {}", build_dir.display());
     println!("iterations:  {iterations}");
     println!();
 
-    assert!(
-        build_dir.exists(),
-        "build_dir does not exist: {}",
-        build_dir.display()
-    );
+    assert!(build_dir.exists(), "build_dir does not exist: {}", build_dir.display());
     let witness_path = build_dir.join("groth16_witness.json");
-    assert!(
-        witness_path.exists(),
-        "witness file does not exist: {}",
-        witness_path.display()
-    );
+    assert!(witness_path.exists(), "witness file does not exist: {}", witness_path.display());
 
     // Load the witness JSON once. We'll copy it to a temp file per iteration to
     // mimic how prove_gpu / prove_groth16_bn254 are actually invoked.
@@ -103,9 +88,8 @@ fn main() {
         println!("[{gpu_label}] one-time PK export: {export_pk_elapsed:?}");
 
         let t = Instant::now();
-        let proving_data =
-            sp1_gpu_groth16::types::Groth16ProvingData::load(gpu_dir_str)
-                .expect("load proving data");
+        let proving_data = sp1_gpu_groth16::types::Groth16ProvingData::load(gpu_dir_str)
+            .expect("load proving data");
         let load_pk_elapsed = t.elapsed();
         println!("[{gpu_label}] one-time PK load:   {load_pk_elapsed:?}");
 
@@ -117,10 +101,8 @@ fn main() {
             // Every iteration we re-run witness solve (Go) + witness load (Rust)
             // + the actual prove. The solve is small compared to the prove and
             // matches production use where each proof has a fresh witness.
-            let witness_temp =
-                tempfile::NamedTempFile::new().expect("temp witness file");
-            std::fs::write(witness_temp.path(), &witness_json)
-                .expect("write witness");
+            let witness_temp = tempfile::NamedTempFile::new().expect("temp witness file");
+            std::fs::write(witness_temp.path(), &witness_json).expect("write witness");
 
             let t = Instant::now();
             sp1_recursion_gnark_ffi::ffi::export_groth16_gpu_witness(
@@ -131,9 +113,8 @@ fn main() {
             let solve_elapsed = t.elapsed();
 
             let t = Instant::now();
-            let witness_data =
-                sp1_gpu_groth16::types::Groth16WitnessData::load(gpu_dir_str)
-                    .expect("load witness data");
+            let witness_data = sp1_gpu_groth16::types::Groth16WitnessData::load(gpu_dir_str)
+                .expect("load witness data");
             let wload_elapsed = t.elapsed();
 
             let t = Instant::now();
@@ -151,19 +132,14 @@ fn main() {
                 gnark_witness.proof_nonce.clone(),
             ];
             let solidity_proof_bytes = gpu_proof.to_solidity_bytes();
-            let mut encoded_bytes =
-                Vec::with_capacity(96 + solidity_proof_bytes.len());
-            for field in [
-                &gnark_witness.exit_code,
-                &gnark_witness.vk_root,
-                &gnark_witness.proof_nonce,
-            ] {
-                let val =
-                    field.parse::<BigUint>().expect("parse public input");
+            let mut encoded_bytes = Vec::with_capacity(96 + solidity_proof_bytes.len());
+            for field in
+                [&gnark_witness.exit_code, &gnark_witness.vk_root, &gnark_witness.proof_nonce]
+            {
+                let val = field.parse::<BigUint>().expect("parse public input");
                 let be_bytes = val.to_bytes_be();
                 let padding = 32usize.saturating_sub(be_bytes.len());
-                encoded_bytes
-                    .extend(std::iter::repeat(0u8).take(padding));
+                encoded_bytes.extend(std::iter::repeat(0u8).take(padding));
                 encoded_bytes.extend(&be_bytes[be_bytes.len().saturating_sub(32)..]);
             }
             encoded_bytes.extend(&solidity_proof_bytes);
@@ -202,8 +178,7 @@ fn main() {
     let mut go_times = Vec::with_capacity(iterations);
     let mut go_proof: Option<Groth16Bn254Proof> = None;
     for i in 0..iterations {
-        let witness_temp =
-            tempfile::NamedTempFile::new().expect("temp witness file");
+        let witness_temp = tempfile::NamedTempFile::new().expect("temp witness file");
         std::fs::write(witness_temp.path(), &witness_json).expect("write witness");
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let t = Instant::now();
@@ -220,11 +195,7 @@ fn main() {
                 go_proof = Some(proof);
             }
             Err(_) => {
-                println!(
-                    "[{}] iter {}: PANICKED — stopping Go path.",
-                    go_path_label,
-                    i + 1
-                );
+                println!("[{}] iter {}: PANICKED — stopping Go path.", go_path_label, i + 1);
                 break;
             }
         }
@@ -241,14 +212,8 @@ fn main() {
     // must all verify against the same vk — we just print proof hex lengths).
     if let (Some(go), Some(gpu)) = (go_proof.as_ref(), gpu_proof.as_ref()) {
         println!();
-        println!(
-            "Go path raw_proof length: {} hex chars",
-            go.raw_proof.len()
-        );
-        println!(
-            "Ours    raw_proof length: {} hex chars",
-            gpu.raw_proof.len()
-        );
+        println!("Go path raw_proof length: {} hex chars", go.raw_proof.len());
+        println!("Ours    raw_proof length: {} hex chars", gpu.raw_proof.len());
     }
 }
 
@@ -274,7 +239,5 @@ fn print_stats(label: &str, times: &[std::time::Duration]) {
     let median = sorted[sorted.len() / 2];
     let max = sorted[sorted.len() - 1];
     let mean = sorted.iter().sum::<std::time::Duration>() / (sorted.len() as u32);
-    println!(
-        "{label:30}  min={min:?}  median={median:?}  mean={mean:?}  max={max:?}"
-    );
+    println!("{label:30}  min={min:?}  median={median:?}  mean={mean:?}  max={max:?}");
 }

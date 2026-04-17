@@ -213,6 +213,14 @@ extern "C" rustCudaError_t batch_coset_iNTT_bn254_with_temp(
     void* d_inout, uint32_t lg, uint32_t poly_count, const cudaStream_t s, void*) {
     return batch_coset_iNTT_bn254(reinterpret_cast<fr_t*>(d_inout), lg, poly_count, s);
 }
+// Fused iNTT + coset NTT: on CUDA/sppark, just call the two separate functions
+// (sppark's NTT already fuses scale internally, so there's no extra kernel to eliminate).
+extern "C" rustCudaError_t batch_iNTT_coset_NTT_fused_bn254_with_temp(
+    void* d_inout, uint32_t lg, uint32_t poly_count, const cudaStream_t s, void*) {
+    rustCudaError_t err = batch_iNTT_bn254(reinterpret_cast<fr_t*>(d_inout), lg, poly_count, s);
+    if (err.message != CUDA_SUCCESS_CSL.message) return err;
+    return batch_coset_NTT_bn254(reinterpret_cast<fr_t*>(d_inout), lg, poly_count, s);
+}
 
 /// No-op on CUDA. On HIP, precomputes twiddle factor values on CPU only.
 extern "C" void bn254_ntt_precompute_host(uint32_t lg_n, bool inverse) {}

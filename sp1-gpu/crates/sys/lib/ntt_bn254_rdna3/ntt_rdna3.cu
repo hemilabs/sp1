@@ -396,11 +396,26 @@ __global__ void bn254_coset_mul_kernel(
     d_data[idx] = d_data[idx] * factor;
 }
 
+// Fused scale + coset pre-multiply: d_data[i] *= scale * coset_lo[i & 0x3FFF] * coset_hi[i >> 14]
+// Eliminates one redundant memory pass when iNTT is followed by coset NTT.
+__global__ void bn254_scale_coset_mul_kernel(
+    fr_t* d_data, fr_t scale,
+    const fr_t* coset_lo, const fr_t* coset_hi, uint32_t n
+) {
+    uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+    fr_t factor = scale * (coset_lo[idx & 0x3FFFu] * coset_hi[idx >> 14]);
+    d_data[idx] = d_data[idx] * factor;
+}
+
 // d_temp_ext: optional pre-allocated temp buffer (N elements). If non-null,
 // the NTT uses it instead of hipMalloc. Caller manages lifetime.
+// skip_inv_scale: if true and inverse=true, skip the N^{-1} scale kernel.
+//   Used by the fused iNTT+cosetNTT path which replaces the separate scale
+//   and coset_mul kernels with a single fused kernel.
 static rustCudaError_t run_ntt_four_step(
     fr_t* d_inout, uint32_t lg_n, bool inverse, bool coset, hipStream_t stream,
-    fr_t* d_temp_ext = nullptr
+    fr_t* d_temp_ext = nullptr, bool skip_inv_scale = false
 ) {
     uint32_t N = 1u << lg_n;
 
@@ -561,8 +576,8 @@ static rustCudaError_t run_ntt_four_step(
         CUDA_OK(hipGetLastError());
     }
 
-    // Inverse: scale by N^{-1}
-    if (inverse) {
+    // Inverse: scale by N^{-1} (skipped when fused with coset NTT)
+    if (inverse && !skip_inv_scale) {
         // N_inv in Montgomery form: compute 2^{-lg_n} mod r
         // domain_size_inverse[lg_n] from alt_bn128.h has this, but it's in
         // sppark's fr_t format (vec256). We need to convert.
@@ -718,6 +733,72 @@ extern "C" rustCudaError_t batch_coset_iNTT_bn254_with_temp(
     for (uint32_t p = 0; p < poly_count; p++) {
         rustCudaError_t err = run_ntt_four_step(d_inout + p * domain_size,
             lg_domain_size, true, true, stream, (fr_t*)d_temp);
+        if (err.message != CUDA_SUCCESS_CSL.message) return err;
+    }
+    return CUDA_SUCCESS_CSL;
+}
+
+// Fused iNTT + coset NTT: replaces separate batch_iNTT + batch_coset_NTT calls.
+// For each polynomial, runs iNTT (without N^{-1} scale), then a single fused
+// scale×coset_mul kernel, then forward NTT (without coset pre-multiply).
+// Saves one memory pass per polynomial (~17ms × poly_count at N=16M).
+extern "C" rustCudaError_t batch_iNTT_coset_NTT_fused_bn254_with_temp(
+    fr_t* d_inout, uint32_t lg_domain_size, uint32_t poly_count,
+    const hipStream_t stream, void* d_temp
+) {
+    if (lg_domain_size == 0 || poly_count == 0) return CUDA_SUCCESS_CSL;
+    uint32_t domain_size = 1u << lg_domain_size;
+
+    // Precompute N^{-1} in Montgomery form on CPU (same as run_ntt_four_step).
+    uint32_t n_inv[8];
+    uint32_t n_mont[8] = {domain_size, 0, 0, 0, 0, 0, 0, 0};
+    cpu_mont_mul(n_mont, n_mont, host_bn254::rRR);
+    uint64_t r_m2[4] = {
+        0x43e1f593f0000001ULL - 2, 0x2833e84879b97091ULL,
+        0xb85045b68181585dULL, 0x30644e72e131a029ULL
+    };
+    memcpy(n_inv, host_bn254::rone, 32);
+    uint32_t base_n[8];
+    memcpy(base_n, n_mont, 32);
+    for (int w = 0; w < 4; w++) {
+        uint64_t ew = r_m2[w];
+        for (int b = 0; b < 64; b++) {
+            if (ew & 1) cpu_mont_mul(n_inv, n_inv, base_n);
+            cpu_mont_mul(base_n, base_n, base_n);
+            ew >>= 1;
+        }
+    }
+    fr_t scale;
+    memcpy(scale.data, n_inv, 32);
+
+    // Ensure coset tables are ready.
+    rustCudaError_t err = ensure_twiddles(lg_domain_size);
+    if (err.message != CUDA_SUCCESS_CSL.message) return err;
+    if (g_cache.d_fwd_coset_lo == nullptr) {
+        return rustCudaError_t{.message = "RDNA3 NTT: coset tables not initialized"};
+    }
+
+    uint32_t threads = 256;
+    uint32_t blocks = (domain_size + threads - 1) / threads;
+
+    for (uint32_t p = 0; p < poly_count; p++) {
+        fr_t* d_poly = d_inout + p * domain_size;
+
+        // Step 1: iNTT without N^{-1} scale
+        err = run_ntt_four_step(d_poly, lg_domain_size, true, false, stream,
+                                (fr_t*)d_temp, /*skip_inv_scale=*/true);
+        if (err.message != CUDA_SUCCESS_CSL.message) return err;
+
+        // Step 2: Fused scale × coset_mul (one kernel, one memory pass)
+        hipLaunchKernelGGL(bn254_scale_coset_mul_kernel,
+            dim3(blocks), dim3(threads), 0, stream,
+            d_poly, scale, g_cache.d_fwd_coset_lo, g_cache.d_fwd_coset_hi, domain_size);
+        hipError_t herr = hipGetLastError();
+        if (herr != hipSuccess)
+            return rustCudaError_t{.message = hipGetErrorString(herr)};
+
+        // Step 3: Forward NTT (no coset pre-multiply — already applied)
+        err = run_ntt_four_step(d_poly, lg_domain_size, false, false, stream, (fr_t*)d_temp);
         if (err.message != CUDA_SUCCESS_CSL.message) return err;
     }
     return CUDA_SUCCESS_CSL;
