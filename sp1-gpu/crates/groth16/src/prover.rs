@@ -199,6 +199,24 @@ pub struct Groth16Prover {
     pinned_b: PinnedBuf,
     #[cfg(feature = "cuda")]
     pinned_k: PinnedBuf,
+    /// Pre-allocated, pre-pinned host buffers for compute_h polynomial
+    /// conversion (BN254Fr -> Fr). Size = domain_size each. Eliminates
+    /// ~510ms per-prove overhead from allocating+zeroing 3 x 512MB Vecs.
+    /// Pinned so that H2D copies use DMA at full PCIe bandwidth (~26 GB/s
+    /// pinned vs ~10 GB/s pageable on AMD).
+    #[cfg(feature = "cuda")]
+    pinned_h_a: PinnedBuf,
+    #[cfg(feature = "cuda")]
+    pinned_h_b: PinnedBuf,
+    #[cfg(feature = "cuda")]
+    pinned_h_c: PinnedBuf,
+    /// Non-CUDA fallback: pre-allocated (unpinned) host buffers.
+    #[cfg(not(feature = "cuda"))]
+    h_host_a: std::sync::Mutex<Vec<Fr>>,
+    #[cfg(not(feature = "cuda"))]
+    h_host_b: std::sync::Mutex<Vec<Fr>>,
+    #[cfg(not(feature = "cuda"))]
+    h_host_c: std::sync::Mutex<Vec<Fr>>,
 }
 
 impl Groth16Prover {
@@ -323,6 +341,35 @@ impl Groth16Prover {
             (pa, pb, pk)
         };
 
+        // Pre-allocate and pin host buffers for compute_h polynomial conversion.
+        // Each buffer is domain_size elements (512 MB for N=2^24). Eliminates
+        // ~510ms per-prove overhead from allocating+zeroing 3 x 512MB Vecs.
+        // Pinning ensures H2D copies use DMA at full PCIe bandwidth (~26 GB/s
+        // pinned vs ~10 GB/s pageable on AMD).
+        #[cfg(feature = "cuda")]
+        let (pinned_h_a, pinned_h_b, pinned_h_c) = {
+            let t = std::time::Instant::now();
+            let n = data.domain_size;
+            let pha = PinnedBuf::new(n);
+            let phb = PinnedBuf::new(n);
+            let phc = PinnedBuf::new(n);
+            eprintln!(
+                "[groth16] Pre-pinned H poly buffers: 3x{}MB: {:?}",
+                n * 32 / (1024 * 1024),
+                t.elapsed()
+            );
+            (pha, phb, phc)
+        };
+        #[cfg(not(feature = "cuda"))]
+        let (h_host_a, h_host_b, h_host_c) = {
+            let n = data.domain_size;
+            (
+                std::sync::Mutex::new(vec![Fr::ZERO; n]),
+                std::sync::Mutex::new(vec![Fr::ZERO; n]),
+                std::sync::Mutex::new(vec![Fr::ZERO; n]),
+            )
+        };
+
         Self {
             data,
             #[cfg(feature = "cuda")]
@@ -344,6 +391,18 @@ impl Groth16Prover {
             pinned_b,
             #[cfg(feature = "cuda")]
             pinned_k,
+            #[cfg(feature = "cuda")]
+            pinned_h_a,
+            #[cfg(feature = "cuda")]
+            pinned_h_b,
+            #[cfg(feature = "cuda")]
+            pinned_h_c,
+            #[cfg(not(feature = "cuda"))]
+            h_host_a,
+            #[cfg(not(feature = "cuda"))]
+            h_host_b,
+            #[cfg(not(feature = "cuda"))]
+            h_host_c,
         }
     }
 
@@ -740,33 +799,57 @@ impl Groth16Prover {
         solution_c: &[BN254Fr],
         #[cfg(feature = "cuda")] ar_preupload_scalars: Option<&[Fr]>,
     ) -> HResult {
-        let n = self.data.domain_size;
-
-        // Convert and pad to domain cardinality
-        let mut a = vec![Fr::ZERO; n];
-        let mut b = vec![Fr::ZERO; n];
-        let mut c = vec![Fr::ZERO; n];
-
-        // Convert BN254Fr to Fr in parallel
-        a[..solution_a.len()]
-            .par_iter_mut()
-            .zip(solution_a.par_iter())
-            .for_each(|(dst, src)| *dst = Fr::from_bn254fr(src));
-        b[..solution_b.len()]
-            .par_iter_mut()
-            .zip(solution_b.par_iter())
-            .for_each(|(dst, src)| *dst = Fr::from_bn254fr(src));
-        c[..solution_c.len()]
-            .par_iter_mut()
-            .zip(solution_c.par_iter())
-            .for_each(|(dst, src)| *dst = Fr::from_bn254fr(src));
+        let _n = self.data.domain_size;
 
         #[cfg(feature = "cuda")]
         {
-            HResult::Device(self.compute_h_gpu(&mut a, &mut b, &mut c, ar_preupload_scalars))
+            // Use pre-allocated, pre-pinned host buffers. Eliminates ~510ms
+            // per-prove from page-fault overhead of fresh 1.5GB allocation,
+            // AND improves H2D throughput (pinned DMA vs pageable).
+            // The tail beyond solution_a.len() stays zero from init (the
+            // circuit's constraint count is constant).
+            let a = self.pinned_h_a.as_mut_slice();
+            let b = self.pinned_h_b.as_mut_slice();
+            let c = self.pinned_h_c.as_mut_slice();
+
+            a[..solution_a.len()]
+                .par_iter_mut()
+                .zip(solution_a.par_iter())
+                .for_each(|(dst, src)| *dst = Fr::from_bn254fr(src));
+            b[..solution_b.len()]
+                .par_iter_mut()
+                .zip(solution_b.par_iter())
+                .for_each(|(dst, src)| *dst = Fr::from_bn254fr(src));
+            c[..solution_c.len()]
+                .par_iter_mut()
+                .zip(solution_c.par_iter())
+                .for_each(|(dst, src)| *dst = Fr::from_bn254fr(src));
+
+            HResult::Device(self.compute_h_gpu(a, b, c, ar_preupload_scalars))
         }
         #[cfg(not(feature = "cuda"))]
         {
+            // Non-GPU fallback: use Mutex-guarded buffers.
+            let mut a = self.h_host_a.lock().unwrap();
+            let mut b = self.h_host_b.lock().unwrap();
+            let mut c = self.h_host_c.lock().unwrap();
+
+            a[..solution_a.len()]
+                .par_iter_mut()
+                .zip(solution_a.par_iter())
+                .for_each(|(dst, src)| *dst = Fr::from_bn254fr(src));
+            a[solution_a.len()..].par_iter_mut().for_each(|dst| *dst = Fr::ZERO);
+            b[..solution_b.len()]
+                .par_iter_mut()
+                .zip(solution_b.par_iter())
+                .for_each(|(dst, src)| *dst = Fr::from_bn254fr(src));
+            b[solution_b.len()..].par_iter_mut().for_each(|dst| *dst = Fr::ZERO);
+            c[..solution_c.len()]
+                .par_iter_mut()
+                .zip(solution_c.par_iter())
+                .for_each(|(dst, src)| *dst = Fr::from_bn254fr(src));
+            c[solution_c.len()..].par_iter_mut().for_each(|dst| *dst = Fr::ZERO);
+
             HResult::Host(self.compute_h_cpu(&mut a, &mut b, &mut c))
         }
     }
