@@ -569,6 +569,23 @@ impl PersistentMsm {
     /// Skips the H2D scalar upload entirely — d_scalars must be a valid device pointer.
     /// Scalars are in Montgomery form; the GPU converts via mont_to_canonical_kernel.
     pub fn msm_device(&self, d_scalars: *const std::ffi::c_void, n: usize) -> G1Jacobian {
+        self.msm_device_with_next(d_scalars, n, None)
+    }
+
+    /// MSM with device scalars + optional concurrent H2D preupload.
+    ///
+    /// If `next_host_scalars` is `Some(slice)`, starts an async H2D upload of
+    /// those scalars on the SDMA copy_stream while the current MSM's compute
+    /// kernels run. The D2D scalar copy uses a GPU kernel (COMPUTE engine)
+    /// instead of hipMemcpy (SDMA engine), freeing the SDMA engine for the
+    /// concurrent upload. The next invoke that checks `next_upload_pending`
+    /// picks up the pre-uploaded scalars and skips its own H2D copy.
+    pub fn msm_device_with_next(
+        &self,
+        d_scalars: *const std::ffi::c_void,
+        n: usize,
+        next_host_scalars: Option<&[crate::fields::Fr]>,
+    ) -> G1Jacobian {
         use crate::{BN254Fq, BN254G1Jacobian};
         use std::ffi::c_void;
 
@@ -580,6 +597,11 @@ impl PersistentMsm {
             z: BN254Fq { limbs: [0; 8] },
         };
 
+        let (next_ptr, next_n) = match next_host_scalars {
+            Some(ns) => (ns.as_ptr() as *const c_void, ns.len()),
+            None => (std::ptr::null(), 0usize),
+        };
+
         let err = if self.use_glv {
             unsafe {
                 sp1_gpu_sys::msm::sp1_bn254_msm_invoke_glv_device(
@@ -588,9 +610,12 @@ impl PersistentMsm {
                     n,
                     d_scalars,
                     true,
+                    next_ptr,
+                    next_n,
                 )
             }
         } else {
+            // Non-GLV path doesn't support preupload — ignore next_host_scalars.
             unsafe {
                 sp1_gpu_sys::msm::sp1_bn254_msm_invoke_device(
                     self.ctx,

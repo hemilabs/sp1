@@ -109,12 +109,22 @@ extern "C" {
     ) -> CudaRustError;
 
     /// GLV-accelerated MSM with scalars already in GPU device memory.
+    ///
+    /// If `next_host_scalars` is non-null and `next_host_n > 0`, starts an
+    /// async H2D upload of those host scalars on the SDMA copy_stream while
+    /// the current MSM's compute kernels run. Uses a GPU kernel for the D2D
+    /// scalar copy (COMPUTE engine) instead of hipMemcpy D2D (SDMA engine),
+    /// freeing the SDMA engine for the concurrent H2D upload. The next
+    /// invoke that checks next_upload_pending picks up the pre-uploaded
+    /// scalars and skips its own H2D copy.
     pub fn sp1_bn254_msm_invoke_glv_device(
         ctx: *mut c_void,
         result: *mut c_void,
         npoints: usize,
         d_scalars: *const c_void,
         mont: bool,
+        next_host_scalars: *const c_void,
+        next_host_n: usize,
     ) -> CudaRustError;
 
     /// GLV-accelerated MSM with device scalars + GPU-side depadding.

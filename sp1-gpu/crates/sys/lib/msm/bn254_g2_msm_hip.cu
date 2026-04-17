@@ -1031,10 +1031,26 @@ rustCudaError_t sp1_bn254_g2_msm_invoke_glv(
         hipEventRecord(ev_start, ctx->stream);
     }
 
-    if (hipMemcpyAsync(bufs.d_scalars, scalars,
-                       (size_t)n * G2_SCALAR_LIMBS * sizeof(uint32_t),
-                       hipMemcpyHostToDevice, ctx->stream) != hipSuccess) {
-        return rustCudaError_t{.message = "hipMemcpyAsync failed in g2_msm_invoke_glv"};
+    // Check if scalars were pre-uploaded by a prior invoke_glv_device call.
+    // If so, the G1 pool's next_upload_pending flag is set and the scalars
+    // are already in d_scalars[cur_buf]. We use hipStreamWaitEvent for
+    // GPU-side cross-stream ordering (the upload ran on copy_stream; our
+    // compute runs on ctx->stream).
+    {
+        extern bool sp1_bn254_glv_pool_check_pending(hipEvent_t* out_event);
+        hipEvent_t upload_event = nullptr;
+        bool pending = sp1_bn254_glv_pool_check_pending(&upload_event);
+        if (pending && upload_event) {
+            // GPU-side wait: ctx->stream waits until upload_event is recorded.
+            hipStreamWaitEvent(ctx->stream, upload_event, 0);
+            // Scalars already in bufs.d_scalars — skip H2D.
+        } else {
+            if (hipMemcpyAsync(bufs.d_scalars, scalars,
+                               (size_t)n * G2_SCALAR_LIMBS * sizeof(uint32_t),
+                               hipMemcpyHostToDevice, ctx->stream) != hipSuccess) {
+                return rustCudaError_t{.message = "hipMemcpyAsync failed in g2_msm_invoke_glv"};
+            }
+        }
     }
 
     if (mont) {

@@ -631,9 +631,14 @@ impl Groth16Prover {
             g1_msm_ark_verify("Krs", &self.data.pk_g1_k, &filtered_wire_values, &krs_msm);
 
             let t = std::time::Instant::now();
-            // Krs2: scalars pre-uploaded during Krs (if host). No next.
+            // Krs2: scalars pre-uploaded during Krs (if host).
+            // On the device path, pass wire_values_b as next_host_scalars so
+            // the SDMA engine uploads G2 scalars concurrently with Krs2's
+            // compute kernels (GPU kernel D2D frees the SDMA engine).
             let krs2_msm = match &h_result {
-                HResult::Device(dh) => self.persistent_g1_z.msm_device(dh.ptr, size_h),
+                HResult::Device(dh) => self.persistent_g1_z.msm_device_with_next(
+                    dh.ptr, size_h, Some(&wire_values_b),
+                ),
                 HResult::Host(h) => self.persistent_g1_z.msm(&h[..size_h]),
             };
             eprintln!("[T] 5d. Krs2 MSM (N={}): {:?}", size_h, t.elapsed());

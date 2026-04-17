@@ -17,6 +17,18 @@ using namespace bn254_msm;
 // Profiling infrastructure
 // ============================================================
 
+// GPU kernel memcpy: copies data using the COMPUTE engine (not SDMA).
+// On gfx1100 (RDNA3), hipMemcpy D2D uses the SDMA engine which contends
+// with concurrent H2D transfers. This kernel uses the compute CUs instead,
+// allowing SDMA to run a concurrent H2D upload without contention.
+// Each thread copies one uint4 (16 bytes). Total elements = byte_count / 16.
+__global__ void gpu_memcpy_u4_kernel(uint4* __restrict__ dst,
+                                      const uint4* __restrict__ src,
+                                      size_t count) {
+    size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < count) dst[i] = src[i];
+}
+
 // Helper kernel: initialize index array
 __global__ void init_indices_kernel(uint32_t* indices, int n) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -949,6 +961,21 @@ rustCudaError_t sp1_bn254_msm_preupload_scalars(
     return CUDA_SUCCESS_CSL;
 }
 
+/// Check and consume the GLV pool's pending upload flag. Returns true if
+/// an upload was pending (and clears the flag). If true, *out_event is set
+/// to the upload_done event that the caller must synchronise against
+/// (GPU-side via hipStreamWaitEvent, NOT host-side hipEventSynchronize).
+extern "C"
+bool sp1_bn254_glv_pool_check_pending(hipEvent_t* out_event) {
+    if (!g_glv_pool || !g_glv_pool->next_upload_pending) {
+        if (out_event) *out_event = nullptr;
+        return false;
+    }
+    if (out_event) *out_event = g_glv_pool->upload_done;
+    g_glv_pool->next_upload_pending = false;
+    return true;
+}
+
 // Lazily allocate or grow the global GLV working-buffer pool so it can serve
 // any context with base point count <= max_n. If the pool already exists and
 // is at least as large as requested, this is a cheap no-op.
@@ -1259,9 +1286,18 @@ rustCudaError_t sp1_bn254_msm_invoke_glv(void* ctx_ptr, void* result,
 }
 
 /// GLV-accelerated MSM with scalars already on GPU device memory.
+///
+/// If `next_host_scalars` is non-null and `next_host_n > 0`, starts an async
+/// H2D upload of those host scalars on the SDMA copy_stream while the compute
+/// kernels run. Uses a GPU kernel for the D2D scalar copy (COMPUTE engine)
+/// instead of hipMemcpy D2D (SDMA engine), so the SDMA engine is free for the
+/// concurrent H2D upload. The uploaded scalars land in d_scalars[1-cur_buf];
+/// the next invoke that checks next_upload_pending picks them up and skips its
+/// own H2D copy.
 extern "C"
 rustCudaError_t sp1_bn254_msm_invoke_glv_device(void* ctx_ptr, void* result,
-                                                  size_t npoints, const void* d_scalars, bool mont)
+                                                  size_t npoints, const void* d_scalars, bool mont,
+                                                  const void* next_host_scalars, size_t next_host_n)
 {
     auto* ctx = reinterpret_cast<hip_msm_context*>(ctx_ptr);
     int n = (int)npoints;
@@ -1280,9 +1316,32 @@ rustCudaError_t sp1_bn254_msm_invoke_glv_device(void* ctx_ptr, void* result,
         gp->next_upload_pending = false;
     }
 
-    // D2D copy scalars into shared pool buffer (use current buffer)
+    // D2D copy scalars into shared pool buffer using GPU kernel (COMPUTE engine).
+    // This leaves the SDMA engine free for a concurrent H2D upload below.
     uint32_t* my_scalars = gp->d_scalars[gp->cur_buf];
-    CUDA_OK(hipMemcpy(my_scalars, d_scalars, n * SCALAR_LIMBS * elem32, hipMemcpyDeviceToDevice));
+    {
+        size_t total_bytes = (size_t)n * SCALAR_LIMBS * elem32;
+        size_t u4_count = total_bytes / sizeof(uint4);  // 16 bytes per uint4
+        int threads = 256;
+        int blocks = (int)((u4_count + threads - 1) / threads);
+        hipLaunchKernelGGL(gpu_memcpy_u4_kernel,
+            dim3(blocks), dim3(threads), 0, 0,
+            (uint4*)my_scalars, (const uint4*)d_scalars, u4_count);
+        CUDA_OK(hipGetLastError());
+    }
+
+    // Start concurrent H2D upload of next scalars on SDMA while compute runs.
+    // This must happen AFTER the GPU kernel D2D (which uses cur_buf) so the
+    // SDMA upload targets the OTHER buffer without conflict.
+    if (next_host_scalars && next_host_n > 0 && (int)next_host_n <= gp->alloc_n) {
+        int next_buf = 1 - gp->cur_buf;
+        hipMemcpyAsync(gp->d_scalars[next_buf], next_host_scalars,
+                       next_host_n * SCALAR_LIMBS * elem32,
+                       hipMemcpyHostToDevice, gp->copy_stream);
+        hipEventRecord(gp->upload_done, gp->copy_stream);
+        gp->cur_buf = next_buf;
+        gp->next_upload_pending = true;
+    }
 
     // Montgomery conversion
     if (mont) {
