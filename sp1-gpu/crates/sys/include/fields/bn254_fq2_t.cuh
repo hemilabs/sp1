@@ -39,7 +39,11 @@ struct bn254_fq2_t {
     }
 
     // Multiplication via Karatsuba: (a0+a1u)(b0+b1u) = (a0b0-a1b1) + ((a0+a1)(b0+b1)-a0b0-a1b1)u
-    __device__ __forceinline__ bn254_fq2_t operator*(const bn254_fq2_t& b) const {
+    // __noinline__: Same trick as G1's Fq mul — pushes the 3 Fq mul temps and
+    // 5 Fq add/sub temps into the callee frame, reducing VGPR pressure in the
+    // G2 accumulate/merge kernels. G2 accumulate was at 255 VGPRs (1 wave/SIMD)
+    // with __forceinline__; this may drop enough for 2 waves.
+    __device__ __noinline__ bn254_fq2_t operator*(const bn254_fq2_t& b) const {
         bn254_fq_t v0 = c0 * b.c0;
         bn254_fq_t v1 = c1 * b.c1;
         bn254_fq_t t  = (c0 + c1) * (b.c0 + b.c1);
@@ -50,7 +54,7 @@ struct bn254_fq2_t {
     }
 
     // Complex squaring: (a+bu)^2 = (a+b)(a-b) + 2abu
-    __device__ __forceinline__ bn254_fq2_t sqr() const {
+    __device__ __noinline__ bn254_fq2_t sqr() const {
         bn254_fq_t t0 = c0 + c1;
         bn254_fq_t t1 = c0 - c1;
         bn254_fq_t ab = c0 * c1;

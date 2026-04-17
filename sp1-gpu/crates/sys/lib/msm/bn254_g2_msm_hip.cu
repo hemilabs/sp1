@@ -187,6 +187,7 @@ __global__ void g2_bucket_accumulate_parallel_kernel(
 // Fully XYZZ end-to-end: no Jacobian/XYZZ coordinate conversion.
 // XYZZ += XYZZ is 12M + 2S in Fq2 (vs Jacobian 12M + 4S).
 // ================================================================
+__launch_bounds__(256, 1)
 __global__ void g2_merge_partial_sums_kernel(
     const bn254_g2_xyzz_t* __restrict__ partial_sums,
     bn254_g2_xyzz_t* __restrict__ buckets_xyzz,
@@ -215,6 +216,7 @@ __global__ void g2_merge_partial_sums_kernel(
 // ================================================================
 static constexpr int G2_REDUCE_BLOCK_SIZE = 64;
 
+__launch_bounds__(256, 1)
 __global__ void g2_reduce_phase1_kernel(
     const bn254_g2_xyzz_t* __restrict__ buckets_xyzz,
     bn254_g2_t* __restrict__ local_partials,
