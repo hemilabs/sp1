@@ -296,19 +296,28 @@ __global__ void bucket_accumulate_parallel_kernel(
     bn254_g1_xyzz_t accum;
     accum.set_infinity();
 
+    // Skip identity points in the SRS (e.g. Groth16 K array has zero entries).
     uint32_t i = par_id;
-    if (i < count) {
+    while (i < count) {
         uint32_t pt_idx = sorted_indices[offset + i];
         bn254_g1_affine_t p = points[pt_idx];
+        if (p.is_infinity()) { i += BUCKET_PAR; continue; }
         if (sorted_signs[offset + i]) p.y = -p.y;
         accum.from_affine(p);
         i += BUCKET_PAR;
+        break;
     }
 
     for (; i < count; i += BUCKET_PAR) {
         uint32_t pt_idx = sorted_indices[offset + i];
         bn254_g1_affine_t p = points[pt_idx];
-        accum.add_affine_unsafe_signed(p, sorted_signs[offset + i]);
+        if (p.is_infinity()) continue;  // skip identity SRS entries
+        if (accum.is_infinity()) {
+            if (sorted_signs[offset + i]) p.y = -p.y;
+            accum.from_affine(p);
+        } else {
+            accum.add_affine_unsafe_signed(p, sorted_signs[offset + i]);
+        }
     }
 
     // Transposed layout: [par_id][bucket_id] — see packed-kernel comment below.
@@ -437,14 +446,21 @@ __global__ void bucket_accumulate_parallel_packed_kernel(
     accum.set_infinity();
 
     uint32_t i = par_id;
-    // First point: initialize accumulator from affine
-    if (i < count) {
+    // First point: initialize accumulator from affine.
+    // Skip identity (0,0) points — some SRS arrays (e.g. Groth16's K)
+    // contain identity entries for unused constraints.
+    while (i < count) {
         uint32_t packed = sorted_packed_indices[offset + i];
         uint32_t pt_idx = packed & 0x7FFFFFFFu;
         bn254_g1_affine_t p = points[pt_idx];
+        if (p.is_infinity()) {
+            i += BUCKET_PAR;
+            continue;
+        }
         if (packed >> 31) p.y = -p.y;
         accum.from_affine(p);
         i += BUCKET_PAR;
+        break;
     }
 
     // Remaining points: double-buffered load to overlap memory latency
@@ -469,8 +485,16 @@ __global__ void bucket_accumulate_parallel_packed_kernel(
                 next_p = points[next_pt_idx]; // issued NOW, completes during add below
             }
 
-            // Process current point
-            accum.add_affine_unsafe_signed(p, packed >> 31);
+            // Process current point (skip identity)
+            if (!p.is_infinity()) {
+                if (accum.is_infinity()) {
+                    bn254_g1_affine_t q = p;
+                    if (packed >> 31) q.y = -q.y;
+                    accum.from_affine(q);
+                } else {
+                    accum.add_affine_unsafe_signed(p, packed >> 31);
+                }
+            }
 
             if (!has_next) break;
 
