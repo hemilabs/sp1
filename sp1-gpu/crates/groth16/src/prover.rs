@@ -762,6 +762,13 @@ impl Groth16Prover {
             })
         };
 
+        // Non-CUDA path: compute Ar MSM on CPU before the scope.
+        #[cfg(not(feature = "cuda"))]
+        let ar = {
+            let ar_msm = self.g1_msm(&self.data.pk_g1_a, &wire_values_a);
+            ar_msm.add(&g1_alpha.to_jacobian()).add(&r_delta)
+        };
+
         #[cfg(not(feature = "cuda"))]
         let (bs2, bs1, krs_msm, krs2_msm) = std::thread::scope(|scope| {
             let g2_handle = scope.spawn(|| {
