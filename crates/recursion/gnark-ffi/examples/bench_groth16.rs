@@ -207,13 +207,130 @@ fn main() {
     #[cfg(feature = "cuda")]
     print_stats("Ours (prove only)", &gpu_times);
 
-    // Sanity check: both paths should have produced the same proof bytes (the
-    // Groth16 scheme uses randomness, so raw_proof differs per call, but Ar/Bs/Krs
-    // must all verify against the same vk — we just print proof hex lengths).
+    // ========================================================================
+    // Byte-by-byte comparison + on-curve checks (before Go verify which may abort)
+    // ========================================================================
     if let (Some(go), Some(gpu)) = (go_proof.as_ref(), gpu_proof.as_ref()) {
-        println!();
-        println!("Go path raw_proof length: {} hex chars", go.raw_proof.len());
-        println!("Ours    raw_proof length: {} hex chars", gpu.raw_proof.len());
+        eprintln!();
+        eprintln!("Go raw_proof len: {} hex chars", go.raw_proof.len());
+        eprintln!("GPU raw_proof len: {} hex chars", gpu.raw_proof.len());
+
+        let go_bytes = hex::decode(&go.raw_proof).expect("decode go hex");
+        let gpu_bytes = hex::decode(&gpu.raw_proof).expect("decode gpu hex");
+
+        if go_bytes == gpu_bytes {
+            eprintln!("raw_proof: IDENTICAL");
+        } else {
+            eprintln!("raw_proof: DIFFERENT (expected — random r,s)");
+            let regions: &[(&str, usize, usize)] = &[
+                ("Ar  (G1)", 0, 64),
+                ("Bs  (G2)", 64, 192),
+                ("Krs (G1)", 192, 256),
+            ];
+            for &(name, start, end) in regions {
+                let end = end.min(go_bytes.len()).min(gpu_bytes.len());
+                if start >= end { continue; }
+                if go_bytes[start..end] == gpu_bytes[start..end] {
+                    eprintln!("  {name}: identical");
+                } else {
+                    eprintln!("  {name}: differs");
+                }
+            }
+            if go_bytes.len() > 256 && gpu_bytes.len() > 256 {
+                if go_bytes[256..] == gpu_bytes[256..] {
+                    eprintln!("  Tail: identical");
+                } else {
+                    eprintln!("  Tail: differs");
+                }
+            }
+        }
+    }
+
+    // G1 on-curve check
+    let p = BigUint::parse_bytes(
+        b"30644e72e131a029b85045b68181585d97816a916871ca8d3c208c16d87cfd47", 16,
+    ).unwrap();
+    let b_coeff = BigUint::from(3u64);
+    let check_g1 = |label: &str, name: &str, data: &[u8]| {
+        let x = BigUint::from_bytes_be(&data[..32]);
+        let y = BigUint::from_bytes_be(&data[32..64]);
+        if x == BigUint::from(0u64) && y == BigUint::from(0u64) {
+            eprintln!("  [{label}] {name}: identity (0,0)");
+            return;
+        }
+        let x3 = x.modpow(&BigUint::from(3u64), &p);
+        let lhs = (&x3 + &b_coeff) % &p;
+        let y2 = y.modpow(&BigUint::from(2u64), &p);
+        if lhs == y2 {
+            eprintln!("  [{label}] {name}: on-curve OK");
+        } else {
+            eprintln!("  [{label}] {name}: NOT ON CURVE");
+        }
+    };
+
+    for (label, proof_opt) in [("Go", go_proof.as_ref()), ("GPU", gpu_proof.as_ref())] {
+        if let Some(proof) = proof_opt {
+            let bytes = hex::decode(&proof.raw_proof).expect("decode hex");
+            eprintln!("=== {label} proof on-curve checks ===");
+            if bytes.len() >= 64 { check_g1(label, "Ar", &bytes[0..64]); }
+            if bytes.len() >= 256 { check_g1(label, "Krs", &bytes[192..256]); }
+            // Commitments + CommitmentPok
+            if bytes.len() > 260 {
+                let n_c = u32::from_be_bytes(bytes[256..260].try_into().unwrap()) as usize;
+                eprintln!("  [{label}] Commitments: {n_c}");
+                let tail_needed = 260 + n_c * 64 + 64;
+                if bytes.len() >= tail_needed {
+                    for i in 0..n_c {
+                        let off = 260 + i * 64;
+                        check_g1(label, &format!("Commit[{i}]"), &bytes[off..off+64]);
+                    }
+                    let pok_off = 260 + n_c * 64;
+                    check_g1(label, "CommitPok", &bytes[pok_off..pok_off+64]);
+                }
+            }
+        }
+    }
+
+    // ========================================================================
+    // Go gnark verification (last — may abort on invalid proofs)
+    // ========================================================================
+    let vkey_hash = gnark_witness.vkey_hash.parse::<BigUint>().expect("parse vkey_hash");
+    let committed_values_digest = gnark_witness.committed_values_digest
+        .parse::<BigUint>().expect("parse committed_values_digest");
+    let exit_code_bu = gnark_witness.exit_code.parse::<BigUint>().expect("parse exit_code");
+    let vk_root_bu = gnark_witness.vk_root.parse::<BigUint>().expect("parse vk_root");
+    let proof_nonce_bu = gnark_witness.proof_nonce.parse::<BigUint>().expect("parse proof_nonce");
+
+    let groth16_vkey_hash =
+        sp1_recursion_gnark_ffi::Groth16Bn254Prover::get_vkey_hash(&build_dir);
+
+    if let Some(go) = go_proof.as_ref() {
+        let mut pf = go.clone();
+        pf.groth16_vkey_hash = groth16_vkey_hash;
+        match sp1_recursion_gnark_ffi::Groth16Bn254Prover::new().verify(
+            &pf, &vkey_hash, &committed_values_digest,
+            &exit_code_bu, &vk_root_bu, &proof_nonce_bu, &build_dir,
+        ) {
+            Ok(()) => eprintln!("[Go]  gnark verify: PASS"),
+            Err(e) => eprintln!("[Go]  gnark verify: FAIL -- {e}"),
+        }
+    }
+
+    #[cfg(feature = "cuda")]
+    if let Some(gpu) = gpu_proof.as_ref() {
+        eprintln!("[GPU] Attempting gnark verify...");
+        match sp1_recursion_gnark_ffi::ffi::verify_groth16_bn254(
+            build_dir.to_str().unwrap(),
+            &gpu.raw_proof,
+            &gnark_witness.vkey_hash,
+            &gnark_witness.committed_values_digest,
+            &gnark_witness.exit_code,
+            &gnark_witness.vk_root,
+            &gnark_witness.proof_nonce,
+        ) {
+            Ok(()) => eprintln!("[GPU] gnark verify: PASS"),
+            Err(e) => eprintln!("[GPU] gnark verify: FAIL -- {e}"),
+        }
     }
 }
 
