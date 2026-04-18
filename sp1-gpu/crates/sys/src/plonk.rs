@@ -120,6 +120,11 @@ extern "C" {
         n: usize,
     );
 
+    /// Convert BN254 Fr elements from canonical (non-Montgomery) to Montgomery form
+    /// in-place on GPU. Each element is multiplied by R² mod r. Used by compute_h
+    /// to convert raw BN254Fr data uploaded from host without CPU conversion.
+    pub fn bn254_canonical_to_mont(d: *mut c_void, n: usize);
+
     /// GPU-accelerated grand product (permutation polynomial Z) for BN254 PLONK.
     ///
     /// Computes Z[0] = 1, Z[i] = Z[i-1] * (num[i-1] / den[i-1]) where:

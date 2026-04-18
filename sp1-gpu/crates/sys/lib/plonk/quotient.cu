@@ -797,3 +797,22 @@ rustCudaError_t bn254_gpu_poly_eval(
     cudaFree(d_partials);
     return CUDA_SUCCESS_CSL;
 }
+
+// ============================================================
+// BN254 Fr canonical → Montgomery conversion kernel
+// ============================================================
+
+// Each thread converts one field element from canonical to Montgomery form
+// by multiplying by R² mod r. Uses the existing bn254_t type's to_montgomery().
+__global__ void bn254_canonical_to_mont_kernel(bn254_t* d, uint32_t n) {
+    uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) d[i].to_montgomery();
+}
+
+extern "C"
+void bn254_canonical_to_mont(void* data, size_t n) {
+    int threads = 256;
+    int blocks = ((int)n + threads - 1) / threads;
+    bn254_canonical_to_mont_kernel<<<blocks, threads>>>(
+        (bn254_t*)data, (uint32_t)n);
+}
