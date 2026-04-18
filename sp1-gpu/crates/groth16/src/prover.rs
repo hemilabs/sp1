@@ -457,8 +457,12 @@ impl Groth16Prover {
 
         // 1. Sample random blinding scalars r, s
         let t = std::time::Instant::now();
-        let r = fr_random();
-        let s = fr_random();
+        let (r, s) = if std::env::var("GROTH16_ZERO_BLIND").ok().as_deref() == Some("1") {
+            eprintln!("[DIAG] Using r=0, s=0 (zero blinding for debugging)");
+            (Fr::ZERO, Fr::ZERO)
+        } else {
+            (fr_random(), fr_random())
+        };
         let kr = -(r * s); // kr = -r*s
         eprintln!("[T] 1. Sample blinding scalars: {:?}", t.elapsed());
 
@@ -679,8 +683,34 @@ impl Groth16Prover {
                 HResult::Host(h) => self.persistent_g1_z.msm(&h[..size_h]),
             };
             eprintln!("[T] 5d. Krs2 MSM (N={}): {:?}", size_h, t.elapsed());
-            if let HResult::Host(h) = &h_result {
-                g1_msm_ark_verify("Krs2", &self.data.pk_g1_z, &h[..size_h], &krs2_msm);
+            match &h_result {
+                HResult::Host(h) => {
+                    g1_msm_ark_verify("Krs2", &self.data.pk_g1_z, &h[..size_h], &krs2_msm);
+                }
+                #[cfg(feature = "cuda")]
+                HResult::Device(dh) => {
+                    // Verify Krs2 on the device path: download H coefficients from GPU.
+                    if std::env::var("GROTH16_G1_VERIFY").ok().as_deref() == Some("1") {
+                        let mut h_host = vec![Fr::ZERO; size_h];
+                        let err = unsafe {
+                            sp1_gpu_sys::runtime::cuda_mem_copy_device_to_host(
+                                h_host.as_mut_ptr() as *mut std::ffi::c_void,
+                                dh.ptr as *const std::ffi::c_void,
+                                size_h * std::mem::size_of::<Fr>(),
+                            )
+                        };
+                        if err == unsafe { sp1_gpu_sys::runtime::CUDA_SUCCESS_CSL } {
+                            g1_msm_ark_verify(
+                                "Krs2",
+                                &self.data.pk_g1_z,
+                                &h_host,
+                                &krs2_msm,
+                            );
+                        } else {
+                            eprintln!("[WARN] Krs2 device verify: D2H copy failed, skipping");
+                        }
+                    }
+                }
             }
 
             let t_g2 = std::time::Instant::now();
@@ -829,6 +859,63 @@ impl Groth16Prover {
             commitment_pok: witness.commitment_pok,
         };
 
+        // Self-verification: check the Groth16 pairing equation using arkworks.
+        // e(Ar, Bs) = e(alpha, beta) * e(Krs, delta)
+        // (ignoring Ci*gamma for now — public inputs not available here)
+        if std::env::var("GROTH16_PAIRING_VERIFY").ok().as_deref() == Some("1") {
+            use ark_bn254::{
+                Bn254, Fq as ArkFq, Fq2 as ArkFq2, G1Affine as ArkG1, G2Affine as ArkG2,
+            };
+            use ark_ec::pairing::Pairing;
+            use ark_ff::BigInt;
+
+            let to_ark_g1 = |p: &crate::BN254G1Affine| -> ArkG1 {
+                let x = ArkFq::new_unchecked(BigInt(crate::Fq::from_bn254fq_raw(&p.x).0));
+                let y = ArkFq::new_unchecked(BigInt(crate::Fq::from_bn254fq_raw(&p.y).0));
+                ArkG1::new_unchecked(x, y)
+            };
+            let to_ark_g2 = |p: &crate::g2::G2Affine| -> ArkG2 {
+                let x = ArkFq2::new(
+                    ArkFq::new_unchecked(BigInt(p.x.c0.0)),
+                    ArkFq::new_unchecked(BigInt(p.x.c1.0)),
+                );
+                let y = ArkFq2::new(
+                    ArkFq::new_unchecked(BigInt(p.y.c0.0)),
+                    ArkFq::new_unchecked(BigInt(p.y.c1.0)),
+                );
+                ArkG2::new_unchecked(x, y)
+            };
+
+            let ar_ark = to_ark_g1(&proof.ar);
+            let krs_ark = to_ark_g1(&proof.krs);
+            let bs_ark = to_ark_g2(&proof.bs);
+            let alpha_ark = to_ark_g1(&self.data.pk_g1_alpha);
+            let beta_ark = to_ark_g2(&self.data.pk_g2_beta);
+            let delta_ark = to_ark_g2(&self.data.pk_g2_delta);
+
+            // Check: e(Ar, Bs) ?= e(alpha, beta) * e(Krs, delta)
+            // Rearranged: e(Ar, Bs) * e(-Krs, delta) ?= e(alpha, beta)
+            let lhs = Bn254::multi_pairing(
+                [ar_ark, (-krs_ark).into()],
+                [bs_ark, delta_ark],
+            );
+            let rhs = Bn254::pairing(alpha_ark, beta_ark);
+            // Note: lhs == rhs only when Ci*gamma = identity (no public inputs).
+            // For circuits with public inputs, lhs/rhs = e(Ci, gamma) != 1.
+            // Still useful: if lhs == rhs, the proof is correct (no pub inputs issue).
+            // If lhs != rhs, the difference is e(Ci, gamma) which we can compute separately.
+            eprintln!(
+                "[groth16 pairing self-check] e(Ar,Bs)*e(-Krs,delta) == e(alpha,beta): {}",
+                lhs == rhs
+            );
+            if lhs != rhs {
+                eprintln!("  LHS (Ar,Bs combined): {:?}", lhs);
+                eprintln!("  RHS (alpha,beta):     {:?}", rhs);
+                eprintln!("  NOTE: If circuit has public inputs, the difference is e(Ci,gamma).");
+                eprintln!("  If this is false AND Krs2 MSM verified correct, the bug is in proof assembly.");
+            }
+        }
+
         eprintln!("[T] TOTAL Groth16 prove: {:?}", t_total.elapsed());
         Ok(proof)
     }
@@ -849,6 +936,38 @@ impl Groth16Prover {
         #[cfg(feature = "cuda")] ar_preupload_scalars: Option<&[Fr]>,
     ) -> HResult {
         let _n = self.data.domain_size;
+
+        #[cfg(feature = "cuda")]
+        if std::env::var("GROTH16_CPU_H").ok().as_deref() == Some("1") {
+            // Force CPU H polynomial for debugging
+            eprintln!("[DIAG] Using CPU H polynomial computation (GROTH16_CPU_H=1)");
+            let n = self.data.domain_size;
+            let mut a = vec![Fr::ZERO; n];
+            let mut b = vec![Fr::ZERO; n];
+            let mut c = vec![Fr::ZERO; n];
+            a[..solution_a.len()].par_iter_mut().zip(solution_a.par_iter())
+                .for_each(|(dst, src)| *dst = Fr::from_bn254fr(src));
+            b[..solution_b.len()].par_iter_mut().zip(solution_b.par_iter())
+                .for_each(|(dst, src)| *dst = Fr::from_bn254fr(src));
+            c[..solution_c.len()].par_iter_mut().zip(solution_c.par_iter())
+                .for_each(|(dst, src)| *dst = Fr::from_bn254fr(src));
+            // CPU H polynomial via domain NTTs (same algorithm as compute_h_cpu)
+            use sp1_gpu_plonk::domain::Domain;
+            let domain = Domain::new(n, self.data.omega);
+            let a_coeffs = domain.ifft(&a);
+            let b_coeffs = domain.ifft(&b);
+            let c_coeffs = domain.ifft(&c);
+            let coset_shift = Fr::from_u64(5);
+            let a_coset = domain.cpu_coset_fft(&a_coeffs, &coset_shift);
+            let b_coset = domain.cpu_coset_fft(&b_coeffs, &coset_shift);
+            let c_coset = domain.cpu_coset_fft(&c_coeffs, &coset_shift);
+            let g_n = fr_pow_u64(&coset_shift, n as u64);
+            let den = (g_n - Fr::ONE).inv();
+            let h_coset: Vec<Fr> = a_coset.par_iter().zip(b_coset.par_iter()).zip(c_coset.par_iter())
+                .map(|((ai, bi), ci)| (*ai * *bi - *ci) * den).collect();
+            let h = domain.cpu_coset_ifft(&h_coset, &coset_shift);
+            return HResult::Host(h);
+        }
 
         #[cfg(feature = "cuda")]
         {
@@ -1121,6 +1240,45 @@ impl Groth16Prover {
         // Now d_a[0..N] contains H. We need to keep it alive for the Krs2 MSM.
         // "Leak" the 3N buffer from the guard so it's not freed prematurely.
         // The DeviceH struct takes ownership and frees on Drop (after MSM completes).
+
+        // Diagnostic: print first few H coefficients for comparison with CPU path.
+        if std::env::var("GROTH16_H_VERIFY").ok().as_deref() == Some("1") {
+            // Synchronize to ensure H computation is complete.
+            unsafe { sp1_gpu_sys::runtime::cuda_device_synchronize(); }
+            let num_check = 8.min(n);
+            let mut h_check = vec![Fr::ZERO; num_check];
+            let err = unsafe {
+                sp1_gpu_sys::runtime::cuda_mem_copy_device_to_host(
+                    h_check.as_mut_ptr() as *mut c_void,
+                    d_a as *const c_void,
+                    num_check * elem_sz,
+                )
+            };
+            if err == unsafe { sp1_gpu_sys::runtime::CUDA_SUCCESS_CSL } {
+                eprintln!("[groth16 H verify] First {} GPU H coefficients (Montgomery Fr):", num_check);
+                for (i, h) in h_check.iter().enumerate() {
+                    eprintln!("  H[{}] = {:?}", i, h);
+                }
+                // Also print the last coefficient (should be ~0 for degree n-2 polynomial).
+                if n > 1 {
+                    let mut h_last = vec![Fr::ZERO; 1];
+                    let last_off = (n - 1) * elem_sz;
+                    let err2 = unsafe {
+                        sp1_gpu_sys::runtime::cuda_mem_copy_device_to_host(
+                            h_last.as_mut_ptr() as *mut c_void,
+                            (d_a as *const u8).add(last_off) as *const c_void,
+                            elem_sz,
+                        )
+                    };
+                    if err2 == unsafe { sp1_gpu_sys::runtime::CUDA_SUCCESS_CSL } {
+                        eprintln!("  H[{}] (last, should be 0) = {:?}", n - 1, h_last[0]);
+                    }
+                }
+            } else {
+                eprintln!("[WARN] H verify: D2H copy failed");
+            }
+        }
+
         std::mem::forget(guard_3n);
         DeviceH { ptr: d_buf, _byte_sz: 3 * byte_sz }
     }

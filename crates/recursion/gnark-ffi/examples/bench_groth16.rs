@@ -316,6 +316,23 @@ fn main() {
         }
     }
 
+    // DIAGNOSTIC: also verify Go proof through FFI to confirm the verify path works
+    if let Some(go) = go_proof.as_ref() {
+        eprintln!("[GO-FFI] Verifying Go proof through FFI path...");
+        match sp1_recursion_gnark_ffi::ffi::verify_groth16_bn254(
+            build_dir.to_str().unwrap(),
+            &go.raw_proof,
+            &gnark_witness.vkey_hash,
+            &gnark_witness.committed_values_digest,
+            &gnark_witness.exit_code,
+            &gnark_witness.vk_root,
+            &gnark_witness.proof_nonce,
+        ) {
+            Ok(()) => eprintln!("[GO-FFI] gnark verify: PASS"),
+            Err(e) => eprintln!("[GO-FFI] gnark verify: FAIL -- {e}"),
+        }
+    }
+
     #[cfg(feature = "cuda")]
     if let Some(gpu) = gpu_proof.as_ref() {
         eprintln!("[GPU] Attempting gnark verify...");
