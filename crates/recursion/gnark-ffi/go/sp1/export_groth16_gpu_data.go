@@ -14,6 +14,8 @@ import (
 	"github.com/consensys/gnark/backend/groth16"
 	groth16_bn254 "github.com/consensys/gnark/backend/groth16/bn254"
 	"github.com/consensys/gnark/constraint"
+	cs "github.com/consensys/gnark/constraint/bn254"
+	"github.com/consensys/gnark/debug"
 )
 
 // ExportGroth16GpuData exports the Groth16 proving key as flat binary files
@@ -36,6 +38,26 @@ func ExportGroth16GpuData(dataDir string, outputDir string) {
 	r1cs.ReadFrom(r1csReader)
 	r1csFile.Close()
 	fmt.Printf("[groth16-export] Reading R1CS took %s\n", time.Since(start))
+
+	// Create stripped R1CS (without debug data) for faster loading in ExportGroth16GpuWitness.
+	// DebugInfo + MDebug + SymbolTable account for ~33% of the 2.4GB file (~817MB) and are
+	// unused during proving. Stripping them reduces load time from ~20s to ~5s.
+	os.MkdirAll(outputDir, 0755)
+	strippedPath := filepath.Join(outputDir, "groth16_circuit_stripped.bin")
+	start = time.Now()
+	_r1cs := r1cs.(*cs.R1CS)
+	_r1cs.DebugInfo = nil
+	_r1cs.MDebug = nil
+	_r1cs.SymbolTable = debug.SymbolTable{}
+	strippedFile, err := os.Create(strippedPath)
+	if err != nil {
+		panic(fmt.Sprintf("Failed to create stripped R1CS: %v", err))
+	}
+	strippedWriter := bufio.NewWriterSize(strippedFile, 1024*1024)
+	r1cs.WriteTo(strippedWriter)
+	strippedWriter.Flush()
+	strippedFile.Close()
+	fmt.Printf("[groth16-export] Wrote stripped R1CS (%s) in %s\n", strippedPath, time.Since(start))
 
 	// Load proving key
 	start = time.Now()

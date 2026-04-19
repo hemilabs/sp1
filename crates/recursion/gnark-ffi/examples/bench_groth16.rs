@@ -31,6 +31,34 @@ use num_bigint::BigUint;
 use sp1_recursion_gnark_ffi::witness::GnarkWitness;
 use sp1_recursion_gnark_ffi::Groth16Bn254Proof;
 
+/// Create a temp directory in /dev/shm (tmpfs) on Linux to avoid disk I/O.
+fn shm_tempdir() -> tempfile::TempDir {
+    #[cfg(target_os = "linux")]
+    {
+        let shm = std::path::Path::new("/dev/shm");
+        if shm.exists() {
+            return tempfile::Builder::new()
+                .tempdir_in(shm)
+                .expect("failed to create temp dir in /dev/shm");
+        }
+    }
+    tempfile::TempDir::new().expect("failed to create temp dir")
+}
+
+/// Create a named temp file in /dev/shm (tmpfs) on Linux to avoid disk I/O.
+fn shm_named_tempfile() -> tempfile::NamedTempFile {
+    #[cfg(target_os = "linux")]
+    {
+        let shm = std::path::Path::new("/dev/shm");
+        if shm.exists() {
+            return tempfile::Builder::new()
+                .tempfile_in(shm)
+                .expect("failed to create temp file in /dev/shm");
+        }
+    }
+    tempfile::NamedTempFile::new().expect("failed to create temp file")
+}
+
 #[cfg(feature = "native")]
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -80,7 +108,7 @@ fn main() {
         // binary format). This matches how a production long-running prover
         // would cache the converted PK, so timing the prove step alone is the
         // fair comparison.
-        let gpu_dir = tempfile::TempDir::new().expect("temp dir");
+        let gpu_dir = shm_tempdir();
         let gpu_dir_str = gpu_dir.path().to_str().unwrap();
         let t = Instant::now();
         sp1_recursion_gnark_ffi::ffi::export_groth16_gpu_data(
@@ -104,7 +132,7 @@ fn main() {
             // Every iteration we re-run witness solve (Go) + witness load (Rust)
             // + the actual prove. The solve is small compared to the prove and
             // matches production use where each proof has a fresh witness.
-            let witness_temp = tempfile::NamedTempFile::new().expect("temp witness file");
+            let witness_temp = shm_named_tempfile();
             std::fs::write(witness_temp.path(), &witness_json).expect("write witness");
 
             let t = Instant::now();
@@ -181,7 +209,7 @@ fn main() {
     let mut go_times = Vec::with_capacity(iterations);
     let mut go_proof: Option<Groth16Bn254Proof> = None;
     for i in 0..iterations {
-        let witness_temp = tempfile::NamedTempFile::new().expect("temp witness file");
+        let witness_temp = shm_named_tempfile();
         std::fs::write(witness_temp.path(), &witness_json).expect("write witness");
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let t = Instant::now();
@@ -412,7 +440,7 @@ fn main() {
         // ---- TEST 2: Jacobian->affine->bn254 roundtrip with alpha ----
         // Take alpha, convert to Jacobian, back to affine, back to BN254, serialize
         // Compare with direct serialization of alpha
-        let gpu_data_dir = tempfile::TempDir::new().expect("temp dir");
+        let gpu_data_dir = shm_tempdir();
         let gpu_data_dir_str = gpu_data_dir.path().to_str().unwrap();
         sp1_recursion_gnark_ffi::ffi::export_groth16_gpu_data(
             build_dir.to_str().unwrap(),

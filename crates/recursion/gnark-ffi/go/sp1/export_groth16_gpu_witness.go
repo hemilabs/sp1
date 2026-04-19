@@ -25,6 +25,17 @@ import (
 	"github.com/consensys/gnark/frontend"
 )
 
+// Package-level cache for R1CS and PK used by ExportGroth16GpuWitness.
+// These are large (~20s + ~2s to load from disk) and immutable once loaded,
+// so we cache them across calls. The cache key is the dataDir path.
+var (
+	gpuWitnessMutex          sync.Mutex
+	gpuWitnessR1cs           constraint.ConstraintSystem
+	gpuWitnessR1csDataDir    string
+	gpuWitnessPk             groth16.ProvingKey
+	gpuWitnessPkDataDir      string
+)
+
 // ExportGroth16GpuWitness solves the Groth16 R1CS and exports the solved
 // witness vectors (W, A, B, C) plus BSB22 Pedersen commitments as flat
 // binary files for the Rust GPU prover.
@@ -33,31 +44,59 @@ import (
 func ExportGroth16GpuWitness(dataDir string, witnessPath string, outputDir string) {
 	start := time.Now()
 
-	// Load R1CS
+	// Load R1CS (cached across calls for the same dataDir)
 	os.Setenv("CONSTRAINTS_JSON", dataDir+"/"+constraintsJsonFile)
 	os.Setenv("GROTH16", "1")
 
-	r1cs := groth16.NewCS(ecc.BN254)
-	r1csFile, err := os.Open(dataDir + "/" + groth16CircuitPath)
-	if err != nil {
-		panic(fmt.Sprintf("Failed to open R1CS: %v", err))
-	}
-	r1csReader := bufio.NewReaderSize(r1csFile, 1024*1024)
-	r1cs.ReadFrom(r1csReader)
-	r1csFile.Close()
-	fmt.Printf("[groth16-witness] Reading R1CS took %s\n", time.Since(start))
+	gpuWitnessMutex.Lock()
+	if gpuWitnessR1cs == nil || gpuWitnessR1csDataDir != dataDir {
+		gpuWitnessR1cs = groth16.NewCS(ecc.BN254)
 
-	// Load proving key (needed for BSB22 commitment keys)
-	start = time.Now()
-	pk := groth16.NewProvingKey(ecc.BN254)
-	pkFile, err := os.Open(dataDir + "/" + groth16PkPath)
-	if err != nil {
-		panic(fmt.Sprintf("Failed to open PK: %v", err))
+		// Prefer the stripped R1CS (without debug data) created by ExportGroth16GpuData.
+		// This reduces load time from ~20s to ~5s by skipping ~817MB of unused debug info.
+		strippedPath := filepath.Join(outputDir, "groth16_circuit_stripped.bin")
+		r1csPath := dataDir + "/" + groth16CircuitPath
+		if _, err := os.Stat(strippedPath); err == nil {
+			r1csPath = strippedPath
+			fmt.Printf("[groth16-witness] Using stripped R1CS: %s\n", strippedPath)
+		}
+
+		r1csFile, err := os.Open(r1csPath)
+		if err != nil {
+			gpuWitnessMutex.Unlock()
+			panic(fmt.Sprintf("Failed to open R1CS: %v", err))
+		}
+		r1csReader := bufio.NewReaderSize(r1csFile, 1024*1024)
+		gpuWitnessR1cs.ReadFrom(r1csReader)
+		r1csFile.Close()
+		gpuWitnessR1csDataDir = dataDir
+		fmt.Printf("[groth16-witness] Reading R1CS took %s\n", time.Since(start))
+	} else {
+		fmt.Printf("[groth16-witness] Using cached R1CS (saved ~20s)\n")
 	}
-	pkReader := bufio.NewReaderSize(pkFile, 1024*1024)
-	pk.ReadDump(pkReader)
-	pkFile.Close()
-	fmt.Printf("[groth16-witness] Reading PK took %s\n", time.Since(start))
+	r1cs := gpuWitnessR1cs
+	gpuWitnessMutex.Unlock()
+
+	// Load proving key (cached across calls for the same dataDir)
+	start = time.Now()
+	gpuWitnessMutex.Lock()
+	if gpuWitnessPk == nil || gpuWitnessPkDataDir != dataDir {
+		gpuWitnessPk = groth16.NewProvingKey(ecc.BN254)
+		pkFile, err := os.Open(dataDir + "/" + groth16PkPath)
+		if err != nil {
+			gpuWitnessMutex.Unlock()
+			panic(fmt.Sprintf("Failed to open PK: %v", err))
+		}
+		pkReader := bufio.NewReaderSize(pkFile, 1024*1024)
+		gpuWitnessPk.ReadDump(pkReader)
+		pkFile.Close()
+		gpuWitnessPkDataDir = dataDir
+		fmt.Printf("[groth16-witness] Reading PK took %s\n", time.Since(start))
+	} else {
+		fmt.Printf("[groth16-witness] Using cached PK (saved ~2s)\n")
+	}
+	pk := gpuWitnessPk
+	gpuWitnessMutex.Unlock()
 
 	// Load and parse witness JSON
 	start = time.Now()
@@ -177,13 +216,16 @@ func ExportGroth16GpuWitness(dataDir string, witnessPath string, outputDir strin
 	os.MkdirAll(outputDir, 0755)
 	start = time.Now()
 
-	writeFrFile(filepath.Join(outputDir, "wire_values.bin"), solution.W)
+	// Write wire_values and h_coefficients in raw Montgomery form (skips
+	// ~79M fromMont calls here and ~31.7M mont_mul calls in Rust loader).
+	// Solution A/B/C stay canonical since they're smaller and consumed differently.
+	writeFrFileMontgomery(filepath.Join(outputDir, "wire_values.bin"), solution.W)
 	writeFrFile(filepath.Join(outputDir, "solution_a.bin"), solution.A)
 	writeFrFile(filepath.Join(outputDir, "solution_b.bin"), solution.B)
 	writeFrFile(filepath.Join(outputDir, "solution_c.bin"), solution.C)
 	writeG1File(filepath.Join(outputDir, "commitments.bin"), commitments)
 	writeG1File(filepath.Join(outputDir, "commitment_pok.bin"), []bn254.G1Affine{commitmentPok})
-	writeFrFile(filepath.Join(outputDir, "h_coefficients.bin"), h)
+	writeFrFileMontgomery(filepath.Join(outputDir, "h_coefficients.bin"), h)
 
 	fmt.Printf("[groth16-witness] Exported witness data in %s\n", time.Since(start))
 }

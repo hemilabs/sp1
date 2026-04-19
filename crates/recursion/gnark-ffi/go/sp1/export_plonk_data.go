@@ -195,6 +195,48 @@ func writeFrFile(path string, elems []fr.Element) {
 	}
 }
 
+// writeFrFileMontgomery writes Fr elements in raw Montgomery form (no fromMont
+// conversion). On x86 little-endian, each fr.Element is [4]uint64 in Montgomery
+// representation. We write a 4-byte magic header ("MFr1") followed by the raw
+// bytes of each element. The Rust loader detects this header and skips the
+// expensive canonical-to-Montgomery conversion (mont_mul with R^2).
+//
+// This saves ~79M fromMont calls in Go and ~31.7M mont_mul calls in Rust for
+// typical Groth16 witnesses (~2.5M wire values + ~1M H coefficients).
+func writeFrFileMontgomery(path string, elems []fr.Element) {
+	f, err := os.Create(path)
+	if err != nil {
+		panic(err)
+	}
+	defer f.Close()
+
+	w := bufio.NewWriterSize(f, 1024*1024)
+	defer w.Flush()
+
+	// Magic header: "MFr1" (Montgomery Fr format version 1)
+	w.Write([]byte("MFr1"))
+
+	// Write raw Montgomery limbs. fr.Element is [4]uint64; on little-endian
+	// x86, unsafe.Slice gives us the LE byte representation directly, which
+	// matches our Rust Fr([u64; 4]) layout exactly.
+	buf := make([]byte, 32)
+	for i := range elems {
+		// Access the [4]uint64 directly and write as LE bytes.
+		for j := 0; j < 4; j++ {
+			limb := elems[i][j]
+			buf[j*8+0] = byte(limb)
+			buf[j*8+1] = byte(limb >> 8)
+			buf[j*8+2] = byte(limb >> 16)
+			buf[j*8+3] = byte(limb >> 24)
+			buf[j*8+4] = byte(limb >> 32)
+			buf[j*8+5] = byte(limb >> 40)
+			buf[j*8+6] = byte(limb >> 48)
+			buf[j*8+7] = byte(limb >> 56)
+		}
+		w.Write(buf)
+	}
+}
+
 func reverseBytes(dst, src []byte) {
 	for i, j := 0, len(src)-1; i < len(src); i, j = i+1, j-1 {
 		dst[i] = src[j]

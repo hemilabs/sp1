@@ -14,6 +14,39 @@ use sp1_recursion_compiler::{
     ir::{Config, Witness},
 };
 
+/// Create a temp directory in /dev/shm (tmpfs) on Linux, falling back to the
+/// default temp dir on other platforms. This avoids disk I/O for large proving
+/// data files.
+#[cfg(feature = "native")]
+fn shm_tempdir() -> tempfile::TempDir {
+    #[cfg(target_os = "linux")]
+    {
+        let shm = std::path::Path::new("/dev/shm");
+        if shm.exists() {
+            return tempfile::Builder::new()
+                .tempdir_in(shm)
+                .expect("failed to create temp dir in /dev/shm");
+        }
+    }
+    tempfile::TempDir::new().expect("failed to create temp dir")
+}
+
+/// Create a named temp file in /dev/shm (tmpfs) on Linux, falling back to the
+/// default temp dir on other platforms.
+#[cfg(feature = "native")]
+fn shm_named_tempfile() -> tempfile::NamedTempFile {
+    #[cfg(target_os = "linux")]
+    {
+        let shm = std::path::Path::new("/dev/shm");
+        if shm.exists() {
+            return tempfile::Builder::new()
+                .tempfile_in(shm)
+                .expect("failed to create temp file in /dev/shm");
+        }
+    }
+    tempfile::NamedTempFile::new().expect("failed to create temp file")
+}
+
 /// A prover that can generate proofs with the Groth16 protocol using bindings to Gnark.
 #[derive(Debug, Clone)]
 pub struct Groth16Bn254Prover;
@@ -79,13 +112,14 @@ impl Groth16Bn254Prover {
         use crate::ffi::{export_groth16_gpu_data, export_groth16_gpu_witness};
 
         // Write witness to temp file for Go
-        let mut witness_file = tempfile::NamedTempFile::new().unwrap();
+        // Use /dev/shm (tmpfs) on Linux to avoid disk I/O overhead.
+        let mut witness_file = shm_named_tempfile();
         let gnark_witness = GnarkWitness::new(witness);
         let serialized = serde_json::to_string(&gnark_witness).unwrap();
         witness_file.write_all(serialized.as_bytes()).unwrap();
 
         // Export PK + solve R1CS + export witness via Go
-        let gpu_dir = tempfile::TempDir::new().expect("failed to create temp dir");
+        let gpu_dir = shm_tempdir();
         let gpu_dir_str = gpu_dir.path().to_str().unwrap();
         let build_dir_str = build_dir.to_str().unwrap();
 

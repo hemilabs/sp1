@@ -271,20 +271,16 @@ impl Groth16WitnessData {
     pub fn load(dir: &str) -> anyhow::Result<Self> {
         let dir = std::path::Path::new(dir);
 
-        // Pre-convert wire_values from canonical BN254Fr to Montgomery Fr at load
-        // time. This moves ~350ms of per-proof CPU work to the one-time load path.
-        let wire_values_raw = load_fr_elements(&dir.join("wire_values.bin"))?;
-        let wire_values: Vec<Fr> = wire_values_raw.par_iter().map(Fr::from_bn254fr).collect();
-        drop(wire_values_raw);
+        // Load wire_values and h_coefficients using auto-detection: if the file
+        // has the "MFr1" Montgomery magic header, the Fr values are used directly
+        // (zero conversion cost). Otherwise falls back to canonical-to-Montgomery
+        // conversion (~350ms for wire_values, ~150ms for H).
+        let wire_values = load_fr_elements_auto(&dir.join("wire_values.bin"))?;
         let solution_a = load_fr_elements(&dir.join("solution_a.bin"))?;
         let solution_b = load_fr_elements(&dir.join("solution_b.bin"))?;
         let solution_c = load_fr_elements(&dir.join("solution_c.bin"))?;
 
-        // Load pre-computed H polynomial (canonical LE Fr, natural order).
-        // Convert to Montgomery Fr at load time.
-        let h_raw = load_fr_elements(&dir.join("h_coefficients.bin"))?;
-        let h_coefficients: Vec<Fr> = h_raw.par_iter().map(Fr::from_bn254fr).collect();
-        drop(h_raw);
+        let h_coefficients = load_fr_elements_auto(&dir.join("h_coefficients.bin"))?;
 
         let commitments = if dir.join("commitments.bin").exists() {
             load_g1_points(&dir.join("commitments.bin"))?
@@ -309,7 +305,15 @@ impl Groth16WitnessData {
             }
         };
 
-        Ok(Self { wire_values, solution_a, solution_b, solution_c, h_coefficients, commitments, commitment_pok })
+        Ok(Self {
+            wire_values,
+            solution_a,
+            solution_b,
+            solution_c,
+            h_coefficients,
+            commitments,
+            commitment_pok,
+        })
     }
 }
 
@@ -415,4 +419,85 @@ fn load_fr_elements(path: &std::path::Path) -> anyhow::Result<Vec<BN254Fr>> {
         elements.push(elem);
     }
     Ok(elements)
+}
+
+/// Magic header for Montgomery-form Fr files written by `writeFrFileMontgomery`.
+const FR_MONTGOMERY_MAGIC: &[u8; 4] = b"MFr1";
+
+/// Load Fr elements that may be in either canonical LE or raw Montgomery format.
+///
+/// If the file starts with the "MFr1" magic header, the remaining bytes are
+/// interpreted as raw Montgomery `Fr` values (4 x u64 LE limbs each) with no
+/// conversion needed. This is possible because gnark's `fr.Element` and our
+/// `Fr` type use identical Montgomery representations (same R = 2^256 mod r).
+///
+/// If the magic header is absent, the file is treated as canonical LE format
+/// (the legacy path) and each element is converted via `Fr::from_bn254fr`.
+///
+/// This auto-detection makes the loader backward-compatible with old exports.
+fn load_fr_elements_auto(path: &std::path::Path) -> anyhow::Result<Vec<Fr>> {
+    let data = std::fs::read(path)?;
+
+    // Check for Montgomery magic header
+    if data.len() >= 4 && &data[..4] == FR_MONTGOMERY_MAGIC.as_slice() {
+        let payload = &data[4..];
+        anyhow::ensure!(
+            payload.len() % 32 == 0,
+            "{}: Montgomery payload size {} not multiple of 32",
+            path.display(),
+            payload.len()
+        );
+        let n = payload.len() / 32;
+        let mut elements = Vec::with_capacity(n);
+        // SAFETY: Fr is #[repr(transparent)] over [u64; 4] (32 bytes).
+        // The file contains raw LE u64 limbs in Montgomery form, which is
+        // exactly the in-memory layout of Fr on little-endian platforms.
+        for i in 0..n {
+            let offset = i * 32;
+            let mut fr = Fr::ZERO;
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    payload[offset..].as_ptr(),
+                    fr.0.as_mut_ptr() as *mut u8,
+                    32,
+                );
+            }
+            elements.push(fr);
+        }
+        eprintln!(
+            "[groth16-load] {}: loaded {} Fr elements (Montgomery, no conversion)",
+            path.display(),
+            n
+        );
+        Ok(elements)
+    } else {
+        // Legacy canonical LE format: load as BN254Fr, convert to Montgomery Fr.
+        anyhow::ensure!(
+            data.len() % 32 == 0,
+            "{}: size {} not multiple of 32",
+            path.display(),
+            data.len()
+        );
+        let n = data.len() / 32;
+        let mut raw = Vec::with_capacity(n);
+        for i in 0..n {
+            let offset = i * 32;
+            let mut elem = BN254Fr { limbs: [0; 8] };
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    data[offset..].as_ptr(),
+                    elem.limbs.as_mut_ptr() as *mut u8,
+                    32,
+                );
+            }
+            raw.push(elem);
+        }
+        let elements: Vec<Fr> = raw.par_iter().map(Fr::from_bn254fr).collect();
+        eprintln!(
+            "[groth16-load] {}: loaded {} Fr elements (canonical, converted to Montgomery)",
+            path.display(),
+            n
+        );
+        Ok(elements)
+    }
 }

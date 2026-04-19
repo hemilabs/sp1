@@ -377,38 +377,63 @@ static rustCudaError_t ensure_twiddles(uint32_t lg_n) {
 // to avoid holding 4 GiB that conflicts with PLONK prover's DeviceBuffers.
 
 // ================================================================
-// Twiddle + transpose kernel for small cols (< 32)
+// Three-level NTT: twiddle + reshuffle kernel (Step 4)
 // ================================================================
-// Used in the three-level NTT when cols < TILE_DIM (32).
-// Input: d_in[rows × cols] row-major  (d_in[i * cols + j])
-// Output: d_out[cols × rows] row-major (d_out[j * rows + i])
-// Twiddle: each element is multiplied by omega_N^(i * j)
-//          using two-level lookup: twiddle_lo[k & 0x3FFF] * twiddle_hi[k >> 14]
+// After Steps 1-3 of the three-level NTT (two rounds of NTT-1024 with a
+// transpose-twiddle in between), the data in d_in is laid out as:
+//
+//   d_in[k0 * (small_n * 1024) + n2 * 1024 + k1]
+//
+// where k0 ∈ [0, 1024), n2 ∈ [0, small_n), k1 ∈ [0, 1024).
+//
+// This kernel applies the twiddle factor for the nested four-step NTT
+// of the 16384-to-(small_n*1024)-element sub-arrays:
+//
+//   omega_{small_n*1024}^{n2 * k1} = omega_N^{(N / (small_n*1024)) * n2 * k1}
+//                                  = omega_N^{1024 * n2 * k1}
+//
+// and reshuffles the data so that the small_n elements for each (k0, k1)
+// pair are contiguous, enabling the subsequent NTT-small_n:
+//
+//   d_out[(k0 * 1024 + k1) * small_n + n2]
+//
+// The twiddle is computed via the two-level windowed lookup table:
+//   omega_N^k = twiddle_lo[k & 0x3FFF] * twiddle_hi[k >> 14]
+// which is valid for k < 2^28 (covers our max k = 1024 * 255 * 1023).
 
-__global__ void bn254_twiddle_transpose_small_kernel(
+__global__ void bn254_three_level_twiddle_reshuffle_kernel(
     fr_t* __restrict__ d_out,
     const fr_t* __restrict__ d_in,
     const fr_t* __restrict__ twiddle_lo,
     const fr_t* __restrict__ twiddle_hi,
-    uint32_t rows,
-    uint32_t cols
+    uint32_t small_n   // 2^(lg_n - 20), e.g. 16 for lg_n=24
 ) {
+    // Total elements: 1024 * small_n * 1024 = N
+    // Each thread handles one element identified by (k0, n2, k1).
     uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-    uint32_t total = rows * cols;
-    if (idx >= total) return;
+    uint32_t N = 1024u * small_n * 1024u;
+    if (idx >= N) return;
 
-    uint32_t i = idx / cols;   // row in input
-    uint32_t j = idx % cols;   // col in input
+    // Decompose flat index in the INPUT layout:
+    //   idx = k0 * (small_n * 1024) + n2 * 1024 + k1
+    uint32_t stride_k0 = small_n * 1024u;  // e.g. 16384 for small_n=16
+    uint32_t k0 = idx / stride_k0;
+    uint32_t rem = idx % stride_k0;
+    uint32_t n2 = rem / 1024u;
+    uint32_t k1 = rem % 1024u;
 
     fr_t elem = d_in[idx];
 
-    // Twiddle multiply: omega_N^(i * j)
-    uint32_t k = i * j;
-    fr_t tw = twiddle_lo[k & 0x3FFFu] * twiddle_hi[k >> 14];
-    elem = elem * tw;
+    // Twiddle: omega_N^{1024 * n2 * k1}
+    uint32_t tw_exp = 1024u * n2 * k1;
+    if (tw_exp != 0) {
+        fr_t tw = twiddle_lo[tw_exp & 0x3FFFu] * twiddle_hi[tw_exp >> 14];
+        elem = elem * tw;
+    }
 
-    // Write to transposed position
-    d_out[j * rows + i] = elem;
+    // Write to reshuffled position: (k0 * 1024 + k1) * small_n + n2
+    uint32_t out_idx = (k0 * 1024u + k1) * small_n + n2;
+    d_out[out_idx] = elem;
 }
 
 // ================================================================
@@ -575,66 +600,37 @@ static rustCudaError_t run_ntt_four_step(
         err = bn254_ntt_1024_lds(d_temp_local, sub_twiddles, num_sub1, stream);
         if (err.message != CUDA_SUCCESS_CSL.message) return err;
 
-        // Step 4: Transpose(1024*small_n groups... actually 2^20 x 2^lg_small) + twiddle
-        // After step 3, data is in d_temp_local as 1024 rows x (N/1024) cols
-        // We need to view as (N/small_n) x small_n and transpose
-        // But the twiddle factors for this level use a different omega
-        // TODO: Compute second-level twiddle tables
-        // For now, use the same omega tables (approximate — will fix in Day 4)
-        uint32_t rows4 = N / small_n; // 2^20
-        uint32_t cols4 = small_n;     // 2^5 or 2^7
-
-        // Step 4 + 5: Twiddle × transpose × small-NTT.
-        // After Steps 1–3, data lives in d_temp_local in row-major layout
-        // (rows4 × cols4) = (N/small_n × small_n).  Each element at position
-        // (i, j) must be multiplied by omega_N^{i·j} (twiddle), then
-        // the matrix is transposed to (cols4 × rows4) = (small_n × N/small_n),
-        // and finally we run N/small_n independent NTT-small_n on contiguous
-        // groups of small_n elements.
+        // Step 4: Twiddle + reshuffle for the third NTT level.
         //
-        // When cols4 >= 32 we can fuse twiddle+transpose into the tiled
-        // transpose kernel.  When cols4 < 32 (e.g. 16 for lg_n=24) the tiled
-        // kernel cannot run, so we use a dedicated kernel that does the
-        // twiddle, transpose, AND small NTT all in one shot.
-        if (cols4 >= 32) {
-            err = bn254_transpose_twiddle(
-                d_inout, d_temp_local, omega_lo, omega_hi,
-                rows4, cols4, stream);
-            if (err.message != CUDA_SUCCESS_CSL.message) return err;
-
-            // Step 5: N/small_n independent small NTTs
-            fr_t one;
-            memcpy(one.data, host_bn254::rone, 32);
-            uint32_t num_small_groups = N / small_n;
+        // After Steps 1-3, d_temp_local holds data in a 3D layout:
+        //
+        //   d_temp_local[k0 * (small_n * 1024) + n2 * 1024 + k1]
+        //
+        // where k0 ∈ [0, 1024), n2 ∈ [0, small_n), k1 ∈ [0, 1024).
+        //
+        // Steps 1-3 computed NTT-1024 twice (with a transpose+twiddle between)
+        // which is a two-level four-step NTT covering the bottom 20 bits.
+        // The remaining dimension is n2 (the "which sub-array" index).
+        //
+        // To complete the NTT, we need the four-step twiddle for the nested
+        // (small_n × 1024)-point sub-NTT: omega_{small_n*1024}^{n2 * k1}
+        // = omega_N^{1024 * n2 * k1}.
+        //
+        // This kernel also reshuffles the data so each group of small_n
+        // elements for NTT-small_n is contiguous:
+        //   d_inout[(k0 * 1024 + k1) * small_n + n2]
+        {
             uint32_t threads = 256;
-            uint32_t groups_per_block = threads / (small_n / 2);
-            if (groups_per_block == 0) groups_per_block = 1;
-            uint32_t blocks = (num_small_groups + groups_per_block - 1) / groups_per_block;
-            hipLaunchKernelGGL(bn254_small_ntt_kernel,
-                dim3(blocks), dim3(threads),
-                groups_per_block * small_n * 8 * sizeof(uint32_t), stream,
-                d_inout, small_twiddles, lg_small, num_small_groups, one);
+            uint32_t blocks = (N + threads - 1) / threads;
+            hipLaunchKernelGGL(bn254_three_level_twiddle_reshuffle_kernel,
+                dim3(blocks), dim3(threads), 0, stream,
+                d_inout, d_temp_local, omega_lo, omega_hi, small_n);
             CUDA_OK(hipGetLastError());
-        } else {
-            // cols4 < 32: twiddle + transpose + small NTT in one kernel.
-            // Input is in d_temp_local as (rows4 × cols4) row-major.
-            // Output goes to d_inout as (cols4 × rows4) = small_n groups
-            // of rows4 elements each (but we actually want rows4 groups of
-            // small_n — the small NTT operates on the transposed layout).
-            //
-            // Simpler approach: separate twiddle-transpose kernel, then
-            // small NTT kernel.
-            {
-                uint32_t threads = 256;
-                uint32_t blocks = (N + threads - 1) / threads;
-                hipLaunchKernelGGL(bn254_twiddle_transpose_small_kernel,
-                    dim3(blocks), dim3(threads), 0, stream,
-                    d_inout, d_temp_local, omega_lo, omega_hi, rows4, cols4);
-                CUDA_OK(hipGetLastError());
-            }
+        }
 
-            // Now d_inout has data in transposed layout: cols4 rows of rows4 elements.
-            // Run rows4 independent NTT-small_n on groups of small_n contiguous elements.
+        // Step 5: N/small_n independent NTT-small_n on contiguous groups.
+        // After the reshuffle, d_inout has 2^20 groups of small_n elements.
+        {
             fr_t one;
             memcpy(one.data, host_bn254::rone, 32);
             uint32_t num_small_groups = N / small_n;
