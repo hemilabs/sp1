@@ -377,6 +377,41 @@ static rustCudaError_t ensure_twiddles(uint32_t lg_n) {
 // to avoid holding 4 GiB that conflicts with PLONK prover's DeviceBuffers.
 
 // ================================================================
+// Twiddle + transpose kernel for small cols (< 32)
+// ================================================================
+// Used in the three-level NTT when cols < TILE_DIM (32).
+// Input: d_in[rows × cols] row-major  (d_in[i * cols + j])
+// Output: d_out[cols × rows] row-major (d_out[j * rows + i])
+// Twiddle: each element is multiplied by omega_N^(i * j)
+//          using two-level lookup: twiddle_lo[k & 0x3FFF] * twiddle_hi[k >> 14]
+
+__global__ void bn254_twiddle_transpose_small_kernel(
+    fr_t* __restrict__ d_out,
+    const fr_t* __restrict__ d_in,
+    const fr_t* __restrict__ twiddle_lo,
+    const fr_t* __restrict__ twiddle_hi,
+    uint32_t rows,
+    uint32_t cols
+) {
+    uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    uint32_t total = rows * cols;
+    if (idx >= total) return;
+
+    uint32_t i = idx / cols;   // row in input
+    uint32_t j = idx % cols;   // col in input
+
+    fr_t elem = d_in[idx];
+
+    // Twiddle multiply: omega_N^(i * j)
+    uint32_t k = i * j;
+    fr_t tw = twiddle_lo[k & 0x3FFFu] * twiddle_hi[k >> 14];
+    elem = elem * tw;
+
+    // Write to transposed position
+    d_out[j * rows + i] = elem;
+}
+
+// ================================================================
 // Four-step NTT dispatch
 // ================================================================
 
@@ -549,31 +584,70 @@ static rustCudaError_t run_ntt_four_step(
         uint32_t rows4 = N / small_n; // 2^20
         uint32_t cols4 = small_n;     // 2^5 or 2^7
 
-        // Only do transpose if cols4 >= 32 (TILE_DIM)
+        // Step 4 + 5: Twiddle × transpose × small-NTT.
+        // After Steps 1–3, data lives in d_temp_local in row-major layout
+        // (rows4 × cols4) = (N/small_n × small_n).  Each element at position
+        // (i, j) must be multiplied by omega_N^{i·j} (twiddle), then
+        // the matrix is transposed to (cols4 × rows4) = (small_n × N/small_n),
+        // and finally we run N/small_n independent NTT-small_n on contiguous
+        // groups of small_n elements.
+        //
+        // When cols4 >= 32 we can fuse twiddle+transpose into the tiled
+        // transpose kernel.  When cols4 < 32 (e.g. 16 for lg_n=24) the tiled
+        // kernel cannot run, so we use a dedicated kernel that does the
+        // twiddle, transpose, AND small NTT all in one shot.
         if (cols4 >= 32) {
             err = bn254_transpose_twiddle(
                 d_inout, d_temp_local, omega_lo, omega_hi,
                 rows4, cols4, stream);
             if (err.message != CUDA_SUCCESS_CSL.message) return err;
-        } else {
-            // For very small cols (< 32), skip transpose and do in-place
-            CUDA_OK(hipMemcpyAsync(d_inout, d_temp_local, N * sizeof(fr_t),
-                                    hipMemcpyDeviceToDevice, stream));
-        }
 
-        // Step 5: 2^20 independent small NTTs (NTT-32 or NTT-128)
-        fr_t one;
-        memcpy(one.data, host_bn254::rone, 32);
-        uint32_t num_small_groups = N / small_n;
-        uint32_t threads = 256;
-        uint32_t groups_per_block = threads / (small_n / 2);
-        if (groups_per_block == 0) groups_per_block = 1;
-        uint32_t blocks = (num_small_groups + groups_per_block - 1) / groups_per_block;
-        hipLaunchKernelGGL(bn254_small_ntt_kernel,
-            dim3(blocks), dim3(threads),
-            groups_per_block * small_n * 8 * sizeof(uint32_t), stream,
-            d_inout, small_twiddles, lg_small, num_small_groups, one);
-        CUDA_OK(hipGetLastError());
+            // Step 5: N/small_n independent small NTTs
+            fr_t one;
+            memcpy(one.data, host_bn254::rone, 32);
+            uint32_t num_small_groups = N / small_n;
+            uint32_t threads = 256;
+            uint32_t groups_per_block = threads / (small_n / 2);
+            if (groups_per_block == 0) groups_per_block = 1;
+            uint32_t blocks = (num_small_groups + groups_per_block - 1) / groups_per_block;
+            hipLaunchKernelGGL(bn254_small_ntt_kernel,
+                dim3(blocks), dim3(threads),
+                groups_per_block * small_n * 8 * sizeof(uint32_t), stream,
+                d_inout, small_twiddles, lg_small, num_small_groups, one);
+            CUDA_OK(hipGetLastError());
+        } else {
+            // cols4 < 32: twiddle + transpose + small NTT in one kernel.
+            // Input is in d_temp_local as (rows4 × cols4) row-major.
+            // Output goes to d_inout as (cols4 × rows4) = small_n groups
+            // of rows4 elements each (but we actually want rows4 groups of
+            // small_n — the small NTT operates on the transposed layout).
+            //
+            // Simpler approach: separate twiddle-transpose kernel, then
+            // small NTT kernel.
+            {
+                uint32_t threads = 256;
+                uint32_t blocks = (N + threads - 1) / threads;
+                hipLaunchKernelGGL(bn254_twiddle_transpose_small_kernel,
+                    dim3(blocks), dim3(threads), 0, stream,
+                    d_inout, d_temp_local, omega_lo, omega_hi, rows4, cols4);
+                CUDA_OK(hipGetLastError());
+            }
+
+            // Now d_inout has data in transposed layout: cols4 rows of rows4 elements.
+            // Run rows4 independent NTT-small_n on groups of small_n contiguous elements.
+            fr_t one;
+            memcpy(one.data, host_bn254::rone, 32);
+            uint32_t num_small_groups = N / small_n;
+            uint32_t threads = 256;
+            uint32_t groups_per_block = threads / (small_n / 2);
+            if (groups_per_block == 0) groups_per_block = 1;
+            uint32_t blocks = (num_small_groups + groups_per_block - 1) / groups_per_block;
+            hipLaunchKernelGGL(bn254_small_ntt_kernel,
+                dim3(blocks), dim3(threads),
+                groups_per_block * small_n * 8 * sizeof(uint32_t), stream,
+                d_inout, small_twiddles, lg_small, num_small_groups, one);
+            CUDA_OK(hipGetLastError());
+        }
     }
 
     // Inverse: scale by N^{-1} (skipped when fused with coset NTT)

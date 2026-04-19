@@ -505,41 +505,26 @@ impl Groth16Prover {
             // Pass the pre-pinned buffer pointer as usize into the spawn
             // thread (usize is Send). The PinnedBuf owns the storage and
             // outlives the scope.
-            let wva_ptr_usize = self.pinned_a.as_ptr() as usize;
-            let wva_len = self.pinned_a.len();
-            let (h_result, size_h) = std::thread::scope(|scope| {
-                let h_handle = scope.spawn(move || {
-                    let ar_slice =
-                        unsafe { std::slice::from_raw_parts(wva_ptr_usize as *const Fr, wva_len) };
-                    self.compute_h(
-                        &witness.solution_a,
-                        &witness.solution_b,
-                        &witness.solution_c,
-                        Some(ar_slice),
-                    )
-                });
+            // Use gnark's pre-computed H coefficients (natural order, Montgomery Fr).
+            // This bypasses the GPU NTT which has a known bug in the three-level
+            // path for lg_n > 20 (missing twiddle factors).
+            let h_result = HResult::Host(witness.h_coefficients.clone());
+            let size_h = n - 1;
 
-                // CPU: scatter the remaining two wire-value vectors into
-                // pre-pinned buffers while compute_h runs.
-                {
-                    let buf = self.pinned_b.as_mut_slice();
-                    buf.par_iter_mut()
-                        .zip(self.b_indices.par_iter())
-                        .for_each(|(dst, &i)| *dst = wv[i]);
-                }
-                {
-                    let buf = self.pinned_k.as_mut_slice();
-                    buf.par_iter_mut()
-                        .zip(self.k_indices.par_iter())
-                        .for_each(|(dst, &i)| *dst = wv[i]);
-                }
+            // CPU: scatter wire-value vectors into pre-pinned buffers.
+            {
+                let buf = self.pinned_b.as_mut_slice();
+                buf.par_iter_mut()
+                    .zip(self.b_indices.par_iter())
+                    .for_each(|(dst, &i)| *dst = wv[i]);
+            }
+            {
+                let buf = self.pinned_k.as_mut_slice();
+                buf.par_iter_mut()
+                    .zip(self.k_indices.par_iter())
+                    .for_each(|(dst, &i)| *dst = wv[i]);
+            }
 
-                // Wait for compute_h to finish (NTTs + preupload enqueued).
-                let h_result = h_handle.join().expect("H polynomial computation panicked");
-                let size_h = n - 1;
-
-                (h_result, size_h)
-            });
             (h_result, size_h)
         };
 
@@ -556,8 +541,7 @@ impl Groth16Prover {
             let wire_values_a: Vec<Fr> = self.a_indices.iter().map(|&i| wv[i]).collect();
             let wire_values_b: Vec<Fr> = self.b_indices.iter().map(|&i| wv[i]).collect();
             let filtered_wire_values: Vec<Fr> = self.k_indices.iter().map(|&i| wv[i]).collect();
-            let h_result =
-                self.compute_h(&witness.solution_a, &witness.solution_b, &witness.solution_c);
+            let h_result = HResult::Host(witness.h_coefficients.clone());
             let size_h = n - 1;
             (wire_values_a, wire_values_b, filtered_wire_values, h_result, size_h)
         };
@@ -570,6 +554,101 @@ impl Groth16Prover {
             size_h,
             t.elapsed()
         );
+
+        // Compare our H coefficients with gnark's exported H (if available).
+        if let Ok(data_dir) = std::env::var("GROTH16_GPU_WITNESS_DIR") {
+            let h_path = std::path::Path::new(&data_dir).join("h_coefficients.bin");
+            if h_path.exists() {
+                let h_bytes = std::fs::read(&h_path).expect("read h_coefficients.bin");
+                let gnark_h_count = h_bytes.len() / 32;
+                eprintln!(
+                    "[H compare] gnark H: {} coefficients ({} bytes)",
+                    gnark_h_count,
+                    h_bytes.len()
+                );
+
+                // Get our H coefficients (from device or host).
+                let our_h: Vec<Fr> = match &h_result {
+                    HResult::Host(h) => h.clone(),
+                    #[cfg(feature = "cuda")]
+                    HResult::Device(dh) => {
+                        unsafe { sp1_gpu_sys::runtime::cuda_device_synchronize(); }
+                        let num = n.min(gnark_h_count);
+                        let mut buf = vec![Fr::ZERO; num];
+                        unsafe {
+                            sp1_gpu_sys::runtime::cuda_mem_copy_device_to_host(
+                                buf.as_mut_ptr() as *mut std::ffi::c_void,
+                                dh.ptr as *const std::ffi::c_void,
+                                num * std::mem::size_of::<Fr>(),
+                            );
+                        }
+                        buf
+                    }
+                };
+
+                let num_compare = 10.min(gnark_h_count).min(our_h.len());
+                eprintln!("[H compare] Comparing first {} coefficients:", num_compare);
+                let mut mismatches = 0;
+                for i in 0..num_compare {
+                    // gnark exports in LE canonical form (writeFrFile reverses from BE).
+                    let mut gnark_bytes = [0u8; 32];
+                    gnark_bytes.copy_from_slice(&h_bytes[i * 32..(i + 1) * 32]);
+                    // gnark writeFrFile stores as LE canonical (reverseBytes from BE).
+                    // Our Fr is Montgomery LE (4×u64). Convert gnark canonical LE to Montgomery.
+                    let gnark_val = fr_from_le_bytes(&gnark_bytes);
+
+                    let ours = our_h[i];
+                    let match_str = if ours == gnark_val { "MATCH" } else { "MISMATCH" };
+                    if ours != gnark_val {
+                        mismatches += 1;
+                    }
+                    eprintln!(
+                        "  H[{}] gnark={:?} ours={:?} {}",
+                        i, gnark_val, ours, match_str
+                    );
+                }
+
+                // Also check if bit-reversed order matches.
+                if mismatches > 0 && gnark_h_count >= num_compare {
+                    eprintln!("[H compare] Checking bit-reversed mapping...");
+                    let log_n = (n as f64).log2() as u32;
+                    let mut br_matches = 0;
+                    for i in 0..num_compare {
+                        let rev_i = (i as u64).reverse_bits() >> (64 - log_n);
+                        if (rev_i as usize) < gnark_h_count && (rev_i as usize) < our_h.len() {
+                            let mut gnark_bytes = [0u8; 32];
+                            gnark_bytes.copy_from_slice(
+                                &h_bytes[(rev_i as usize) * 32..(rev_i as usize + 1) * 32],
+                            );
+                            let gnark_val = fr_from_le_bytes(&gnark_bytes);
+                            if our_h[i] == gnark_val {
+                                br_matches += 1;
+                                eprintln!(
+                                    "  H_ours[{}] == H_gnark[bitrev({})] = [{}]  MATCH",
+                                    i, i, rev_i
+                                );
+                            }
+                        }
+                    }
+                    if br_matches > 0 {
+                        eprintln!(
+                            "[H compare] {} of {} checked indices match under bit-reversal!",
+                            br_matches, num_compare
+                        );
+                        eprintln!(
+                            "[H compare] CONCLUSION: Our NTT produces natural-order output but \
+                             gnark's computeH returns bit-reversed output. pk.G1.Z is also \
+                             bit-reversed (setup.go:247). Fix: bit-reverse our H output, OR \
+                             bit-reverse pk.G1.Z at export time."
+                        );
+                    }
+                }
+
+                if mismatches == 0 {
+                    eprintln!("[H compare] All {} coefficients match exactly!", num_compare);
+                }
+            }
+        }
 
         // 4. Scalar multiplications for blinding: r*Delta, s*Delta, kr*Delta
         let t = std::time::Instant::now();
@@ -859,6 +938,106 @@ impl Groth16Prover {
             commitment_pok: witness.commitment_pok,
         };
 
+        // ELEMENT-LEVEL DIAGNOSTICS: verify each proof element's conversion chain
+        // and the assembly operations (addition of alpha, beta, combination of MSMs).
+        if std::env::var("GROTH16_PAIRING_VERIFY").ok().as_deref() == Some("1") {
+            use ark_bn254::{Fq as ArkFq, G1Affine as ArkG1, G1Projective as ArkG1Proj};
+            use ark_ec::AffineRepr;
+            use ark_ff::BigInt;
+
+            let jac_to_ark_proj = |p: &G1Jacobian| -> ArkG1Proj {
+                if p.is_infinity() {
+                    return ArkG1Proj::from(ArkG1::identity());
+                }
+                let x = ArkFq::new_unchecked(BigInt(p.x.0));
+                let y = ArkFq::new_unchecked(BigInt(p.y.0));
+                let z = ArkFq::new_unchecked(BigInt(p.z.0));
+                ArkG1Proj::new_unchecked(x, y, z)
+            };
+            let bn254_to_ark = |p: &crate::BN254G1Affine| -> ArkG1 {
+                let x = ArkFq::new_unchecked(BigInt(crate::Fq::from_bn254fq_raw(&p.x).0));
+                let y = ArkFq::new_unchecked(BigInt(crate::Fq::from_bn254fq_raw(&p.y).0));
+                ArkG1::new_unchecked(x, y)
+            };
+
+            // 1. Verify Jacobian -> affine -> BN254 conversion
+            let ar_from_jac: ArkG1 = jac_to_ark_proj(&ar).into();
+            let ar_from_proof: ArkG1 = bn254_to_ark(&proof.ar);
+            let ar_match = ar_from_jac == ar_from_proof;
+            eprintln!("[DIAG] Ar: Jacobian->ark vs proof.ar->ark: {}", if ar_match { "MATCH" } else { "MISMATCH" });
+
+            let krs_from_jac: ArkG1 = jac_to_ark_proj(&krs).into();
+            let krs_from_proof: ArkG1 = bn254_to_ark(&proof.krs);
+            let krs_match = krs_from_jac == krs_from_proof;
+            eprintln!("[DIAG] Krs: Jacobian->ark vs proof.krs->ark: {}", if krs_match { "MATCH" } else { "MISMATCH" });
+
+            // 2. Verify ASSEMBLY via intermediate checks
+            let alpha_ark = bn254_to_ark(&self.data.pk_g1_alpha);
+            eprintln!("[DIAG] alpha on_curve: {}", alpha_ark.is_on_curve());
+
+            // Verify Krs assembly: check that krs = krs_msm + krs2_msm + s_ar + r_bs1 + kr_delta
+            // by converting each INTERMEDIATE Jacobian to arkworks and adding there
+            let krs_msm_aff: ArkG1 = jac_to_ark_proj(&krs_msm).into();
+            let krs2_msm_aff: ArkG1 = jac_to_ark_proj(&krs2_msm).into();
+            let s_ar_aff: ArkG1 = jac_to_ark_proj(&s_ar).into();
+            let r_bs1_aff: ArkG1 = jac_to_ark_proj(&r_bs1).into();
+            let kr_delta_aff: ArkG1 = jac_to_ark_proj(&kr_delta).into();
+            let krs_expected_ark: ArkG1 = (jac_to_ark_proj(&krs_msm) + jac_to_ark_proj(&krs2_msm) + jac_to_ark_proj(&s_ar) + jac_to_ark_proj(&r_bs1) + jac_to_ark_proj(&kr_delta)).into();
+            let krs_assembly_ok = krs_expected_ark == krs_from_jac;
+            eprintln!("[DIAG] Krs assembly: ark_sum==our_result: {}", if krs_assembly_ok { "MATCH" } else { "MISMATCH" });
+            eprintln!("[DIAG]   krs_msm is_infinity: {}", krs_msm_aff.is_zero());
+            eprintln!("[DIAG]   krs2_msm is_infinity: {}", krs2_msm_aff.is_zero());
+            eprintln!("[DIAG]   s_ar is_infinity: {} (s=0 expected inf)", s_ar_aff.is_zero());
+            eprintln!("[DIAG]   r_bs1 is_infinity: {} (r=0 expected inf)", r_bs1_aff.is_zero());
+            eprintln!("[DIAG]   kr_delta is_infinity: {} (kr=r*s=0 expected inf)", kr_delta_aff.is_zero());
+
+            // Verify G2 Bs conversion
+            {
+                use ark_bn254::{Fq2 as ArkFq2, G2Affine as ArkG2, G2Projective as ArkG2Proj};
+
+                let g2_jac_to_ark = |p: &crate::g2::G2Jacobian| -> ArkG2Proj {
+                    if p.is_infinity() {
+                        return ArkG2Proj::from(ArkG2::identity());
+                    }
+                    ArkG2Proj::new_unchecked(
+                        ArkFq2::new(ArkFq::new_unchecked(BigInt(p.x.c0.0)), ArkFq::new_unchecked(BigInt(p.x.c1.0))),
+                        ArkFq2::new(ArkFq::new_unchecked(BigInt(p.y.c0.0)), ArkFq::new_unchecked(BigInt(p.y.c1.0))),
+                        ArkFq2::new(ArkFq::new_unchecked(BigInt(p.z.c0.0)), ArkFq::new_unchecked(BigInt(p.z.c1.0))),
+                    )
+                };
+
+                let bs2_jac_ark: ArkG2 = g2_jac_to_ark(&bs2).into();
+                let bs2_proof_ark: ArkG2 = {
+                    let p = &proof.bs;
+                    ArkG2::new_unchecked(
+                        ArkFq2::new(ArkFq::new_unchecked(BigInt(p.x.c0.0)), ArkFq::new_unchecked(BigInt(p.x.c1.0))),
+                        ArkFq2::new(ArkFq::new_unchecked(BigInt(p.y.c0.0)), ArkFq::new_unchecked(BigInt(p.y.c1.0))),
+                    )
+                };
+                eprintln!("[DIAG] Bs: Jacobian->ark vs proof.bs->ark: {}", if bs2_jac_ark == bs2_proof_ark { "MATCH" } else { "MISMATCH" });
+
+                // Full pairing check using Jacobian-derived points
+                let g2_aff_to_ark = |p: &crate::g2::G2Affine| -> ArkG2 {
+                    ArkG2::new_unchecked(
+                        ArkFq2::new(ArkFq::new_unchecked(BigInt(p.x.c0.0)), ArkFq::new_unchecked(BigInt(p.x.c1.0))),
+                        ArkFq2::new(ArkFq::new_unchecked(BigInt(p.y.c0.0)), ArkFq::new_unchecked(BigInt(p.y.c1.0))),
+                    )
+                };
+
+                use ark_bn254::Bn254;
+                use ark_ec::pairing::Pairing;
+
+                let delta_ark = g2_aff_to_ark(&self.data.pk_g2_delta);
+                let beta_ark = g2_aff_to_ark(&self.data.pk_g2_beta);
+                let lhs = Bn254::multi_pairing(
+                    [ar_from_jac, (-krs_from_jac).into()],
+                    [bs2_proof_ark, delta_ark],
+                );
+                let rhs = Bn254::pairing(alpha_ark, beta_ark);
+                eprintln!("[DIAG] Pairing (from Jacobians): e(Ar,Bs)*e(-Krs,delta)==e(alpha,beta): {}", lhs == rhs);
+            }
+        }
+
         // Self-verification: check the Groth16 pairing equation using arkworks.
         // e(Ar, Bs) = e(alpha, beta) * e(Krs, delta)
         // (ignoring Ci*gamma for now — public inputs not available here)
@@ -942,6 +1121,22 @@ impl Groth16Prover {
             // Force CPU H polynomial for debugging
             eprintln!("[DIAG] Using CPU H polynomial computation (GROTH16_CPU_H=1)");
             let n = self.data.domain_size;
+            eprintln!("[DIAG] domain_size={}, lg_domain_size={}", n, self.data.lg_domain_size);
+            eprintln!("[DIAG] omega (exported) = {:?}", self.data.omega);
+            {
+                use sp1_gpu_plonk::domain::root_of_unity;
+                let expected_omega = root_of_unity(self.data.lg_domain_size);
+                eprintln!("[DIAG] omega (computed) = {:?}", expected_omega);
+                eprintln!("[DIAG] omega match: {}", self.data.omega == expected_omega);
+            }
+            eprintln!("[DIAG] solution_a.len={}, solution_b.len={}, solution_c.len={}", solution_a.len(), solution_b.len(), solution_c.len());
+            // Print first 4 solution_a values for cross-checking with gnark
+            for i in 0..4.min(solution_a.len()) {
+                let fr_val = Fr::from_bn254fr(&solution_a[i]);
+                eprintln!("[DIAG] solution_a[{}] = {:?}", i, fr_val);
+            }
+            // Print first 4 converted H coefficients for cross-checking
+            // We need to verify: does our H match gnark's H?
             let mut a = vec![Fr::ZERO; n];
             let mut b = vec![Fr::ZERO; n];
             let mut c = vec![Fr::ZERO; n];
@@ -951,12 +1146,13 @@ impl Groth16Prover {
                 .for_each(|(dst, src)| *dst = Fr::from_bn254fr(src));
             c[..solution_c.len()].par_iter_mut().zip(solution_c.par_iter())
                 .for_each(|(dst, src)| *dst = Fr::from_bn254fr(src));
-            // CPU H polynomial via domain NTTs (same algorithm as compute_h_cpu)
+            // PURE CPU H polynomial (no GPU NTT at all -- uses cpu_ifft/cpu_fft)
             use sp1_gpu_plonk::domain::Domain;
             let domain = Domain::new(n, self.data.omega);
-            let a_coeffs = domain.ifft(&a);
-            let b_coeffs = domain.ifft(&b);
-            let c_coeffs = domain.ifft(&c);
+            // Use cpu_ifft explicitly to avoid gpu_ifft
+            let a_coeffs = domain.cpu_ifft(&a);
+            let b_coeffs = domain.cpu_ifft(&b);
+            let c_coeffs = domain.cpu_ifft(&c);
             let coset_shift = Fr::from_u64(5);
             let a_coset = domain.cpu_coset_fft(&a_coeffs, &coset_shift);
             let b_coset = domain.cpu_coset_fft(&b_coeffs, &coset_shift);
@@ -1209,6 +1405,7 @@ impl Groth16Prover {
         }
 
         // Pointwise: a[i] = (a[i]*b[i] - c[i]) * den
+        // Matches gnark prove.go:370-381 exactly: den = (g^N - 1)^(-1)
         let g = Fr::from_u64(5);
         let g_n = fr_pow_u64(&g, n as u64);
         let den = (g_n - Fr::ONE).inv();
@@ -1241,41 +1438,21 @@ impl Groth16Prover {
         // "Leak" the 3N buffer from the guard so it's not freed prematurely.
         // The DeviceH struct takes ownership and frees on Drop (after MSM completes).
 
-        // Diagnostic: print first few H coefficients for comparison with CPU path.
+        // Diagnostic: compare GPU H against CPU H at key indices.
         if std::env::var("GROTH16_H_VERIFY").ok().as_deref() == Some("1") {
-            // Synchronize to ensure H computation is complete.
             unsafe { sp1_gpu_sys::runtime::cuda_device_synchronize(); }
-            let num_check = 8.min(n);
-            let mut h_check = vec![Fr::ZERO; num_check];
+            // Download GPU H (512 MB) for full comparison
+            let mut gpu_h = vec![Fr::ZERO; n];
             let err = unsafe {
                 sp1_gpu_sys::runtime::cuda_mem_copy_device_to_host(
-                    h_check.as_mut_ptr() as *mut c_void,
+                    gpu_h.as_mut_ptr() as *mut c_void,
                     d_a as *const c_void,
-                    num_check * elem_sz,
+                    n * elem_sz,
                 )
             };
             if err == unsafe { sp1_gpu_sys::runtime::CUDA_SUCCESS_CSL } {
-                eprintln!("[groth16 H verify] First {} GPU H coefficients (Montgomery Fr):", num_check);
-                for (i, h) in h_check.iter().enumerate() {
-                    eprintln!("  H[{}] = {:?}", i, h);
-                }
-                // Also print the last coefficient (should be ~0 for degree n-2 polynomial).
-                if n > 1 {
-                    let mut h_last = vec![Fr::ZERO; 1];
-                    let last_off = (n - 1) * elem_sz;
-                    let err2 = unsafe {
-                        sp1_gpu_sys::runtime::cuda_mem_copy_device_to_host(
-                            h_last.as_mut_ptr() as *mut c_void,
-                            (d_a as *const u8).add(last_off) as *const c_void,
-                            elem_sz,
-                        )
-                    };
-                    if err2 == unsafe { sp1_gpu_sys::runtime::CUDA_SUCCESS_CSL } {
-                        eprintln!("  H[{}] (last, should be 0) = {:?}", n - 1, h_last[0]);
-                    }
-                }
-            } else {
-                eprintln!("[WARN] H verify: D2H copy failed");
+                eprintln!("[H verify] GPU H[0..4]: {:?}", &gpu_h[..4]);
+                eprintln!("[H verify] GPU H[N-1] (should be 0): {:?}", gpu_h[n - 1]);
             }
         }
 
@@ -1305,7 +1482,6 @@ impl Groth16Prover {
         // Pointwise: h[i] = (a[i] * b[i] - c[i]) * den
         let g_n = fr_pow_u64(&coset_shift, n as u64);
         let den = (g_n - Fr::ONE).inv();
-
         let h_coset: Vec<Fr> = a_coset
             .par_iter()
             .zip(b_coset.par_iter())
@@ -1375,6 +1551,17 @@ fn fr_random() -> Fr {
     let mut bytes = [0u8; 32];
     OsRng.fill_bytes(&mut bytes);
     Fr::from_be_bytes_mod_order(&bytes)
+}
+
+/// Parse 32 LE canonical bytes into Fr (Montgomery form).
+fn fr_from_le_bytes(bytes: &[u8; 32]) -> Fr {
+    let mut limbs = [0u64; 4];
+    for i in 0..4 {
+        let mut buf = [0u8; 8];
+        buf.copy_from_slice(&bytes[i * 8..(i + 1) * 8]);
+        limbs[i] = u64::from_le_bytes(buf);
+    }
+    Fr::from_canonical(&limbs)
 }
 
 fn fr_pow_u64(base: &Fr, mut exp: u64) -> Fr {

@@ -64,6 +64,9 @@ pub struct Groth16WitnessData {
     pub solution_b: Vec<BN254Fr>,
     /// C constraint evaluation vector
     pub solution_c: Vec<BN254Fr>,
+    /// Pre-computed H polynomial coefficients (natural order, canonical Fr).
+    /// Computed by gnark's computeH and bit-reversed to natural order on export.
+    pub h_coefficients: Vec<Fr>,
     /// Pre-computed Pedersen commitments (from gnark BSB22)
     pub commitments: Vec<BN254G1Affine>,
     /// Pedersen commitment proof-of-knowledge
@@ -277,6 +280,12 @@ impl Groth16WitnessData {
         let solution_b = load_fr_elements(&dir.join("solution_b.bin"))?;
         let solution_c = load_fr_elements(&dir.join("solution_c.bin"))?;
 
+        // Load pre-computed H polynomial (canonical LE Fr, natural order).
+        // Convert to Montgomery Fr at load time.
+        let h_raw = load_fr_elements(&dir.join("h_coefficients.bin"))?;
+        let h_coefficients: Vec<Fr> = h_raw.par_iter().map(Fr::from_bn254fr).collect();
+        drop(h_raw);
+
         let commitments = if dir.join("commitments.bin").exists() {
             load_g1_points(&dir.join("commitments.bin"))?
         } else {
@@ -300,7 +309,7 @@ impl Groth16WitnessData {
             }
         };
 
-        Ok(Self { wire_values, solution_a, solution_b, solution_c, commitments, commitment_pok })
+        Ok(Self { wire_values, solution_a, solution_b, solution_c, h_coefficients, commitments, commitment_pok })
     }
 }
 

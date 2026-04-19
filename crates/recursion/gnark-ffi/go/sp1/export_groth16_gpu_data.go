@@ -10,6 +10,7 @@ import (
 
 	"github.com/consensys/gnark-crypto/ecc"
 	"github.com/consensys/gnark-crypto/ecc/bn254"
+	"github.com/consensys/gnark-crypto/ecc/bn254/fr/fft"
 	"github.com/consensys/gnark/backend/groth16"
 	groth16_bn254 "github.com/consensys/gnark/backend/groth16/bn254"
 	"github.com/consensys/gnark/constraint"
@@ -131,7 +132,33 @@ func exportGr16PK(dir string, pk *groth16_bn254.ProvingKey) {
 	// G1 points as LE canonical Fq coordinates (using reverseBytes, matching PLONK export)
 	writeG1File(filepath.Join(dir, "pk_g1_a.bin"), pk.G1.A)
 	writeG1File(filepath.Join(dir, "pk_g1_b.bin"), pk.G1.B)
-	writeG1File(filepath.Join(dir, "pk_g1_z.bin"), pk.G1.Z)
+	// gnark's setup stores pk.G1.Z in BIT-REVERSED order (setup.go:247
+	// calls bitReverse before slicing). gnark's computeH produces H in
+	// bit-reversed order too (DIF FFTInverse output), so gnark's MSM is
+	// consistent. But our GPU NTT produces NATURAL-ORDER H coefficients,
+	// so we need to export Z in natural order to match.
+	// gnark stores pk.G1.Z in bit-reversed order (setup.go:247). Our GPU
+	// prover uses gnark's pre-computed H which we export in natural order
+	// (un-bit-reversed in ExportGroth16GpuWitness). So Z must also be in
+	// natural order to match.
+	zNatural := make([]bn254.G1Affine, len(pk.G1.Z))
+	copy(zNatural, pk.G1.Z)
+	// pk.G1.Z has domain.Cardinality-1 elements (not power of 2).
+	// Pad to next power of 2 for fft.BitReverse, then truncate.
+	zLen := len(zNatural)
+	if zLen > 0 && (zLen&(zLen-1)) == 0 {
+		fft.BitReverse(zNatural)
+	} else {
+		nbits := uint(0)
+		for (1 << nbits) < uint64(zLen) {
+			nbits++
+		}
+		padded := make([]bn254.G1Affine, 1<<nbits)
+		copy(padded, zNatural)
+		fft.BitReverse(padded)
+		copy(zNatural, padded[:zLen])
+	}
+	writeG1File(filepath.Join(dir, "pk_g1_z.bin"), zNatural)
 	writeG1File(filepath.Join(dir, "pk_g1_k.bin"), pk.G1.K)
 
 	// G2 points as LE canonical Fq2 coordinates

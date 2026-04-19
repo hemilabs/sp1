@@ -35,6 +35,10 @@ cfg-if = { workspace = true }
 
 [dev-dependencies]
 dirs = "5.0.1"
+ark-bn254 = { version = "0.5", default-features = false, features = ["std", "curve"] }
+ark-ec = { version = "0.5", default-features = false, features = ["parallel"] }
+ark-ff = { version = "0.5", default-features = false, features = ["parallel"] }
+ark-serialize = { version = "0.5", default-features = false }
 
 [[example]]
 name = "bench_groth16"

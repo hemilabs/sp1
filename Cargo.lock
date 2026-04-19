@@ -7706,6 +7706,10 @@ name = "sp1-recursion-gnark-ffi"
 version = "6.0.2"
 dependencies = [
  "anyhow",
+ "ark-bn254",
+ "ark-ec",
+ "ark-ff 0.5.0",
+ "ark-serialize 0.5.0",
  "bincode",
  "bindgen",
  "cfg-if",

@@ -7,11 +7,14 @@ import (
 	"math/big"
 	"os"
 	"path/filepath"
+	"runtime"
+	"sync"
 	"time"
 
 	"github.com/consensys/gnark-crypto/ecc"
 	"github.com/consensys/gnark-crypto/ecc/bn254"
 	"github.com/consensys/gnark-crypto/ecc/bn254/fr"
+	"github.com/consensys/gnark-crypto/ecc/bn254/fr/fft"
 	"github.com/consensys/gnark-crypto/ecc/bn254/fr/hash_to_field"
 	"github.com/consensys/gnark/backend/groth16"
 	groth16_bn254 "github.com/consensys/gnark/backend/groth16/bn254"
@@ -150,6 +153,26 @@ func ExportGroth16GpuWitness(dataDir string, witnessPath string, outputDir strin
 		}
 	}
 
+	// Compute H using gnark's algorithm (copied from prove.go:346 since it's unexported).
+	// Save copies of A, B, C since computeH modifies them in-place.
+	start = time.Now()
+	aCopy := make([]fr.Element, len(solution.A))
+	copy(aCopy, solution.A)
+	bCopy := make([]fr.Element, len(solution.B))
+	copy(bCopy, solution.B)
+	cCopy := make([]fr.Element, len(solution.C))
+	copy(cCopy, solution.C)
+
+	h := localComputeH(aCopy, bCopy, cCopy, &_pk.Domain)
+	fmt.Printf("[groth16-witness] computeH took %s (len=%d)\n", time.Since(start), len(h))
+
+	// gnark's localComputeH produces H in BIT-REVERSED order (DIF FFTInverse
+	// output). gnark's pk.G1.Z is also in bit-reversed order, so their MSM is
+	// consistent. But we export Z in NATURAL order for the GPU prover, so we
+	// must also export H in natural order. Un-bit-reverse H here.
+	// H has domain.Cardinality elements (power of 2), so fft.BitReverse works.
+	fft.BitReverse(h)
+
 	// Export
 	os.MkdirAll(outputDir, 0755)
 	start = time.Now()
@@ -160,6 +183,82 @@ func ExportGroth16GpuWitness(dataDir string, witnessPath string, outputDir strin
 	writeFrFile(filepath.Join(outputDir, "solution_c.bin"), solution.C)
 	writeG1File(filepath.Join(outputDir, "commitments.bin"), commitments)
 	writeG1File(filepath.Join(outputDir, "commitment_pok.bin"), []bn254.G1Affine{commitmentPok})
+	writeFrFile(filepath.Join(outputDir, "h_coefficients.bin"), h)
 
 	fmt.Printf("[groth16-witness] Exported witness data in %s\n", time.Since(start))
+}
+
+// localComputeH is a copy of gnark's unexported computeH (prove.go:346).
+// It computes the H polynomial for Groth16: H = (A*B - C) / Z where
+// Z(x) = x^n - 1 is the vanishing polynomial.
+//
+// IMPORTANT: The output is in BIT-REVERSED order because the final
+// FFTInverse uses DIF decimation, which produces bit-reversed output.
+// gnark's pk.G1.Z is also stored in bit-reversed order (see setup.go:247),
+// so the MSM sum(h[i] * Z[i]) is consistent.
+func localComputeH(a, b, c []fr.Element, domain *fft.Domain) []fr.Element {
+	n := len(a)
+
+	// Pad to domain cardinality
+	padding := make([]fr.Element, int(domain.Cardinality)-n)
+	a = append(a, padding...)
+	b = append(b, padding...)
+	c = append(c, padding...)
+	n = len(a)
+
+	// Step 1: iFFT (DIF → output is bit-reversed)
+	domain.FFTInverse(a, fft.DIF)
+	domain.FFTInverse(b, fft.DIF)
+	domain.FFTInverse(c, fft.DIF)
+
+	// Step 2: coset FFT (DIT on bit-reversed input → output is natural-order)
+	domain.FFT(a, fft.DIT, fft.OnCoset())
+	domain.FFT(b, fft.DIT, fft.OnCoset())
+	domain.FFT(c, fft.DIT, fft.OnCoset())
+
+	// den = (g^N - 1)^(-1)
+	var den, one fr.Element
+	one.SetOne()
+	den.Exp(domain.FrMultiplicativeGen, big.NewInt(int64(domain.Cardinality)))
+	den.Sub(&den, &one).Inverse(&den)
+
+	// Pointwise: h[i] = (a[i]*b[i] - c[i]) * den
+	localParallelize(n, func(start, end int) {
+		for i := start; i < end; i++ {
+			a[i].Mul(&a[i], &b[i]).
+				Sub(&a[i], &c[i]).
+				Mul(&a[i], &den)
+		}
+	})
+
+	// Step 3: coset iFFT (DIF → output is BIT-REVERSED)
+	domain.FFTInverse(a, fft.DIF, fft.OnCoset())
+
+	return a
+}
+
+// localParallelize is a minimal replacement for gnark's internal utils.Parallelize.
+func localParallelize(n int, work func(start, end int)) {
+	nbTasks := runtime.NumCPU()
+	if nbTasks > n {
+		nbTasks = n
+	}
+	if nbTasks <= 1 {
+		work(0, n)
+		return
+	}
+	chunkSize := (n + nbTasks - 1) / nbTasks
+	var wg sync.WaitGroup
+	for start := 0; start < n; start += chunkSize {
+		end := start + chunkSize
+		if end > n {
+			end = n
+		}
+		wg.Add(1)
+		go func(s, e int) {
+			defer wg.Done()
+			work(s, e)
+		}(start, end)
+	}
+	wg.Wait()
 }
