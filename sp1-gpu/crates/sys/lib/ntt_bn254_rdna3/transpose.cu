@@ -23,7 +23,8 @@ __global__ void bn254_transpose_twiddle_kernel(
     const fr_t* __restrict__ twiddle_lo, // omega_N^k for k = 0..16383
     const fr_t* __restrict__ twiddle_hi, // omega_N^(k * 16384) for k = 0..16383
     uint32_t rows,                       // R dimension of input
-    uint32_t cols                        // C dimension of input
+    uint32_t cols,                       // C dimension of input
+    uint32_t twiddle_stride              // multiply twiddle index by this (1 for standard)
 ) {
     // 32x32 tile = 1024 elements x 8 words = 32 KB
     __shared__ uint32_t lds[TILE_DIM * TILE_DIM * 8];
@@ -49,8 +50,8 @@ __global__ void bn254_transpose_twiddle_kernel(
         if (global_row < rows && global_col < cols) {
             elem = input[global_row * cols + global_col];
 
-            // Twiddle: omega_N^(row * col) via two-level lookup
-            uint32_t k = global_row * global_col;
+            // Twiddle: omega_N^(stride * row * col) via two-level lookup
+            uint32_t k = twiddle_stride * global_row * global_col;
             fr_t tw_lo = twiddle_lo[k & 0x3FFFu];
             fr_t tw_hi = twiddle_hi[k >> 14];
             fr_t tw = tw_lo * tw_hi;
@@ -98,7 +99,8 @@ rustCudaError_t bn254_transpose_twiddle(
     const void* d_twiddle_hi,
     uint32_t rows,
     uint32_t cols,
-    hipStream_t stream
+    hipStream_t stream,
+    uint32_t twiddle_stride = 1
 ) {
     if (rows % TILE_DIM != 0 || cols % TILE_DIM != 0) {
         return rustCudaError_t{.message = "transpose: rows and cols must be multiples of 32"};
@@ -116,7 +118,7 @@ rustCudaError_t bn254_transpose_twiddle(
         (const fr_t*)d_input,
         (const fr_t*)d_twiddle_lo,
         (const fr_t*)d_twiddle_hi,
-        rows, cols
+        rows, cols, twiddle_stride
     );
     CUDA_OK(hipGetLastError());
     return CUDA_SUCCESS_CSL;

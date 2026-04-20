@@ -803,7 +803,7 @@ rustCudaError_t bn254_gpu_poly_eval(
 // ============================================================
 
 // Each thread converts one field element from canonical to Montgomery form
-// by multiplying by R² mod r. Uses the existing bn254_t type's to_montgomery().
+// by multiplying by R² mod r.
 __global__ void bn254_canonical_to_mont_kernel(bn254_t* d, uint32_t n) {
     uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) d[i].to_montgomery();
