@@ -504,11 +504,12 @@ impl Groth16Prover {
             // thread (usize is Send). The PinnedBuf owns the storage and
             // outlives the scope.
             // Use gnark's pre-computed H coefficients (natural order, Montgomery Fr).
-            // The GPU NTT is self-consistent (round-trip works) but uses a
-            // different output permutation from the standard DFT. This means
-            // GPU-computed H coefficients are in a permuted order that doesn't
-            // match the natural-order Z SRS, making the H MSM incorrect.
-            // gnark's CPU H is in natural order (matching Z), so we use it.
+            // The RDNA3 GPU NTT computes a DIFFERENT linear transform than the
+            // standard DFT (not just a permutation — verified empirically).
+            // While it is self-consistent (NTT∘iNTT = identity), the H output
+            // values differ from the standard DFT values, so no reordering of Z
+            // can make the MSM correct. The correct fix is to port sppark's NTT
+            // to HIP, which produces standard DFT output.
             let h_result = HResult::Host(witness.h_coefficients.clone());
             let size_h = n - 1;
 

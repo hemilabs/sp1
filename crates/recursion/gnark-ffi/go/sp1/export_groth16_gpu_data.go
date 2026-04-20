@@ -154,11 +154,6 @@ func exportGr16PK(dir string, pk *groth16_bn254.ProvingKey) {
 	// G1 points as LE canonical Fq coordinates (using reverseBytes, matching PLONK export)
 	writeG1File(filepath.Join(dir, "pk_g1_a.bin"), pk.G1.A)
 	writeG1File(filepath.Join(dir, "pk_g1_b.bin"), pk.G1.B)
-	// gnark's setup stores pk.G1.Z in BIT-REVERSED order (setup.go:247
-	// calls bitReverse before slicing). gnark's computeH produces H in
-	// bit-reversed order too (DIF FFTInverse output), so gnark's MSM is
-	// consistent. But our GPU NTT produces NATURAL-ORDER H coefficients,
-	// so we need to export Z in natural order to match.
 	// gnark stores pk.G1.Z in bit-reversed order (setup.go:247). Our GPU
 	// prover uses gnark's pre-computed H which we export in natural order
 	// (un-bit-reversed in ExportGroth16GpuWitness). So Z must also be in
@@ -192,6 +187,37 @@ func exportGr16PK(dir string, pk *groth16_bn254.ProvingKey) {
 	writeG1File(filepath.Join(dir, "pk_g1_delta.bin"), []bn254.G1Affine{pk.G1.Delta})
 	writeG2File(filepath.Join(dir, "pk_g2_beta.bin"), []bn254.G2Affine{pk.G2.Beta})
 	writeG2File(filepath.Join(dir, "pk_g2_delta.bin"), []bn254.G2Affine{pk.G2.Delta})
+}
+
+// rdna3NTTPermutation computes the output permutation σ(i) of the RDNA3
+// three-level four-step NTT for domain size N = 2^24.
+//
+// The NTT decomposes N as:
+//   Outer: C_outer=1024, R_outer=N/1024=16384
+//   Inner (within each R_outer group): C_inner=1024, R_inner=16
+//
+// A single four-step NTT with rows R, cols C outputs index k at position
+//   σ(k0·R + k1) = k1·C + k0,  k0 ∈ [0,C), k1 ∈ [0,R)
+//
+// The composed permutation for the three-level NTT is:
+//   Decompose i: k0_outer = i / R_outer, k1_outer = i % R_outer
+//   Decompose k1_outer: k0_inner = k1_outer / R_inner, k1_inner = k1_outer % R_inner
+//   σ(i) = (k1_inner · C_inner + k0_inner) · C_outer + k0_outer
+func rdna3NTTPermutation(i int, N int) int {
+	const (
+		cOuter = 1024
+		rInner = 16
+		cInner = 1024
+	)
+	rOuter := N / cOuter // 16384 for N=2^24
+
+	k0Outer := i / rOuter
+	k1Outer := i % rOuter
+
+	k0Inner := k1Outer / rInner
+	k1Inner := k1Outer % rInner
+
+	return (k1Inner*cInner + k0Inner) * cOuter + k0Outer
 }
 
 // writeG2File writes G2Affine points as LE canonical bytes (128 bytes each).
