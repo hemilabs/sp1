@@ -524,103 +524,96 @@ static rustCudaError_t run_ntt_four_step(
             CUDA_OK(hipGetLastError());
         }
     } else if (lg_n <= 20) {
-        // Two-level: 2^(lg_n-10) x 2^10
+        // Two-level four-step NTT: N = rows × cols where cols=1024, rows=N/1024.
+        //
+        // Forward: NTT-1024(rows) → Transpose(R×C)+twiddle → NTT-rows(cols)
+        // Inverse: iNTT-rows(cols) → Transpose(C×R)+twiddle_inv → iNTT-1024(rows)
+        //
+        // The inverse REVERSES the step order because the four-step
+        // decomposition is asymmetric when rows != cols. Only at lg_n=20
+        // (rows=cols=1024) is the order irrelevant.
         uint32_t rows = N >> 10;  // 2^(lg_n-10)
         uint32_t cols = 1024;
 
-        // Step 1: rows independent NTT-1024
-        err = bn254_ntt_1024_lds(d_inout, sub_twiddles, rows, stream);
-        if (err.message != CUDA_SUCCESS_CSL.message) return err;
+        // Helper lambda: run NTT-rows on `num_groups` groups
+        auto ntt_rows = [&](fr_t* data, uint32_t num_groups) -> rustCudaError_t {
+            if (rows >= 1024) {
+                uint32_t sub_rows = rows >> 10;
+                return bn254_ntt_1024_lds(data, sub_twiddles, num_groups * sub_rows, stream);
+            } else {
+                uint32_t lg_rows = lg_n - 10;
+                fr_t one;
+                memcpy(one.data, host_bn254::rone, 32);
+                uint32_t threads = 256;
+                uint32_t small_n = rows;
+                uint32_t groups_per_block = threads / (small_n / 2);
+                if (groups_per_block == 0) groups_per_block = 1;
+                uint32_t nblocks = (num_groups + groups_per_block - 1) / groups_per_block;
+                hipLaunchKernelGGL(bn254_small_ntt_kernel,
+                    dim3(nblocks), dim3(threads),
+                    groups_per_block * small_n * 8 * sizeof(uint32_t), stream,
+                    data, small_twiddles, lg_rows, num_groups, one);
+                CUDA_OK(hipGetLastError());
+                return CUDA_SUCCESS_CSL;
+            }
+        };
 
-        // Step 2: Transpose(rows x cols) + twiddle
-        err = bn254_transpose_twiddle(
-            d_temp_local, d_inout, omega_lo, omega_hi, rows, cols, stream);
-        if (err.message != CUDA_SUCCESS_CSL.message) return err;
+        if (!inverse) {
+            // Forward: NTT-1024 → transpose(R×C)+tw → NTT-rows
+            err = bn254_ntt_1024_lds(d_inout, sub_twiddles, rows, stream);
+            if (err.message != CUDA_SUCCESS_CSL.message) return err;
 
-        // Step 3: cols independent NTT of size rows (using small NTT kernel)
-        // For now, run as sub-NTT-1024 if rows >= 1024, or small kernel otherwise
-        if (rows >= 1024) {
-            uint32_t sub_rows = rows >> 10;
-            err = bn254_ntt_1024_lds(d_temp_local, sub_twiddles, cols * sub_rows, stream);
+            err = bn254_transpose_twiddle(
+                d_temp_local, d_inout, omega_lo, omega_hi, rows, cols, stream);
+            if (err.message != CUDA_SUCCESS_CSL.message) return err;
+
+            err = ntt_rows(d_temp_local, cols);
+            if (err.message != CUDA_SUCCESS_CSL.message) return err;
         } else {
-            // Small NTT for remaining stages
-            uint32_t lg_rows = lg_n - 10;
-            fr_t one;
-            memcpy(one.data, host_bn254::rone, 32);
-            uint32_t threads = 256;
-            uint32_t small_n = rows;
-            uint32_t groups_per_block = threads / (small_n / 2);
-            uint32_t blocks = (cols + groups_per_block - 1) / groups_per_block;
-            hipLaunchKernelGGL(bn254_small_ntt_kernel,
-                dim3(blocks), dim3(threads),
-                groups_per_block * small_n * 8 * sizeof(uint32_t), stream,
-                (fr_t*)d_temp_local, small_twiddles, lg_rows, cols, one);
-            CUDA_OK(hipGetLastError());
+            // Inverse: iNTT-rows → transpose(C×R)+tw_inv → iNTT-1024
+            // Input is in forward output layout: [k0·R + k1] where
+            // k0 ∈ [0,C=1024), k1 ∈ [0,R). This means C groups of R
+            // contiguous elements.
+            err = ntt_rows(d_inout, cols);
+            if (err.message != CUDA_SUCCESS_CSL.message) return err;
+
+            // Transpose C×R → R×C (note: dimensions swapped vs forward!)
+            err = bn254_transpose_twiddle(
+                d_temp_local, d_inout, omega_lo, omega_hi, cols, rows, stream);
+            if (err.message != CUDA_SUCCESS_CSL.message) return err;
+
+            err = bn254_ntt_1024_lds(d_temp_local, sub_twiddles, rows, stream);
+            if (err.message != CUDA_SUCCESS_CSL.message) return err;
         }
 
         // Copy back
         CUDA_OK(hipMemcpyAsync(d_inout, d_temp_local, N * sizeof(fr_t),
                                 hipMemcpyDeviceToDevice, stream));
     } else {
-        // For lg_n > 20: two-level four-step NTT with rows = N/1024, cols = 1024.
+        // Three-level NTT: N = inner_rows × 1024 × 1024.
         //
-        // Step 1: NTT-1024 on each of rows groups (sub-NTTs on columns).
-        // Step 2: Transpose(rows × 1024) + twiddle omega_N^{row*col}.
-        // Step 3: NTT-rows on each of 1024 groups.
+        // Forward (5 steps):
+        //   1: NTT-1024 on N/1024 groups
+        //   2: Transpose(rows × 1024) + twiddle ω_N^{r·c}
+        //   3a: NTT-1024 on N/1024 groups (inner level 1)
+        //   3b: Batch transpose(ir × 1024) + twiddle ω_N^{1024·i·j} (inner level 2)
+        //   3c: NTT-ir on N/ir groups (inner level 3)
         //
-        // Step 3 decomposes NTT-rows as a nested two-level four-step NTT:
-        //   3a: NTT-1024 on inner groups of 1024
-        //   3b: Batched transpose(inner_rows × 1024) + twiddle omega_N^{1024*i*j}
-        //   3c: NTT-inner_rows on inner groups
+        // Inverse (reversed order):
+        //   3c': iNTT-ir on N/ir groups
+        //   3b': Batch transpose(1024 × ir → ir × 1024) + twiddle_inv
+        //   3a': iNTT-1024 on N/1024 groups
+        //   2':  Transpose(1024 × rows → rows × 1024) + twiddle_inv
+        //   1':  iNTT-1024 on N/1024 groups
         uint32_t rows = N >> 10;             // N/1024
         uint32_t inner_rows = rows >> 10;    // rows/1024 (e.g. 16 for lg_n=24)
         uint32_t lg_inner = lg_n - 20;       // log2(inner_rows)
 
-        // Step 1: N/1024 independent NTT-1024
-        err = bn254_ntt_1024_lds(d_inout, sub_twiddles, rows, stream);
-        if (err.message != CUDA_SUCCESS_CSL.message) return err;
-
-        // Step 2: Transpose(rows × 1024) + twiddle omega_N^{row*col}
-        err = bn254_transpose_twiddle(
-            d_temp_local, d_inout, omega_lo, omega_hi,
-            rows, 1024, stream, /*twiddle_stride=*/1);
-        if (err.message != CUDA_SUCCESS_CSL.message) return err;
-
-        // Step 3: NTT-rows on each of 1024 columns.
-        // d_temp_local is (1024 × rows) row-major = 1024 contiguous blocks
-        // of `rows` elements each.
-        //
-        // Sub-step 3a: NTT-1024 on all (1024 * inner_rows) = rows groups
-        err = bn254_ntt_1024_lds(d_temp_local, sub_twiddles, rows, stream);
-        if (err.message != CUDA_SUCCESS_CSL.message) return err;
-
-        // Sub-step 3b: Batched transpose+twiddle within each column's block.
-        // Each of 1024 columns has `rows` elements = (inner_rows × 1024).
-        // Transpose each to (1024 × inner_rows) with twiddle omega_rows^{i*j}
-        // = omega_N^{1024 * i * j} (stride=1024).
-        {
-            uint32_t threads = 256;
-            uint32_t blocks = (N + threads - 1) / threads;
-            hipLaunchKernelGGL(bn254_batch_column_transpose_twiddle_kernel,
-                dim3(blocks), dim3(threads), 0, stream,
-                d_inout,              // output
-                d_temp_local,         // input
-                omega_lo, omega_hi,
-                1024,                 // num_blocks (one per column)
-                rows,                 // block_size
-                inner_rows,           // inner_rows
-                1024,                 // inner_cols
-                1024);                // twiddle_stride: omega_N^{1024*i*j}
-            CUDA_OK(hipGetLastError());
-        }
-
-        // Sub-step 3c: NTT-inner_rows on each group of inner_rows elements.
-        // After transpose, each column's `rows` elements are (1024 × inner_rows).
-        // We have 1024 columns × 1024 inner groups = 2^20 total groups.
-        {
+        // Helper: run NTT-inner_rows on all N/inner_rows groups
+        auto ntt_inner = [&](fr_t* data) -> rustCudaError_t {
             fr_t one;
             memcpy(one.data, host_bn254::rone, 32);
-            uint32_t num_groups = N / inner_rows;  // 2^20
+            uint32_t num_groups = N / inner_rows;
             uint32_t threads = 256;
             uint32_t groups_per_block = threads / (inner_rows / 2);
             if (groups_per_block == 0) groups_per_block = 1;
@@ -628,17 +621,78 @@ static rustCudaError_t run_ntt_four_step(
             hipLaunchKernelGGL(bn254_small_ntt_kernel,
                 dim3(nblocks), dim3(threads),
                 groups_per_block * inner_rows * 8 * sizeof(uint32_t), stream,
-                d_inout, small_twiddles, lg_inner, num_groups, one);
+                data, small_twiddles, lg_inner, num_groups, one);
             CUDA_OK(hipGetLastError());
+            return CUDA_SUCCESS_CSL;
+        };
+
+        // Helper: batch column transpose+twiddle (ir × 1024 blocks)
+        // If fwd=true: transpose ir×1024 → 1024×ir
+        // If fwd=false (inverse): transpose 1024×ir → ir×1024
+        auto batch_col_transpose = [&](fr_t* dst, fr_t* src, bool fwd) -> rustCudaError_t {
+            uint32_t threads = 256;
+            uint32_t blocks = (N + threads - 1) / threads;
+            uint32_t ir = fwd ? inner_rows : 1024;
+            uint32_t ic = fwd ? 1024 : inner_rows;
+            hipLaunchKernelGGL(bn254_batch_column_transpose_twiddle_kernel,
+                dim3(blocks), dim3(threads), 0, stream,
+                dst, src, omega_lo, omega_hi,
+                1024, rows, ir, ic, 1024);
+            CUDA_OK(hipGetLastError());
+            return CUDA_SUCCESS_CSL;
+        };
+
+        if (!inverse) {
+            // Forward: 1 → 2 → 3a → 3b → 3c
+            err = bn254_ntt_1024_lds(d_inout, sub_twiddles, rows, stream);
+            if (err.message != CUDA_SUCCESS_CSL.message) return err;
+
+            err = bn254_transpose_twiddle(
+                d_temp_local, d_inout, omega_lo, omega_hi,
+                rows, 1024, stream, 1);
+            if (err.message != CUDA_SUCCESS_CSL.message) return err;
+
+            err = bn254_ntt_1024_lds(d_temp_local, sub_twiddles, rows, stream);
+            if (err.message != CUDA_SUCCESS_CSL.message) return err;
+
+            err = batch_col_transpose(d_inout, d_temp_local, true);
+            if (err.message != CUDA_SUCCESS_CSL.message) return err;
+
+            err = ntt_inner(d_inout);
+            if (err.message != CUDA_SUCCESS_CSL.message) return err;
+        } else {
+            // Inverse: 3c' → 3b' → 3a' → 2' → 1'
+            err = ntt_inner(d_inout);
+            if (err.message != CUDA_SUCCESS_CSL.message) return err;
+
+            err = batch_col_transpose(d_temp_local, d_inout, false);
+            if (err.message != CUDA_SUCCESS_CSL.message) return err;
+
+            err = bn254_ntt_1024_lds(d_temp_local, sub_twiddles, rows, stream);
+            if (err.message != CUDA_SUCCESS_CSL.message) return err;
+
+            // Transpose 1024×rows → rows×1024 (swapped dims vs forward)
+            err = bn254_transpose_twiddle(
+                d_inout, d_temp_local, omega_lo, omega_hi,
+                1024, rows, stream, 1);
+            if (err.message != CUDA_SUCCESS_CSL.message) return err;
+
+            // Copy d_inout to d_temp_local for final iNTT-1024
+            CUDA_OK(hipMemcpyAsync(d_temp_local, d_inout, N * sizeof(fr_t),
+                                    hipMemcpyDeviceToDevice, stream));
+
+            err = bn254_ntt_1024_lds(d_temp_local, sub_twiddles, rows, stream);
+            if (err.message != CUDA_SUCCESS_CSL.message) return err;
+
+            CUDA_OK(hipMemcpyAsync(d_inout, d_temp_local, N * sizeof(fr_t),
+                                    hipMemcpyDeviceToDevice, stream));
         }
 
-        // Result is already in d_inout, skip the final copy.
-        // Free temp buffer if needed, then return early.
+        // Free temp buffer early since result is in d_inout
         if (d_temp_local && temp_is_owned) {
             hipFree(d_temp_local);
             d_temp_local = nullptr;
         }
-        // Fall through to coset post-divide and final cleanup.
     }
 
     // Inverse: scale by N^{-1} (skipped when fused with coset NTT)

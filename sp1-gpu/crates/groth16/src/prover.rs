@@ -504,8 +504,11 @@ impl Groth16Prover {
             // thread (usize is Send). The PinnedBuf owns the storage and
             // outlives the scope.
             // Use gnark's pre-computed H coefficients (natural order, Montgomery Fr).
-            // This bypasses the GPU NTT which has a known bug in the three-level
-            // path for lg_n > 20 on RDNA3 (twiddle factor issue).
+            // The GPU NTT is self-consistent (round-trip works) but uses a
+            // different output permutation from the standard DFT. This means
+            // GPU-computed H coefficients are in a permuted order that doesn't
+            // match the natural-order Z SRS, making the H MSM incorrect.
+            // gnark's CPU H is in natural order (matching Z), so we use it.
             let h_result = HResult::Host(witness.h_coefficients.clone());
             let size_h = n - 1;
 
