@@ -685,7 +685,10 @@ void bn254_h_poly_pointwise(void* d_a, const void* d_b, const void* d_c,
     uint32_t blocks = ((uint32_t)n + threads - 1) / threads;
     bn254_h_poly_kernel<<<blocks, threads>>>(
         (fr_t*)d_a, (const fr_t*)d_b, (const fr_t*)d_c, den, (uint32_t)n);
-    cudaDeviceSynchronize();
+    // No cudaDeviceSynchronize: next kernel on the same stream (coset iNTT)
+    // will order automatically. Removing the explicit sync avoids waiting on
+    // unrelated concurrent work (e.g., MSM preupload on other streams) — was
+    // adding ~100ms to measured "pointwise" stage on 7900 XTX.
 }
 
 extern "C"
