@@ -192,32 +192,15 @@ func ExportGroth16GpuWitness(dataDir string, witnessPath string, outputDir strin
 		}
 	}
 
-	// Compute H using gnark's algorithm (copied from prove.go:346 since it's unexported).
-	// Save copies of A, B, C since computeH modifies them in-place.
-	start = time.Now()
-	aCopy := make([]fr.Element, len(solution.A))
-	copy(aCopy, solution.A)
-	bCopy := make([]fr.Element, len(solution.B))
-	copy(bCopy, solution.B)
-	cCopy := make([]fr.Element, len(solution.C))
-	copy(cCopy, solution.C)
-
-	h := localComputeH(aCopy, bCopy, cCopy, &_pk.Domain)
-	fmt.Printf("[groth16-witness] computeH took %s (len=%d)\n", time.Since(start), len(h))
-
-	// gnark's localComputeH produces H in BIT-REVERSED order (DIF FFTInverse
-	// output). gnark's pk.G1.Z is also in bit-reversed order, so their MSM is
-	// consistent. But we export Z in NATURAL order for the GPU prover, so we
-	// must also export H in natural order. Un-bit-reverse H here.
-	// H has domain.Cardinality elements (power of 2), so fft.BitReverse works.
-	fft.BitReverse(h)
+	// H polynomial is now computed on GPU (compute_h_gpu in Rust),
+	// so we skip the CPU H computation and export here (saves ~3s).
 
 	// Export
 	os.MkdirAll(outputDir, 0755)
 	start = time.Now()
 
-	// Write wire_values and h_coefficients in raw Montgomery form (skips
-	// ~79M fromMont calls here and ~31.7M mont_mul calls in Rust loader).
+	// Write wire_values in raw Montgomery form (skips ~15M fromMont calls
+	// and the corresponding mont_mul calls in the Rust loader).
 	// Solution A/B/C stay canonical since they're smaller and consumed differently.
 	writeFrFileMontgomery(filepath.Join(outputDir, "wire_values.bin"), solution.W)
 	writeFrFile(filepath.Join(outputDir, "solution_a.bin"), solution.A)
@@ -225,7 +208,6 @@ func ExportGroth16GpuWitness(dataDir string, witnessPath string, outputDir strin
 	writeFrFile(filepath.Join(outputDir, "solution_c.bin"), solution.C)
 	writeG1File(filepath.Join(outputDir, "commitments.bin"), commitments)
 	writeG1File(filepath.Join(outputDir, "commitment_pok.bin"), []bn254.G1Affine{commitmentPok})
-	writeFrFileMontgomery(filepath.Join(outputDir, "h_coefficients.bin"), h)
 
 	fmt.Printf("[groth16-witness] Exported witness data in %s\n", time.Since(start))
 }

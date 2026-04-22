@@ -271,16 +271,22 @@ impl Groth16WitnessData {
     pub fn load(dir: &str) -> anyhow::Result<Self> {
         let dir = std::path::Path::new(dir);
 
-        // Load wire_values and h_coefficients using auto-detection: if the file
-        // has the "MFr1" Montgomery magic header, the Fr values are used directly
-        // (zero conversion cost). Otherwise falls back to canonical-to-Montgomery
-        // conversion (~350ms for wire_values, ~150ms for H).
+        // Load wire_values using auto-detection: if the file has the "MFr1"
+        // Montgomery magic header, the Fr values are used directly (zero
+        // conversion cost). Otherwise falls back to canonical-to-Montgomery
+        // conversion.
         let wire_values = load_fr_elements_auto(&dir.join("wire_values.bin"))?;
         let solution_a = load_fr_elements(&dir.join("solution_a.bin"))?;
         let solution_b = load_fr_elements(&dir.join("solution_b.bin"))?;
         let solution_c = load_fr_elements(&dir.join("solution_c.bin"))?;
 
-        let h_coefficients = load_fr_elements_auto(&dir.join("h_coefficients.bin"))?;
+        // H is computed on GPU; load if present (backward compat), else empty.
+        let h_path = dir.join("h_coefficients.bin");
+        let h_coefficients = if h_path.exists() {
+            load_fr_elements_auto(&h_path)?
+        } else {
+            Vec::new()
+        };
 
         let commitments = if dir.join("commitments.bin").exists() {
             load_g1_points(&dir.join("commitments.bin"))?
