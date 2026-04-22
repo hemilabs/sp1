@@ -137,6 +137,7 @@ if(USE_HIP)
         algebra_objs basefold_objs challenger_objs
         jagged_assist_objs jagged_sumcheck_objs
         logup_gkr_objs merkle_tree_objs mle_objs ntt_objs
+        ntt_bn254_objs
         runtime_objs scan_objs sum_and_reduce_objs sumcheck_objs
         tracegen_objs transpose_objs zerocheck_objs
         msm_objs

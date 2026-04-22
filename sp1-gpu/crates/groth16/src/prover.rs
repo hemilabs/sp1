@@ -500,16 +500,11 @@ impl Groth16Prover {
             }
             eprintln!("[T] 2a. Wire scatter Ar (pre-pinned): {:?}", t_gather.elapsed());
 
-            // Pass the pre-pinned buffer pointer as usize into the spawn
-            // thread (usize is Send). The PinnedBuf owns the storage and
-            // outlives the scope.
             // Use gnark's pre-computed H coefficients (natural order, Montgomery Fr).
-            // The RDNA3 GPU NTT computes a DIFFERENT linear transform than the
-            // standard DFT (not just a permutation — verified empirically).
-            // While it is self-consistent (NTT∘iNTT = identity), the H output
-            // values differ from the standard DFT values, so no reordering of Z
-            // can make the MSM correct. The correct fix is to port sppark's NTT
-            // to HIP, which produces standard DFT output.
+            // Even with sppark NTT on HIP (which has correct standard DFT output),
+            // the full compute_h_gpu pipeline has subtle issues around the coset
+            // NTT / batched poly handling that need further debugging. Keep the
+            // proven gnark H path for correctness.
             let h_result = HResult::Host(witness.h_coefficients.clone());
             let size_h = n - 1;
 
