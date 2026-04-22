@@ -3526,7 +3526,9 @@ impl PlonkProver {
                         * (l_evals[i] + beta_val * s1_evals[i] + gamma_val)
                         * (r_evals[i] + beta_val * s2_evals[i] + gamma_val)
                         * (o_evals[i] + beta_val * s3_evals[i] + gamma_val);
-                    let perm = alpha_val * (perm_den - perm_num);
+                    // PLONK permutation identity: α·(Z·num - Z(ωX)·den).
+                    // Matches gnark's orderingConstraint which returns (num - den).
+                    let perm = alpha_val * (perm_num - perm_den);
 
                     let l1_x = zh_values[i] * x_minus_one_n_inv[i];
                     let boundary = alpha_sq * (z_evals[i] - Fr::ONE) * l1_x;
@@ -4356,8 +4358,8 @@ mod tests {
                 * (l_x + beta * s1_x + gamma)
                 * (r_x + beta * s2_x + gamma)
                 * (o_x + beta * s3_x + gamma);
-            // gnark REVERSED convention: (den - num), matching linearization sign
-            let perm = alpha * (perm_den - perm_num);
+            // gnark convention: α·(Z·num - Z(ωX)·den) = α·(perm_num - perm_den)
+            let perm = alpha * (perm_num - perm_den);
 
             // Boundary: alpha^2 * (Z - 1) * L_1(x)
             let l1_x = zh_x * ((*x - Fr::ONE) * n_fr).inv();
@@ -5117,16 +5119,16 @@ mod tests {
     ///
     /// The comprehensive test (`test_constraint_satisfaction_comprehensive`) uses
     /// identity permutation, which makes perm_num == perm_den at every point.
-    /// This means the sign of `(perm_den - perm_num)` vs `(perm_num - perm_den)`
+    /// This means the sign of `(perm_num - perm_den)` vs `(perm_den - perm_num)`
     /// is irrelevant -- both are zero. That test cannot catch a sign error in
     /// the permutation term of the quotient polynomial.
     ///
     /// This test constructs a circuit with a non-identity permutation (swap two
     /// wire positions) so that Z is NOT all ones. The permutation contribution
     /// to the quotient becomes non-trivial, and we verify:
-    ///   h(x) * Z_H(x) == gate(x) + alpha*(perm_den - perm_num) + alpha^2*(Z-1)*L1(x)
-    /// at random evaluation points. If the sign were wrong (perm_num - perm_den),
-    /// this check would fail.
+    ///   h(x) * Z_H(x) == gate(x) + alpha*(perm_num - perm_den) + alpha^2*(Z-1)*L1(x)
+    /// at random evaluation points. This matches gnark's orderingConstraint
+    /// which returns (num - den).
     #[test]
     fn test_constraint_satisfaction_nonidentity_permutation() {
         let n: usize = 8;
@@ -5336,8 +5338,8 @@ mod tests {
                 * (l_x + beta * s1_x + gamma)
                 * (r_x + beta * s2_x + gamma)
                 * (o_x + beta * s3_x + gamma);
-            // gnark convention: (den - num)
-            let perm = alpha * (perm_den - perm_num);
+            // gnark convention: α·(num - den)
+            let perm = alpha * (perm_num - perm_den);
 
             // Boundary: alpha^2 * (Z - 1) * L_1(x)
             let l1_x = zh_x * ((*x - Fr::ONE) * n_fr).inv();
@@ -5373,8 +5375,8 @@ mod tests {
                 * (l_x + beta * s1_x + gamma)
                 * (r_x + beta * s2_x + gamma)
                 * (o_x + beta * s3_x + gamma);
-            // WRONG sign: (num - den) instead of (den - num)
-            let perm = alpha * (perm_num - perm_den);
+            // WRONG sign: (den - num) instead of (num - den)
+            let perm = alpha * (perm_den - perm_num);
 
             let l1_x = zh_x * ((*x - Fr::ONE) * n_fr).inv();
             let boundary = alpha.square() * (z_x - Fr::ONE) * l1_x;
@@ -5393,7 +5395,7 @@ mod tests {
             // Correct sign MUST match
             assert_eq!(
                 lhs, rhs_correct,
-                "CRITICAL: h(x)*Z_H(x) != numerator(x) with (perm_den - perm_num) sign.\n\
+                "CRITICAL: h(x)*Z_H(x) != numerator(x) with (perm_num - perm_den) sign.\n\
                  This means the quotient computation or the sign convention is wrong.\n\
                  h(x)*Z_H(x)  = {:?}\n\
                  numerator(x) = {:?}",

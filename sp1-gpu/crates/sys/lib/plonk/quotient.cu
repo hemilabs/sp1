@@ -147,7 +147,11 @@ __global__ void plonk_quotient_fused_kernel(
     }
     perm_den *= z_shifted;
 
-    fr_t perm = alpha * (perm_den - perm_num);
+    // PLONK permutation identity: α·(Z·num - Z(ωX)·den). Matches gnark's
+    // orderingConstraint which returns (num - den). SP1 previously used the
+    // opposite sign which produced an internally-consistent quotient but
+    // disagreed with the verifier's (gnark-style) linearization formula.
+    fr_t perm = alpha * (perm_num - perm_den);
 
     // Boundary constraint: alpha^2 * (Z - 1) * L_1(x)
     fr_t l1_x;
@@ -444,7 +448,11 @@ __global__ void plonk_quotient_streamed_kernel(
     }
     perm_den *= z_shifted;
 
-    fr_t perm = alpha * (perm_den - perm_num);
+    // PLONK permutation identity: α·(Z·num - Z(ωX)·den). Matches gnark's
+    // orderingConstraint which returns (num - den). SP1 previously used the
+    // opposite sign which produced an internally-consistent quotient but
+    // disagreed with the verifier's (gnark-style) linearization formula.
+    fr_t perm = alpha * (perm_num - perm_den);
 
     // Boundary constraint: alpha^2 * (Z - 1) * L_1(x)
     fr_t l1_x;
