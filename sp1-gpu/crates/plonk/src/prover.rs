@@ -5748,4 +5748,416 @@ mod tests {
             "const_lin_prover != const_lin_verifier (see stderr diagnostics above)",
         );
     }
+
+    /// Extended version of `test_lin_poly_matches_verifier_formula` that activates
+    /// BSB22 commitments AND multiple (non-zero) public inputs.
+    ///
+    /// Production SP1 circuits have nb_pub > 1 AND BSB22 commitments. The plain
+    /// matching test (`test_lin_poly_matches_verifier_formula`) uses nb_pub=1 with
+    /// no BSB22 and passes, while production PLONK proofs fail gnark verification.
+    /// This test isolates whether the bug is in one of those two dimensions.
+    ///
+    /// Verifier formula (canonical, per crates/verifier/src/plonk/verify.rs):
+    ///   PI(ζ)   = Σ_{i<nb_pub} L_i(ζ)·pi[i] + Σ_j L_{nb_pub+idx_j}(ζ)·hash_j
+    ///   const_lin_verifier = -(PI(ζ) - α²·L₁(ζ) + α·(l+βs1+γ)(r+βs2+γ)(o+γ)·z(ωζ))
+    ///
+    /// The prover's `compute_linearization(...).eval(ζ)` MUST equal this.
+    #[test]
+    fn test_lin_poly_matches_verifier_formula_with_bsb22() {
+        let n: usize = 8;
+        let log_n = n.trailing_zeros();
+        let omega = crate::domain::root_of_unity(log_n);
+        let domain = Domain::new(n, omega);
+
+        // ---- SRS (dummy, structurally correct) ----
+        let g = crate::g1::G1Affine {
+            x: crate::fields::Fq::from_u64(1),
+            y: crate::fields::Fq::from_u64(2),
+        };
+        let srs_lagrange: Vec<BN254G1Affine> = (1..=n as u64)
+            .map(|i| g.to_jacobian().scalar_mul(&[i, 0, 0, 0]).to_affine().to_bn254())
+            .collect();
+        let srs_canonical: Vec<BN254G1Affine> = (1..=(n + 3) as u64)
+            .map(|i| g.to_jacobian().scalar_mul(&[i, 0, 0, 0]).to_affine().to_bn254())
+            .collect();
+
+        let coset_shift = Fr::from_u64(5);
+        let k1 = coset_shift;
+        let k2 = k1 * k1;
+        let omega_powers = domain.omega_powers();
+
+        // ---- Identity permutation ----
+        let s1_fr: Vec<Fr> = omega_powers.clone();
+        let s2_fr: Vec<Fr> = omega_powers.iter().map(|w| *w * k1).collect();
+        let s3_fr: Vec<Fr> = omega_powers.iter().map(|w| *w * k2).collect();
+        let s1: Vec<BN254Fr> = s1_fr.iter().map(|v| v.to_bn254fr()).collect();
+        let s2: Vec<BN254Fr> = s2_fr.iter().map(|v| v.to_bn254fr()).collect();
+        let s3: Vec<BN254Fr> = s3_fr.iter().map(|v| v.to_bn254fr()).collect();
+
+        // ---- nb_pub = 2 (multiple PUBLIC INPUTS with non-zero values) ----
+        // Row 0 and row 1 are public-input rows (gnark: Ql = -1, Qk = 0, PI = +v).
+        // One BSB22 commitment at commitment_constraint_index = 0  ->  PI row is
+        // nb_pub + 0 = 2. That gives us: rows 0,1 as PIs; row 2 as BSB22 hash row.
+        let nb_pub = 2usize;
+        let pi_values = [Fr::from_u64(42), Fr::from_u64(99)];
+        let commitment_constraint_index = 0usize;
+        let bsb22_row = nb_pub + commitment_constraint_index; // row 2
+
+        // ---- Selectors ----
+        // Rows 0,1: Ql = -1, rest=0  -> gate = -L[i] + PI[i], with PI[i]=+pi_values[i]
+        //   so set L[i]=pi_values[i] to satisfy gate.
+        // Row  2 : Ql = -1, Qcp=0, rest=0 -> gate = -L[2] + PI[2], with PI[2]=+hash(bsb22),
+        //   so set L[2]=hash. NOTE: Qcp NOT applied at bsb22_row so we don't double-count.
+        //   Actually the standard gnark convention is: Qcp_i(X) selects WHERE the BSB22 poly
+        //   is consumed (typically separate from bsb22_row). We use a DIFFERENT row for
+        //   Qcp to make the constraint non-trivial.
+        // Rows 3..n: simple addition gate with Ql=1, Qr=1, Qo=-1, Qcp=0.
+        // Row 3     : the "BSB22 consume" row with Qcp[3] = 2, so gate contributes 2*bsb22_poly[3]
+        //   and we absorb this into O[3] via Qo=-1.
+        let mut ql_evals = vec![Fr::ONE; n];
+        ql_evals[0] = -Fr::ONE;
+        ql_evals[1] = -Fr::ONE;
+        ql_evals[2] = -Fr::ONE;
+        let mut qr_evals = vec![Fr::ONE; n];
+        qr_evals[0] = Fr::ZERO;
+        qr_evals[1] = Fr::ZERO;
+        qr_evals[2] = Fr::ZERO;
+        let qm_evals = vec![Fr::ZERO; n];
+        let mut qo_evals: Vec<Fr> = vec![-Fr::ONE; n];
+        qo_evals[0] = Fr::ZERO;
+        qo_evals[1] = Fr::ZERO;
+        qo_evals[2] = Fr::ZERO;
+        let qk_evals = vec![Fr::ZERO; n];
+
+        // Qcp: non-zero only at row 3, where it multiplies the BSB22 polynomial.
+        let mut qcp_evals = vec![Fr::ZERO; n];
+        qcp_evals[3] = Fr::from_u64(2);
+
+        let ql_bn: Vec<BN254Fr> = ql_evals.iter().map(|v| v.to_bn254fr()).collect();
+        let qr_bn: Vec<BN254Fr> = qr_evals.iter().map(|v| v.to_bn254fr()).collect();
+        let qm_bn: Vec<BN254Fr> = qm_evals.iter().map(|v| v.to_bn254fr()).collect();
+        let qo_bn: Vec<BN254Fr> = qo_evals.iter().map(|v| v.to_bn254fr()).collect();
+        let qk_bn: Vec<BN254Fr> = qk_evals.iter().map(|v| v.to_bn254fr()).collect();
+        let qcp_bn: Vec<BN254Fr> = qcp_evals.iter().map(|v| v.to_bn254fr()).collect();
+
+        // ---- BSB22 commitment (dummy but non-trivial) and hash-to-field ----
+        let bsb22_commit = g.to_jacobian().scalar_mul(&[7, 0, 0, 0]).to_affine().to_bn254();
+        let bsb22_hash =
+            crate::hash_to_field::hash_to_field_bsb22(&bsb22_commit.to_transcript_bytes());
+        assert!(!bsb22_hash.is_zero(), "BSB22 hash must be non-zero for meaningful test");
+
+        // ---- BSB22 committed polynomial values (non-trivial) ----
+        let bsb22_poly_fr: Vec<Fr> =
+            (0..n as u64).map(|i| Fr::from_u64(i + 1)).collect();
+
+        // ---- Wire values satisfying the gate ----
+        // PI(X) evaluation-form (what the verifier formula reconstructs):
+        //   PI[0]=+pi[0], PI[1]=+pi[1], PI[2]=+hash, others 0.
+        let mut pi_evals = vec![Fr::ZERO; n];
+        pi_evals[0] = pi_values[0];
+        pi_evals[1] = pi_values[1];
+        pi_evals[bsb22_row] = bsb22_hash;
+
+        // Build L: L[0..=2] forced by constraint; rows 3..n are arbitrary.
+        let mut l_fr: Vec<Fr> = (1..=n as u64).map(Fr::from_u64).collect();
+        l_fr[0] = pi_values[0];
+        l_fr[1] = pi_values[1];
+        l_fr[2] = bsb22_hash;
+
+        // R: arbitrary except zero on rows 0..=2 (Qr=0 there).
+        let mut r_fr: Vec<Fr> = (10..10 + n as u64).map(Fr::from_u64).collect();
+        r_fr[0] = Fr::ZERO;
+        r_fr[1] = Fr::ZERO;
+        r_fr[2] = Fr::ZERO;
+
+        // O: satisfy Ql*L + Qr*R + Qo*O + Qcp*bsb22_poly + PI = 0
+        //    For Qo=-1: O[i] = Ql[i]*L[i] + Qr[i]*R[i] + Qcp[i]*bsb22_poly[i] + PI[i].
+        //    Rows with Qo=0 (0,1,2): O forced by remaining terms; but gate already
+        //    balanced there (Ql*L + PI = 0), so Qcp*bsb22_poly term is zero (Qcp=0).
+        //    Pick O=0 on those rows for simplicity.
+        let mut o_fr = vec![Fr::ZERO; n];
+        for (i, entry) in o_fr.iter_mut().enumerate().take(n).skip(3) {
+            *entry =
+                ql_evals[i] * l_fr[i] + qr_evals[i] * r_fr[i]
+                    + qcp_evals[i] * bsb22_poly_fr[i] + pi_evals[i];
+        }
+
+        // Sanity: full gate constraint (with BSB22) must be satisfied at every row.
+        for i in 0..n {
+            let gate = ql_evals[i] * l_fr[i]
+                + qr_evals[i] * r_fr[i]
+                + qm_evals[i] * l_fr[i] * r_fr[i]
+                + qo_evals[i] * o_fr[i]
+                + qk_evals[i]
+                + pi_evals[i]
+                + qcp_evals[i] * bsb22_poly_fr[i];
+            assert_eq!(gate, Fr::ZERO, "Gate constraint violated at row {i}");
+        }
+
+        // ---- Build proving data ----
+        let data = PlonkProvingData {
+            domain_size: n,
+            lg_domain_size: log_n,
+            omega: omega.to_bn254fr(),
+            nb_public_variables: nb_pub,
+            coset_shift: coset_shift.to_bn254fr(),
+            srs_lagrange,
+            srs_canonical,
+            ql: ql_bn,
+            qr: qr_bn,
+            qm: qm_bn,
+            qo: qo_bn,
+            qk: qk_bn,
+            qcp: vec![qcp_bn],
+            commitment_constraint_indexes: vec![commitment_constraint_index],
+            s1,
+            s2,
+            s3,
+        };
+        let prover = PlonkProver::new(data);
+
+        // ---- Deterministic challenges ----
+        let beta = Fr::from_u64(7);
+        let gamma = Fr::from_u64(13);
+        let alpha = Fr::from_u64(17);
+        let zeta = Fr::from_u64(987_654_321);
+
+        // ---- Grand product (identity permutation => Z is all ones) ----
+        let z_lagrange = prover
+            .compute_grand_product(
+                &l_fr,
+                &r_fr,
+                &o_fr,
+                &s1_fr,
+                &s2_fr,
+                &s3_fr,
+                &beta,
+                &gamma,
+                &domain,
+                &coset_shift,
+            )
+            .unwrap();
+        assert_eq!(z_lagrange[0], Fr::ONE);
+
+        // ---- Coefficient forms ----
+        let l_coeffs = domain.ifft(&l_fr);
+        let r_coeffs = domain.ifft(&r_fr);
+        let o_coeffs = domain.ifft(&o_fr);
+        let z_coeffs = domain.ifft(&z_lagrange);
+        let ql_coeffs = domain.ifft(&ql_evals);
+        let qr_coeffs = domain.ifft(&qr_evals);
+        let qm_coeffs = domain.ifft(&qm_evals);
+        let qo_coeffs = domain.ifft(&qo_evals);
+        let qk_coeffs = domain.ifft(&qk_evals);
+        let s1_coeffs = domain.ifft(&s1_fr);
+        let s2_coeffs = domain.ifft(&s2_fr);
+        let s3_coeffs = domain.ifft(&s3_fr);
+        // Use the qcp coefficients cached by the prover so they match the cached
+        // coset evals used inside compute_quotient.
+        let qcp_coeffs_list: Vec<Vec<Fr>> = prover.cached.qcp_coeffs.clone();
+        let bsb22_coeffs_list: Vec<Vec<Fr>> = vec![domain.ifft(&bsb22_poly_fr)];
+
+        // ---- Quotient ----
+        let bsb22_commitments_bn = vec![bsb22_commit];
+        let h_coeffs = prover.compute_quotient(
+            n,
+            &domain,
+            &l_coeffs,
+            &r_coeffs,
+            &o_coeffs,
+            &z_coeffs,
+            &ql_coeffs,
+            &qr_coeffs,
+            &qm_coeffs,
+            &qo_coeffs,
+            &qk_coeffs,
+            &s1_coeffs,
+            &s2_coeffs,
+            &s3_coeffs,
+            &qcp_coeffs_list,
+            &bsb22_coeffs_list,
+            &alpha,
+            &beta,
+            &gamma,
+            &coset_shift,
+            &pi_values,
+            &bsb22_commitments_bn,
+        );
+        let (h0_coeffs, h1_coeffs, h2_coeffs) = split_quotient(&h_coeffs, n);
+
+        // ---- Polynomial evals at ζ ----
+        let l_poly = Polynomial::new(l_coeffs.clone());
+        let r_poly = Polynomial::new(r_coeffs.clone());
+        let o_poly = Polynomial::new(o_coeffs.clone());
+        let z_poly = Polynomial::new(z_coeffs.clone());
+        let s1_poly = Polynomial::new(s1_coeffs.clone());
+        let s2_poly = Polynomial::new(s2_coeffs.clone());
+
+        let l_zeta = l_poly.eval(&zeta);
+        let r_zeta = r_poly.eval(&zeta);
+        let o_zeta = o_poly.eval(&zeta);
+        let s1_zeta = s1_poly.eval(&zeta);
+        let s2_zeta = s2_poly.eval(&zeta);
+        let z_shifted_zeta = z_poly.eval(&(zeta * omega));
+        let qcp_zeta: Vec<Fr> = qcp_coeffs_list
+            .iter()
+            .map(|q| Polynomial::new(q.clone()).eval(&zeta))
+            .collect();
+
+        // ---- Prover side: lin(ζ) = compute_linearization(...).eval(ζ) ----
+        let lin_poly = prover.compute_linearization(
+            n,
+            &zeta,
+            &alpha,
+            &beta,
+            &gamma,
+            &l_zeta,
+            &r_zeta,
+            &o_zeta,
+            &s1_zeta,
+            &s2_zeta,
+            &z_shifted_zeta,
+            &z_coeffs,
+            &ql_coeffs,
+            &qr_coeffs,
+            &qm_coeffs,
+            &qo_coeffs,
+            &qk_coeffs,
+            &s3_coeffs,
+            &qcp_coeffs_list,
+            &qcp_zeta,
+            &bsb22_coeffs_list,
+            h0_coeffs,
+            h1_coeffs,
+            h2_coeffs,
+            &domain,
+            &coset_shift,
+        );
+        let const_lin_prover = lin_poly.eval(&zeta);
+
+        // ---- Verifier side: canonical formula including BSB22 ----
+        // PI(ζ) = Σ_{i<nb_pub} L_i(ζ)·pi[i] + Σ_j L_{nb_pub + idx_j}(ζ)·hash_j
+        // L_k(ζ) = (ζⁿ-1)·ωᵏ / (n·(ζ-ωᵏ))
+        let zh_zeta = domain.vanishing_eval(&zeta);
+        let size_inv = domain.size_inv;
+
+        // Public-input contribution
+        let mut pi_zeta_pi_part = Fr::ZERO;
+        {
+            let mut accw = Fr::ONE;
+            for ev in pi_values.iter() {
+                if !ev.is_zero() {
+                    let den = zeta - accw;
+                    assert!(!den.is_zero(), "ζ coincided with a root of unity");
+                    let mut term = zh_zeta;
+                    term *= den.inv();
+                    term *= size_inv;
+                    term *= accw;
+                    term *= *ev;
+                    pi_zeta_pi_part += term;
+                }
+                accw *= domain.omega;
+            }
+        }
+        // BSB22 contribution: at row nb_pub + idx_j
+        let mut pi_zeta_bsb22_part = Fr::ZERO;
+        {
+            let row = nb_pub + commitment_constraint_index;
+            let w_pow = domain.omega.pow(&[row as u64, 0, 0, 0]);
+            let den = zeta - w_pow;
+            assert!(!den.is_zero(), "ζ coincided with BSB22 row's ωᵏ");
+            let mut term = zh_zeta;
+            term *= w_pow;
+            term *= den.inv();
+            term *= size_inv;
+            term *= bsb22_hash;
+            pi_zeta_bsb22_part += term;
+        }
+        let pi_zeta_verifier = pi_zeta_pi_part + pi_zeta_bsb22_part;
+
+        // L₁(ζ) = (ζⁿ-1) / (n·(ζ-1))
+        let l1_zeta = {
+            let mut li = (zeta - Fr::ONE).inv();
+            li *= zh_zeta;
+            li *= domain.size_inv;
+            li
+        };
+        let alpha_sq_l1 = alpha.square() * l1_zeta;
+
+        // α · (l + β·s1 + γ) · (r + β·s2 + γ) · (o + γ) · z(ωζ)
+        let perm_summand = {
+            let t1 = l_zeta + beta * s1_zeta + gamma;
+            let t2 = r_zeta + beta * s2_zeta + gamma;
+            let t3 = o_zeta + gamma;
+            alpha * t1 * t2 * t3 * z_shifted_zeta
+        };
+
+        let const_lin_verifier = -(pi_zeta_verifier - alpha_sq_l1 + perm_summand);
+
+        // ---- Diagnostics on mismatch ----
+        if const_lin_prover != const_lin_verifier {
+            eprintln!("--- const_lin divergence (BSB22 + multi-PI) ---");
+            eprintln!("nb_pub                  = {}", nb_pub);
+            eprintln!("pi_values               = {:?}", pi_values);
+            eprintln!("commitment_cst_idx      = {}", commitment_constraint_index);
+            eprintln!("bsb22_row               = {}", bsb22_row);
+            eprintln!("bsb22_hash              = {:?}", bsb22_hash);
+            eprintln!("pi_evals (vk+bsb22)     = {:?}", pi_evals);
+            eprintln!("zeta                    = {:?}", zeta);
+            eprintln!("alpha                   = {:?}", alpha);
+            eprintln!("beta                    = {:?}", beta);
+            eprintln!("gamma                   = {:?}", gamma);
+            eprintln!("l_zeta                  = {:?}", l_zeta);
+            eprintln!("r_zeta                  = {:?}", r_zeta);
+            eprintln!("o_zeta                  = {:?}", o_zeta);
+            eprintln!("s1_zeta                 = {:?}", s1_zeta);
+            eprintln!("s2_zeta                 = {:?}", s2_zeta);
+            eprintln!("z_shifted_zeta          = {:?}", z_shifted_zeta);
+            eprintln!("qcp_zeta                = {:?}", qcp_zeta);
+            eprintln!("zh_zeta                 = {:?}", zh_zeta);
+            eprintln!("L1(zeta)                = {:?}", l1_zeta);
+            eprintln!("PI(ζ) pi part           = {:?}", pi_zeta_pi_part);
+            eprintln!("PI(ζ) bsb22 part        = {:?}", pi_zeta_bsb22_part);
+            eprintln!("PI(ζ) verifier (total)  = {:?}", pi_zeta_verifier);
+            eprintln!("alpha^2 * L1(ζ)         = {:?}", alpha_sq_l1);
+            eprintln!("perm_summand            = {:?}", perm_summand);
+            eprintln!("const_lin_prover        = {:?}", const_lin_prover);
+            eprintln!("const_lin_verifier      = {:?}", const_lin_verifier);
+            eprintln!("diff (prover-verifier)  = {:?}", const_lin_prover - const_lin_verifier);
+
+            eprintln!(
+                "diff + PI(ζ) pi part    = {:?}   (zero => prover missing +PI_pi)",
+                (const_lin_prover - const_lin_verifier) + pi_zeta_pi_part,
+            );
+            eprintln!(
+                "diff - PI(ζ) pi part    = {:?}   (zero => prover missing -PI_pi)",
+                (const_lin_prover - const_lin_verifier) - pi_zeta_pi_part,
+            );
+            eprintln!(
+                "diff + PI(ζ) bsb22 part = {:?}   (zero => prover missing +PI_bsb22)",
+                (const_lin_prover - const_lin_verifier) + pi_zeta_bsb22_part,
+            );
+            eprintln!(
+                "diff - PI(ζ) bsb22 part = {:?}   (zero => prover missing -PI_bsb22)",
+                (const_lin_prover - const_lin_verifier) - pi_zeta_bsb22_part,
+            );
+            eprintln!(
+                "diff + 2*PI(ζ) bsb22    = {:?}   (zero => sign of PI_bsb22 is flipped)",
+                (const_lin_prover - const_lin_verifier)
+                    + pi_zeta_bsb22_part
+                    + pi_zeta_bsb22_part,
+            );
+            eprintln!(
+                "diff + 2*PI(ζ) pi part  = {:?}   (zero => sign of PI_pi is flipped)",
+                (const_lin_prover - const_lin_verifier)
+                    + pi_zeta_pi_part
+                    + pi_zeta_pi_part,
+            );
+        }
+        assert_eq!(
+            const_lin_prover, const_lin_verifier,
+            "const_lin_prover != const_lin_verifier with BSB22 + multi-PI \
+             (see stderr diagnostics above)",
+        );
+    }
 }
