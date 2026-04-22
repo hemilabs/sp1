@@ -90,4 +90,77 @@ impl PlonkProof {
 
         bytes
     }
+
+    /// Serialize the proof to bytes in gnark's `WriteRawTo` format.
+    ///
+    /// This is the format gnark's `plonk.Proof.ReadFrom` expects (and therefore
+    /// what the Go FFI `verify_plonk_bn254` consumes). It differs from
+    /// `to_bytes()` (MarshalSolidity) in both order and framing:
+    ///
+    /// Layout (for 1 BSB22 commitment, total = 904 bytes):
+    /// - `LRO[0..3]`                                              (3 × 64 = 192 bytes)
+    /// - `Z`                                                      (64 bytes)
+    /// - `H[0..3]`                                                (3 × 64 = 192 bytes)
+    /// - `BatchedProof.H`                                         (64 bytes)
+    /// - `BatchedProof.ClaimedValues` as `fr.Vector`:
+    ///     * 4-byte big-endian `uint32` length prefix
+    ///     * length × 32-byte big-endian canonical `fr.Element`
+    ///     (length is typically 7: [linearized, L, R, O, S1, S2, BSB22])
+    /// - `ZShiftedOpening.H`                                      (64 bytes)
+    /// - `ZShiftedOpening.ClaimedValue`                           (32 bytes)
+    /// - `Bsb22Commitments` as `[]G1Affine`:
+    ///     * 4-byte big-endian `uint32` length prefix
+    ///     * length × 64-byte raw G1Affine (X‖Y, big-endian, uncompressed)
+    ///
+    /// Reference: gnark-crypto v0.19.3 `ecc/bn254/marshal.go` Encoder and
+    /// gnark's `backend/plonk/bn254/marshal.go` `WriteRawTo`.
+    pub fn to_write_raw_bytes(&self) -> Vec<u8> {
+        // 3*64 (LRO) + 64 (Z) + 3*64 (H) + 64 (Wz) + 4 + n_cv*32
+        // + 64 (Wzω) + 32 (z_shifted claim) + 4 + n_bsb22*64
+        let n_cv = self.batched_proof.claimed_values.len();
+        let n_bsb22 = self.bsb22_commitments.len();
+        let total = 3 * 64 + 64 + 3 * 64 + 64 + 4 + n_cv * 32 + 64 + 32 + 4 + n_bsb22 * 64;
+        let mut bytes = Vec::with_capacity(total);
+
+        // LRO (3 × 64 bytes)
+        for lro_i in &self.lro {
+            bytes.extend_from_slice(&lro_i.to_transcript_bytes());
+        }
+
+        // Z (64 bytes) — comes AFTER LRO and BEFORE H in WriteRawTo.
+        bytes.extend_from_slice(&self.z.to_transcript_bytes());
+
+        // H (3 × 64 bytes)
+        for h_i in &self.h {
+            bytes.extend_from_slice(&h_i.to_transcript_bytes());
+        }
+
+        // BatchedProof.H (64 bytes)
+        bytes.extend_from_slice(&self.batched_proof.h.to_transcript_bytes());
+
+        // BatchedProof.ClaimedValues as fr.Vector:
+        //   - 4-byte big-endian uint32 length
+        //   - length × 32-byte big-endian canonical Fr
+        bytes.extend_from_slice(&(n_cv as u32).to_be_bytes());
+        for cv in &self.batched_proof.claimed_values {
+            bytes.extend_from_slice(&cv.to_be_bytes());
+        }
+
+        // ZShiftedOpening.H (64 bytes)
+        bytes.extend_from_slice(&self.z_shifted_opening.h.to_transcript_bytes());
+
+        // ZShiftedOpening.ClaimedValue (32 bytes)
+        bytes.extend_from_slice(&self.z_shifted_opening.claimed_value.to_be_bytes());
+
+        // Bsb22Commitments as []G1Affine:
+        //   - 4-byte big-endian uint32 length
+        //   - length × 64-byte raw G1Affine (X‖Y big-endian)
+        bytes.extend_from_slice(&(n_bsb22 as u32).to_be_bytes());
+        for c in &self.bsb22_commitments {
+            bytes.extend_from_slice(&c.to_transcript_bytes());
+        }
+
+        debug_assert_eq!(bytes.len(), total);
+        bytes
+    }
 }

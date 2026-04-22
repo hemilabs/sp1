@@ -61,8 +61,8 @@ fn main() {
     let nb_public = data.nb_public_variables;
     let public_inputs = witness.public_inputs(nb_public);
 
-    let proof_bytes: Vec<u8> = if skip_gpu {
-        Vec::new()
+    let (proof_bytes, proof_raw_bytes): (Vec<u8>, Vec<u8>) = if skip_gpu {
+        (Vec::new(), Vec::new())
     } else {
         println!("Creating GPU prover (caching VK commitments)...");
         let t = Instant::now();
@@ -95,9 +95,12 @@ fn main() {
         println!("  proof generated in {prove_elapsed:?}");
 
         let bytes = proof.to_bytes();
+        let raw_bytes = proof.to_write_raw_bytes();
         println!("  proof bytes: {} (expected 864 for 1 BSB22)", bytes.len());
+        println!("  raw   bytes: {} (expected 904 for 1 BSB22)", raw_bytes.len());
         assert_eq!(bytes.len(), 864, "unexpected PLONK proof size");
-        bytes
+        assert_eq!(raw_bytes.len(), 904, "unexpected WriteRawTo PLONK proof size");
+        (bytes, raw_bytes)
     };
 
     // Per-G1-point on-curve + subgroup check (via arkworks) so we can tell
@@ -190,14 +193,17 @@ fn main() {
         Some(r)
     };
 
-    // ----- Path (B): gnark Go FFI (WriteRawTo format — known mismatch) -----
-    // Included only for completeness. PlonkProof::to_bytes() emits MarshalSolidity
-    // format, not WriteRawTo, so gnark's proof.ReadFrom rejects these bytes
-    // (different layout + missing fr.Vector length prefixes). Skipped by default.
-    if !skip_gpu && std::env::var("SP1_RUN_GNARK_FFI_VERIFY").is_ok() {
-        let proof_hex = hex::encode(&proof_bytes);
+    // ----- Path (B): gnark Go FFI on WriteRawTo-encoded GPU proof -----
+    // PlonkProof::to_write_raw_bytes() produces the gnark-compatible framing
+    // (LRO, Z, H, Wz, ClaimedValues as fr.Vector, Wzω, z_shifted claim, Bsb22
+    // commitments as []G1Affine). Passed through the Go FFI, this is a fully
+    // independent oracle from sp1-verifier.
+    let gpu_go_result: Option<Result<(), String>> = if skip_gpu {
+        None
+    } else {
+        let proof_hex = hex::encode(&proof_raw_bytes);
         println!();
-        println!("[B] Invoking gnark VerifyPlonk via Go FFI on GPU proof (expected fail — format mismatch)...");
+        println!("[B] Invoking gnark VerifyPlonk via Go FFI on GPU proof (WriteRawTo format)...");
         let t = Instant::now();
         let result = sp1_recursion_gnark_ffi::ffi::verify_plonk_bn254(
             build_dir.to_str().unwrap(),
@@ -209,11 +215,13 @@ fn main() {
             &gnark_witness.proof_nonce,
         );
         let verify_elapsed = t.elapsed();
-        match result {
+        match &result {
             Ok(()) => println!("[B] gnark FFI verify(GPU): PASS (in {verify_elapsed:?})"),
             Err(e) => eprintln!("[B] gnark FFI verify(GPU): FAIL -- {e}"),
         }
-    }
+        Some(result.map_err(|e| e.to_string()))
+    };
+    let _ = gpu_go_result;
 
     // ----------------------------------------------------------------------
     // Ground-truth check: generate a gnark *CPU* PLONK proof and run it
@@ -247,6 +255,32 @@ fn main() {
             "  raw_proof len (hex)={}, encoded_proof len (hex)={}",
             cpu_proof.raw_proof.len(),
             cpu_proof.encoded_proof.len()
+        );
+
+        // ----- (C.0) WriteRawTo round-trip: our encoder framing matches gnark -----
+        // The gnark CPU prover's raw_proof IS a WriteRawTo-encoded proof. We can
+        // parse its framing (length-prefix positions) and confirm they match
+        // what our `to_write_raw_bytes` would produce for the same counts.
+        let cpu_raw = hex::decode(&cpu_proof.raw_proof).expect("decode raw_proof hex");
+        // Positions (for 1 BSB22, 7 claimed values): see to_write_raw_bytes doc.
+        //   offset 192+64+192+64 = 512 : fr.Vector length (BE u32)
+        //   then length*32 Fr bytes, then 64 Wzω, 32 ZShifted claim:
+        //   512 + 4 + 7*32 + 64 + 32 = 836 : []G1Affine length (BE u32)
+        let cv_len_off = 512usize;
+        let cv_len = u32::from_be_bytes(cpu_raw[cv_len_off..cv_len_off + 4].try_into().unwrap());
+        let bsb22_len_off = cv_len_off + 4 + (cv_len as usize) * 32 + 64 + 32;
+        let bsb22_len =
+            u32::from_be_bytes(cpu_raw[bsb22_len_off..bsb22_len_off + 4].try_into().unwrap());
+        println!(
+            "[C.0] CPU raw_proof framing: claimed_values_len={cv_len}, bsb22_len={bsb22_len}, \
+             total={} (expected {})",
+            cpu_raw.len(),
+            bsb22_len_off + 4 + (bsb22_len as usize) * 64
+        );
+        assert_eq!(
+            cpu_raw.len(),
+            bsb22_len_off + 4 + (bsb22_len as usize) * 64,
+            "[C.0] framing mismatch: our WriteRawTo layout disagrees with gnark's"
         );
 
         // ----- (C.1) gnark Go FFI verify (WriteRawTo) on CPU proof -----

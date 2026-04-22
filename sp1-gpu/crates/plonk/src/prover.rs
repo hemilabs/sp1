@@ -878,8 +878,24 @@ impl PlonkProver {
         let z_lagrange: Vec<Fr> = Vec::new();
 
         // Determine GPU path early (before NTTs) so we can keep d_pi_coset on device.
+        //
+        // HIP (AMD RDNA3) is forced onto the CPU-fusion path regardless of VRAM:
+        //   1. The out-of-place RDNA3 NTT needs a 4 GiB temp buffer that the
+        //      in-place sppark NTT (CUDA) does not, and the GPU-fusion path
+        //      keeps a 4 GiB d_qk_plus_pi + 4 GiB d_pi_coset live during the
+        //      Z MSM + Z NTT, which fragments the heap and OOMs at 24 GiB.
+        //   2. The `#[cfg(hip_backend)]` spill block at the top of the post-
+        //      fusion section moves d_qk_plus_pi to host but drops the host
+        //      copy when its block scope ends — d_qk_plus_pi is then lost for
+        //      the quotient stage. The CPU-fusion path avoids that bug.
+        //   3. The CPU-fusion path is the well-tested HIP path that's been in
+        //      use for HIP proving; the GPU-fusion path was only ever validated
+        //      on CUDA.
         #[cfg(feature = "cuda")]
-        let use_gpu_quotient = {
+        let use_gpu_quotient = if sp1_gpu_sys::is_hip_backend() {
+            // HIP forced to CPU-fusion path (see comment above).
+            false
+        } else {
             let mut total: usize = 0;
             let mut free: usize = 0;
             unsafe {
@@ -916,12 +932,15 @@ impl PlonkProver {
 
             use crate::domain::gpu_ntt::gpu_ifft_then_coset_fft_to_device;
 
-            // PI: iFFT + coset FFT, keep on device
-            let d_pi_coset = crate::domain::gpu_ntt::gpu_ifft_then_coset_fft_to_device_no_coeffs(
-                &pi_poly_evals,
-                lg_n,
-                big_log,
-            );
+            // ORDER MATTERS FOR 24 GiB VRAM (AMD 7900 XTX):
+            // Do the Z commit MSM FIRST, before allocating any of the 4 GiB
+            // coset-evals buffers (d_pi_coset, d_bsb22_coset). At MSM time the
+            // largest live buffers are persistent_lag_msm(~6.2 GiB), l/r/o
+            // uploads(3 GiB), d_z_gp(1 GiB), plus cached selectors/SRS — well
+            // under 24 GiB. Deferring d_pi_coset/d_bsb22_coset until AFTER the
+            // persistent MSM is dropped frees ~6 GiB of scratch headroom for
+            // the MSM itself. Previously these were allocated BEFORE the Z
+            // commit and blew past 24 GiB on HIP.
 
             let (
                 mut d_qk_plus_pi_opt,
@@ -932,8 +951,30 @@ impl PlonkProver {
                 commit_z_r2,
             ) = if use_gpu_quotient {
                 // ≥20 GiB path: GPU fusion.
-                // Order: PI → BSB22 → Z NTT → GPU fusion → L/R/O NTTs.
-                // Z NTT runs BEFORE GPU fusion so its 4 GiB NTT temp buffer fits.
+                // Revised order: Z commit → drop MSM → PI NTT → BSB22 NTT → fusion.
+                // This keeps peak VRAM well below 24 GiB on HIP while still
+                // allowing the GPU fusion path on 24 GiB cards.
+
+                // Z commit FIRST, while d_pi_coset / d_bsb22_coset don't exist yet.
+                // d_z_gp stays alive for Z NTT in R3 (after L/R/O NTTs).
+                let commit_z_inner = {
+                    let t = std::time::Instant::now();
+                    let msm = persistent_lag_msm_opt
+                        .take()
+                        .expect("persistent_lag_msm should be available for Z commit");
+                    let c = msm.msm_device(d_z_gp as *const c_void, n).to_affine();
+                    drop(msm); // Frees ~6.2 GiB VRAM
+                    eprintln!("[T] 5. Z commit (in R2, MSM freed): {:?}", t.elapsed());
+                    c
+                };
+
+                // Now allocate d_pi_coset: iFFT + coset FFT, keep on device.
+                let d_pi_coset =
+                    crate::domain::gpu_ntt::gpu_ifft_then_coset_fft_to_device_no_coeffs(
+                        &pi_poly_evals,
+                        lg_n,
+                        big_log,
+                    );
 
                 // BSB22: iFFT+cosetFFT, coefficients to host, coset evals kept on device.
                 let mut bsb22_coeffs_list = Vec::with_capacity(bsb22_polys_fr.len());
@@ -944,21 +985,8 @@ impl PlonkProver {
                     d_bsb22_coset.push(d_evals);
                 }
 
-                // Z commit BEFORE freeing persistent_lag_msm.
-                // d_z_gp stays alive for Z NTT in R3 (after L/R/O NTTs).
-                let commit_z_inner = {
-                    let t = std::time::Instant::now();
-                    let msm = persistent_lag_msm_opt
-                        .take()
-                        .expect("persistent_lag_msm should be available for Z commit");
-                    let c = msm.msm_device(d_z_gp as *const c_void, n).to_affine();
-                    drop(msm); // Frees ~3.8 GiB VRAM
-                    eprintln!("[T] 5. Z commit (in R2, MSM freed): {:?}", t.elapsed());
-                    c
-                };
-
                 // GPU fusion: d_qk_plus_pi = d_pi_coset + qk + sum(qcp[i]*bsb22[i])
-                // VRAM: d_pi_coset(4) + d_bsb22(4) + d_z(4) = 12 GiB, ~12 GiB free
+                // VRAM now: d_pi_coset(4) + d_bsb22(4) + d_z(1) + l/r/o(3) ≈ 12 GiB
                 let d_qk_plus_pi = d_pi_coset;
 
                 // Add qcp[i] * bsb22[i] for each BSB22 polynomial (usually 1 for SP1)
@@ -1016,7 +1044,29 @@ impl PlonkProver {
                     Some(commit_z_inner),
                 )
             } else {
-                // <20 GiB path: D2H pi_coset, BSB22 to host, CPU fusion (original path)
+                // CPU-fusion path (<20 GiB CUDA + all HIP): D2H pi_coset, BSB22 to
+                // host, fuse on CPU. Z commit happens here FIRST so we can drop the
+                // persistent MSM (~6.2 GiB VRAM) before any of the 4 GiB coset-evals
+                // and 12 GiB of L/R/O NTT results allocate.
+                let commit_z_inner = {
+                    let t = std::time::Instant::now();
+                    let msm = persistent_lag_msm_opt
+                        .take()
+                        .expect("persistent_lag_msm should be available for Z commit (R2 early)");
+                    let c = msm.msm_device(d_z_gp as *const c_void, n).to_affine();
+                    drop(msm); // Frees ~6.2 GiB VRAM before the big NTT allocations.
+                    eprintln!("[T] 5. Z commit (CPU-fusion, MSM freed early): {:?}", t.elapsed());
+                    c
+                };
+
+                // PI NTT here (inside else branch) to mirror the deferred allocation
+                // used in the ≥20 GiB branch.
+                let d_pi_coset =
+                    crate::domain::gpu_ntt::gpu_ifft_then_coset_fft_to_device_no_coeffs(
+                        &pi_poly_evals,
+                        lg_n,
+                        big_log,
+                    );
                 let mut pi_coset_evals = Vec::with_capacity(big_n);
                 unsafe {
                     pi_coset_evals.set_len(big_n);
@@ -1071,7 +1121,7 @@ impl PlonkProver {
                     pi_bsb22
                 });
 
-                (None, Some(pi_bsb22), bsb22_coeffs_list, Vec::new(), None, None)
+                (None, Some(pi_bsb22), bsb22_coeffs_list, Vec::new(), None, Some(commit_z_inner))
             };
 
             // NTT VRAM strategy: sppark NTT (CUDA) is fully in-place (no temp buffer),
@@ -1786,6 +1836,118 @@ impl PlonkProver {
             }
             result
         };
+
+        // ================================================================
+        // DIAGNOSTIC: Cross-check const_lin via verifier's formula
+        // Activated by env var: SP1_PLONK_DEBUG_CONST_LIN=1
+        //
+        // Formulation A (prover shortcut, above): const_lin = Σ scalar_i · component_i(ζ)
+        // Formulation B (verifier formula, this block):
+        //   const_lin = -[ PI(ζ) - α²·L₁(ζ) + α·(l+β·s1+γ)·(r+β·s2+γ)·(o+γ)·z(ωζ) ]
+        //
+        // Both Round 5 and Round 4 audits flagged this as the highest-risk divergence.
+        // If values disagree, one of:
+        //   - A scalar in the shortcut is wrong
+        //   - A polynomial evaluation is wrong
+        //   - The two sides use inconsistent sign conventions
+        //   - Polynomial length mismatches (z/h coeffs should be n+2 per gnark convention)
+        // ================================================================
+        if std::env::var("SP1_PLONK_DEBUG_CONST_LIN").as_deref() == Ok("1") {
+            // Compute PI(ζ) from pi_poly_evals using verifier's Lagrange formula.
+            // PI(ζ) = Σ_i L_i(ζ) · pi_evals[i],
+            // where L_i(ζ) = (ζⁿ-1)/(n·(ζ-ωⁱ)) · ωⁱ
+            // (matches crates/verifier/src/plonk/verify.rs lines 126-140)
+            let pi_zeta_verifier = {
+                let zh_zeta_local = domain.vanishing_eval(&zeta);
+                let size_inv = domain.size_inv;
+                let mut accw = Fr::ONE;
+                let mut pi_acc = Fr::ZERO;
+                for ev in pi_poly_evals.iter() {
+                    if !ev.is_zero() {
+                        let mut den = zeta;
+                        den -= accw;
+                        // If ζ happens to equal a root of unity (probability ~0), skip.
+                        if !den.is_zero() {
+                            let inv_den = den.inv();
+                            let mut term = zh_zeta_local;
+                            term *= inv_den;
+                            term *= size_inv;
+                            term *= accw;
+                            term *= *ev;
+                            pi_acc += term;
+                        }
+                    }
+                    accw *= domain.omega;
+                }
+                pi_acc
+            };
+
+            // L₁(ζ) = (ζⁿ-1) / (n·(ζ-1))
+            let l1_zeta_verifier = {
+                let zh_zeta_local = domain.vanishing_eval(&zeta);
+                if (zeta - Fr::ONE).is_zero() {
+                    Fr::ONE
+                } else {
+                    let mut li = (zeta - Fr::ONE).inv();
+                    li *= zh_zeta_local;
+                    li *= domain.size_inv;
+                    li
+                }
+            };
+
+            // α²·L₁(ζ)
+            let alpha_sq_l1 = alpha * alpha * l1_zeta_verifier;
+
+            // Permutation product: α·(l+β·s1+γ)·(r+β·s2+γ)·(o+γ)·z(ωζ)
+            let perm_summand = {
+                let t1 = l_zeta + beta * s1_zeta + gamma;
+                let t2 = r_zeta + beta * s2_zeta + gamma;
+                let t3 = o_zeta + gamma;
+                alpha * t1 * t2 * t3 * z_shifted_zeta
+            };
+
+            // const_lin_check = -[ PI(ζ) - α²·L₁(ζ) + perm_summand ]
+            let inner = pi_zeta_verifier - alpha_sq_l1 + perm_summand;
+            let const_lin_check = -inner;
+
+            let matches_v = const_lin == const_lin_check;
+            eprintln!("[CONST-LIN CHECK] prover   = {:?}", const_lin.0);
+            eprintln!("[CONST-LIN CHECK] verifier = {:?}", const_lin_check.0);
+            eprintln!("[CONST-LIN CHECK] match    = {}", matches_v);
+            if !matches_v {
+                let diff = const_lin - const_lin_check;
+                eprintln!("[CONST-LIN CHECK] diff    = {:?}", diff.0);
+                eprintln!("[CONST-LIN CHECK] --- components ---");
+                eprintln!("[CONST-LIN CHECK] PI(zeta)             = {:?}", pi_zeta_verifier.0);
+                eprintln!("[CONST-LIN CHECK] L1(zeta)             = {:?}", l1_zeta_verifier.0);
+                eprintln!("[CONST-LIN CHECK] alpha^2 * L1(zeta)   = {:?}", alpha_sq_l1.0);
+                eprintln!("[CONST-LIN CHECK] perm_summand         = {:?}", perm_summand.0);
+                eprintln!("[CONST-LIN CHECK] -inner (verifier)    = {:?}", const_lin_check.0);
+                eprintln!("[CONST-LIN CHECK] l_zeta               = {:?}", l_zeta.0);
+                eprintln!("[CONST-LIN CHECK] r_zeta               = {:?}", r_zeta.0);
+                eprintln!("[CONST-LIN CHECK] o_zeta               = {:?}", o_zeta.0);
+                eprintln!("[CONST-LIN CHECK] s1_zeta              = {:?}", s1_zeta.0);
+                eprintln!("[CONST-LIN CHECK] s2_zeta              = {:?}", s2_zeta.0);
+                eprintln!("[CONST-LIN CHECK] z_shifted_zeta       = {:?}", z_shifted_zeta.0);
+                eprintln!("[CONST-LIN CHECK] alpha                = {:?}", alpha.0);
+                eprintln!("[CONST-LIN CHECK] beta                 = {:?}", beta.0);
+                eprintln!("[CONST-LIN CHECK] gamma                = {:?}", gamma.0);
+                eprintln!("[CONST-LIN CHECK] zeta                 = {:?}", zeta.0);
+            }
+            // Always report polynomial lengths for the length-mismatch audit item.
+            eprintln!(
+                "[CONST-LIN CHECK] z_coeffs.len()={} (gnark expects n+2={})",
+                z_coeffs.len(),
+                n + 2
+            );
+            eprintln!(
+                "[CONST-LIN CHECK] h0/h1/h2 lens = {}/{}/{} (gnark expects n+2={})",
+                h0_coeffs.len(),
+                h1_coeffs.len(),
+                h2_coeffs.len(),
+                n + 2
+            );
+        }
 
         eprintln!("[T] 9. Round 4 (evaluations): {:?}", t.elapsed());
         tracing::info!("Round 4 complete");
