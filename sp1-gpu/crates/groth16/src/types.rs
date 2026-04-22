@@ -282,11 +282,8 @@ impl Groth16WitnessData {
 
         // H is computed on GPU; load if present (backward compat), else empty.
         let h_path = dir.join("h_coefficients.bin");
-        let h_coefficients = if h_path.exists() {
-            load_fr_elements_auto(&h_path)?
-        } else {
-            Vec::new()
-        };
+        let h_coefficients =
+            if h_path.exists() { load_fr_elements_auto(&h_path)? } else { Vec::new() };
 
         let commitments = if dir.join("commitments.bin").exists() {
             load_g1_points(&dir.join("commitments.bin"))?

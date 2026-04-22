@@ -20,6 +20,10 @@ sp1-gpu-sys = { workspace = true, optional = true }
 
 [dev-dependencies]
 num-bigint = { workspace = true }
+sp1-verifier = { workspace = true }
+dirs = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
 
 [lints]
 workspace = true

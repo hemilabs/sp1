@@ -555,9 +555,8 @@ impl Groth16Prover {
             let wva_len = self.pinned_a.len();
             let (h_result, size_h) = std::thread::scope(|scope| {
                 let h_handle = scope.spawn(move || {
-                    let ar_slice = unsafe {
-                        std::slice::from_raw_parts(wva_ptr_usize as *const Fr, wva_len)
-                    };
+                    let ar_slice =
+                        unsafe { std::slice::from_raw_parts(wva_ptr_usize as *const Fr, wva_len) };
                     self.compute_h(
                         &witness.solution_a,
                         &witness.solution_b,
@@ -1652,7 +1651,8 @@ impl Groth16Prover {
                     sp1_gpu_sys::runtime::cuda_stream_synchronize(stream),
                     "stream_sync(stream) for H timing",
                 );
-                let wall = h2d_wall_start.map(|t| t.elapsed().as_secs_f32() * 1000.0).unwrap_or(0.0);
+                let wall =
+                    h2d_wall_start.map(|t| t.elapsed().as_secs_f32() * 1000.0).unwrap_or(0.0);
                 eprintln!(
                     "[H-timing] H2D A+B+C (copy_stream events): {:.2}ms  (wall-to-H2D-sync: {:.2}ms)",
                     h2d_ms_captured, wall

@@ -1,5 +1,13 @@
 //! Individual validation of each sppark NTT variant against CPU reference.
 //!
+//! *** Canonical home: `tests/ntt_correctness.rs` ***
+//!
+//! This example is retained for ad-hoc / interactive inspection (it prints
+//! per-test PASS/FAIL with first-mismatch diagnostics). The authoritative
+//! automated regression tests live in `tests/ntt_correctness.rs` and are
+//! picked up by `cargo test` (they are gated behind `#[ignore]` because
+//! they require a GPU; run them with `cargo test --features cuda -- --ignored`).
+//!
 //! Tests:
 //!   1. batch_NTT_bn254 (forward) vs cpu_fft
 //!   2. batch_iNTT_bn254 (inverse) vs cpu_ifft
@@ -73,8 +81,7 @@ fn main() {
         }
         let byte_size = std::mem::size_of_val(data);
         let mut d_ptr: *mut c_void = std::ptr::null_mut();
-        let err =
-            unsafe { sp1_gpu_sys::runtime::cuda_malloc(&mut d_ptr as *mut _, byte_size) };
+        let err = unsafe { sp1_gpu_sys::runtime::cuda_malloc(&mut d_ptr as *mut _, byte_size) };
         if err != unsafe { sp1_gpu_sys::runtime::CUDA_SUCCESS_CSL } {
             panic!("cuda_malloc failed");
         }
@@ -183,12 +190,7 @@ fn main() {
         packed.extend_from_slice(&p0);
         packed.extend_from_slice(&p1);
         packed.extend_from_slice(&p2);
-        run_batch_kernel(
-            &mut packed,
-            lg_n,
-            3,
-            sp1_gpu_sys::dft_bn254::batch_NTT_bn254,
-        );
+        run_batch_kernel(&mut packed, lg_n, 3, sp1_gpu_sys::dft_bn254::batch_NTT_bn254);
 
         let b0 = &packed[0..n];
         let b1 = &packed[n..2 * n];
