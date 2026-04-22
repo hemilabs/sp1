@@ -40,6 +40,12 @@ fn main() {
     let gnark_witness: sp1_recursion_gnark_ffi::witness::GnarkWitness =
         serde_json::from_str(&witness_json).expect("parse plonk_witness.json");
 
+    let skip_gpu = std::env::var("SP1_SKIP_GPU_PROVE").is_ok();
+
+    if skip_gpu {
+        println!("SP1_SKIP_GPU_PROVE set — skipping GPU prove entirely (CPU diagnostic only).");
+    }
+
     println!("Loading PLONK proving data...");
     let t = Instant::now();
     let data = sp1_gpu_plonk::types::PlonkProvingData::load(export_dir.to_str().unwrap())
@@ -55,29 +61,44 @@ fn main() {
     let nb_public = data.nb_public_variables;
     let public_inputs = witness.public_inputs(nb_public);
 
-    println!("Creating GPU prover (caching VK commitments)...");
-    let t = Instant::now();
-    let prover = sp1_gpu_plonk::prover::PlonkProver::new(data);
-    println!("  prover ready in {:?}", t.elapsed());
+    let proof_bytes: Vec<u8> = if skip_gpu {
+        Vec::new()
+    } else {
+        println!("Creating GPU prover (caching VK commitments)...");
+        let t = Instant::now();
+        let prover = sp1_gpu_plonk::prover::PlonkProver::new(data);
+        println!("  prover ready in {:?}", t.elapsed());
 
-    println!("Generating PLONK proof on GPU...");
-    let t = Instant::now();
-    let proof = prover
-        .prove(
-            &witness.l,
-            &witness.r,
-            &witness.o,
-            &public_inputs,
-            &witness.bsb22_commitments,
-            &witness.bsb22_polys,
-        )
-        .expect("GPU prove failed");
-    let prove_elapsed = t.elapsed();
-    println!("  proof generated in {prove_elapsed:?}");
+        // Optional: run grand product diagnostic before proving.
+        // Set SP1_PLONK_DEBUG_Z=1 to enable.
+        if std::env::var("SP1_PLONK_DEBUG_Z").is_ok() {
+            println!("\n--- Running grand product diagnostic ---");
+            prover
+                .debug_grand_product(&witness.l, &witness.r, &witness.o, &public_inputs)
+                .expect("debug_grand_product failed");
+            println!("--- End grand product diagnostic ---\n");
+        }
 
-    let proof_bytes = proof.to_bytes();
-    println!("  proof bytes: {} (expected 864 for 1 BSB22)", proof_bytes.len());
-    assert_eq!(proof_bytes.len(), 864, "unexpected PLONK proof size");
+        println!("Generating PLONK proof on GPU...");
+        let t = Instant::now();
+        let proof = prover
+            .prove(
+                &witness.l,
+                &witness.r,
+                &witness.o,
+                &public_inputs,
+                &witness.bsb22_commitments,
+                &witness.bsb22_polys,
+            )
+            .expect("GPU prove failed");
+        let prove_elapsed = t.elapsed();
+        println!("  proof generated in {prove_elapsed:?}");
+
+        let bytes = proof.to_bytes();
+        println!("  proof bytes: {} (expected 864 for 1 BSB22)", bytes.len());
+        assert_eq!(bytes.len(), 864, "unexpected PLONK proof size");
+        bytes
+    };
 
     // Per-G1-point on-curve + subgroup check (via arkworks) so we can tell
     // which of the proof's 8 G1 points is mangled if gnark verify fails.
@@ -107,17 +128,19 @@ fn main() {
         let in_sub = on_curve && p.is_in_correct_subgroup_assuming_on_curve();
         println!("  {label}: on_curve={on_curve}, in_subgroup={in_sub}");
     };
-    println!("Per-point on-curve/subgroup checks:");
-    check_g1("L  ", &proof_bytes[0..64]);
-    check_g1("R  ", &proof_bytes[64..128]);
-    check_g1("O  ", &proof_bytes[128..192]);
-    check_g1("H0 ", &proof_bytes[192..256]);
-    check_g1("H1 ", &proof_bytes[256..320]);
-    check_g1("H2 ", &proof_bytes[320..384]);
-    check_g1("Z  ", &proof_bytes[544..608]);
-    check_g1("Wz ", &proof_bytes[640..704]);
-    check_g1("Wzw", &proof_bytes[704..768]);
-    check_g1("BSB22", &proof_bytes[800..864]);
+    if !skip_gpu {
+        println!("Per-point on-curve/subgroup checks:");
+        check_g1("L  ", &proof_bytes[0..64]);
+        check_g1("R  ", &proof_bytes[64..128]);
+        check_g1("O  ", &proof_bytes[128..192]);
+        check_g1("H0 ", &proof_bytes[192..256]);
+        check_g1("H1 ", &proof_bytes[256..320]);
+        check_g1("H2 ", &proof_bytes[320..384]);
+        check_g1("Z  ", &proof_bytes[544..608]);
+        check_g1("Wz ", &proof_bytes[640..704]);
+        check_g1("Wzw", &proof_bytes[704..768]);
+        check_g1("BSB22", &proof_bytes[800..864]);
+    }
 
     // ----------------------------------------------------------------------
     // Two verification paths, both use gnark's BN254 primitives:
@@ -148,25 +171,33 @@ fn main() {
 
     // ----- Path (A): sp1-verifier (Rust, MarshalSolidity format) -----
     let plonk_vk_bytes = std::fs::read(build_dir.join("plonk_vk.bin")).expect("read plonk_vk.bin");
-    println!();
-    println!("[A] Verifying via sp1_verifier::PlonkVerifier::verify_gnark_proof...");
-    let t = Instant::now();
-    let sp1_result =
-        sp1_verifier::PlonkVerifier::verify_gnark_proof(&proof_bytes, &public_inputs_be, &plonk_vk_bytes);
-    let sp1_elapsed = t.elapsed();
-    match &sp1_result {
-        Ok(()) => println!("[A] sp1-verifier: PASS (in {sp1_elapsed:?})"),
-        Err(e) => eprintln!("[A] sp1-verifier: FAIL -- {e:?}"),
-    }
+    let sp1_result: Option<Result<(), _>> = if skip_gpu {
+        None
+    } else {
+        println!();
+        println!("[A] Verifying GPU proof via sp1_verifier::PlonkVerifier::verify_gnark_proof...");
+        let t = Instant::now();
+        let r = sp1_verifier::PlonkVerifier::verify_gnark_proof(
+            &proof_bytes,
+            &public_inputs_be,
+            &plonk_vk_bytes,
+        );
+        let sp1_elapsed = t.elapsed();
+        match &r {
+            Ok(()) => println!("[A] sp1-verifier(GPU): PASS (in {sp1_elapsed:?})"),
+            Err(e) => eprintln!("[A] sp1-verifier(GPU): FAIL -- {e:?}"),
+        }
+        Some(r)
+    };
 
     // ----- Path (B): gnark Go FFI (WriteRawTo format — known mismatch) -----
     // Included only for completeness. PlonkProof::to_bytes() emits MarshalSolidity
     // format, not WriteRawTo, so gnark's proof.ReadFrom rejects these bytes
     // (different layout + missing fr.Vector length prefixes). Skipped by default.
-    if std::env::var("SP1_RUN_GNARK_FFI_VERIFY").is_ok() {
+    if !skip_gpu && std::env::var("SP1_RUN_GNARK_FFI_VERIFY").is_ok() {
         let proof_hex = hex::encode(&proof_bytes);
         println!();
-        println!("[B] Invoking gnark VerifyPlonk via Go FFI (expected to fail — format mismatch)...");
+        println!("[B] Invoking gnark VerifyPlonk via Go FFI on GPU proof (expected fail — format mismatch)...");
         let t = Instant::now();
         let result = sp1_recursion_gnark_ffi::ffi::verify_plonk_bn254(
             build_dir.to_str().unwrap(),
@@ -179,18 +210,131 @@ fn main() {
         );
         let verify_elapsed = t.elapsed();
         match result {
-            Ok(()) => println!("[B] gnark FFI verify: PASS (in {verify_elapsed:?})"),
-            Err(e) => eprintln!("[B] gnark FFI verify: FAIL -- {e}"),
+            Ok(()) => println!("[B] gnark FFI verify(GPU): PASS (in {verify_elapsed:?})"),
+            Err(e) => eprintln!("[B] gnark FFI verify(GPU): FAIL -- {e}"),
         }
     }
 
-    if sp1_result.is_ok() {
+    // ----------------------------------------------------------------------
+    // Ground-truth check: generate a gnark *CPU* PLONK proof and run it
+    // through BOTH verifier paths (Go FFI and Rust sp1-verifier).  This
+    // is the decisive test:
+    //   - If Go FFI passes and Rust FAILS  =>  bug in sp1-verifier port
+    //   - If BOTH pass                     =>  bug in the GPU prover
+    //   - If BOTH fail                     =>  something systemic
+    //     (format decoding, witness, vkey, etc.)
+    //
+    // Controlled by SP1_RUN_GNARK_CPU_PROVE=1 (opt-in because it spends
+    // minutes building the gnark prover on first invocation).
+    // ----------------------------------------------------------------------
+    if std::env::var("SP1_RUN_GNARK_CPU_PROVE").is_ok() {
         println!();
-        println!("=== RESULT: GPU PLONK proof verifies cryptographically (sp1-verifier Rust port of gnark) ===");
-    } else {
-        eprintln!();
-        eprintln!("=== RESULT: GPU PLONK proof does NOT verify ===");
-        std::process::exit(1);
+        println!("=== Ground truth: gnark CPU PLONK prover ===");
+
+        // Find the canonical witness JSON: build_dir/plonk_witness.json works
+        // because BuildPlonk emits it there alongside plonk_pk.bin.
+        let witness_path = build_dir.join("plonk_witness.json");
+        println!("witness:  {}", witness_path.display());
+
+        println!("Invoking gnark CPU ProvePlonkBn254 (this takes minutes)...");
+        let t = Instant::now();
+        let cpu_proof = sp1_recursion_gnark_ffi::ffi::prove_plonk_bn254(
+            build_dir.to_str().unwrap(),
+            witness_path.to_str().unwrap(),
+        );
+        println!("  CPU prove done in {:?}", t.elapsed());
+        println!(
+            "  raw_proof len (hex)={}, encoded_proof len (hex)={}",
+            cpu_proof.raw_proof.len(),
+            cpu_proof.encoded_proof.len()
+        );
+
+        // ----- (C.1) gnark Go FFI verify (WriteRawTo) on CPU proof -----
+        // This is the ground-truth path — if this fails gnark itself is broken.
+        println!();
+        println!("[C.1] gnark Go FFI VerifyPlonk on CPU-proof raw_proof (WriteRawTo)...");
+        let t = Instant::now();
+        let cpu_go_result = sp1_recursion_gnark_ffi::ffi::verify_plonk_bn254(
+            build_dir.to_str().unwrap(),
+            &cpu_proof.raw_proof,
+            &gnark_witness.vkey_hash,
+            &gnark_witness.committed_values_digest,
+            &gnark_witness.exit_code,
+            &gnark_witness.vk_root,
+            &gnark_witness.proof_nonce,
+        );
+        match &cpu_go_result {
+            Ok(()) => println!("[C.1] Go FFI verify(CPU): PASS (in {:?})", t.elapsed()),
+            Err(e) => eprintln!("[C.1] Go FFI verify(CPU): FAIL -- {e}"),
+        }
+
+        // ----- (C.2) sp1-verifier Rust on CPU proof (MarshalSolidity) -----
+        // encoded_proof prepends exit_code | vk_root | proof_nonce (3×32=96 bytes)
+        // before the MarshalSolidity-encoded gnark proof. Strip the 96-byte prefix.
+        let enc_bytes = hex::decode(&cpu_proof.encoded_proof).expect("decode encoded_proof hex");
+        assert!(
+            enc_bytes.len() >= 96 + 864,
+            "encoded_proof must be >=960 bytes, got {}",
+            enc_bytes.len()
+        );
+        let cpu_solidity = &enc_bytes[96..96 + 864];
+        println!();
+        println!("[C.2] sp1_verifier::PlonkVerifier on CPU-proof MarshalSolidity bytes...");
+        let t = Instant::now();
+        let cpu_rust_result = sp1_verifier::PlonkVerifier::verify_gnark_proof(
+            cpu_solidity,
+            &public_inputs_be,
+            &plonk_vk_bytes,
+        );
+        match &cpu_rust_result {
+            Ok(()) => println!("[C.2] sp1-verifier(CPU): PASS (in {:?})", t.elapsed()),
+            Err(e) => eprintln!("[C.2] sp1-verifier(CPU): FAIL -- {e:?}"),
+        }
+
+        // Summary
+        let gpu_ok = sp1_result.as_ref().map(|r| r.is_ok());
+        println!();
+        println!("=== DIAGNOSTIC SUMMARY ===");
+        match gpu_ok {
+            Some(true) => println!("  [A]    sp1-verifier on GPU proof   : PASS"),
+            Some(false) => println!("  [A]    sp1-verifier on GPU proof   : FAIL"),
+            None => println!("  [A]    sp1-verifier on GPU proof   : SKIPPED"),
+        }
+        println!("  [C.1]  Go FFI verify on CPU proof  : {}", if cpu_go_result.is_ok() { "PASS" } else { "FAIL" });
+        println!("  [C.2]  sp1-verifier on CPU proof   : {}", if cpu_rust_result.is_ok() { "PASS" } else { "FAIL" });
+        println!();
+        match (gpu_ok, cpu_go_result.is_ok(), cpu_rust_result.is_ok()) {
+            (_, false, _) => {
+                println!("gnark CPU proof fails Go verify — witness/vkey/build_dir mismatch.");
+            }
+            (_, true, false) => {
+                println!(">>> Bug is in sp1-verifier (Rust port): gnark CPU proof passes Go verify but fails Rust verifier.");
+            }
+            (Some(false), true, true) => {
+                println!(">>> Bug is in the GPU prover: CPU proof passes both verifiers, GPU proof fails sp1-verifier.");
+            }
+            (Some(true), true, true) => {
+                println!("All paths pass — nothing to debug.");
+            }
+            (None, true, true) => {
+                println!("CPU proof passes both verifiers. GPU prove was skipped; re-run without SP1_SKIP_GPU_PROVE to compare.");
+            }
+        }
+    }
+
+    match sp1_result {
+        Some(Ok(())) => {
+            println!();
+            println!("=== RESULT: GPU PLONK proof verifies cryptographically (sp1-verifier Rust port of gnark) ===");
+        }
+        Some(Err(_)) => {
+            eprintln!();
+            eprintln!("=== RESULT: GPU PLONK proof does NOT verify ===");
+            std::process::exit(1);
+        }
+        None => {
+            // skip_gpu: don't error, let CPU diagnostic be the verdict.
+        }
     }
 }
 

@@ -2503,6 +2503,203 @@ impl PlonkProver {
         Ok(z)
     }
 
+    /// DIAGNOSTIC: Run GPU grand product vs CPU grand product and report first mismatch.
+    ///
+    /// Mimics Round 1 transcript so (beta, gamma) match the real proof, then runs
+    /// `sp1_bn254_grand_product` on GPU, downloads the result, computes the CPU
+    /// reference via `compute_grand_product`, and compares element-wise.
+    #[cfg(feature = "cuda")]
+    pub fn debug_grand_product(
+        &self,
+        l: &[BN254Fr],
+        r: &[BN254Fr],
+        o: &[BN254Fr],
+        public_inputs: &[BN254Fr],
+    ) -> anyhow::Result<()> {
+        use std::ffi::c_void;
+
+        let domain = &self.cached.domain;
+        let n = domain.size;
+        let coset_shift = self.cached.coset_shift;
+
+        eprintln!("=== Grand product diagnostic ===");
+        eprintln!("  N = {}  (log2 = {})", n, domain.log_size);
+
+        let l_fr: Vec<Fr> = l.par_iter().map(Fr::from_bn254fr).collect();
+        let r_fr: Vec<Fr> = r.par_iter().map(Fr::from_bn254fr).collect();
+        let o_fr: Vec<Fr> = o.par_iter().map(Fr::from_bn254fr).collect();
+        let pi_fr: Vec<Fr> = public_inputs.iter().map(Fr::from_bn254fr).collect();
+
+        // Build transcript identically to prove() Round 1 so (gamma, beta) are correct.
+        let mut transcript = Transcript::new(vec![
+            "gamma".to_string(),
+            "beta".to_string(),
+            "alpha".to_string(),
+            "zeta".to_string(),
+            "u".to_string(),
+        ]);
+        self.bind_public_data(&mut transcript, &pi_fr)?;
+
+        // Commit wire polynomials (CPU MSM — slow but diagnostic only)
+        let srs_lagrange = &self.cached.srs_lagrange;
+        let commit_l = self.commit_lagrange(srs_lagrange, &l_fr);
+        let commit_r = self.commit_lagrange(srs_lagrange, &r_fr);
+        let commit_o = self.commit_lagrange(srs_lagrange, &o_fr);
+
+        transcript.bind("gamma", &commit_l.to_bn254().to_transcript_bytes());
+        transcript.bind("gamma", &commit_r.to_bn254().to_transcript_bytes());
+        transcript.bind("gamma", &commit_o.to_bn254().to_transcript_bytes());
+        let gamma = Fr::from_be_bytes_mod_order(&transcript.compute_challenge("gamma"));
+        let beta = Fr::from_be_bytes_mod_order(&transcript.compute_challenge("beta"));
+
+        eprintln!("  gamma = {:?}", gamma.0);
+        eprintln!("  beta  = {:?}", beta.0);
+        eprintln!("  k1    = {:?}", coset_shift.0);
+
+        // Compute CPU reference Z
+        eprintln!("Computing CPU reference grand product...");
+        let t = std::time::Instant::now();
+        let z_cpu = self.compute_grand_product(
+            &l_fr,
+            &r_fr,
+            &o_fr,
+            &self.cached.s1,
+            &self.cached.s2,
+            &self.cached.s3,
+            &beta,
+            &gamma,
+            domain,
+            &coset_shift,
+        )?;
+        eprintln!("  CPU Z in {:?}  (Z[0].0 = {:?}, Z[N-1].0 = {:?})", t.elapsed(), z_cpu[0].0, z_cpu[n - 1].0);
+
+        // Compute GPU Z
+        eprintln!("Running GPU grand product kernel...");
+        let elem_sz = std::mem::size_of::<Fr>();
+        let byte_sz = n * elem_sz;
+
+        let mut d_l: *mut c_void = std::ptr::null_mut();
+        let mut d_r: *mut c_void = std::ptr::null_mut();
+        let mut d_o: *mut c_void = std::ptr::null_mut();
+        let mut d_s1: *mut c_void = std::ptr::null_mut();
+        let mut d_s2: *mut c_void = std::ptr::null_mut();
+        let mut d_s3: *mut c_void = std::ptr::null_mut();
+        let mut d_omega: *mut c_void = std::ptr::null_mut();
+        let mut d_z: *mut c_void = std::ptr::null_mut();
+        unsafe {
+            sp1_gpu_sys::runtime::cuda_malloc(&mut d_l as *mut _, byte_sz);
+            sp1_gpu_sys::runtime::cuda_malloc(&mut d_r as *mut _, byte_sz);
+            sp1_gpu_sys::runtime::cuda_malloc(&mut d_o as *mut _, byte_sz);
+            sp1_gpu_sys::runtime::cuda_malloc(&mut d_s1 as *mut _, byte_sz);
+            sp1_gpu_sys::runtime::cuda_malloc(&mut d_s2 as *mut _, byte_sz);
+            sp1_gpu_sys::runtime::cuda_malloc(&mut d_s3 as *mut _, byte_sz);
+            sp1_gpu_sys::runtime::cuda_malloc(&mut d_omega as *mut _, byte_sz);
+            sp1_gpu_sys::runtime::cuda_malloc(&mut d_z as *mut _, byte_sz);
+            sp1_gpu_sys::runtime::cuda_mem_copy_host_to_device(d_l, l_fr.as_ptr() as *const c_void, byte_sz);
+            sp1_gpu_sys::runtime::cuda_mem_copy_host_to_device(d_r, r_fr.as_ptr() as *const c_void, byte_sz);
+            sp1_gpu_sys::runtime::cuda_mem_copy_host_to_device(d_o, o_fr.as_ptr() as *const c_void, byte_sz);
+            sp1_gpu_sys::runtime::cuda_mem_copy_host_to_device(
+                d_s1,
+                self.cached.s1.as_ptr() as *const c_void,
+                byte_sz,
+            );
+            sp1_gpu_sys::runtime::cuda_mem_copy_host_to_device(
+                d_s2,
+                self.cached.s2.as_ptr() as *const c_void,
+                byte_sz,
+            );
+            sp1_gpu_sys::runtime::cuda_mem_copy_host_to_device(
+                d_s3,
+                self.cached.s3.as_ptr() as *const c_void,
+                byte_sz,
+            );
+            sp1_gpu_sys::runtime::cuda_mem_copy_host_to_device(
+                d_omega,
+                self.cached.omega_powers.as_ptr() as *const c_void,
+                byte_sz,
+            );
+        }
+
+        let t = std::time::Instant::now();
+        let err = unsafe {
+            sp1_gpu_sys::plonk::sp1_bn254_grand_product(
+                d_l as *const c_void,
+                d_r as *const c_void,
+                d_o as *const c_void,
+                d_s1 as *const c_void,
+                d_s2 as *const c_void,
+                d_s3 as *const c_void,
+                d_omega as *const c_void,
+                &beta as *const Fr as *const c_void,
+                &gamma as *const Fr as *const c_void,
+                &coset_shift as *const Fr as *const c_void,
+                n as u32,
+                d_z,
+            )
+        };
+        if err != unsafe { sp1_gpu_sys::runtime::CUDA_SUCCESS_CSL } {
+            anyhow::bail!("GPU grand product kernel failed");
+        }
+        eprintln!("  GPU Z in {:?}", t.elapsed());
+
+        // Download d_z
+        let mut z_gpu: Vec<Fr> = vec![Fr::ZERO; n];
+        unsafe {
+            sp1_gpu_sys::runtime::cuda_mem_copy_device_to_host(
+                z_gpu.as_mut_ptr() as *mut c_void,
+                d_z,
+                byte_sz,
+            );
+            sp1_gpu_sys::runtime::cuda_free(d_l as *const c_void);
+            sp1_gpu_sys::runtime::cuda_free(d_r as *const c_void);
+            sp1_gpu_sys::runtime::cuda_free(d_o as *const c_void);
+            sp1_gpu_sys::runtime::cuda_free(d_s1 as *const c_void);
+            sp1_gpu_sys::runtime::cuda_free(d_s2 as *const c_void);
+            sp1_gpu_sys::runtime::cuda_free(d_s3 as *const c_void);
+            sp1_gpu_sys::runtime::cuda_free(d_omega as *const c_void);
+            sp1_gpu_sys::runtime::cuda_free(d_z as *const c_void);
+        }
+
+        eprintln!("  GPU Z[0].0 = {:?}", z_gpu[0].0);
+        eprintln!("  GPU Z[N-1].0 = {:?}", z_gpu[n - 1].0);
+
+        // Compare element-wise
+        let mut first_mismatch: Option<usize> = None;
+        let mut mismatch_count = 0usize;
+        for i in 0..n {
+            if z_gpu[i] != z_cpu[i] {
+                if first_mismatch.is_none() {
+                    first_mismatch = Some(i);
+                }
+                mismatch_count += 1;
+            }
+        }
+
+        match first_mismatch {
+            None => {
+                eprintln!("=== RESULT: GPU Z matches CPU Z exactly for all {} elements ===", n);
+            }
+            Some(idx) => {
+                eprintln!("=== RESULT: Z MISMATCH ===");
+                eprintln!("  first mismatch at index {}", idx);
+                eprintln!("  total mismatches: {} / {}", mismatch_count, n);
+                eprintln!("  GPU[{}].0 = {:?}", idx, z_gpu[idx].0);
+                eprintln!("  CPU[{}].0 = {:?}", idx, z_cpu[idx].0);
+                if idx > 0 {
+                    eprintln!("  GPU[{}].0 = {:?}", idx - 1, z_gpu[idx - 1].0);
+                    eprintln!("  CPU[{}].0 = {:?}", idx - 1, z_cpu[idx - 1].0);
+                }
+                // Ratio GPU/CPU at mismatch (in normal form)
+                let gpu_i = z_gpu[idx];
+                let cpu_i = z_cpu[idx];
+                let ratio = gpu_i * batch_inv_fr(&[cpu_i])[0];
+                eprintln!("  ratio GPU/CPU = {:?}", ratio.0);
+            }
+        }
+
+        Ok(())
+    }
+
     /// Compute the quotient polynomial h(X).
     ///
     /// h(X) = [gate_constraint + α·permutation_constraint + α²·boundary_constraint] / Z_H(X)
