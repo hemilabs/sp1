@@ -25,6 +25,8 @@ extern "C" void nvtx_range_end(uint64_t id);
 
 extern "C" rustCudaError_t cuda_event_create(cudaEvent_t* event);
 
+extern "C" rustCudaError_t cuda_event_create_timing(cudaEvent_t* event);
+
 extern "C" rustCudaError_t cuda_event_destroy(cudaEvent_t event);
 
 extern "C" rustCudaError_t cuda_event_record(cudaEvent_t event, cudaStream_t stream);

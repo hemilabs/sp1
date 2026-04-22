@@ -175,6 +175,14 @@ extern "C" rustCudaError_t cuda_event_create(cudaEvent_t* event) {
     return CUDA_SUCCESS_CSL;
 }
 
+// Creates an event with timing enabled (default flags). Used by
+// instrumentation paths that call cudaEventElapsedTime.
+extern "C" rustCudaError_t cuda_event_create_timing(cudaEvent_t* event) {
+    // 0 == default flags (timing enabled, non-blocking sync).
+    CUDA_OK(cudaEventCreateWithFlags(event, 0));
+    return CUDA_SUCCESS_CSL;
+}
+
 extern "C" rustCudaError_t cuda_event_destroy(cudaEvent_t event) {
     CUDA_OK(cudaEventDestroy(event));
     return CUDA_SUCCESS_CSL;

@@ -395,6 +395,54 @@ impl Groth16Prover {
 
         let domain_size = data.domain_size;
 
+        // Pay the sppark BN254 NTT cold-start cost at prover-setup time rather
+        // than inside the first `prove()` call. sppark lazily allocates the
+        // per-domain-size `partial_group_gen_powers[29][32768]` (~30 MiB per
+        // direction) and runs `generate_all_twiddles` / `generate_partial_twiddles`
+        // kernels on first use. For N=2^24 this is ~1-2s that would otherwise
+        // show up as variance on iter 1 of a benchmark.
+        //
+        // `sppark_init_bn254` sets up the global sppark gpu_t singleton and
+        // twiddle tables. `bn254_ntt_precompute_twiddles` forces twiddle-table
+        // compute+upload for the exact (lg_n, inverse) pairs the H-polynomial
+        // pipeline will hit: iNTT at lg_n, coset NTT at lg_n, coset iNTT at
+        // lg_n (the fused iNTT+coset NTT kernel reuses the same tables).
+        #[cfg(feature = "cuda")]
+        {
+            let t = std::time::Instant::now();
+            let stream = unsafe { sp1_gpu_sys::runtime::DEFAULT_STREAM };
+            let err = unsafe { sp1_gpu_sys::dft_bn254::sppark_init_bn254(stream) };
+            if err != unsafe { sp1_gpu_sys::runtime::CUDA_SUCCESS_CSL } {
+                eprintln!(
+                    "[groth16] WARN: sppark_init_bn254 failed; first prove will pay cold-start cost"
+                );
+            } else {
+                let lg_n = domain_size.trailing_zeros();
+                // Precompute forward + inverse twiddles for the domain size.
+                // Groth16 H-poly uses: iNTT (inverse), coset NTT (forward),
+                // coset iNTT (inverse) — all at lg_n. The sppark twiddle cache
+                // is shared across plain/coset variants at a given lg_n.
+                let e1 =
+                    unsafe { sp1_gpu_sys::dft_bn254::bn254_ntt_precompute_twiddles(lg_n, false) };
+                let e2 =
+                    unsafe { sp1_gpu_sys::dft_bn254::bn254_ntt_precompute_twiddles(lg_n, true) };
+                if e1 != unsafe { sp1_gpu_sys::runtime::CUDA_SUCCESS_CSL }
+                    || e2 != unsafe { sp1_gpu_sys::runtime::CUDA_SUCCESS_CSL }
+                {
+                    eprintln!(
+                        "[groth16] WARN: bn254_ntt_precompute_twiddles(lg_n={}) failed; first prove will pay cold-start cost",
+                        lg_n
+                    );
+                } else {
+                    eprintln!(
+                        "[groth16] Pre-initialised sppark BN254 NTT (lg_n={}): {:?}",
+                        lg_n,
+                        t.elapsed()
+                    );
+                }
+            }
+        }
+
         Self {
             data,
             #[cfg(feature = "cuda")]
@@ -1267,21 +1315,34 @@ impl Groth16Prover {
         }
     }
 
-    /// GPU-accelerated H polynomial computation. Returns a device pointer to the
-    /// H coefficients so the Krs2 MSM can consume them without a D2H/H2D round-trip.
+    /// GPU-accelerated H polynomial computation. Returns a device pointer to
+    /// the H coefficients so the Krs2 MSM can consume them without a D2H/H2D
+    /// round-trip. The returned `DeviceH` owns the GPU allocation and frees
+    /// it on Drop.
     ///
-    /// The returned `DeviceH` owns the GPU allocation and frees it on Drop.
+    /// Pipeline (all on the default compute stream unless noted):
+    ///   1. Raw-memcpy solution_a/b/c (BN254Fr, canonical LE) into pre-pinned
+    ///      host buffers, then async H2D to `d_a`/`d_b`/`d_c` on a dedicated
+    ///      SDMA copy_stream. CPU memcpy of B/C overlaps with the SDMA
+    ///      transfer of A/B.
+    ///   2. GPU canonical-LE -> Montgomery conversion over 3N elements
+    ///      (replaces ~78 ms of CPU rayon Montgomery multiplies with ~1 ms
+    ///      GPU kernel).
+    ///   3. Fused iNTT + coset NTT, batched over A,B,C (sppark on CUDA/HIP).
+    ///   4. If `ar_preupload_scalars` is `Some`, issue an async H2D of those
+    ///      scalars onto the MSM pool's copy_stream so the Ar MSM scalar
+    ///      upload (~130 ms) overlaps the NTT kernels.
+    ///   5. Pointwise h = (a*b - c) * den, where den = (g^N - 1)^(-1)
+    ///      (matches gnark prove.go).
+    ///   6. Coset iNTT -> H in coefficient form, stays on GPU in `d_a`.
     ///
-    /// `ar_preupload_scalars` (HIP GLV only): if provided, after the NTT kernels
-    /// are enqueued on the default compute stream, we kick off an async H2D
-    /// upload of these scalars onto the GLV pool's copy_stream (SDMA). The
-    /// SDMA engine runs in parallel with the NTT kernels, so the Ar MSM
-    /// scalar upload is hidden behind the tail of the H polynomial compute
-    /// (~130 ms saved off the subsequent Ar MSM). The preupload is issued
-    /// from the same host thread that drives compute_h_gpu — calling into
-    /// HIP from a different thread than the one running the NTTs would
-    /// trigger the cross-thread context lock described in
-    /// feedback_hip_cross_thread_gpu_ops.md.
+    /// Threading: all GPU calls run on the caller's thread. On HIP, GPU ops
+    /// from a different thread than the one driving the NTTs would hit the
+    /// cross-thread context lock (see feedback_hip_cross_thread_gpu_ops.md).
+    ///
+    /// Set `GROTH16_H_TIMING=1` to emit per-kernel event-based timings,
+    /// and `GROTH16_H_VERIFY=1` to download H and print a few entries for
+    /// cross-checking against gnark's `computeH`.
     #[cfg(feature = "cuda")]
     fn compute_h_gpu(
         &self,
@@ -1381,9 +1442,55 @@ impl Groth16Prover {
                 }
             };
 
+        // --- Per-kernel timing instrumentation (gated on GROTH16_H_TIMING=1) ---
+        // Uses CUDA/HIP events placed on the default compute stream. Event
+        // `h_evt[0]` is recorded after the copy_stream sync (i.e., after H2D
+        // is complete), then one event per subsequent kernel submission.
+        let h_timing_enabled = std::env::var("GROTH16_H_TIMING").ok().as_deref() == Some("1");
+        // Stages: 0=start(post-H2D), 1=after canonical_to_mont, 2=after fused
+        // iNTT+cosetNTT×3, 3=after pointwise, 4=after final coset_iNTT.
+        const N_H_EVENTS: usize = 5;
+        let mut h_evt: [sp1_gpu_sys::runtime::CudaEventHandle; N_H_EVENTS] =
+            [sp1_gpu_sys::runtime::CudaEventHandle(std::ptr::null_mut()); N_H_EVENTS];
+        // Separate event to time the H2D uploads themselves on copy_stream.
+        let mut h2d_start = sp1_gpu_sys::runtime::CudaEventHandle(std::ptr::null_mut());
+        let mut h2d_end = sp1_gpu_sys::runtime::CudaEventHandle(std::ptr::null_mut());
+        let h2d_wall_start = if h_timing_enabled { Some(std::time::Instant::now()) } else { None };
+        if h_timing_enabled {
+            unsafe {
+                check_gpu(
+                    sp1_gpu_sys::runtime::cuda_event_create_timing(&mut h2d_start as *mut _),
+                    "event_create(h2d_start)",
+                );
+                check_gpu(
+                    sp1_gpu_sys::runtime::cuda_event_create_timing(&mut h2d_end as *mut _),
+                    "event_create(h2d_end)",
+                );
+                for e in h_evt.iter_mut() {
+                    check_gpu(
+                        sp1_gpu_sys::runtime::cuda_event_create_timing(e as *mut _),
+                        "event_create(h_evt)",
+                    );
+                }
+                check_gpu(
+                    sp1_gpu_sys::runtime::cuda_event_record(h2d_start, copy_stream),
+                    "event_record(h2d_start)",
+                );
+            }
+        }
+
         copy_and_upload(solution_a, &self.pinned_h_a, d_a, "async H2D(A)");
         copy_and_upload(solution_b, &self.pinned_h_b, d_b, "async H2D(B)");
         copy_and_upload(solution_c, &self.pinned_h_c, d_c, "async H2D(C)");
+
+        if h_timing_enabled {
+            unsafe {
+                check_gpu(
+                    sp1_gpu_sys::runtime::cuda_event_record(h2d_end, copy_stream),
+                    "event_record(h2d_end)",
+                );
+            }
+        }
 
         // Wait for all 3 async uploads to complete before proceeding to
         // GPU kernels on the default stream.
@@ -1391,8 +1498,35 @@ impl Groth16Prover {
             unsafe { sp1_gpu_sys::runtime::cuda_stream_synchronize(copy_stream) },
             "stream_sync(copy_stream)",
         );
+
+        // Capture the H2D elapsed time BEFORE destroying copy_stream to
+        // avoid any HIP lifetime corner cases with events tied to a
+        // destroyed stream.
+        let mut h2d_ms_captured: f32 = -1.0;
+        if h_timing_enabled {
+            unsafe {
+                check_gpu(
+                    sp1_gpu_sys::runtime::cuda_event_elapsed_time(
+                        &mut h2d_ms_captured as *mut _,
+                        h2d_start,
+                        h2d_end,
+                    ),
+                    "elapsed(h2d) early",
+                );
+            }
+        }
+
         unsafe {
             sp1_gpu_sys::runtime::cuda_stream_destroy(copy_stream);
+        }
+
+        if h_timing_enabled {
+            unsafe {
+                check_gpu(
+                    sp1_gpu_sys::runtime::cuda_event_record(h_evt[0], stream),
+                    "event_record(h_evt[0])",
+                );
+            }
         }
 
         // Convert all 3×N elements from canonical LE to Montgomery form on GPU.
@@ -1400,6 +1534,14 @@ impl Groth16Prover {
         // of GPU compute (48M elements × 1 Montgomery mul each).
         unsafe {
             sp1_gpu_sys::plonk::bn254_canonical_to_mont(d_a, 3 * n);
+        }
+        if h_timing_enabled {
+            unsafe {
+                check_gpu(
+                    sp1_gpu_sys::runtime::cuda_event_record(h_evt[1], stream),
+                    "event_record(h_evt[1])",
+                );
+            }
         }
 
         // Use pre-allocated NTT temp buffer (or fallback to per-prove alloc).
@@ -1426,23 +1568,29 @@ impl Groth16Prover {
                 "batch_iNTT_coset_NTT_fused(A,B,C)",
             );
         }
+        if h_timing_enabled {
+            unsafe {
+                check_gpu(
+                    sp1_gpu_sys::runtime::cuda_event_record(h_evt[2], stream),
+                    "event_record(h_evt[2])",
+                );
+            }
+        }
 
-        // DMA/compute overlap: now that the iNTT and coset_NTT kernel
-        // batches are queued on the default compute stream, kick off an
-        // async H2D upload of the Ar MSM scalars on the shared GLV pool's
-        // copy_stream. The SDMA engine runs in parallel with the NTT
-        // kernels so the upload (~130 ms) finishes while the NTTs are
-        // still running; the subsequent Ar MSM invoke picks up the
-        // pre-uploaded scalars and skips its synchronous hipMemcpy.
+        // DMA/compute overlap: now that the fused iNTT+cosetNTT kernels are
+        // queued on the default compute stream, kick off an async H2D upload
+        // of the Ar MSM scalars on the MSM pool's copy_stream. The SDMA
+        // engine runs in parallel with the NTT kernels so the upload
+        // (~130 ms) finishes while the NTTs are still running; the
+        // subsequent Ar MSM invoke picks up the pre-uploaded scalars and
+        // skips its synchronous memcpy.
         //
-        // Safety: this call must be on the same host thread that drives
-        // compute_h_gpu — HIP serialises GPU calls across threads (see
-        // feedback_hip_cross_thread_gpu_ops.md). Because we are already
-        // on that thread here, and all GPU ops are enqueued in order,
-        // the SDMA copy and the NTT compute are properly scheduled by
-        // the HIP runtime.
+        // Safety: on HIP this call must be on the same host thread that
+        // drives compute_h_gpu — HIP serialises GPU calls across threads
+        // (see feedback_hip_cross_thread_gpu_ops.md). We are already on
+        // that thread, and all GPU ops enqueued in order, so the SDMA
+        // copy and NTT compute are properly scheduled by the runtime.
         if let Some(ar_scalars) = ar_preupload_scalars {
-            use std::ffi::c_void;
             let err = unsafe {
                 sp1_gpu_sys::msm::sp1_bn254_msm_preupload_scalars(
                     ar_scalars.as_ptr() as *const c_void,
@@ -1475,6 +1623,14 @@ impl Groth16Prover {
                 n,
             );
         }
+        if h_timing_enabled {
+            unsafe {
+                check_gpu(
+                    sp1_gpu_sys::runtime::cuda_event_record(h_evt[3], stream),
+                    "event_record(h_evt[3])",
+                );
+            }
+        }
 
         // Coset iNTT → H in coefficient form, stays on GPU in d_a
         unsafe {
@@ -1484,6 +1640,50 @@ impl Groth16Prover {
                 ),
                 "coset_iNTT(H)",
             );
+        }
+        if h_timing_enabled {
+            unsafe {
+                check_gpu(
+                    sp1_gpu_sys::runtime::cuda_event_record(h_evt[4], stream),
+                    "event_record(h_evt[4])",
+                );
+                // Sync compute stream so all events are complete.
+                check_gpu(
+                    sp1_gpu_sys::runtime::cuda_stream_synchronize(stream),
+                    "stream_sync(stream) for H timing",
+                );
+                let wall = h2d_wall_start.map(|t| t.elapsed().as_secs_f32() * 1000.0).unwrap_or(0.0);
+                eprintln!(
+                    "[H-timing] H2D A+B+C (copy_stream events): {:.2}ms  (wall-to-H2D-sync: {:.2}ms)",
+                    h2d_ms_captured, wall
+                );
+                let stage_names = [
+                    "canonical_to_mont (3N)",
+                    "fused iNTT+cosetNTT (x3)",
+                    "pointwise (a*b-c)*den",
+                    "final coset_iNTT (x1)",
+                ];
+                let mut total = 0.0f32;
+                for i in 0..(N_H_EVENTS - 1) {
+                    let mut ms: f32 = 0.0;
+                    check_gpu(
+                        sp1_gpu_sys::runtime::cuda_event_elapsed_time(
+                            &mut ms as *mut _,
+                            h_evt[i],
+                            h_evt[i + 1],
+                        ),
+                        "elapsed(h_evt)",
+                    );
+                    eprintln!("[H-timing] stage {} {}: {:.2}ms", i + 1, stage_names[i], ms);
+                    total += ms;
+                }
+                eprintln!("[H-timing] compute-kernels total (post-H2D): {:.2}ms", total);
+                for e in h_evt.iter() {
+                    sp1_gpu_sys::runtime::cuda_event_destroy(*e);
+                }
+                sp1_gpu_sys::runtime::cuda_event_destroy(h2d_start);
+                sp1_gpu_sys::runtime::cuda_event_destroy(h2d_end);
+            }
         }
 
         // Only free the NTT temp if it was a fallback allocation (not pre-allocated).
