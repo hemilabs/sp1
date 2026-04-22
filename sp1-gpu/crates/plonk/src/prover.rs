@@ -5412,4 +5412,340 @@ mod tests {
             );
         }
     }
+
+    /// Exposes the PLONK `const_lin` bug deterministically with `nb_pub=1` and a
+    /// NON-ZERO public input, which activates the `PI(ζ)` term in the verifier
+    /// formula. The other constraint-satisfaction tests use `nb_pub=0`, so PI(ζ)
+    /// vanishes and any PI-handling mismatch is hidden.
+    ///
+    /// The test computes `const_lin` two ways and asserts they match:
+    ///   A. Prover side: `compute_linearization(...).eval(ζ)`.
+    ///   B. Verifier canonical formula:
+    ///        const_lin = -[ PI(ζ) - α²·L₁(ζ)
+    ///                       + α·(l+β·s1+γ)·(r+β·s2+γ)·(o+γ)·z(ωζ) ]
+    ///
+    /// NOTE: Formulation A (the prover shortcut) includes the H contribution
+    /// `-Z_H(ζ)·(H0+ζⁿ⁺²·H1+ζ²ⁿ⁺⁴·H2)(ζ)`. The verifier formula B does NOT.
+    /// The identity `A == B` therefore requires
+    ///     gate_lin + bsb22_lin + s3_lin + z_lin + h_lin == B
+    /// where each term is evaluated at ζ. This is equivalent to the PLONK
+    /// identity `h(ζ)·Z_H(ζ) = numerator(ζ)` combined with the gnark
+    /// const_lin convention — any divergence between the two signals a bug
+    /// in one of: PI polynomial sign, PI(ζ) Lagrange interpolation, L₁(ζ),
+    /// permutation sign, or the o_zeta term in the perm summand (note the
+    /// verifier uses `(o+γ)` NOT `(o+β·s3+γ)` because S3(X) is a committed
+    /// polynomial absorbed into lin_poly on the prover side).
+    #[test]
+    fn test_lin_poly_matches_verifier_formula() {
+        let n: usize = 8;
+        let log_n = n.trailing_zeros();
+        let omega = crate::domain::root_of_unity(log_n);
+        let domain = Domain::new(n, omega);
+
+        // ---- SRS (dummy, structurally correct) ----
+        let g = crate::g1::G1Affine {
+            x: crate::fields::Fq::from_u64(1),
+            y: crate::fields::Fq::from_u64(2),
+        };
+        let srs_lagrange: Vec<BN254G1Affine> = (1..=n as u64)
+            .map(|i| g.to_jacobian().scalar_mul(&[i, 0, 0, 0]).to_affine().to_bn254())
+            .collect();
+        let srs_canonical: Vec<BN254G1Affine> = (1..=(n + 3) as u64)
+            .map(|i| g.to_jacobian().scalar_mul(&[i, 0, 0, 0]).to_affine().to_bn254())
+            .collect();
+
+        let coset_shift = Fr::from_u64(5);
+        let k1 = coset_shift;
+        let k2 = k1 * k1;
+        let omega_powers = domain.omega_powers();
+
+        // ---- Identity permutation ----
+        let s1_fr: Vec<Fr> = omega_powers.clone();
+        let s2_fr: Vec<Fr> = omega_powers.iter().map(|w| *w * k1).collect();
+        let s3_fr: Vec<Fr> = omega_powers.iter().map(|w| *w * k2).collect();
+        let s1: Vec<BN254Fr> = s1_fr.iter().map(|v| v.to_bn254fr()).collect();
+        let s2: Vec<BN254Fr> = s2_fr.iter().map(|v| v.to_bn254fr()).collect();
+        let s3: Vec<BN254Fr> = s3_fr.iter().map(|v| v.to_bn254fr()).collect();
+
+        // ---- nb_pub = 1 with a NON-ZERO public input value ----
+        // This makes PI(ζ) non-zero, activating the PI term in the verifier
+        // formula which is what the other tests miss.
+        let nb_pub = 1usize;
+        let public_input_val = Fr::from_u64(42);
+
+        // ---- Selectors: row 0 is a "public-input row" per gnark convention:
+        //   Ql[0] = -1, Qk[0] = +v  (so the complete gate is Ql·L + ... + Qk + PI = 0
+        //   with PI[0] = +v, contributing -L[0] + v + v = 0 only if L[0] = 2v …
+        //   simpler: make row 0 the PI row by enforcing "L[0] = public_input_val"
+        //   via Ql[0] = 1, Qk[0] = 0, and PI[0] = -public_input_val? Gnark puts
+        //   PI as +v and expects Ql[0]·L[0] + PI[0] = 0 → with Ql[0]=-1 and
+        //   L[0]=v, we get -v + v = 0. Use that convention.)
+        //
+        // Other rows are an addition gate with Ql=1, Qr=1, Qo=-1 so O = L + R.
+        let mut ql_evals = vec![Fr::ONE; n];
+        ql_evals[0] = -Fr::ONE;
+        let qr_evals: Vec<Fr> = {
+            let mut v = vec![Fr::ONE; n];
+            v[0] = Fr::ZERO;
+            v
+        };
+        let qm_evals = vec![Fr::ZERO; n];
+        let qo_evals: Vec<Fr> = {
+            let mut v = vec![-Fr::ONE; n];
+            v[0] = Fr::ZERO;
+            v
+        };
+        let qk_evals = vec![Fr::ZERO; n];
+
+        let ql_bn: Vec<BN254Fr> = ql_evals.iter().map(|v| v.to_bn254fr()).collect();
+        let qr_bn: Vec<BN254Fr> = qr_evals.iter().map(|v| v.to_bn254fr()).collect();
+        let qm_bn: Vec<BN254Fr> = qm_evals.iter().map(|v| v.to_bn254fr()).collect();
+        let qo_bn: Vec<BN254Fr> = qo_evals.iter().map(|v| v.to_bn254fr()).collect();
+        let qk_bn: Vec<BN254Fr> = qk_evals.iter().map(|v| v.to_bn254fr()).collect();
+
+        // ---- Wire values ----
+        // Row 0: L[0] = public_input_val so the gate is  -L[0] + PI[0] = 0.
+        // Rows >= 1: addition gate, O = L + R.
+        let mut l_fr: Vec<Fr> = (1..=n as u64).map(Fr::from_u64).collect();
+        l_fr[0] = public_input_val;
+        let mut r_fr: Vec<Fr> = (10..10 + n as u64).map(Fr::from_u64).collect();
+        r_fr[0] = Fr::ZERO;
+        let mut o_fr: Vec<Fr> = (0..n).map(|i| l_fr[i] + r_fr[i]).collect();
+        o_fr[0] = Fr::ZERO;
+
+        // PI polynomial evaluations (per gnark: +pi[i] at public rows, zero elsewhere).
+        let mut pi_evals = vec![Fr::ZERO; n];
+        pi_evals[0] = public_input_val;
+
+        // Sanity: gate constraint must be satisfied at every row.
+        for i in 0..n {
+            let gate = ql_evals[i] * l_fr[i]
+                + qr_evals[i] * r_fr[i]
+                + qm_evals[i] * l_fr[i] * r_fr[i]
+                + qo_evals[i] * o_fr[i]
+                + qk_evals[i]
+                + pi_evals[i];
+            assert_eq!(gate, Fr::ZERO, "Gate constraint violated at row {i}");
+        }
+
+        // ---- Build proving data ----
+        let data = PlonkProvingData {
+            domain_size: n,
+            lg_domain_size: log_n,
+            omega: omega.to_bn254fr(),
+            nb_public_variables: nb_pub,
+            coset_shift: coset_shift.to_bn254fr(),
+            srs_lagrange,
+            srs_canonical,
+            ql: ql_bn,
+            qr: qr_bn,
+            qm: qm_bn,
+            qo: qo_bn,
+            qk: qk_bn,
+            qcp: vec![],
+            commitment_constraint_indexes: vec![],
+            s1,
+            s2,
+            s3,
+        };
+        let prover = PlonkProver::new(data);
+
+        // ---- Deterministic challenges ----
+        let beta = Fr::from_u64(7);
+        let gamma = Fr::from_u64(13);
+        let alpha = Fr::from_u64(17);
+        let zeta = Fr::from_u64(987_654_321);
+
+        // ---- Grand product (identity permutation with the chosen wires: Z MUST be all ones) ----
+        let z_lagrange = prover
+            .compute_grand_product(
+                &l_fr,
+                &r_fr,
+                &o_fr,
+                &s1_fr,
+                &s2_fr,
+                &s3_fr,
+                &beta,
+                &gamma,
+                &domain,
+                &coset_shift,
+            )
+            .unwrap();
+        assert_eq!(z_lagrange[0], Fr::ONE);
+
+        // ---- Coefficient forms ----
+        let l_coeffs = domain.ifft(&l_fr);
+        let r_coeffs = domain.ifft(&r_fr);
+        let o_coeffs = domain.ifft(&o_fr);
+        let z_coeffs = domain.ifft(&z_lagrange);
+        let ql_coeffs = domain.ifft(&ql_evals);
+        let qr_coeffs = domain.ifft(&qr_evals);
+        let qm_coeffs = domain.ifft(&qm_evals);
+        let qo_coeffs = domain.ifft(&qo_evals);
+        let qk_coeffs = domain.ifft(&qk_evals);
+        let s1_coeffs = domain.ifft(&s1_fr);
+        let s2_coeffs = domain.ifft(&s2_fr);
+        let s3_coeffs = domain.ifft(&s3_fr);
+
+        // ---- Quotient (pure CPU path) ----
+        let h_coeffs = prover.compute_quotient(
+            n,
+            &domain,
+            &l_coeffs,
+            &r_coeffs,
+            &o_coeffs,
+            &z_coeffs,
+            &ql_coeffs,
+            &qr_coeffs,
+            &qm_coeffs,
+            &qo_coeffs,
+            &qk_coeffs,
+            &s1_coeffs,
+            &s2_coeffs,
+            &s3_coeffs,
+            &[], // no qcp
+            &[], // no bsb22
+            &alpha,
+            &beta,
+            &gamma,
+            &coset_shift,
+            &[public_input_val],
+            &[], // no bsb22 commitments
+        );
+        let (h0_coeffs, h1_coeffs, h2_coeffs) = split_quotient(&h_coeffs, n);
+
+        // ---- Polynomial evals at ζ ----
+        let l_poly = Polynomial::new(l_coeffs.clone());
+        let r_poly = Polynomial::new(r_coeffs.clone());
+        let o_poly = Polynomial::new(o_coeffs.clone());
+        let z_poly = Polynomial::new(z_coeffs.clone());
+        let s1_poly = Polynomial::new(s1_coeffs.clone());
+        let s2_poly = Polynomial::new(s2_coeffs.clone());
+
+        let l_zeta = l_poly.eval(&zeta);
+        let r_zeta = r_poly.eval(&zeta);
+        let o_zeta = o_poly.eval(&zeta);
+        let s1_zeta = s1_poly.eval(&zeta);
+        let s2_zeta = s2_poly.eval(&zeta);
+        let z_shifted_zeta = z_poly.eval(&(zeta * omega));
+
+        // ---- Prover side: const_lin_prover = compute_linearization(...).eval(ζ) ----
+        let lin_poly = prover.compute_linearization(
+            n,
+            &zeta,
+            &alpha,
+            &beta,
+            &gamma,
+            &l_zeta,
+            &r_zeta,
+            &o_zeta,
+            &s1_zeta,
+            &s2_zeta,
+            &z_shifted_zeta,
+            &z_coeffs,
+            &ql_coeffs,
+            &qr_coeffs,
+            &qm_coeffs,
+            &qo_coeffs,
+            &qk_coeffs,
+            &s3_coeffs,
+            &[],
+            &[],
+            &[],
+            h0_coeffs,
+            h1_coeffs,
+            h2_coeffs,
+            &domain,
+            &coset_shift,
+        );
+        let const_lin_prover = lin_poly.eval(&zeta);
+
+        // ---- Verifier side: canonical formula ----
+        // PI(ζ) = Σ_i L_i(ζ) · pi_evals[i], with L_i(ζ) = (ζⁿ-1) · ωⁱ / (n · (ζ-ωⁱ)).
+        // Matches the SP1_PLONK_DEBUG_CONST_LIN=1 diagnostic in prover.rs.
+        let zh_zeta = domain.vanishing_eval(&zeta);
+        let pi_zeta_verifier: Fr = {
+            let size_inv = domain.size_inv;
+            let mut accw = Fr::ONE;
+            let mut pi_acc = Fr::ZERO;
+            for ev in pi_evals.iter() {
+                if !ev.is_zero() {
+                    let den = zeta - accw;
+                    assert!(!den.is_zero(), "ζ coincided with a root of unity");
+                    let mut term = zh_zeta;
+                    term *= den.inv();
+                    term *= size_inv;
+                    term *= accw;
+                    term *= *ev;
+                    pi_acc += term;
+                }
+                accw *= domain.omega;
+            }
+            pi_acc
+        };
+
+        // L₁(ζ) = (ζⁿ-1) / (n · (ζ-1))
+        let l1_zeta = {
+            let mut li = (zeta - Fr::ONE).inv();
+            li *= zh_zeta;
+            li *= domain.size_inv;
+            li
+        };
+        let alpha_sq_l1 = alpha.square() * l1_zeta;
+
+        // α · (l + β·s1 + γ) · (r + β·s2 + γ) · (o + γ) · z(ωζ)
+        let perm_summand = {
+            let t1 = l_zeta + beta * s1_zeta + gamma;
+            let t2 = r_zeta + beta * s2_zeta + gamma;
+            let t3 = o_zeta + gamma;
+            alpha * t1 * t2 * t3 * z_shifted_zeta
+        };
+
+        let const_lin_verifier = -(pi_zeta_verifier - alpha_sq_l1 + perm_summand);
+
+        // ---- Assert they match, with detailed diagnostics on failure ----
+        if const_lin_prover != const_lin_verifier {
+            eprintln!("--- const_lin divergence ---");
+            eprintln!("nb_pub               = {}", nb_pub);
+            eprintln!("public_input_val     = {:?}", public_input_val);
+            eprintln!("pi_evals             = {:?}", pi_evals);
+            eprintln!("zeta                 = {:?}", zeta);
+            eprintln!("alpha                = {:?}", alpha);
+            eprintln!("beta                 = {:?}", beta);
+            eprintln!("gamma                = {:?}", gamma);
+            eprintln!("l_zeta               = {:?}", l_zeta);
+            eprintln!("r_zeta               = {:?}", r_zeta);
+            eprintln!("o_zeta               = {:?}", o_zeta);
+            eprintln!("s1_zeta              = {:?}", s1_zeta);
+            eprintln!("s2_zeta              = {:?}", s2_zeta);
+            eprintln!("z_shifted_zeta       = {:?}", z_shifted_zeta);
+            eprintln!("zh_zeta              = {:?}", zh_zeta);
+            eprintln!("L1(zeta)             = {:?}", l1_zeta);
+            eprintln!("PI(zeta) [verifier]  = {:?}", pi_zeta_verifier);
+            eprintln!("alpha^2 * L1(zeta)   = {:?}", alpha_sq_l1);
+            eprintln!("perm_summand         = {:?}", perm_summand);
+            eprintln!("const_lin_prover     = {:?}", const_lin_prover);
+            eprintln!("const_lin_verifier   = {:?}", const_lin_verifier);
+            eprintln!("diff (prover-verif)  = {:?}", const_lin_prover - const_lin_verifier);
+
+            // Also report the "PI term missing/flipped" candidate diffs so
+            // we can immediately see which term is wrong.
+            eprintln!(
+                "diff + PI(zeta)      = {:?}  (zero means prover is MISSING +PI(ζ))",
+                const_lin_prover - const_lin_verifier + pi_zeta_verifier,
+            );
+            eprintln!(
+                "diff - PI(zeta)      = {:?}  (zero means prover is MISSING -PI(ζ))",
+                const_lin_prover - const_lin_verifier - pi_zeta_verifier,
+            );
+            eprintln!(
+                "diff + 2*PI(zeta)    = {:?}  (zero means sign of PI(ζ) is FLIPPED)",
+                const_lin_prover - const_lin_verifier + pi_zeta_verifier + pi_zeta_verifier,
+            );
+        }
+        assert_eq!(
+            const_lin_prover, const_lin_verifier,
+            "const_lin_prover != const_lin_verifier (see stderr diagnostics above)",
+        );
+    }
 }
