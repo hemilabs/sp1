@@ -63,6 +63,10 @@ extern "C" rustCudaError_t sppark_init_bn254(const cudaStream_t stream) {
 /// Forward NTT for a batch of BN254 Fr polynomials.
 /// d_inout: device pointer to poly_count polynomials, each 2^lg_domain_size elements.
 /// Polynomials are transformed in-place.
+///
+/// NOTE: sppark's BN254 NTT uses "wide" kernels that don't honor the batch_count
+/// grid dimension (only narrow kernels do, and narrow isn't compiled for BN254).
+/// We loop over polys manually to ensure each one is transformed.
 extern "C" rustCudaError_t batch_NTT_bn254(
     fr_t* d_inout,
     uint32_t lg_domain_size,
@@ -75,15 +79,15 @@ extern "C" rustCudaError_t batch_NTT_bn254(
     uint32_t domain_size = 1U << lg_domain_size;
 
     try {
-        NTT::Base_dev_ptr_batch(
-            stream,
-            d_inout,
-            lg_domain_size,
-            NTT::InputOutputOrder::NN,
-            NTT::Direction::forward,
-            NTT::Type::standard,
-            poly_count,
-            domain_size);
+        for (uint32_t p = 0; p < poly_count; p++) {
+            NTT::Base(
+                stream,
+                d_inout + p * (size_t)domain_size,
+                lg_domain_size,
+                NTT::InputOutputOrder::NN,
+                NTT::Direction::forward,
+                NTT::Type::standard);
+        }
     } catch (const cuda_error& e) {
         return rustCudaError_t{.message = e.what()};
     } catch (...) {
@@ -107,15 +111,15 @@ extern "C" rustCudaError_t batch_iNTT_bn254(
     uint32_t domain_size = 1U << lg_domain_size;
 
     try {
-        NTT::Base_dev_ptr_batch(
-            stream,
-            d_inout,
-            lg_domain_size,
-            NTT::InputOutputOrder::NN,
-            NTT::Direction::inverse,
-            NTT::Type::standard,
-            poly_count,
-            domain_size);
+        for (uint32_t p = 0; p < poly_count; p++) {
+            NTT::Base(
+                stream,
+                d_inout + p * (size_t)domain_size,
+                lg_domain_size,
+                NTT::InputOutputOrder::NN,
+                NTT::Direction::inverse,
+                NTT::Type::standard);
+        }
     } catch (const cuda_error& e) {
         return rustCudaError_t{.message = e.what()};
     } catch (...) {
@@ -139,15 +143,15 @@ extern "C" rustCudaError_t batch_coset_NTT_bn254(
     uint32_t domain_size = 1U << lg_domain_size;
 
     try {
-        NTT::Base_dev_ptr_batch(
-            stream,
-            d_inout,
-            lg_domain_size,
-            NTT::InputOutputOrder::NN,
-            NTT::Direction::forward,
-            NTT::Type::coset,
-            poly_count,
-            domain_size);
+        for (uint32_t p = 0; p < poly_count; p++) {
+            NTT::Base(
+                stream,
+                d_inout + p * (size_t)domain_size,
+                lg_domain_size,
+                NTT::InputOutputOrder::NN,
+                NTT::Direction::forward,
+                NTT::Type::coset);
+        }
     } catch (const cuda_error& e) {
         return rustCudaError_t{.message = e.what()};
     } catch (...) {
@@ -170,15 +174,15 @@ extern "C" rustCudaError_t batch_coset_iNTT_bn254(
     uint32_t domain_size = 1U << lg_domain_size;
 
     try {
-        NTT::Base_dev_ptr_batch(
-            stream,
-            d_inout,
-            lg_domain_size,
-            NTT::InputOutputOrder::NN,
-            NTT::Direction::inverse,
-            NTT::Type::coset,
-            poly_count,
-            domain_size);
+        for (uint32_t p = 0; p < poly_count; p++) {
+            NTT::Base(
+                stream,
+                d_inout + p * (size_t)domain_size,
+                lg_domain_size,
+                NTT::InputOutputOrder::NN,
+                NTT::Direction::inverse,
+                NTT::Type::coset);
+        }
     } catch (const cuda_error& e) {
         return rustCudaError_t{.message = e.what()};
     } catch (...) {

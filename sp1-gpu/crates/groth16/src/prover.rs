@@ -500,27 +500,41 @@ impl Groth16Prover {
             }
             eprintln!("[T] 2a. Wire scatter Ar (pre-pinned): {:?}", t_gather.elapsed());
 
-            // Use gnark's pre-computed H coefficients (natural order, Montgomery Fr).
-            // Even with sppark NTT on HIP (which has correct standard DFT output),
-            // the full compute_h_gpu pipeline has subtle issues around the coset
-            // NTT / batched poly handling that need further debugging. Keep the
-            // proven gnark H path for correctness.
-            let h_result = HResult::Host(witness.h_coefficients.clone());
-            let size_h = n - 1;
+            // GPU H polynomial: 7 NTTs (3× iNTT+cosetNTT fused, 1× coset iNTT).
+            // sppark NTT on HIP produces standard DFT output. The batched variants
+            // are now correctly looped (previously only poly 0 was transformed).
+            let wva_ptr_usize = self.pinned_a.as_ptr() as usize;
+            let wva_len = self.pinned_a.len();
+            let (h_result, size_h) = std::thread::scope(|scope| {
+                let h_handle = scope.spawn(move || {
+                    let ar_slice = unsafe {
+                        std::slice::from_raw_parts(wva_ptr_usize as *const Fr, wva_len)
+                    };
+                    self.compute_h(
+                        &witness.solution_a,
+                        &witness.solution_b,
+                        &witness.solution_c,
+                        Some(ar_slice),
+                    )
+                });
 
-            // CPU: scatter wire-value vectors into pre-pinned buffers.
-            {
-                let buf = self.pinned_b.as_mut_slice();
-                buf.par_iter_mut()
-                    .zip(self.b_indices.par_iter())
-                    .for_each(|(dst, &i)| *dst = wv[i]);
-            }
-            {
-                let buf = self.pinned_k.as_mut_slice();
-                buf.par_iter_mut()
-                    .zip(self.k_indices.par_iter())
-                    .for_each(|(dst, &i)| *dst = wv[i]);
-            }
+                // CPU: scatter the remaining two wire-value vectors while NTTs run.
+                {
+                    let buf = self.pinned_b.as_mut_slice();
+                    buf.par_iter_mut()
+                        .zip(self.b_indices.par_iter())
+                        .for_each(|(dst, &i)| *dst = wv[i]);
+                }
+                {
+                    let buf = self.pinned_k.as_mut_slice();
+                    buf.par_iter_mut()
+                        .zip(self.k_indices.par_iter())
+                        .for_each(|(dst, &i)| *dst = wv[i]);
+                }
+
+                let h_result = h_handle.join().expect("H polynomial computation panicked");
+                (h_result, n - 1)
+            });
 
             (h_result, size_h)
         };
