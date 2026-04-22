@@ -2054,6 +2054,27 @@ impl PlonkProver {
         fold_transcript.bind("gamma", &z_shifted_zeta.to_be_bytes()); // data transcript (zu)
         let gamma_fold = Fr::from_be_bytes_mod_order(&fold_transcript.compute_challenge("gamma"));
 
+        // DIAGNOSTIC: dump all FS challenges so verifier can be cross-checked.
+        // Activated by env var: SP1_PLONK_DEBUG_CHALLENGES=1
+        if std::env::var("SP1_PLONK_DEBUG_CHALLENGES").as_deref() == Ok("1") {
+            eprintln!("[CHALLENGE-DUMP] gamma       = {:?}", gamma);
+            eprintln!("[CHALLENGE-DUMP] beta        = {:?}", beta);
+            eprintln!("[CHALLENGE-DUMP] alpha       = {:?}", alpha);
+            eprintln!("[CHALLENGE-DUMP] zeta        = {:?}", zeta);
+            eprintln!("[CHALLENGE-DUMP] gamma_fold  = {:?}", gamma_fold);
+            eprintln!("[CHALLENGE-DUMP] --- claimed_values (in order stored) ---");
+            eprintln!("[CHALLENGE-DUMP] const_lin     = {:?}", claimed_values[0]);
+            eprintln!("[CHALLENGE-DUMP] l_zeta        = {:?}", claimed_values[1]);
+            eprintln!("[CHALLENGE-DUMP] r_zeta        = {:?}", claimed_values[2]);
+            eprintln!("[CHALLENGE-DUMP] o_zeta        = {:?}", claimed_values[3]);
+            eprintln!("[CHALLENGE-DUMP] s1_zeta       = {:?}", claimed_values[4]);
+            eprintln!("[CHALLENGE-DUMP] s2_zeta       = {:?}", claimed_values[5]);
+            for (i, v) in claimed_values.iter().skip(6).enumerate() {
+                eprintln!("[CHALLENGE-DUMP] qcp[{}]_zeta  = {:?}", i, v);
+            }
+            eprintln!("[CHALLENGE-DUMP] z_shifted_zeta = {:?}", z_shifted_zeta);
+        }
+
         // Fused fold: combine linearization construction + fold_and_subtract into
         // a single linear combination, eliminating the intermediate N-coefficient
         // linearization polynomial (~3s of 10 sequential O(N) passes saved).
