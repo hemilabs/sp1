@@ -121,6 +121,11 @@ func main() {
 			usage()
 		}
 		emit(os.Args[2], os.Args[3], planV2)
+	case "emit-layers":
+		if len(os.Args) != 4 {
+			usage()
+		}
+		emitLayers(os.Args[2], os.Args[3])
 	case "interpret":
 		if len(os.Args) != 6 {
 			usage()
@@ -145,6 +150,7 @@ func usage() {
 	fmt.Fprintln(os.Stderr, "Usage:")
 	fmt.Fprintln(os.Stderr, "  r1cs_solve_plan emit          <build_dir> <out_solve_plan.bin>")
 	fmt.Fprintln(os.Stderr, "  r1cs_solve_plan emit-v2       <build_dir> <out_solve_plan.bin>")
+	fmt.Fprintln(os.Stderr, "  r1cs_solve_plan emit-layers   <build_dir> <out_layers.bin>")
 	fmt.Fprintln(os.Stderr, "  r1cs_solve_plan interpret     <build_dir> <solve_plan.bin> <witness.json> <out_wire_values.bin>")
 	fmt.Fprintln(os.Stderr, "  r1cs_solve_plan roundtrip     <build_dir> <witness.json>")
 	fmt.Fprintln(os.Stderr, "  r1cs_solve_plan roundtrip-v2  <build_dir> <witness.json>")
@@ -340,6 +346,166 @@ func writeLE(w io.Writer, le constraint.LinearExpression) {
 		mustU32(w, uint32(t.CoeffID()))
 		mustU32(w, uint32(t.WireID()))
 	}
+}
+
+// ---------------- emit-layers ----------------
+//
+// Sidecar file giving each instruction a topological layer ID so the
+// Rust loader can group instructions by layer for the GPU dispatcher.
+//
+// File format:
+//   magic[4]       "LAYR"
+//   version[u32]   1
+//   nbInstr[u32]   matches the v2 plan's nbInstructions
+//   nbLayers[u32]  max(layerID) + 1
+//   layerID[u32 × nbInstr]
+//
+// Computation:
+//   - Wire 0..nbInputs-1 have depth 0 (witness inputs).
+//   - For each instruction in declaration order:
+//     - depth = max(input wire depths) + 1
+//     - assign output wires that depth
+//   - layerID = depth (so layer 0 = constraints/hints whose only inputs
+//     are witness wires; layer N = furthest from inputs).
+
+func emitLayers(buildDir, outPath string) {
+	r := loadR1CS(buildDir)
+
+	nbWires := r.NbInternalVariables + r.GetNbPublicVariables() + r.GetNbSecretVariables()
+	wireDepth := make([]int32, nbWires)
+	for i := range wireDepth {
+		wireDepth[i] = -1
+	}
+	nbInputs := r.GetNbPublicVariables() + r.GetNbSecretVariables()
+	for i := 0; i < nbInputs; i++ {
+		wireDepth[i] = 0
+	}
+
+	hintBpID, found := findHintBlueprint(r)
+	hintBP, _ := r.Blueprints[hintBpID].(constraint.BlueprintHint)
+	var hm constraint.HintMapping
+
+	nbInstr := r.GetNbInstructions()
+	layerID := make([]uint32, nbInstr)
+	maxDepth := int32(0)
+
+	t0 := time.Now()
+	for i := 0; i < nbInstr; i++ {
+		pi := r.Instructions[i]
+		inst := pi.Unpack(&r.System)
+		var d int32 = 0
+
+		processVID := func(vid uint32) {
+			if int(vid) >= len(wireDepth) || wireDepth[vid] < 0 {
+				return
+			}
+			if wireDepth[vid] > d {
+				d = wireDepth[vid]
+			}
+		}
+
+		if found && pi.BlueprintID == hintBpID {
+			hm.Inputs = hm.Inputs[:0]
+			hintBP.DecompressHint(&hm, inst)
+			for _, le := range hm.Inputs {
+				for _, t := range le {
+					if !t.IsConstant() {
+						processVID(uint32(t.WireID()))
+					}
+				}
+			}
+			thisDepth := d + 1
+			for w := hm.OutputRange.Start; w < hm.OutputRange.End; w++ {
+				if int(w) < len(wireDepth) {
+					wireDepth[w] = thisDepth
+				}
+			}
+			layerID[i] = uint32(thisDepth)
+			if thisDepth > maxDepth {
+				maxDepth = thisDepth
+			}
+			continue
+		}
+
+		bp := r.Blueprints[pi.BlueprintID]
+		r1c, ok := bp.(constraint.BlueprintR1C)
+		if !ok {
+			fail("inst %d: unexpected blueprint %T", i, bp)
+		}
+		var c constraint.R1C
+		r1c.DecompressR1C(&c, inst)
+		var newWire int32 = -1
+		processLE := func(le constraint.LinearExpression, allowNew bool) {
+			for _, t := range le {
+				vid := int32(t.WireID())
+				if vid < 0 || t.IsConstant() || int(vid) >= len(wireDepth) {
+					continue
+				}
+				if wireDepth[vid] < 0 {
+					if allowNew {
+						newWire = vid
+					}
+					continue
+				}
+				if wireDepth[vid] > d {
+					d = wireDepth[vid]
+				}
+			}
+		}
+		processLE(c.L, false)
+		processLE(c.R, false)
+		processLE(c.O, true)
+		thisDepth := d + 1
+		if newWire >= 0 {
+			wireDepth[newWire] = thisDepth
+		}
+		layerID[i] = uint32(thisDepth)
+		if thisDepth > maxDepth {
+			maxDepth = thisDepth
+		}
+	}
+
+	out, err := os.Create(outPath)
+	if err != nil {
+		fail("create layers out: %v", err)
+	}
+	w := bufio.NewWriterSize(out, 1<<20)
+	must(w.Write([]byte("LAYR")))
+	mustU32(w, 1)
+	mustU32(w, uint32(nbInstr))
+	mustU32(w, uint32(maxDepth+1))
+	for _, l := range layerID {
+		mustU32(w, l)
+	}
+	w.Flush()
+	out.Close()
+
+	// Histogram
+	width := make([]int, maxDepth+1)
+	for _, l := range layerID {
+		width[l]++
+	}
+	wide := 0
+	wideWork := 0
+	for _, n := range width {
+		if n >= 10000 {
+			wide++
+			wideWork += n
+		}
+	}
+	fmt.Fprintf(os.Stderr, "[plan] emitted %d layer-IDs in %s; nbLayers=%d max-width=%d wide-layers(>=10k)=%d covering %d/%d insts (%.1f%%)\n",
+		nbInstr, time.Since(t0), maxDepth+1, max(width), wide, wideWork, nbInstr,
+		100*float64(wideWork)/float64(nbInstr))
+}
+
+func max(xs []int) int {
+	m := 0
+	for _, x := range xs {
+		if x > m {
+			m = x
+		}
+	}
+	return m
 }
 
 // ---------------- interpret ----------------
