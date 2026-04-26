@@ -211,38 +211,39 @@ Two tricks worth calling out:
 
 ### 4.3 Hint kind catalog (must port to GPU)
 
-From `crates/recursion/gnark-ffi/go/sp1/koalabear/koalabear.go`
-(SP1-specific, all 4 are essential to the recursion circuit):
+**Phase 0 census complete (2026-04-26).** Output of
+`go run ./sp1/r1cs_hint_census ~/.sp1/circuits/groth16/v6.0.0`
+on the production R1CS:
 
-| Kind | Function | Description | GPU complexity |
-|---|---|---|---|
-| `kb.InvFHint` | inverse over Fr (KoalaBear field) | modular inverse via Fermat | 1 modexp; embarrassingly parallel |
-| `kb.InvEHint` | inverse over the degree-4 extension | tower-field inverse | ~6 Fr muls per call; trivial |
-| `kb.ReduceHint` | reduce a wide-uint into [0, p) | division with remainder | 1 divrem; 2-3 Fr muls |
-| `kb.SplitLimbsHint` | bit-decompose a wire into 7-bit limbs | for range checks | log-lookup-friendly; trivial |
+| # | Kind | Calls | % | Avg in→out | Where it fires |
+|---:|---|---:|---:|---|---|
+| 1 | `gnark/std/math/bits.nBits` | 227,113 | 50.1 % | 1→30 | mixed (78K wide / 94K deep tail) |
+| 2 | `koalabear.SplitLimbsHint` | 86,199 | 19.0 % | 1→2 | mixed |
+| 3 | `gnark/solver.InvZeroHint` | 86,199 | 19.0 % | 2→1 | mixed |
+| 4 | `koalabear.ReduceHint` | 51,528 | 11.4 % | 6→2 | mostly mid/deep |
+| 5 | `koalabear.InvFHint` | 1,974 | 0.4 % | 5→1 | deep tail only |
+| 6 | `koalabear.InvEHint` | 128 | 0.03 % | 4→4 | wide layers only |
 
-From gnark stdlib (transitively imported by SP1 circuit; counts
-estimated from spike — confirm with `grep` against the production
-constraints.json):
+**Total: 6 unique hint kinds, 453,141 calls. All have registered
+names. No `std/math/emulated` usage.** This is dramatically smaller
+than the upper bound this doc originally assumed.
 
-| Package | Hints | Complexity |
-|---|---|---|
-| `std/math/bits` | `NBits`, `NTrits`, `IthBit` | bit-decomposition; trivial |
-| `std/math/bitslice` | `Partition` | range-check helpers; trivial |
-| `std/math/cmp` | `IsLess`, `IsZero` | compare; trivial |
-| `std/math/emulated` | `Reduce`, `Inverse`, `Mul`, etc. | full BigInt ops; **largest port** |
-| `std/rangecheck` | the log-derivative table prep | counting; trivial |
-| `std/selector` | `Mux`, `KeyDecoder` | indexed select; trivial |
+What this means for the project:
+- Phase 3 (hint kernels) shrinks from ~1 week to **2–3 days**: each
+  of the 6 kinds is either a bit-decomposition or a modular
+  inverse, and we already have BN254 Fr / KoalaBear field
+  arithmetic on GPU. No BigInt port, no new field implementation.
+- The `bits.nBits` kernel handles 50 % of all hint calls; getting it
+  right is the single most important piece. Inputs are always one
+  wire (a value to decompose) and outputs are 30 bits on average.
+- `InvZeroHint` is BN254 Fr modular inverse via Fermat — one warp
+  per call should be plenty.
+- The 3 koalabear hints operate on a 31-bit prime; their kernels
+  are nearly trivial.
 
-**Action item before coding starts:** instrument `r1cs_characterize`
-to print the actual hint-kind histogram on the production circuit.
-The list above is the *upper bound* — many of these may not appear
-in SP1's recursion verifier. Cuts to this list cut weeks of work.
-
-`std/math/emulated` is the biggest unknown: if SP1's circuit uses
-it heavily for cross-field arithmetic, that's a multi-day port on
-its own. If the recursion verifier stays in KoalaBear and only
-uses BN254 Fr at the very top, this is small.
+The hint risk in §8 (was: "medium" likelihood that
+`std/math/emulated` is heavily used) is now **closed — risk does
+not apply**.
 
 ---
 
