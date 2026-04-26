@@ -321,6 +321,19 @@ impl PersistentG2Msm {
                 };
                 eprintln!("[G2 MSM] WARN: g2_glv_pool_reserve({}) failed: {}; continuing", n, msg);
             }
+
+            // H3: force GLV init at setup (not lazy on first invoke) so the
+            // ~70ms iter-1 penalty (endo-expand + hipMalloc(2N) + free of
+            // d_points) doesn't hit the first prove.
+            let err = unsafe { sp1_gpu_sys::msm::sp1_bn254_g2_msm_force_init_glv(ctx) };
+            if err != unsafe { sp1_gpu_sys::runtime::CUDA_SUCCESS_CSL } {
+                let msg = if err.message.is_null() {
+                    "unknown error".to_string()
+                } else {
+                    unsafe { std::ffi::CStr::from_ptr(err.message) }.to_string_lossy().into_owned()
+                };
+                eprintln!("[G2 MSM] WARN: g2_msm_force_init_glv failed: {}; continuing", msg);
+            }
         }
 
         Some(Self { ctx, npoints: n, use_glv })

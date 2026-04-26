@@ -450,6 +450,20 @@ impl PersistentMsm {
                 };
                 panic!("Failed to pre-reserve GLV working-buffer pool: {}", msg);
             }
+
+            // H3: Force the per-ctx GLV init at setup time, not lazily on
+            // first invoke. Saves ~70ms iter-1 penalty per context (endo
+            // expand + hipMalloc(2N) + hipFree of d_points/d_partial_sums/
+            // d_scalars).
+            let err = unsafe { sp1_gpu_sys::msm::sp1_bn254_msm_force_init_glv(ctx) };
+            if err != unsafe { sp1_gpu_sys::runtime::CUDA_SUCCESS_CSL } {
+                let msg = if err.message.is_null() {
+                    "unknown error".to_string()
+                } else {
+                    unsafe { std::ffi::CStr::from_ptr(err.message) }.to_string_lossy().into_owned()
+                };
+                panic!("Failed to force-init GLV for G1 ctx: {}", msg);
+            }
         }
 
         Self { ctx, npoints: n, use_glv }

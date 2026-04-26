@@ -546,6 +546,61 @@ __global__ void bucket_merge_kernel(
     buckets_xyzz[bucket_id] = accum;
 }
 
+// N-way parallel merge mirror of bn254_g2_msm_hip.cu's
+// g2_merge_partial_sums_Nway_kernel. WAYS threads cooperate per bucket; each
+// thread does BUCKET_PAR/WAYS sequential adds, then log2(WAYS)-step LDS tree
+// reduce. G1 XYZZ is 128 B (half of G2's 256 B) so LDS budget is generous.
+template<int WAYS>
+__launch_bounds__(256, 2)
+__global__ void bucket_merge_Nway_kernel(
+    const bn254_g1_xyzz_t* __restrict__ partial_sums,
+    bn254_g1_xyzz_t* __restrict__ buckets_xyzz,
+    int num_buckets
+) {
+    constexpr int MERGE_WAYS = WAYS;
+    constexpr int BUCKETS_PER_BLOCK = 256 / MERGE_WAYS;
+    __shared__ __align__(32) char lds_raw[MERGE_WAYS * BUCKETS_PER_BLOCK * sizeof(bn254_g1_xyzz_t)];
+    bn254_g1_xyzz_t* lds = reinterpret_cast<bn254_g1_xyzz_t*>(lds_raw);
+
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    int flat_bucket = tid / MERGE_WAYS;
+    int lane = tid % MERGE_WAYS;
+    if (flat_bucket >= num_buckets) return;
+    int local_bucket = threadIdx.x / MERGE_WAYS;
+
+    bn254_g1_xyzz_t acc;
+    acc.set_infinity();
+    int per_thread = BUCKET_PAR / MERGE_WAYS;
+    int start = lane * per_thread;
+    int end = start + per_thread;
+    for (int j = start; j < end; j++) {
+        const bn254_g1_xyzz_t& ps = partial_sums[(size_t)j * num_buckets + flat_bucket];
+        if (!ps.is_infinity()) {
+            if (acc.is_infinity()) acc = ps;
+            else acc += ps;
+        }
+    }
+    lds[local_bucket * MERGE_WAYS + lane] = acc;
+    __syncthreads();
+
+    #pragma unroll
+    for (int stride = MERGE_WAYS / 2; stride > 0; stride >>= 1) {
+        if (lane < stride) {
+            bn254_g1_xyzz_t a = lds[local_bucket * MERGE_WAYS + lane];
+            bn254_g1_xyzz_t b = lds[local_bucket * MERGE_WAYS + lane + stride];
+            if (!b.is_infinity()) {
+                if (a.is_infinity()) a = b;
+                else a += b;
+            }
+            lds[local_bucket * MERGE_WAYS + lane] = a;
+        }
+        __syncthreads();
+    }
+    if (lane == 0) {
+        buckets_xyzz[flat_bucket] = lds[local_bucket * MERGE_WAYS + 0];
+    }
+}
+
 // ================================================================
 // Kernel 3: Bucket Reduction (running-sum trick)
 // Computes the weighted sum: sum(j * bucket[j]) for j=1..num_buckets-1

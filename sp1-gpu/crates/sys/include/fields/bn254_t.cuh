@@ -351,6 +351,11 @@ struct bn254_t {
     // Matches mont_t::from() on CUDA which converts FROM Montgomery to canonical.
     __device__ __forceinline__ void from() { from_montgomery(); }
 
+    // Alias matching sppark's mont_t::to() (canonical → Montgomery). Lets
+    // kernels compile unchanged on both HIP (this type) and CUDA (sppark
+    // mont_t — see the `#else using bn254_t = fr_mont;` branch below).
+    __device__ __forceinline__ void to() { to_montgomery(); }
+
     // Convert from Montgomery to canonical form: a*R -> a
     __device__ __forceinline__ void from_montgomery() {
         bn254_t one_canonical(1, 0, 0, 0, 0, 0, 0, 0);

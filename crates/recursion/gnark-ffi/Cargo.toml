@@ -28,6 +28,8 @@ anyhow = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
 sp1-gpu-groth16 = { path = "../../../sp1-gpu/crates/groth16" }
+clap = { workspace = true, features = ["derive"], optional = true }
+libloading = { version = "0.8", optional = true }
 
 [build-dependencies]
 bindgen = { workspace = true }
@@ -50,8 +52,25 @@ required-features = ["native"]
 name = "bench_plonk"
 required-features = ["native", "cuda"]
 
+# Subprocess helper invoked by sp1-prover's recursion task to run the GPU
+# Groth16 final wrap in a clean child process. Necessary because the parent
+# process holds persistent HIP/CUDA contexts from the shard prover that
+# deadlock the in-process Groth16 prover at the first MSM.
+#
+# The `cuda` feature gates the GPU-accelerated Groth16 code paths in
+# sp1-gpu-groth16 (despite the name, it enables both HIP and CUDA
+# backends — the runtime backend is selected by SP1_GPU_BACKEND / the
+# sp1-gpu-sys build.rs). Without it, the helper compiles the CPU
+# fallback path that expects `h_coefficients.bin` to be populated by
+# the Go exporter (it isn't — H is computed on GPU) and runs Pippenger
+# MSMs on CPU (taking >20 min on 5090).
+[[bin]]
+name = "groth16_gpu_helper"
+path = "src/bin/groth16_gpu_helper.rs"
+required-features = ["native", "cuda"]
+
 [features]
-native = []
+native = ["dep:clap", "dep:libloading"]
 groth16-cuda = []
 cuda = ["sp1-gpu-groth16/cuda", "sp1-gpu-plonk/cuda"]
 

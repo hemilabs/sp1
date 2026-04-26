@@ -759,6 +759,20 @@ impl<A: ArtifactClient, C: SP1ProverComponents> SP1RecursionProver<A, C> {
                 witness
             };
             let prover = Groth16Bn254Prover::new();
+            // GPU-accelerated final-wrap path (sp1-gpu-groth16) via a
+            // SUBPROCESS helper. The shard-prover's persistent HIP/CUDA
+            // contexts from the earlier recursion phase would deadlock the
+            // in-process Groth16 GPU prover at the first MSM; spawning a
+            // clean child process isolates HIP state. Parent still does the
+            // Go R1CS solve + PK export (CPU-only) in-process — only the GPU
+            // compute step is subprocess-isolated.
+            //
+            // Falls back to gnark Go / Docker when native-gnark is not set.
+            // On AMD 7900 XTX the GPU path drops the wrap step from ~41 s
+            // (Docker CPU gnark) to ~3 s (round-6.4 standalone measurement).
+            #[cfg(feature = "native-gnark")]
+            let proof = prover.prove_gpu_subprocess(witness, &build_dir);
+            #[cfg(not(feature = "native-gnark"))]
             let proof = prover.prove(witness, &build_dir);
             prover
                 .verify(
@@ -831,6 +845,17 @@ impl<A: ArtifactClient, C: SP1ProverComponents> SP1RecursionProver<A, C> {
                 witness
             };
             let prover = PlonkBn254Prover::new();
+            // TODO(plonk-gpu): PLONK final wrap still uses gnark Go / Docker.
+            // A prove_gpu equivalent is NOT YET available because:
+            //   1. No ExportPlonkGpuWitness FFI analog to ExportGroth16GpuWitness.
+            //   2. The sp1-gpu-plonk prover has a known correctness bug: the
+            //      re-derived selector commitments (Ql/Qr/Qm/Qo/Qk) don't match
+            //      the VK-stored ones, failing gnark pairing verification. See
+            //      memory `project_plonk_bug_rootcause.md` for the root-cause
+            //      analysis (nbPublic mismatch at export-time vs VK-build-time).
+            // Once those land, mirror the Groth16 pattern above with
+            // `prover.prove_gpu(witness, &build_dir)` under `cfg(feature =
+            // "native-gnark")`.
             let proof = prover.prove(witness, &build_dir);
             // Note: ProvePlonk (Go) already verifies internally before returning.
             // The external verify via Docker has a WriteRawTo/ReadFrom serialization

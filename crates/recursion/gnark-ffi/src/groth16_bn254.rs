@@ -47,6 +47,107 @@ fn shm_named_tempfile() -> tempfile::NamedTempFile {
     tempfile::NamedTempFile::new().expect("failed to create temp file")
 }
 
+/// Release the parent process's GPU memory before spawning the helper
+/// subprocess. After the recursion phase the parent's shard-prover
+/// state still holds ~10 GB of pooled device memory; without releasing
+/// it the helper's `hipMalloc`/`cudaMalloc` for the H polynomial (a
+/// 3 × 512 MB GPU-side buffer) fails with "out of memory" on a 24 GB
+/// card.
+///
+/// `hipDeviceReset` / `cudaDeviceReset` returns every pooled device
+/// allocation to the OS and tears down the userspace runtime's view of
+/// the device. It does NOT release the kernel-driver process
+/// registration (KFD on AMD / the CUDA driver context on NVIDIA) —
+/// the parent remains the "owner" of the GPU — but the helper does
+/// not need a separate GPU; it only needs enough free VRAM to do its
+/// own `hipMalloc`s, which the reset provides.
+///
+/// Side effect: every device pointer the parent currently holds is
+/// invalidated. After this call the parent must NOT touch the GPU. In
+/// the recursion pipeline the only remaining work after the Groth16
+/// task is CPU-only (gnark Go verify + artifact upload) and the
+/// process-exit Drop chain. Drop impls call `hipFree`/`cudaFree`,
+/// which return errors on dangling pointers but do not panic.
+///
+/// We call the reset via `libloading` so this crate doesn't need a
+/// hard build-time dependency on either toolkit. Library-name order:
+/// CUDA first on CUDA builds (libcudart), HIP first on HIP builds
+/// (libamdhip64). If both are present we prefer the one matching
+/// `SP1_GPU_BACKEND`; otherwise we fall through.
+#[cfg(feature = "native")]
+fn try_release_parent_gpu_memory() -> bool {
+    use libloading::{Library, Symbol};
+
+    // Prefer the runtime that matches SP1_GPU_BACKEND so on a machine
+    // with both ROCm and CUDA installed we reset the right device.
+    // (Calling `cudaDeviceReset` when the parent was using HIP still
+    // loads libcudart and acts on the null CUDA context, which does
+    // nothing useful. Ordering matters.)
+    let backend = std::env::var("SP1_GPU_BACKEND").ok();
+    let cuda_first = matches!(backend.as_deref(), Some("cuda") | Some("nvidia"));
+
+    let cuda_candidates: &[(&str, &str)] = &[
+        ("libcudart.so", "cudaDeviceReset"),
+        ("libcudart.so.13", "cudaDeviceReset"),
+        ("libcudart.so.12", "cudaDeviceReset"),
+    ];
+    let hip_candidates: &[(&str, &str)] = &[
+        ("libamdhip64.so", "hipDeviceReset"),
+        ("libamdhip64.so.6", "hipDeviceReset"),
+        ("libamdhip64.so.5", "hipDeviceReset"),
+    ];
+    let groups: [&[(&str, &str)]; 2] =
+        if cuda_first { [cuda_candidates, hip_candidates] } else { [hip_candidates, cuda_candidates] };
+
+    for group in groups {
+        for (libname, fname) in group {
+            // SAFETY: dlopen of a system shared library; the symbol's
+            // signature (`fn() -> i32`) matches both `hipDeviceReset`
+            // and `cudaDeviceReset`.
+            let lib = unsafe { Library::new(libname) };
+            let Ok(lib) = lib else { continue };
+            let sym: Result<Symbol<unsafe extern "C" fn() -> i32>, _> =
+                unsafe { lib.get(fname.as_bytes()) };
+            let Ok(reset_fn) = sym else { continue };
+            // SAFETY: signature matches; calling once with no args.
+            let rc = unsafe { reset_fn() };
+            tracing::info!(
+                "Released parent GPU memory via {}::{} (rc={})",
+                libname,
+                fname,
+                rc
+            );
+            return true;
+        }
+    }
+    tracing::warn!(
+        "Could not release parent GPU memory — neither HIP nor CUDA runtime library found. \
+         The Groth16 GPU helper may OOM at the first `hipMalloc` if the parent holds GPU state."
+    );
+    false
+}
+
+/// Locate the `groth16_gpu_helper` subprocess binary. Priority:
+///   1. `SP1_GROTH16_GPU_HELPER` env var (absolute path)
+///   2. Alongside the current executable (standard Cargo target-dir layout)
+///   3. `$PATH` lookup (the binary name as a relative path — lets `Command`
+///      resolve via PATH)
+#[cfg(feature = "native")]
+fn resolve_helper_path(name: &str) -> std::path::PathBuf {
+    if let Ok(p) = std::env::var("SP1_GROTH16_GPU_HELPER") {
+        return std::path::PathBuf::from(p);
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let candidate = dir.join(name);
+            if candidate.exists() {
+                return candidate;
+            }
+        }
+    }
+    std::path::PathBuf::from(name)
+}
+
 /// A prover that can generate proofs with the Groth16 protocol using bindings to Gnark.
 #[derive(Debug, Clone)]
 pub struct Groth16Bn254Prover;
@@ -185,6 +286,119 @@ impl Groth16Bn254Prover {
             raw_proof: raw_proof_hex,
             groth16_vkey_hash: Self::get_vkey_hash(build_dir),
         }
+    }
+
+    /// Subprocess-isolated variant of `prove_gpu`. Spawns the
+    /// `groth16_gpu_helper` binary so the GPU Groth16 prover runs in a clean
+    /// process that does NOT inherit HIP/CUDA state from the caller
+    /// (sp1-prover's recursion task holds persistent shard-prover contexts
+    /// that deadlock the in-process GPU prover at the first MSM; see memory
+    /// file `project_groth16_gpu_wrap_pipeline_conflict.md`).
+    ///
+    /// The parent still does the Go shell-out (witness solve + PK export)
+    /// in-process, since those are CPU-only and don't share GPU state.
+    /// Only the GPU compute step is isolated.
+    ///
+    /// Returns the same Groth16Bn254Proof as `prove_gpu`.
+    #[cfg(feature = "native")]
+    pub fn prove_gpu_subprocess<C: Config>(
+        &self,
+        witness: Witness<C>,
+        build_dir: &Path,
+    ) -> Groth16Bn254Proof {
+        use crate::ffi::{export_groth16_gpu_data, export_groth16_gpu_witness};
+
+        // Step 1: write witness JSON (CPU-only, no HIP).
+        let mut witness_file = shm_named_tempfile();
+        let gnark_witness = GnarkWitness::new(witness);
+        let serialized = serde_json::to_string(&gnark_witness).unwrap();
+        witness_file.write_all(serialized.as_bytes()).unwrap();
+
+        // Step 2: Go shell-out to solve R1CS + export PK / witness in
+        // GPU-friendly layout (CPU-only, no HIP).
+        let gpu_dir = shm_tempdir();
+        let gpu_dir_str = gpu_dir.path().to_str().unwrap();
+        let build_dir_str = build_dir.to_str().unwrap();
+        tracing::info!("Exporting Groth16 GPU data...");
+        export_groth16_gpu_data(build_dir_str, gpu_dir_str);
+        tracing::info!("Solving R1CS and exporting witness...");
+        export_groth16_gpu_witness(
+            build_dir_str,
+            witness_file.path().to_str().unwrap(),
+            gpu_dir_str,
+        );
+
+        // Step 3: invoke the helper subprocess. Locate it in the same
+        // directory as the current executable; fall back to PATH.
+        let helper_path = resolve_helper_path("groth16_gpu_helper");
+        let out_file = shm_named_tempfile();
+        let vkey_hash = Self::get_vkey_hash(build_dir);
+        let vkey_hash_hex = hex::encode(vkey_hash);
+
+        // Release the parent's pooled GPU memory so the helper's ~3 GB
+        // of H-polynomial + SRS allocations fit alongside whatever the
+        // parent still retains. Without this the helper OOMs at the
+        // first GPU `hipMalloc`/`cudaMalloc` because the parent's
+        // shard-prover state holds ~10 GB of pooled buffers.
+        try_release_parent_gpu_memory();
+
+        tracing::info!("Spawning GPU Groth16 subprocess: {helper_path:?}");
+        // GLV defaults:
+        // - HIP build: leave SP1_GPU_GLV / SP1_GPU_G2_GLV unset so the
+        //   helper's auto-detect (20 GB total VRAM threshold) decides.
+        //   After `try_release_parent_gpu_memory`, ~24 GB is free on
+        //   24 GB cards, so both turn on. Both-on is a 21 % win on the
+        //   Groth16 prove step (-800 ms on 7900 XTX). The MIXED config
+        //   (G1 off + G2 on) produces invalid proofs; auto-detect
+        //   couples them via the shared threshold so this can't happen
+        //   by accident.
+        // - CUDA build: GLV is HIP-only (sppark's MSM doesn't use the
+        //   endomorphism path), so the helper *must* see SP1_GPU_GLV=0
+        //   or it will panic at the first MSM with "GLV MSM is HIP-
+        //   only". The auto-detect doesn't know it's running on a CUDA
+        //   build, so we force it here.
+        let mut cmd = std::process::Command::new(&helper_path);
+        cmd.arg("--gpu-dir")
+            .arg(gpu_dir.path())
+            .arg("--witness-json")
+            .arg(witness_file.path())
+            .arg("--vkey-hash-hex")
+            .arg(&vkey_hash_hex)
+            .arg("--out")
+            .arg(out_file.path());
+        // CUDA builds need GLV forced off; HIP builds let auto-detect
+        // pick. Detect via the parent's runtime backend env var (the
+        // helper inherits the same SASS / arch as the parent process).
+        let backend_is_cuda = matches!(
+            std::env::var("SP1_GPU_BACKEND").ok().as_deref(),
+            Some("cuda") | Some("nvidia")
+        );
+        if backend_is_cuda {
+            if std::env::var_os("SP1_GPU_GLV").is_none() {
+                cmd.env("SP1_GPU_GLV", "0");
+            }
+            if std::env::var_os("SP1_GPU_G2_GLV").is_none() {
+                cmd.env("SP1_GPU_G2_GLV", "0");
+            }
+        }
+        let status = cmd.status()
+            .unwrap_or_else(|e| {
+                panic!(
+                    "failed to spawn GPU Groth16 helper {helper_path:?}: {e}. \
+                     Either build the `groth16_gpu_helper` binary (cargo build \
+                     --release -p sp1-recursion-gnark-ffi --features native,cuda) \
+                     or set SP1_GROTH16_GPU_HELPER to its path."
+                )
+            });
+        if !status.success() {
+            panic!("GPU Groth16 helper exited non-zero: {status:?}");
+        }
+
+        // Step 4: read the helper's proof JSON and return.
+        let proof_bytes = std::fs::read(out_file.path()).unwrap();
+        serde_json::from_slice(&proof_bytes).unwrap_or_else(|e| {
+            panic!("failed to parse helper's Groth16Bn254Proof JSON: {e}");
+        })
     }
 
     /// Verify a Groth16 proof and verify that the supplied vkey_hash and committed_values_digest

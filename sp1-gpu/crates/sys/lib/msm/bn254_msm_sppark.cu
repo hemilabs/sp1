@@ -254,3 +254,86 @@ void sp1_bn254_msm_destroy(void* ctx)
         delete reinterpret_cast<msm_context_t*>(ctx);
     }
 }
+
+// ============================================================================
+// HIP-only symbols — stubs for CUDA builds
+// ============================================================================
+//
+// These FFI entry points exist only in bn254_msm_hip.cu (the custom RDNA3 MSM
+// path). Rust callers in sp1-gpu-plonk always declare them in `sys/src/msm.rs`
+// so the same Rust binary surface works on both backends, but the symbols
+// themselves must link on CUDA too — even if the call sites are gated by the
+// runtime `SP1_GPU_GLV` env var and never fire in sppark builds. sppark has
+// its own internal scalar prep and endomorphism handling inside `msm_t`; its
+// PersistentMsm path doesn't need any of these hooks.
+//
+// All stubs return CUDA_SUCCESS_CSL (or are void). Calling any of these on a
+// CUDA build with `SP1_GPU_GLV=1` would silently run the non-GLV code path
+// (sppark's default). That's the intended fallback.
+
+extern "C" rustCudaError_t
+sp1_bn254_msm_force_init_glv(void* /*ctx*/) { return CUDA_SUCCESS_CSL; }
+
+extern "C" rustCudaError_t
+sp1_bn254_g2_msm_force_init_glv(void* /*ctx*/) { return CUDA_SUCCESS_CSL; }
+
+// CUDA stub — sppark MSM doesn't show the cold-start pattern that the HIP
+// path's bn254_msm_hip.cu addresses. No-op on CUDA.
+extern "C" rustCudaError_t
+sp1_bn254_gpu_warmup(int /*spin_us*/) { return CUDA_SUCCESS_CSL; }
+
+extern "C" rustCudaError_t
+sp1_bn254_glv_pool_reserve(size_t /*max_n*/) { return CUDA_SUCCESS_CSL; }
+
+extern "C" void sp1_bn254_glv_pool_free(void) {}
+
+// Note: sp1_bn254_g2_glv_pool_reserve / sp1_bn254_g2_glv_pool_free are
+// already defined in bn254_g2_msm_sppark.cu — do not duplicate here.
+
+extern "C" rustCudaError_t
+sp1_bn254_msm_preupload_scalars(const void* /*scalars*/, size_t /*npoints*/) {
+    return CUDA_SUCCESS_CSL;
+}
+
+extern "C" rustCudaError_t
+sp1_bn254_msm_preupload_gather(
+    void* /*d_wire_values_dst*/, const void* /*h_wire_values*/,
+    size_t /*wire_values_bytes*/, const void* /*d_indices*/, size_t /*npoints*/)
+{
+    return CUDA_SUCCESS_CSL;
+}
+
+// GLV-accelerated MSM invokes — on CUDA these should never be called (GLV
+// is HIP-only), so return an error rather than silently running a wrong
+// path. The Rust caller must gate via SP1_GPU_GLV. If something slips
+// through, the helper will surface it as a proof failure rather than a
+// hang or miscomputation.
+extern "C" rustCudaError_t
+sp1_bn254_msm_invoke_glv(
+    void* /*ctx*/, void* /*result*/, size_t /*npoints*/,
+    const void* /*scalars*/, bool /*mont*/,
+    const void* /*next_scalars*/, size_t /*next_n*/)
+{
+    return rustCudaError_t{.message = "GLV MSM is HIP-only; set SP1_GPU_GLV=0"};
+}
+
+extern "C" rustCudaError_t
+sp1_bn254_msm_invoke_glv_device(
+    void* /*ctx*/, void* /*result*/, size_t /*npoints*/,
+    const void* /*d_scalars*/, bool /*mont*/,
+    const void* /*next_host_scalars*/, size_t /*next_host_n*/)
+{
+    return rustCudaError_t{.message = "GLV MSM is HIP-only; set SP1_GPU_GLV=0"};
+}
+
+extern "C" rustCudaError_t
+sp1_bn254_msm_invoke_glv_device_depad(
+    void* /*ctx*/, void* /*result*/, size_t /*npoints*/,
+    const void* /*d_scalars*/, bool /*mont*/,
+    const void* /*hot_values_host*/, int /*num_hot*/)
+{
+    return rustCudaError_t{.message = "GLV MSM is HIP-only; set SP1_GPU_GLV=0"};
+}
+
+// Note: sp1_bn254_g2_msm_invoke_glv is already defined in
+// bn254_g2_msm_sppark.cu — do not duplicate here.

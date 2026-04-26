@@ -224,9 +224,22 @@ pub struct Groth16Prover {
     /// from compute_h_gpu which runs single-threaded.
     #[cfg(feature = "cuda")]
     d_ntt_temp: *mut std::ffi::c_void,
+    /// GPU wire-gather: persistent device-side u32 index arrays, uploaded
+    /// once at setup. Used by `sp1_bn254_msm_preupload_gather` to skip the
+    /// ~22ms CPU par_iter scatter for Ar MSM (~51 MB for a_indices at
+    /// N=12.76M).
+    #[cfg(feature = "cuda")]
+    d_a_indices: *mut std::ffi::c_void,
+    /// GPU wire-gather: persistent device-side wire-values buffer, sized to
+    /// hold nb_wires × 32 bytes (~504 MB at nb_wires=15.74M). Re-filled at
+    /// the start of each prove via async H2D on copy_stream.
+    #[cfg(feature = "cuda")]
+    d_wire_values: *mut std::ffi::c_void,
+    #[cfg(feature = "cuda")]
+    d_wire_values_cap: usize,
 }
 
-// Raw pointer d_ntt_temp needs explicit Send/Sync.
+// Raw pointers need explicit Send/Sync.
 unsafe impl Send for Groth16Prover {}
 unsafe impl Sync for Groth16Prover {}
 
@@ -238,6 +251,18 @@ impl Drop for Groth16Prover {
                 sp1_gpu_sys::runtime::cuda_free(self.d_ntt_temp as *const std::ffi::c_void);
             }
             self.d_ntt_temp = std::ptr::null_mut();
+        }
+        if !self.d_a_indices.is_null() {
+            unsafe {
+                sp1_gpu_sys::runtime::cuda_free(self.d_a_indices as *const std::ffi::c_void);
+            }
+            self.d_a_indices = std::ptr::null_mut();
+        }
+        if !self.d_wire_values.is_null() {
+            unsafe {
+                sp1_gpu_sys::runtime::cuda_free(self.d_wire_values as *const std::ffi::c_void);
+            }
+            self.d_wire_values = std::ptr::null_mut();
         }
     }
 }
@@ -443,6 +468,50 @@ impl Groth16Prover {
             }
         }
 
+        // Pre-compute GPU wire-gather buffers (d_a_indices one-time H2D, and
+        // d_wire_values reserved at nb_wires × 32 B). Done before the struct
+        // literal to avoid moving a_indices / data into the literal first.
+        #[cfg(feature = "cuda")]
+        let d_a_indices: *mut std::ffi::c_void = {
+            let a_idx_u32: Vec<u32> = a_indices.iter().map(|&i| i as u32).collect();
+            let byte_sz = a_idx_u32.len() * std::mem::size_of::<u32>();
+            let mut ptr: *mut std::ffi::c_void = std::ptr::null_mut();
+            let err = unsafe { sp1_gpu_sys::runtime::cuda_malloc(&mut ptr as *mut _, byte_sz) };
+            if err != unsafe { sp1_gpu_sys::runtime::CUDA_SUCCESS_CSL } || ptr.is_null() {
+                eprintln!("[groth16] WARN: d_a_indices malloc failed; GPU gather disabled");
+                std::ptr::null_mut()
+            } else {
+                let err = unsafe {
+                    sp1_gpu_sys::runtime::cuda_mem_copy_host_to_device(
+                        ptr,
+                        a_idx_u32.as_ptr() as *const std::ffi::c_void,
+                        byte_sz,
+                    )
+                };
+                if err != unsafe { sp1_gpu_sys::runtime::CUDA_SUCCESS_CSL } {
+                    eprintln!("[groth16] WARN: d_a_indices H2D failed; freeing");
+                    unsafe { sp1_gpu_sys::runtime::cuda_free(ptr as *const _) };
+                    std::ptr::null_mut()
+                } else {
+                    ptr
+                }
+            }
+        };
+        #[cfg(feature = "cuda")]
+        let d_wire_values_cap: usize = data.nb_wires;
+        #[cfg(feature = "cuda")]
+        let d_wire_values: *mut std::ffi::c_void = {
+            let byte_sz = d_wire_values_cap * std::mem::size_of::<Fr>();
+            let mut ptr: *mut std::ffi::c_void = std::ptr::null_mut();
+            let err = unsafe { sp1_gpu_sys::runtime::cuda_malloc(&mut ptr as *mut _, byte_sz) };
+            if err != unsafe { sp1_gpu_sys::runtime::CUDA_SUCCESS_CSL } || ptr.is_null() {
+                eprintln!("[groth16] WARN: d_wire_values malloc failed; GPU gather disabled");
+                std::ptr::null_mut()
+            } else {
+                ptr
+            }
+        };
+
         Self {
             data,
             #[cfg(feature = "cuda")]
@@ -486,6 +555,12 @@ impl Groth16Prover {
                 }
                 ptr
             },
+            #[cfg(feature = "cuda")]
+            d_a_indices,
+            #[cfg(feature = "cuda")]
+            d_wire_values,
+            #[cfg(feature = "cuda")]
+            d_wire_values_cap,
         }
     }
 
@@ -496,6 +571,7 @@ impl Groth16Prover {
     /// CPU handles: 1 G2 MSM, scalar multiplications, proof assembly.
     pub fn prove(&self, witness: &Groth16WitnessData) -> anyhow::Result<Groth16Proof> {
         let t_total = std::time::Instant::now();
+        let _prove_scope = crate::profile::Scope::new("groth16_prove");
         let n = self.data.domain_size;
         let nb_wires = self.data.nb_wires;
 
@@ -503,6 +579,7 @@ impl Groth16Prover {
 
         // 1. Sample random blinding scalars r, s
         let t = std::time::Instant::now();
+        let _blind_scope = crate::profile::Scope::new("1_sample_blinding");
         let (r, s) = if std::env::var("GROTH16_ZERO_BLIND").ok().as_deref() == Some("1") {
             eprintln!("[DIAG] Using r=0, s=0 (zero blinding for debugging)");
             (Fr::ZERO, Fr::ZERO)
@@ -511,12 +588,14 @@ impl Groth16Prover {
         };
         let kr = -(r * s); // kr = -r*s
         eprintln!("[T] 1. Sample blinding scalars: {:?}", t.elapsed());
+        drop(_blind_scope);
 
         // 2+3. Overlap wire filtering (CPU) with H polynomial (GPU).
         // These are independent: filter reads wire_values; H reads solution_a/b/c.
         // On CUDA, the GPU NTTs run while the CPU filters, hiding ~460ms of filter
         // time behind the ~860ms of GPU work.
         let t = std::time::Instant::now();
+        let _h_phase_scope = crate::profile::Scope::new("2_3_filter_and_hpoly");
         let wv = &witness.wire_values;
 
         #[cfg(feature = "cuda")]
@@ -539,46 +618,99 @@ impl Groth16Prover {
             //
             // The pre-pinned buffers eliminate per-prove hipHostRegister /
             // hipHostUnregister calls (~60-80ms of TLB shootdown overhead).
-            let t_gather = std::time::Instant::now();
-            {
+            // GPU wire-gather (enabled when witness is pinned at load time).
+            // witness.pinned_on_device means wire_values is hipHostRegister'd,
+            // so the async H2D on copy_stream actually uses SDMA and doesn't
+            // block the host. Skipping the CPU par_iter scatter saves ~22 ms
+            // on the critical path; the 504 MB async H2D + 1 ms gather kernel
+            // run in parallel with the H-poly NTTs on compute_h's thread.
+            // Debug toggle: SP1_GPU_USE_GATHER=1 to enable GPU wire-gather path.
+            // Default off — even with pinned witness, the gather path has shown
+            // a ~27ms regression on H-poly phase (SDMA queue serialization of
+            // +504 MB wire_values H2D behind the existing 3×504 MB solution
+            // H2Ds on copy_stream; combined exceeds NTT-compute wall window).
+            let gather_env_on = std::env::var("SP1_GPU_USE_GATHER").ok().as_deref() == Some("1");
+            let use_gpu_gather_a = gather_env_on
+                && witness.pinned_on_device
+                && !self.d_wire_values.is_null()
+                && !self.d_a_indices.is_null();
+            if use_gpu_gather_a {
+                let t_gather = std::time::Instant::now();
+                let _g = crate::profile::Scope::new("2a_gpu_gather_ar");
+                let wv_bytes = wv.len() * std::mem::size_of::<Fr>();
+                debug_assert!(wv.len() <= self.d_wire_values_cap);
+                let err = unsafe {
+                    sp1_gpu_sys::msm::sp1_bn254_msm_preupload_gather(
+                        self.d_wire_values,
+                        wv.as_ptr() as *const std::ffi::c_void,
+                        wv_bytes,
+                        self.d_a_indices,
+                        self.a_indices.len(),
+                    )
+                };
+                if err != unsafe { sp1_gpu_sys::runtime::CUDA_SUCCESS_CSL } {
+                    panic!("[groth16] sp1_bn254_msm_preupload_gather failed");
+                }
+                eprintln!(
+                    "[T] 2a. Wire gather Ar (GPU pinned async H2D+kernel): {:?}",
+                    t_gather.elapsed()
+                );
+            } else {
+                let t_gather = std::time::Instant::now();
+                let _g = crate::profile::Scope::new("2a_scatter_ar");
                 let buf = self.pinned_a.as_mut_slice();
                 buf.par_iter_mut()
                     .zip(self.a_indices.par_iter())
                     .for_each(|(dst, &i)| *dst = wv[i]);
+                eprintln!("[T] 2a. Wire scatter Ar (CPU pre-pinned): {:?}", t_gather.elapsed());
             }
-            eprintln!("[T] 2a. Wire scatter Ar (pre-pinned): {:?}", t_gather.elapsed());
 
             // GPU H polynomial: 7 NTTs (3× iNTT+cosetNTT fused, 1× coset iNTT).
             // sppark NTT on HIP produces standard DFT output. The batched variants
             // are now correctly looped (previously only poly 0 was transformed).
             let wva_ptr_usize = self.pinned_a.as_ptr() as usize;
             let wva_len = self.pinned_a.len();
+            let gpu_gather_active = use_gpu_gather_a;
             let (h_result, size_h) = std::thread::scope(|scope| {
                 let h_handle = scope.spawn(move || {
-                    let ar_slice =
-                        unsafe { std::slice::from_raw_parts(wva_ptr_usize as *const Fr, wva_len) };
+                    let _g = crate::profile::Scope::new("2b_compute_h_worker");
+                    // When GPU gather is active, the Ar scalars are already
+                    // being uploaded onto copy_stream by the gather path; pass
+                    // None so compute_h doesn't re-upload from pinned_a
+                    // (pinned_a is stale in that case).
+                    let ar_slice_opt: Option<&[Fr]> = if gpu_gather_active {
+                        None
+                    } else {
+                        let ar_slice = unsafe {
+                            std::slice::from_raw_parts(wva_ptr_usize as *const Fr, wva_len)
+                        };
+                        Some(ar_slice)
+                    };
                     self.compute_h(
                         &witness.solution_a,
                         &witness.solution_b,
                         &witness.solution_c,
-                        Some(ar_slice),
+                        ar_slice_opt,
                     )
                 });
 
                 // CPU: scatter the remaining two wire-value vectors while NTTs run.
                 {
+                    let _g = crate::profile::Scope::new("2c_scatter_b");
                     let buf = self.pinned_b.as_mut_slice();
                     buf.par_iter_mut()
                         .zip(self.b_indices.par_iter())
                         .for_each(|(dst, &i)| *dst = wv[i]);
                 }
                 {
+                    let _g = crate::profile::Scope::new("2c_scatter_k");
                     let buf = self.pinned_k.as_mut_slice();
                     buf.par_iter_mut()
                         .zip(self.k_indices.par_iter())
                         .for_each(|(dst, &i)| *dst = wv[i]);
                 }
 
+                let _g = crate::profile::Scope::new("2d_h_join_wait");
                 let h_result = h_handle.join().expect("H polynomial computation panicked");
                 (h_result, n - 1)
             });
@@ -604,6 +736,7 @@ impl Groth16Prover {
             (wire_values_a, wire_values_b, filtered_wire_values, h_result, size_h)
         };
 
+        drop(_h_phase_scope);
         eprintln!(
             "[T] 2+3. Filter + H polynomial (overlapped): A={}, B={}, K={}, sizeH={}: {:?}",
             wire_values_a.len(),
@@ -612,6 +745,7 @@ impl Groth16Prover {
             size_h,
             t.elapsed()
         );
+        let _h_to_ar_gap_scope = crate::profile::Scope::new("h_join_to_ar_gap");
 
         // Compare our H coefficients with gnark's exported H (if available).
         if let Ok(data_dir) = std::env::var("GROTH16_GPU_WITNESS_DIR") {
@@ -717,6 +851,8 @@ impl Groth16Prover {
         let s_delta = g1_scalar_mul(&g1_delta.to_jacobian(), &s);
         let kr_delta = g1_scalar_mul(&g1_delta.to_jacobian(), &kr);
         eprintln!("[T] 4. Scalar multiplications: {:?}", t.elapsed());
+        // close the h_join_to_ar gap scope just before the MSM phase begins
+        drop(_h_to_ar_gap_scope);
 
         // 5. MSMs using PersistentMsm (SRS pre-uploaded to GPU at prover init).
         // Each MSM only uploads per-proof scalars (mont=true, GPU converts).
@@ -780,8 +916,20 @@ impl Groth16Prover {
 
             // Ar: first MSM — no prior compute to overlap with.
             // Pre-upload Bs1 scalars during Ar compute.
+            //
+            // NOTE: the wall-time of this MSM call (typically ~466 ms on
+            // 7900 XTX) includes ~190 ms of waiting for compute_h's NTT
+            // kernels to drain — they're still in flight on the same
+            // stream when this call queues. The MSM's actual GPU compute
+            // is only ~276 ms; the rest is unavoidable serialization
+            // against compute_h. To eliminate the wait, compute_h itself
+            // must be faster (NTT optimization), not the MSM. Confirmed
+            // 2026-04-26 via explicit cuda_device_synchronize() before
+            // this call: total prove time unchanged (2.95 s).
+            let _g = crate::profile::Scope::new("5a_msm_ar");
             let ar_msm = self.persistent_g1_a.msm_with_next(&wire_values_a, Some(&wire_values_b));
             let ar = ar_msm.add(&g1_alpha.to_jacobian()).add(&r_delta);
+            drop(_g);
             eprintln!(
                 "[T] 5a. Ar MSM (N={}, pipelined next): {:?}",
                 wire_values_a.len(),
@@ -790,24 +938,29 @@ impl Groth16Prover {
             g1_msm_ark_verify("Ar", &self.data.pk_g1_a, &wire_values_a, &ar_msm);
 
             let t = std::time::Instant::now();
+            let _g = crate::profile::Scope::new("5b_msm_bs1");
             // Bs1: scalars pre-uploaded during Ar. Pre-upload Krs scalars.
             let bs1_msm =
                 self.persistent_g1_b.msm_with_next(&wire_values_b, Some(&filtered_wire_values));
             let bs1 = bs1_msm.add(&g1_beta.to_jacobian()).add(&s_delta);
+            drop(_g);
             eprintln!("[T] 5b. Bs1 MSM (N={}): {:?}", wire_values_b.len(), t.elapsed());
             g1_msm_ark_verify("Bs1", &self.data.pk_g1_b, &wire_values_b, &bs1_msm);
 
             let t = std::time::Instant::now();
+            let _g = crate::profile::Scope::new("5c_msm_krs");
             // Krs: scalars pre-uploaded during Bs1. Pre-upload Krs2 if host.
             let krs2_next = match &h_result {
                 HResult::Host(h) => Some(&h[..size_h]),
                 HResult::Device(_) => None, // device path doesn't use host upload
             };
             let krs_msm = self.persistent_g1_k.msm_with_next(&filtered_wire_values, krs2_next);
+            drop(_g);
             eprintln!("[T] 5c. Krs MSM (N={}): {:?}", filtered_wire_values.len(), t.elapsed());
             g1_msm_ark_verify("Krs", &self.data.pk_g1_k, &filtered_wire_values, &krs_msm);
 
             let t = std::time::Instant::now();
+            let _g = crate::profile::Scope::new("5d_msm_krs2");
             // Krs2: scalars pre-uploaded during Krs (if host).
             // On the device path, pass wire_values_b as next_host_scalars so
             // the SDMA engine uploads G2 scalars concurrently with Krs2's
@@ -818,6 +971,7 @@ impl Groth16Prover {
                 }
                 HResult::Host(h) => self.persistent_g1_z.msm(&h[..size_h]),
             };
+            drop(_g);
             eprintln!("[T] 5d. Krs2 MSM (N={}): {:?}", size_h, t.elapsed());
             match &h_result {
                 HResult::Host(h) => {
@@ -845,6 +999,7 @@ impl Groth16Prover {
             }
 
             let t_g2 = std::time::Instant::now();
+            let _g = crate::profile::Scope::new("6_msm_g2");
             let bs2_msm = self
                 .persistent_g2_b
                 .as_ref()
@@ -884,6 +1039,7 @@ impl Groth16Prover {
             let ar_msm = self.persistent_g1_a.msm(&wire_values_a);
             let ar = ar_msm.add(&g1_alpha.to_jacobian()).add(&r_delta);
             eprintln!("[T] 5a. Ar MSM (N={}): {:?}", wire_values_a.len(), t.elapsed());
+            g1_msm_ark_verify("Ar", &self.data.pk_g1_a, wire_values_a, &ar_msm);
             std::thread::scope(|scope| {
                 let g2_handle = scope.spawn(|| {
                     let bs2_msm = g2_msm_gpu(g2_b, &wire_values_b)
@@ -899,10 +1055,12 @@ impl Groth16Prover {
                 let bs1_msm = self.persistent_g1_b.msm(&wire_values_b);
                 let bs1 = bs1_msm.add(&g1_beta.to_jacobian()).add(&s_delta);
                 eprintln!("[T] 5b. Bs1 MSM (N={}): {:?}", wire_values_b.len(), t.elapsed());
+                g1_msm_ark_verify("Bs1", &self.data.pk_g1_b, wire_values_b, &bs1_msm);
 
                 let t = std::time::Instant::now();
                 let krs_msm = self.persistent_g1_k.msm(&filtered_wire_values);
                 eprintln!("[T] 5c. Krs MSM (N={}): {:?}", filtered_wire_values.len(), t.elapsed());
+                g1_msm_ark_verify("Krs", &self.data.pk_g1_k, filtered_wire_values, &krs_msm);
 
                 let t = std::time::Instant::now();
                 let krs2_msm = match &h_result {
@@ -910,6 +1068,9 @@ impl Groth16Prover {
                     HResult::Host(h) => self.persistent_g1_z.msm(&h[..size_h]),
                 };
                 eprintln!("[T] 5d. Krs2 MSM (N={}): {:?}", size_h, t.elapsed());
+                if let HResult::Host(h) = &h_result {
+                    g1_msm_ark_verify("Krs2", &self.data.pk_g1_z, &h[..size_h], &krs2_msm);
+                }
 
                 let t_join = std::time::Instant::now();
                 let bs2 = g2_handle.join().expect("G2 MSM thread panicked");

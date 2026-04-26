@@ -171,6 +171,47 @@ extern "C" {
     /// leak at process exit), but useful for tests and long-running daemons.
     pub fn sp1_bn254_glv_pool_free();
 
+    /// Force GLV initialization for a G1 MSM context at prover setup time.
+    /// Normally fires lazily on first MSM invoke (costing ~70ms per context on
+    /// iter 1 for a Groth16 prove). Calling this in `PersistentMsm::new` after
+    /// ctx creation moves that cost off the iter-1 critical path.
+    pub fn sp1_bn254_msm_force_init_glv(ctx: *mut c_void) -> CudaRustError;
+
+    /// Run a tiny GPU warmup kernel to keep the GPU at peak DPM clocks
+    /// across the host-CPU gap between MSMs. Without this, RDNA3 lets the
+    /// GPU clocks drop during the ~9-122 ms host gap between Groth16 G1
+    /// MSMs, and the FIRST window kernel of each subsequent MSM pays a
+    /// 145 ms cold-start tax (rocprofv3 timeline 2026-04-26 shows
+    /// Ar/Bs1/Krs window 0 at 154-158 ms vs windows 1-9 at 8-13 ms).
+    /// `spin_us` controls the warmup duration; ~5000 µs is enough to
+    /// hold clocks across a typical inter-MSM gap.
+    /// HIP-only stub on CUDA (sppark MSM doesn't show this pattern).
+    pub fn sp1_bn254_gpu_warmup(spin_us: i32) -> CudaRustError;
+
+    /// Pre-upload MSM scalars via GPU gather from a persistent device-side
+    /// wire-values buffer plus a persistent device-side u32 index array.
+    /// Eliminates the ~22ms CPU par_iter_mut scatter + the ~100ms pinned
+    /// host-to-device SDMA copy of pinned_a scalars that otherwise sit before
+    /// the first MSM.
+    ///
+    /// - d_wire_values: device pointer to wire-value Fr array (8×u32 each).
+    ///   Caller is responsible for having uploaded the wire-values once per
+    ///   prove (e.g. via cuda_mem_copy_host_to_device_async).
+    /// - d_indices: device pointer to u32 indices, one per output element.
+    ///   Caller uploads this once at prover setup.
+    /// - npoints: number of output scalars (== d_indices length).
+    ///
+    /// Lands scalars in g_glv_pool->d_scalars[cur_buf], records upload_done
+    /// event, sets next_upload_pending=true — identical contract to
+    /// sp1_bn254_msm_preupload_scalars.
+    pub fn sp1_bn254_msm_preupload_gather(
+        d_wire_values_dst: *mut c_void,
+        h_wire_values: *const c_void,
+        wire_values_bytes: usize,
+        d_indices: *const c_void,
+        npoints: usize,
+    ) -> CudaRustError;
+
     // ========================================================================
     // G2 MSM (sppark-templated, CUDA-only)
     // ========================================================================
@@ -213,6 +254,10 @@ extern "C" {
 
     /// Destroy a persistent G2 MSM context.
     pub fn sp1_bn254_g2_msm_destroy(ctx: *mut c_void);
+
+    /// Force G2 GLV initialization at prover setup time (analog of
+    /// sp1_bn254_msm_force_init_glv for G2).
+    pub fn sp1_bn254_g2_msm_force_init_glv(ctx: *mut c_void) -> CudaRustError;
 
     // ========================================================================
     // GLV-accelerated G2 MSM (endomorphism optimization, HIP)

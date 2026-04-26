@@ -131,6 +131,27 @@ struct bn254_fq_t {
         return r;
     }
 
+    // Lazy modular addition — skips the final conditional subtract. Result
+    // is in [0, 2P), i.e. up to 255 bits (P[7] = 0x30644e72 < 2^30, so
+    // 2P[7] < 2^31). Used as the LEFT operand to operator* in Karatsuba Fp2
+    // mul: the CIOS produces (a*b)/R mod P with a < 2P and b < P; output
+    // ≤ 3P/2, which the single trailing cond_sub already handles. The RIGHT
+    // operand to operator* must remain reduced (P[7] safety margin only
+    // accommodates one unreduced side per mul). Saves ~8 VGPRs (the `sub[N]`
+    // temp array) and one branchless select chain per Fp2 mul/sqr inner add.
+    __host__ __device__ __forceinline__ bn254_fq_t add_lazy(const bn254_fq_t& b) const {
+        bn254_fq_t r;
+        uint64_t carry = 0;
+        for (int i = 0; i < N; i++) {
+            uint64_t sum = (uint64_t)data[i] + b.data[i] + carry;
+            r.data[i] = (uint32_t)sum;
+            carry = sum >> 32;
+        }
+        // No cond_sub. carry is provably 0 because both inputs are < P,
+        // and 2P < 2^256 (P[7] < 2^30).
+        return r;
+    }
+
     __host__ __device__ __forceinline__ bn254_fq_t& operator+=(const bn254_fq_t& b) {
         *this = *this + b;
         return *this;

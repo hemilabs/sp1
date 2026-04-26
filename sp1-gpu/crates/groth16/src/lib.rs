@@ -9,6 +9,7 @@
 
 pub mod fq2;
 pub mod g2;
+pub mod profile;
 pub mod proof;
 pub mod prover;
 pub mod types;

@@ -498,6 +498,14 @@ public:
                          + (points ? npoints * sizeof(d_points[0]) : 0);
 
         d_buckets = reinterpret_cast<decltype(d_buckets)>(gpu.Dmalloc(d_blob_sz));
+        // Zero the entire d_blob. d_buckets is accumulated into (not
+        // fully overwritten) across batches in invoke(), and d_hist /
+        // d_points get populated lazily. Without this explicit zero the
+        // first invoke is non-deterministic and produces wrong results
+        // on certain base-point arrays (manifested as Ar/Bs1 MSM
+        // mismatches in Groth16 on CUDA). Harmless on subsequent
+        // invokes where the buffers are properly overwritten.
+        CUDA_OK(cudaMemset(d_buckets, 0, d_blob_sz));
         d_hist = vec2d_t<uint32_t>(&d_buckets[d_buckets_sz], row_sz);
         if (points) {
             d_points = reinterpret_cast<decltype(d_points)>(d_hist[nwins]);

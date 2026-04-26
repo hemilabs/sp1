@@ -120,6 +120,9 @@ __global__ void g2_bucket_boundaries_kernel(
 static constexpr int G2_BUCKET_PAR = 128;
 
 __launch_bounds__(256, 1)  // G2 XYZZ is 256B (2x G1), needs ~128 VGPRs; 1 block/CU avoids spills
+// ROUND-6 experiment (reverted): (256, 2) forcing 8 waves/CU gave no win
+// (median 3.054 vs 3.040 baseline). Compiler can't fit 2 blocks at 152 VGPR
+// (1216 VGPR needed > 1536 budget ×2 blocks). Keep 1 block/CU.
 __global__ void g2_bucket_accumulate_parallel_kernel(
     const bn254_g2_affine_t* __restrict__ points,
     const uint32_t* __restrict__ sorted_idx,
@@ -183,9 +186,97 @@ __global__ void g2_bucket_accumulate_parallel_kernel(
 }
 
 // ================================================================
+// Fused accumulate+merge kernel (Phase 3, 2026-04-23).
+// Replaces g2_bucket_accumulate_parallel_kernel + g2_merge_partial_sums_kernel
+// with a single workgroup-per-bucket kernel that keeps the 128 per-thread
+// partial sums in LDS (32 KB per block) and does a tree-reduce in-place
+// before writing one XYZZ per bucket.
+//
+// Eliminates the 134 MB DRAM roundtrip on d_partial_sums (write + read in
+// separate kernels) + collapses the 128-step sequential merge walk to a
+// log2(128)=7-step LDS tree reduce.
+//
+// Launch: <<<num_buckets, 128, 0, stream>>>.
+// Occupancy: 128 threads/block × 32 KB LDS/block → 2 blocks/WGP possible
+// (limited by VGPR budget of accumulate, same 152 as old kernel).
+// ================================================================
+__launch_bounds__(128, 2)  // 128 threads × 32KB LDS = 2 blocks/WGP, 8 waves/WGP
+__global__ void g2_bucket_accum_merge_fused_kernel(
+    const bn254_g2_affine_t* __restrict__ points,
+    const uint32_t* __restrict__ sorted_idx,
+    const uint32_t* __restrict__ starts,
+    const uint32_t* __restrict__ ends,
+    bn254_g2_xyzz_t* __restrict__ buckets_out,
+    int num_buckets
+) {
+    // Align to 32B for safe XYZZ (256B) LDS access. Tree reduce reads 128
+    // XYZZ values in pairs — the compiler/HW handles the 8-lane chunked
+    // load over the 32-wide LDS bank organization.
+    __shared__ __align__(32) char lds_raw[128 * sizeof(bn254_g2_xyzz_t)];
+    bn254_g2_xyzz_t* lds = reinterpret_cast<bn254_g2_xyzz_t*>(lds_raw);
+
+    int bid = blockIdx.x;
+    int par_id = threadIdx.x;
+    if (bid >= num_buckets) return;
+
+    uint32_t s = starts[bid];
+    uint32_t e = ends[bid];
+
+    bn254_g2_xyzz_t acc;
+    acc.set_infinity();
+
+    // --- Per-thread stride accumulate (same as old accumulate kernel) ---
+    if (s < e && s != UINT32_MAX && bid > 0) {
+        uint32_t count = e - s;
+        uint32_t i = par_id;
+        if (i < count) {
+            uint32_t packed = sorted_idx[s + i];
+            uint32_t pi = packed & 0x7FFFFFFFu;
+            bn254_g2_affine_t p = points[pi];
+            if (packed >> 31) { p.y = -p.y; }
+            if (!p.is_infinity()) acc.from_affine(p);
+            i += 128;
+        }
+        for (; i < count; i += 128) {
+            uint32_t packed = sorted_idx[s + i];
+            uint32_t pi = packed & 0x7FFFFFFFu;
+            bn254_g2_affine_t p = points[pi];
+            if (packed >> 31) { p.y = -p.y; }
+            if (!p.is_infinity()) {
+                if (acc.is_infinity()) acc.from_affine(p);
+                else acc.add_affine_unsafe(p);
+            }
+        }
+    }
+
+    // --- Store partial to LDS + tree reduce ---
+    lds[par_id] = acc;
+    __syncthreads();
+
+    #pragma unroll
+    for (int stride = 64; stride > 0; stride >>= 1) {
+        if (par_id < stride) {
+            bn254_g2_xyzz_t a = lds[par_id];
+            bn254_g2_xyzz_t b = lds[par_id + stride];
+            if (!b.is_infinity()) {
+                if (a.is_infinity()) a = b;
+                else a += b;
+            }
+            lds[par_id] = a;
+        }
+        __syncthreads();
+    }
+
+    if (par_id == 0) {
+        buckets_out[bid] = lds[0];
+    }
+}
+
+// ================================================================
 // Kernel: Merge XYZZ partial sums within each bucket → XYZZ buckets.
 // Fully XYZZ end-to-end: no Jacobian/XYZZ coordinate conversion.
 // XYZZ += XYZZ is 12M + 2S in Fq2 (vs Jacobian 12M + 4S).
+// SUPERSEDED by g2_bucket_accum_merge_fused_kernel when enabled.
 // ================================================================
 __launch_bounds__(256, 1)
 __global__ void g2_merge_partial_sums_kernel(
@@ -204,6 +295,63 @@ __global__ void g2_merge_partial_sums_kernel(
         if (!ps.is_infinity()) acc += ps;
     }
     buckets_xyzz[bid] = acc;
+}
+
+// Parallel merge: N threads cooperate per bucket. Each does G2_BUCKET_PAR/N
+// sequential adds, then log2(N)-step tree reduce via LDS. Splits the 128-step
+// serial walk. Template param WAYS must be 2, 4, 8, or 16.
+template<int WAYS>
+__launch_bounds__(256, 2)
+__global__ void g2_merge_partial_sums_Nway_kernel(
+    const bn254_g2_xyzz_t* __restrict__ partial_sums,
+    bn254_g2_xyzz_t* __restrict__ buckets_xyzz,
+    int num_buckets
+) {
+    constexpr int MERGE_WAYS = WAYS;
+    constexpr int BUCKETS_PER_BLOCK = 256 / MERGE_WAYS;
+    __shared__ __align__(32) char lds_raw[MERGE_WAYS * BUCKETS_PER_BLOCK * sizeof(bn254_g2_xyzz_t)];
+    bn254_g2_xyzz_t* lds = reinterpret_cast<bn254_g2_xyzz_t*>(lds_raw);
+
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    int flat_bucket = tid / MERGE_WAYS;
+    int lane = tid % MERGE_WAYS;
+    if (flat_bucket >= num_buckets) return;
+
+    int local_bucket = threadIdx.x / MERGE_WAYS;
+
+    bn254_g2_xyzz_t acc;
+    acc.set_infinity();
+    // Each of the 4 threads handles 32 of the 128 partials.
+    int per_thread = G2_BUCKET_PAR / MERGE_WAYS;  // 32
+    int start = lane * per_thread;
+    int end = start + per_thread;
+    for (int j = start; j < end; j++) {
+        const bn254_g2_xyzz_t& ps = partial_sums[(size_t)j * num_buckets + flat_bucket];
+        if (!ps.is_infinity()) {
+            if (acc.is_infinity()) acc = ps;
+            else acc += ps;
+        }
+    }
+    lds[local_bucket * MERGE_WAYS + lane] = acc;
+    __syncthreads();
+
+    // Tree reduce across MERGE_WAYS lanes within each bucket, log2(WAYS) steps.
+    #pragma unroll
+    for (int stride = MERGE_WAYS / 2; stride > 0; stride >>= 1) {
+        if (lane < stride) {
+            bn254_g2_xyzz_t a = lds[local_bucket * MERGE_WAYS + lane];
+            bn254_g2_xyzz_t b = lds[local_bucket * MERGE_WAYS + lane + stride];
+            if (!b.is_infinity()) {
+                if (a.is_infinity()) a = b;
+                else a += b;
+            }
+            lds[local_bucket * MERGE_WAYS + lane] = a;
+        }
+        __syncthreads();
+    }
+    if (lane == 0) {
+        buckets_xyzz[flat_bucket] = lds[local_bucket * MERGE_WAYS + 0];
+    }
 }
 
 // ================================================================
@@ -610,6 +758,20 @@ rustCudaError_t sp1_bn254_g2_msm_create(
     return CUDA_SUCCESS_CSL;
 }
 
+// Forward-declared here so the public force-init API below can call it.
+// Actual definition lives later in this TU.
+static rustCudaError_t g2_glv_init_ctx(hip_g2_msm_context* ctx);
+
+// Public FFI to force G2 GLV initialization at prover setup time, avoiding the
+// ~70ms iter-1 penalty where g2_glv_init_ctx runs lazily on first invoke
+// (endo-expand 2N points, allocate d_expanded_points, free old bufs).
+extern "C"
+rustCudaError_t sp1_bn254_g2_msm_force_init_glv(void* ctx_ptr) {
+    if (!ctx_ptr) return CUDA_SUCCESS_CSL;
+    hip_g2_msm_context* ctx = static_cast<hip_g2_msm_context*>(ctx_ptr);
+    return g2_glv_init_ctx(ctx);
+}
+
 extern "C"
 rustCudaError_t sp1_bn254_g2_msm_invoke(
     void* ctx_ptr,
@@ -965,15 +1127,67 @@ static void g2_glv_run_pipeline(hip_g2_msm_context* ctx,
             d_sorted_digits, ctx->d_starts, ctx->d_ends, n2
         );
 
-        g2_bucket_accumulate_parallel_kernel<<<blocks_par, threads, 0, stream>>>(
-            st->d_expanded_points, d_sorted_packed,
-            ctx->d_starts, ctx->d_ends,
-            ctx->d_partial_sums, num_buckets
-        );
+        // Phase 3: fused accumulate+merge (LDS tree-reduce) can replace the
+        // pair of accumulate + merge kernels. Toggle via env var since it's
+        // experimental and has different VGPR/LDS tradeoffs than the old
+        // separate-kernel path.
+        static int g2_fused_cached = -1;
+        if (g2_fused_cached < 0) {
+            const char* s = getenv("SP1_GPU_G2_FUSED");
+            g2_fused_cached = (s && s[0] == '1') ? 1 : 0;
+        }
+        if (g2_fused_cached) {
+            g2_bucket_accum_merge_fused_kernel<<<num_buckets, 128, 0, stream>>>(
+                st->d_expanded_points, d_sorted_packed,
+                ctx->d_starts, ctx->d_ends,
+                ctx->d_buckets, num_buckets
+            );
+        } else {
+            g2_bucket_accumulate_parallel_kernel<<<blocks_par, threads, 0, stream>>>(
+                st->d_expanded_points, d_sorted_packed,
+                ctx->d_starts, ctx->d_ends,
+                ctx->d_partial_sums, num_buckets
+            );
 
-        g2_merge_partial_sums_kernel<<<blocks_b, threads, 0, stream>>>(
-            ctx->d_partial_sums, ctx->d_buckets, num_buckets
-        );
+            // Phase 3: N-way parallel merge. N=8 default (measured 2026-04-23):
+            // sweep of 0/2/4/8/16 showed 8 best at median 2.992s. 4 is 3.001s,
+            // 2 is 3.005s, 0 (legacy serial) is 3.025s.
+            // Override via SP1_GPU_G2_MERGE_WAYS=0|2|4|8|16.
+            static int g2_merge_ways_cached = -1;
+            if (g2_merge_ways_cached < 0) {
+                const char* s = getenv("SP1_GPU_G2_MERGE_WAYS");
+                if (s) {
+                    int v = atoi(s);
+                    if (v == 0 || v == 2 || v == 4 || v == 8 || v == 16) g2_merge_ways_cached = v;
+                    else g2_merge_ways_cached = 8;
+                } else {
+                    g2_merge_ways_cached = 8;
+                }
+            }
+            int ways = g2_merge_ways_cached;
+            if (ways == 0) {
+                g2_merge_partial_sums_kernel<<<blocks_b, threads, 0, stream>>>(
+                    ctx->d_partial_sums, ctx->d_buckets, num_buckets
+                );
+            } else {
+                int threads_n = 256;
+                int blocks_n = (num_buckets * ways + threads_n - 1) / threads_n;
+                switch (ways) {
+                    case 2:
+                        g2_merge_partial_sums_Nway_kernel<2><<<blocks_n, threads_n, 0, stream>>>(
+                            ctx->d_partial_sums, ctx->d_buckets, num_buckets); break;
+                    case 4:
+                        g2_merge_partial_sums_Nway_kernel<4><<<blocks_n, threads_n, 0, stream>>>(
+                            ctx->d_partial_sums, ctx->d_buckets, num_buckets); break;
+                    case 8:
+                        g2_merge_partial_sums_Nway_kernel<8><<<blocks_n, threads_n, 0, stream>>>(
+                            ctx->d_partial_sums, ctx->d_buckets, num_buckets); break;
+                    case 16:
+                        g2_merge_partial_sums_Nway_kernel<16><<<blocks_n, threads_n, 0, stream>>>(
+                            ctx->d_partial_sums, ctx->d_buckets, num_buckets); break;
+                }
+            }
+        }
 
         g2_reduce_phase1_kernel<<<blocks_reduce, threads, 0, stream>>>(
             ctx->d_buckets, ctx->d_local_partials, ctx->d_local_suffixes, num_buckets

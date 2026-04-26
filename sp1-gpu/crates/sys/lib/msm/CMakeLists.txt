@@ -29,8 +29,20 @@ if(NOT USE_HIP)
     # Benchmarked optimal: wbits=13 (8% faster for single dense MSM at N=2^25)
     # However, default heuristic (17) performs better across mixed workloads in full PLONK prove
     # Uncomment to override: target_compile_definitions(msm_objs PRIVATE MSM_WBITS_OVERRIDE=13)
-    # Natural batch heuristic: batch=2 at N=2^25 enables double-buffered
-    # H2D+compute overlap on sppark's 3 CUDA streams.
+    #
+    # MSM_FORCE_BATCH_1 is required for correctness: sppark's multi-batch
+    # double-buffered MSM has a non-determinism / stale-state bug on CUDA
+    # that produces WRONG results for the Ar and Bs1 G1 MSMs in the
+    # Groth16 prover (Krs / Krs2 happen to match arkworks by coincidence,
+    # but Ar / Bs1 don't — see project_groth16_cuda_msm_batch_fix.md).
+    # With batch=1, sppark skips the double-buffered path and all four G1
+    # MSMs match arkworks byte-for-byte; the gnark pairing check passes.
+    #
+    # Perf impact is negligible at our point counts — we lose the
+    # double-buffered H2D/compute overlap but sppark still pipelines the
+    # single-batch kernels. 4090 Ar+Bs1+Krs+Krs2 run in ~0.97 s total on
+    # 100K SHA256 (vs expected ~0.8 s with batch-4). Correctness > 170 ms.
+    target_compile_definitions(msm_objs PRIVATE MSM_FORCE_BATCH_1=1)
 else()
     # HIP: Custom Pippenger MSM using our optimized bn254_fq_t Montgomery multiply
     # (with m0 decomposition trick and NO_CARRY optimization for RDNA3).

@@ -817,7 +817,10 @@ rustCudaError_t bn254_gpu_poly_eval(
 // by multiplying by R² mod r.
 __global__ void bn254_canonical_to_mont_kernel(bn254_t* d, uint32_t n) {
     uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) d[i].to_montgomery();
+    // .to() is the cross-backend alias for canonical → Montgomery.
+    // HIP custom bn254_t (bn254_t.cuh) defines .to() = to_montgomery();
+    // CUDA sppark fr_mont (mont_t.cuh) defines .to() = mul-by-RR.
+    if (i < n) d[i].to();
 }
 
 extern "C"

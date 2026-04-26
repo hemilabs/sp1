@@ -67,6 +67,11 @@ extern "C" rustCudaError_t sppark_init_bn254(const cudaStream_t stream) {
 /// NOTE: sppark's BN254 NTT uses "wide" kernels that don't honor the batch_count
 /// grid dimension (only narrow kernels do, and narrow isn't compiled for BN254).
 /// We loop over polys manually to ensure each one is transformed.
+///
+/// IMPORTANT: callers pass DEVICE pointers, so we use NTT::Base_dev_ptr (not
+/// NTT::Base, which is the host-pointer API that internally allocates a 537 MB
+/// staging buffer + does H2D + NTT + D2H + cudaFree per call — ~40 ms wasted
+/// per invocation, totalling ~270 ms across the 7 NTTs in compute_h_gpu).
 extern "C" rustCudaError_t batch_NTT_bn254(
     fr_t* d_inout,
     uint32_t lg_domain_size,
@@ -80,7 +85,7 @@ extern "C" rustCudaError_t batch_NTT_bn254(
 
     try {
         for (uint32_t p = 0; p < poly_count; p++) {
-            NTT::Base(
+            NTT::Base_dev_ptr(
                 stream,
                 d_inout + p * (size_t)domain_size,
                 lg_domain_size,
@@ -112,7 +117,7 @@ extern "C" rustCudaError_t batch_iNTT_bn254(
 
     try {
         for (uint32_t p = 0; p < poly_count; p++) {
-            NTT::Base(
+            NTT::Base_dev_ptr(
                 stream,
                 d_inout + p * (size_t)domain_size,
                 lg_domain_size,
@@ -144,7 +149,7 @@ extern "C" rustCudaError_t batch_coset_NTT_bn254(
 
     try {
         for (uint32_t p = 0; p < poly_count; p++) {
-            NTT::Base(
+            NTT::Base_dev_ptr(
                 stream,
                 d_inout + p * (size_t)domain_size,
                 lg_domain_size,
@@ -175,7 +180,7 @@ extern "C" rustCudaError_t batch_coset_iNTT_bn254(
 
     try {
         for (uint32_t p = 0; p < poly_count; p++) {
-            NTT::Base(
+            NTT::Base_dev_ptr(
                 stream,
                 d_inout + p * (size_t)domain_size,
                 lg_domain_size,

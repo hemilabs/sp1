@@ -165,13 +165,49 @@ static rustCudaError_t msm_one_window(
         CUDA_OK(hipGetLastError());
     }
 
-    // Merge partial sums into bucket results
+    // Merge partial sums into bucket results.
+    // Phase 3 round-7 (2026-04-23): N-way parallel merge mirroring G2's win.
+    // SP1_GPU_G1_MERGE_WAYS=N (0|2|4|8|16) selects; default 8.
     {
+        static int g1_merge_ways_cached = -1;
+        if (g1_merge_ways_cached < 0) {
+            const char* s = getenv("SP1_GPU_G1_MERGE_WAYS");
+            if (s) {
+                int v = atoi(s);
+                if (v == 0 || v == 2 || v == 4 || v == 8 || v == 16) g1_merge_ways_cached = v;
+                else g1_merge_ways_cached = 8;
+            } else {
+                g1_merge_ways_cached = 8;
+            }
+        }
+        int ways = g1_merge_ways_cached;
         int threads = 256;
-        int blocks = (NUM_BUCKETS + threads - 1) / threads;
-        hipLaunchKernelGGL(bucket_merge_kernel,
-            dim3(blocks), dim3(threads), 0, 0,
-            d_partial_sums, d_buckets, NUM_BUCKETS);
+        if (ways == 0) {
+            int blocks = (NUM_BUCKETS + threads - 1) / threads;
+            hipLaunchKernelGGL(bucket_merge_kernel,
+                dim3(blocks), dim3(threads), 0, 0,
+                d_partial_sums, d_buckets, NUM_BUCKETS);
+        } else {
+            int blocks = (NUM_BUCKETS * ways + threads - 1) / threads;
+            switch (ways) {
+                case 2:
+                    hipLaunchKernelGGL((bucket_merge_Nway_kernel<2>),
+                        dim3(blocks), dim3(threads), 0, 0,
+                        d_partial_sums, d_buckets, NUM_BUCKETS); break;
+                case 4:
+                    hipLaunchKernelGGL((bucket_merge_Nway_kernel<4>),
+                        dim3(blocks), dim3(threads), 0, 0,
+                        d_partial_sums, d_buckets, NUM_BUCKETS); break;
+                case 8:
+                    hipLaunchKernelGGL((bucket_merge_Nway_kernel<8>),
+                        dim3(blocks), dim3(threads), 0, 0,
+                        d_partial_sums, d_buckets, NUM_BUCKETS); break;
+                case 16:
+                    hipLaunchKernelGGL((bucket_merge_Nway_kernel<16>),
+                        dim3(blocks), dim3(threads), 0, 0,
+                        d_partial_sums, d_buckets, NUM_BUCKETS); break;
+            }
+        }
         CUDA_OK(hipGetLastError());
     }
 
@@ -797,6 +833,67 @@ void sp1_bn254_glv_pool_free() {
     glv_pool_free();
 }
 
+// Forward-declared here so the public "force init" API below can call it.
+// The actual definition is at line ~1058.
+static rustCudaError_t init_glv_buffers(hip_msm_context* ctx);
+
+// Public FFI to force GLV initialization at prover setup time, avoiding the
+// ~70ms iter-1 penalty where init_glv_buffers runs lazily on first MSM invoke
+// (expanding 2N points, allocating d_expanded_points, freeing d_points /
+// d_partial_sums / d_scalars).
+extern "C"
+rustCudaError_t sp1_bn254_msm_force_init_glv(void* ctx_ptr) {
+    if (!ctx_ptr) return CUDA_SUCCESS_CSL;
+    hip_msm_context* ctx = static_cast<hip_msm_context*>(ctx_ptr);
+    return init_glv_buffers(ctx);
+}
+
+// GPU clock-ramp warmup: keeps the GPU at peak DPM state by running a tiny
+// dependent-MUL chain that occupies SIMDs for ~`spin_us` microseconds. The
+// MSM "first window" of each MSM in a Groth16 prove is otherwise 145 ms
+// slower than subsequent windows on RDNA3 (S1 timeline 2026-04-26 shows
+// Ar/Bs1/Krs window 0 = 154-158 ms vs windows 1-9 = 8-13 ms each), which
+// accounts for ~435 ms / 2.95 s prove (~15%) of pure clock-ramp tax. By
+// pre-running a warmup kernel before each MSM, the GPU stays at peak
+// clocks and the actual MSM kernels run at full speed from window 0.
+//
+// Empirically a ~5 ms warmup is enough to hold the GPU at high DPM
+// across the host-CPU gap between MSMs (~9 ms gap on the timeline).
+__global__ void gpu_warmup_kernel(uint32_t* sink, int iters) {
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    uint32_t x = tid * 2654435761u;  // Knuth's mult constant
+    #pragma unroll 1
+    for (int i = 0; i < iters; i++) {
+        x = x * 2654435761u + 1;
+    }
+    // Write only on impossible condition so the loop isn't dead-code
+    // eliminated; the volatile store also serves as a memory barrier.
+    if (x == 0xDEADBEEF) sink[tid] = x;
+}
+
+// FFI: launch the warmup kernel for ~spin_us microseconds. Caller should
+// invoke this before each Groth16 G1 MSM to avoid the cold-start tax.
+extern "C"
+rustCudaError_t sp1_bn254_gpu_warmup(int spin_us) {
+    static uint32_t* d_sink = nullptr;
+    if (!d_sink) {
+        // Tiny sink — never actually written to (see kernel).
+        if (hipMalloc(&d_sink, 1024 * sizeof(uint32_t)) != hipSuccess) {
+            return rustCudaError_t{.message = "warmup: hipMalloc sink failed"};
+        }
+    }
+    // Calibrated for RDNA3 gfx1100: ~16K iters per microsecond at peak
+    // clocks. Use a conservative multiplier so the kernel stays inside
+    // ~5 ms even on a slow card.
+    int iters = spin_us * 16000;
+    if (iters < 1000) iters = 1000;
+    int threads = 256;
+    int blocks = 96;  // 1 block/CU on 7900 XTX
+    hipLaunchKernelGGL(gpu_warmup_kernel,
+        dim3(blocks), dim3(threads), 0, 0, d_sink, iters);
+    return CUDA_SUCCESS_CSL;
+}
+
 // ============================================================
 // GLV-accelerated MSM: halve window count via endomorphism
 // ============================================================
@@ -956,6 +1053,81 @@ rustCudaError_t sp1_bn254_msm_preupload_scalars(
     size_t bytes = (size_t)npoints * SCALAR_LIMBS * sizeof(uint32_t);
     CUDA_OK(hipMemcpyAsync(gp->d_scalars[buf], scalars, bytes,
                            hipMemcpyHostToDevice, gp->copy_stream));
+    CUDA_OK(hipEventRecord(gp->upload_done, gp->copy_stream));
+    gp->next_upload_pending = true;
+    return CUDA_SUCCESS_CSL;
+}
+
+/// GPU-side wire gather: dst[tid*8 + l] = wv[idx[tid]*8 + l].
+/// Each Fr is 8 u32 limbs; one thread handles all 8 limbs of one output
+/// element. Gathers N Fr's from wv[] indexed by idx[] (u32 indices) into
+/// dst[]. Expected cost at N=12.76M: ~1-2ms.
+__global__ void bn254_wire_gather_kernel(
+    uint32_t* __restrict__ dst,
+    const uint32_t* __restrict__ wv,
+    const uint32_t* __restrict__ idx,
+    int n)
+{
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= n) return;
+    uint32_t src_idx = idx[tid];
+    const uint32_t* src = wv + (size_t)src_idx * 8;
+    uint32_t* out = dst + (size_t)tid * 8;
+    #pragma unroll
+    for (int l = 0; l < 8; l++) out[l] = src[l];
+}
+
+/// Pre-upload scalars via GPU gather from a persistent d_wire_values buffer
+/// and a persistent d_indices array. Runs on copy_stream (compute engine —
+/// the gather is memory-bound but fast), lands scalars in d_scalars[cur_buf].
+/// Mirrors sp1_bn254_msm_preupload_scalars semantics (sets next_upload_pending
+/// + records upload_done event).
+///
+/// If `h_wire_values` is non-null, an async H2D of `wire_values_bytes` from
+/// host into d_wire_values is queued on copy_stream BEFORE the gather kernel
+/// — both are async to the host. Caller must keep the host pointer valid
+/// until the upload_done event fires.
+///
+/// Used by Groth16 to eliminate the ~22ms CPU par_iter scatter that otherwise
+/// sits on the critical path before compute_h can spawn.
+extern "C"
+rustCudaError_t sp1_bn254_msm_preupload_gather(
+    void* d_wire_values_dst,        // device ptr to wire-values buffer (writable)
+    const void* h_wire_values,      // host ptr (paged ok); may be nullptr to skip H2D
+    size_t wire_values_bytes,       // bytes to copy (ignored if h_wire_values null)
+    const void* d_indices,          // device ptr, u32 indices
+    size_t npoints
+) {
+    if (!g_glv_pool) {
+        return rustCudaError_t{.message = "GLV pool not reserved — call sp1_bn254_glv_pool_reserve first"};
+    }
+    auto* gp = g_glv_pool;
+    if ((int)npoints > gp->alloc_n) {
+        return rustCudaError_t{.message = "preupload_gather npoints > pool alloc_n"};
+    }
+    // If a previous preupload is still pending, wait for it first so we
+    // don't overwrite its target buffer.
+    if (gp->next_upload_pending) {
+        CUDA_OK(hipEventSynchronize(gp->upload_done));
+        gp->next_upload_pending = false;
+    }
+    // 1) Async H2D of host wire_values onto copy_stream (returns immediately).
+    if (h_wire_values && wire_values_bytes > 0) {
+        CUDA_OK(hipMemcpyAsync(d_wire_values_dst, h_wire_values, wire_values_bytes,
+                               hipMemcpyHostToDevice, gp->copy_stream));
+    }
+    // 2) Gather kernel queued on the same copy_stream — waits implicitly on
+    //    the H2D in stream order. Fully async to host.
+    int buf = gp->cur_buf;
+    int threads = 256;
+    int blocks = ((int)npoints + threads - 1) / threads;
+    hipLaunchKernelGGL(bn254_wire_gather_kernel,
+        dim3(blocks), dim3(threads), 0, gp->copy_stream,
+        gp->d_scalars[buf],
+        reinterpret_cast<const uint32_t*>(d_wire_values_dst),
+        reinterpret_cast<const uint32_t*>(d_indices),
+        (int)npoints);
+    CUDA_OK(hipGetLastError());
     CUDA_OK(hipEventRecord(gp->upload_done, gp->copy_stream));
     gp->next_upload_pending = true;
     return CUDA_SUCCESS_CSL;

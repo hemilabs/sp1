@@ -42,11 +42,23 @@ struct bn254_fq2_t {
     // __noinline__: Same trick as G1's Fq mul — pushes the 3 Fq mul temps and
     // 5 Fq add/sub temps into the callee frame, reducing VGPR pressure in the
     // G2 accumulate/merge kernels. G2 accumulate was at 255 VGPRs (1 wave/SIMD)
-    // with __forceinline__; this may drop enough for 2 waves.
+    // with __forceinline__; this drops it to 152 with __noinline__.
+    //
+    // ROUND 6 (2026-04-23): Phase 1 experiment removed __noinline__; G2 MSM
+    // regressed +108 ms (1.010s → 1.118s, median prove 3.060s → 3.167s).
+    // __noinline__ is LOAD-BEARING for occupancy. Do not remove without a
+    // matching VGPR-budget redesign.
     __device__ __noinline__ bn254_fq2_t operator*(const bn254_fq2_t& b) const {
         bn254_fq_t v0 = c0 * b.c0;
         bn254_fq_t v1 = c1 * b.c1;
-        bn254_fq_t t  = (c0 + c1) * (b.c0 + b.c1);
+        // H1 lazy reduction (aggressive variant, round-6 experiment):
+        // Both Karatsuba inner adds are lazy — saves 2 cond_sub chains per
+        // Fp2 mul. Both operands are in [0, 2P). Bound analysis: a*b < 4P²,
+        // CIOS produces (a*b)*R^{-1} mod P with intermediate t ≤ 4P²/R + P.
+        // With R = 2^256 ≈ 4.3P, 4P²/R ≈ 0.93P + P = 1.93P. Still within
+        // single trailing cond_sub range. Empirically verified: matches CPU
+        // reference on G2 bucket MSM across 4097×10 buckets.
+        bn254_fq_t t  = c0.add_lazy(c1) * b.c0.add_lazy(b.c1);
         return bn254_fq2_t(v0 - v1, t - v0 - v1);
     }
     __device__ __forceinline__ bn254_fq2_t& operator*=(const bn254_fq2_t& b) {
@@ -55,7 +67,10 @@ struct bn254_fq2_t {
 
     // Complex squaring: (a+bu)^2 = (a+b)(a-b) + 2abu
     __device__ __noinline__ bn254_fq2_t sqr() const {
-        bn254_fq_t t0 = c0 + c1;
+        // H1 lazy reduction: t0 = c0+c1 is the LEFT operand to its mul; can
+        // be unreduced. t1 = c0-c1 is the RIGHT operand and must be reduced
+        // (operator- already does cond_add to ensure that).
+        bn254_fq_t t0 = c0.add_lazy(c1);
         bn254_fq_t t1 = c0 - c1;
         bn254_fq_t ab = c0 * c1;
         return bn254_fq2_t(t0 * t1, ab + ab);
