@@ -127,6 +127,123 @@ fn try_release_parent_gpu_memory() -> bool {
     false
 }
 
+/// Resolve a stable, per-circuit cache directory for the
+/// `export_groth16_gpu_data` output. The PK export is the largest
+/// single CPU cost in a Groth16 prove (~42 s on 100K SHA256:
+/// 20.6 s reading the 2.4 GB R1CS + 21.6 s writing the GPU-format
+/// flat binaries). It depends only on the build_dir contents
+/// (deterministic per circuit), so we can amortize it across all
+/// proves of the same vk by writing to a stable path and skipping the
+/// re-export when a complete cache is present.
+///
+/// Cache layout (under /dev/shm or fallback temp):
+///   sp1_groth16_pk_cache_<vkey_hash_hex>/
+///     <all flat-binary files written by export_groth16_gpu_data>
+///     .sp1_pk_cache_complete         ← sentinel; only written once
+///                                      every other file is finalized
+///                                      and an explicit fsync has run
+///
+/// The sentinel-file pattern protects against partial caches from a
+/// crashed prior run. Override the cache root via SP1_GROTH16_PK_CACHE.
+/// Set `SP1_GROTH16_PK_CACHE_DISABLE=1` to fall back to the previous
+/// per-prove tempdir behavior.
+#[cfg(feature = "native")]
+fn pk_cache_dir(vkey_hash_hex: &str) -> Option<std::path::PathBuf> {
+    if std::env::var_os("SP1_GROTH16_PK_CACHE_DISABLE").is_some() {
+        return None;
+    }
+    let root = std::env::var("SP1_GROTH16_PK_CACHE").ok().unwrap_or_else(|| {
+        if std::path::Path::new("/dev/shm").exists() {
+            "/dev/shm".to_string()
+        } else {
+            std::env::temp_dir().to_string_lossy().into_owned()
+        }
+    });
+    Some(std::path::PathBuf::from(root).join(format!("sp1_groth16_pk_cache_{vkey_hash_hex}")))
+}
+
+#[cfg(feature = "native")]
+const PK_CACHE_SENTINEL: &str = ".sp1_pk_cache_complete";
+
+/// Resolved gpu_dir for one prove, plus a flag indicating whether the
+/// caller needs to run the (expensive) PK export.
+#[cfg(feature = "native")]
+struct ResolvedGpuDir {
+    /// The directory the caller should pass to the helper / load from.
+    path: std::path::PathBuf,
+    /// True iff a complete cache was found and PK export can be skipped.
+    cache_hit: bool,
+    /// The cache root, present when caching is enabled. Used to write
+    /// the sentinel file after a successful export.
+    cache_dir: Option<std::path::PathBuf>,
+    /// RAII guard for the per-prove tempdir, only set when the cache is
+    /// disabled. Drop releases the tempdir.
+    _per_prove_tempdir: Option<tempfile::TempDir>,
+}
+
+/// Resolve the gpu_dir for a single prove, applying the PK export cache.
+/// On cache hit, returns the stable cache path with `cache_hit = true`
+/// and the caller should skip `export_groth16_gpu_data`. On miss, returns
+/// either the (empty, freshly created) cache directory or a temp dir
+/// when the cache is disabled. On miss the caller MUST run
+/// `export_groth16_gpu_data` and then call `mark_cache_complete` to
+/// finalize the cache.
+#[cfg(feature = "native")]
+fn resolve_gpu_dir(vkey_hash_hex: &str) -> ResolvedGpuDir {
+    let cache_dir = pk_cache_dir(vkey_hash_hex);
+    if let Some(cdir) = cache_dir {
+        let sentinel = cdir.join(PK_CACHE_SENTINEL);
+        if sentinel.exists() {
+            tracing::info!(
+                "Using cached Groth16 PK export at {} (sentinel present)",
+                cdir.display()
+            );
+            ResolvedGpuDir {
+                path: cdir.clone(),
+                cache_hit: true,
+                cache_dir: Some(cdir),
+                _per_prove_tempdir: None,
+            }
+        } else {
+            if cdir.exists() {
+                tracing::warn!(
+                    "Removing partial PK cache at {} (no sentinel)",
+                    cdir.display()
+                );
+                let _ = std::fs::remove_dir_all(&cdir);
+            }
+            std::fs::create_dir_all(&cdir).expect("create PK cache dir");
+            ResolvedGpuDir {
+                path: cdir.clone(),
+                cache_hit: false,
+                cache_dir: Some(cdir),
+                _per_prove_tempdir: None,
+            }
+        }
+    } else {
+        let td = shm_tempdir();
+        let path = td.path().to_path_buf();
+        ResolvedGpuDir {
+            path,
+            cache_hit: false,
+            cache_dir: None,
+            _per_prove_tempdir: Some(td),
+        }
+    }
+}
+
+/// Mark the PK cache complete by writing the sentinel file. Must be
+/// called only after `export_groth16_gpu_data` has finished writing all
+/// PK files and they are flushed to the page cache.
+#[cfg(feature = "native")]
+fn mark_cache_complete(resolved: &ResolvedGpuDir) {
+    if let Some(ref cdir) = resolved.cache_dir {
+        if let Err(e) = std::fs::write(cdir.join(PK_CACHE_SENTINEL), b"ok\n") {
+            tracing::warn!("failed to write PK cache sentinel: {e}");
+        }
+    }
+}
+
 /// Locate the `groth16_gpu_helper` subprocess binary. Priority:
 ///   1. `SP1_GROTH16_GPU_HELPER` env var (absolute path)
 ///   2. Alongside the current executable (standard Cargo target-dir layout)
@@ -219,13 +336,25 @@ impl Groth16Bn254Prover {
         let serialized = serde_json::to_string(&gnark_witness).unwrap();
         witness_file.write_all(serialized.as_bytes()).unwrap();
 
-        // Export PK + solve R1CS + export witness via Go
-        let gpu_dir = shm_tempdir();
-        let gpu_dir_str = gpu_dir.path().to_str().unwrap();
+        // Export PK + solve R1CS + export witness via Go.
+        // PK-export cache: the export step is fully determined by
+        // build_dir and reused across all proves of the same circuit.
+        let vkey_hash = Self::get_vkey_hash(build_dir);
+        let vkey_hash_hex = hex::encode(vkey_hash);
+        let resolved = resolve_gpu_dir(&vkey_hash_hex);
+        let gpu_dir_str = resolved.path.to_str().unwrap();
         let build_dir_str = build_dir.to_str().unwrap();
 
-        tracing::info!("Exporting Groth16 GPU data...");
-        export_groth16_gpu_data(build_dir_str, gpu_dir_str);
+        if !resolved.cache_hit {
+            tracing::info!("Exporting Groth16 GPU data (cache miss)...");
+            let t0 = std::time::Instant::now();
+            export_groth16_gpu_data(build_dir_str, gpu_dir_str);
+            tracing::info!(
+                "Groth16 PK export completed in {:?}; writing cache sentinel",
+                t0.elapsed()
+            );
+            mark_cache_complete(&resolved);
+        }
 
         tracing::info!("Solving R1CS and exporting witness...");
         export_groth16_gpu_witness(
@@ -314,13 +443,30 @@ impl Groth16Bn254Prover {
         let serialized = serde_json::to_string(&gnark_witness).unwrap();
         witness_file.write_all(serialized.as_bytes()).unwrap();
 
+        // Compute the cache key early so we can reuse a previously-
+        // exported PK if available.
+        let vkey_hash = Self::get_vkey_hash(build_dir);
+        let vkey_hash_hex = hex::encode(vkey_hash);
+
         // Step 2: Go shell-out to solve R1CS + export PK / witness in
-        // GPU-friendly layout (CPU-only, no HIP).
-        let gpu_dir = shm_tempdir();
-        let gpu_dir_str = gpu_dir.path().to_str().unwrap();
+        // GPU-friendly layout (CPU-only, no HIP). PK export is cached
+        // per-vk under /dev/shm; see `resolve_gpu_dir`.
+        let resolved = resolve_gpu_dir(&vkey_hash_hex);
+        let gpu_dir_path = resolved.path.clone();
+        let gpu_dir_str = gpu_dir_path.to_str().unwrap();
         let build_dir_str = build_dir.to_str().unwrap();
-        tracing::info!("Exporting Groth16 GPU data...");
-        export_groth16_gpu_data(build_dir_str, gpu_dir_str);
+
+        if !resolved.cache_hit {
+            tracing::info!("Exporting Groth16 GPU data (cache miss)...");
+            let t0 = std::time::Instant::now();
+            export_groth16_gpu_data(build_dir_str, gpu_dir_str);
+            tracing::info!(
+                "Groth16 PK export completed in {:?}; writing cache sentinel",
+                t0.elapsed()
+            );
+            mark_cache_complete(&resolved);
+        }
+
         tracing::info!("Solving R1CS and exporting witness...");
         export_groth16_gpu_witness(
             build_dir_str,
@@ -332,8 +478,6 @@ impl Groth16Bn254Prover {
         // directory as the current executable; fall back to PATH.
         let helper_path = resolve_helper_path("groth16_gpu_helper");
         let out_file = shm_named_tempfile();
-        let vkey_hash = Self::get_vkey_hash(build_dir);
-        let vkey_hash_hex = hex::encode(vkey_hash);
 
         // Release the parent's pooled GPU memory so the helper's ~3 GB
         // of H-polynomial + SRS allocations fit alongside whatever the
@@ -359,7 +503,7 @@ impl Groth16Bn254Prover {
         //   build, so we force it here.
         let mut cmd = std::process::Command::new(&helper_path);
         cmd.arg("--gpu-dir")
-            .arg(gpu_dir.path())
+            .arg(&gpu_dir_path)
             .arg("--witness-json")
             .arg(witness_file.path())
             .arg("--vkey-hash-hex")
@@ -431,6 +575,72 @@ impl Groth16Bn254Prover {
             &proof_nonce.to_string(),
         )
         .map_err(|e| anyhow::anyhow!("failed to verify proof: {e}"))
+    }
+}
+
+#[cfg(all(test, feature = "native"))]
+mod pk_cache_tests {
+    use super::*;
+
+    /// Drive `resolve_gpu_dir` through the miss → complete → hit cycle
+    /// and verify the sentinel logic + partial-cache wipe.
+    #[test]
+    fn resolve_gpu_dir_miss_complete_hit() {
+        // Use a unique cache root for this test so we don't collide with
+        // other tests or any real cache on the dev machine.
+        let tmp = tempfile::tempdir().unwrap();
+        std::env::set_var("SP1_GROTH16_PK_CACHE", tmp.path());
+        std::env::remove_var("SP1_GROTH16_PK_CACHE_DISABLE");
+
+        let key = "deadbeef_pk_cache_unit_test";
+
+        // 1) First call: cache miss, fresh empty directory.
+        let r1 = resolve_gpu_dir(key);
+        assert!(!r1.cache_hit, "first call must be a miss");
+        assert!(r1.path.exists(), "miss path must be a real directory");
+        assert!(
+            !r1.path.join(PK_CACHE_SENTINEL).exists(),
+            "sentinel must not exist before mark_cache_complete"
+        );
+        // Simulate `export_groth16_gpu_data` writing some PK files.
+        std::fs::write(r1.path.join("pk_dummy.bin"), b"pretend pk").unwrap();
+        mark_cache_complete(&r1);
+        assert!(r1.path.join(PK_CACHE_SENTINEL).exists(), "sentinel write failed");
+        let cache_path = r1.path.clone();
+
+        // 2) Second call: cache hit, same path, sentinel + dummy file
+        // still present.
+        let r2 = resolve_gpu_dir(key);
+        assert!(r2.cache_hit, "second call must be a hit");
+        assert_eq!(r2.path, cache_path);
+        assert!(r2.path.join("pk_dummy.bin").exists(), "cached file must survive");
+
+        // 3) Corrupt the cache by removing only the sentinel: next call
+        // is a miss and wipes the partial cache.
+        std::fs::remove_file(cache_path.join(PK_CACHE_SENTINEL)).unwrap();
+        let r3 = resolve_gpu_dir(key);
+        assert!(!r3.cache_hit, "missing sentinel must force a miss");
+        assert!(
+            !r3.path.join("pk_dummy.bin").exists(),
+            "partial cache must have been wiped"
+        );
+
+        // Cleanup env var so we don't leak into other tests.
+        std::env::remove_var("SP1_GROTH16_PK_CACHE");
+    }
+
+    /// `SP1_GROTH16_PK_CACHE_DISABLE` must fall back to per-prove tempdir.
+    #[test]
+    fn resolve_gpu_dir_disabled() {
+        std::env::set_var("SP1_GROTH16_PK_CACHE_DISABLE", "1");
+        let r = resolve_gpu_dir("anything");
+        assert!(!r.cache_hit);
+        assert!(r.cache_dir.is_none(), "disabled cache must not return a cache_dir");
+        assert!(r._per_prove_tempdir.is_some(), "disabled cache must own a tempdir");
+        assert!(r.path.exists());
+        // mark_cache_complete is a no-op when there is no cache_dir.
+        mark_cache_complete(&r);
+        std::env::remove_var("SP1_GROTH16_PK_CACHE_DISABLE");
     }
 }
 
