@@ -83,6 +83,21 @@ func main() {
 	fmt.Printf("[hint-census] nbWires=%d  nbInstructions=%d  nbHintRegistered=%d\n",
 		nbWires, nbInstr, len(r.MHintsDependencies))
 
+	// Report BSB22 commitment usage — these are special hints that
+	// involve a G1 MSM and don't appear in MHintsDependencies because
+	// they are runtime-overridden during prove. If non-zero the solve
+	// plan must support a "commitment" instruction kind separate from
+	// the simple per-call hint kinds.
+	if comm, ok := r.CommitmentInfo.(constraint.Groth16Commitments); ok {
+		fmt.Printf("[hint-census] BSB22 commitments in this circuit: %d\n", len(comm))
+		for i, c := range comm {
+			fmt.Printf("  commitment %d: nbPrivateCommitted=%d, commitmentIndex=%d, hashCommitted=%d\n",
+				i, len(c.PrivateCommitted), c.CommitmentIndex, len(c.PublicAndCommitmentCommitted))
+		}
+	} else {
+		fmt.Printf("[hint-census] CommitmentInfo type %T (not Groth16Commitments)\n", r.CommitmentInfo)
+	}
+
 	// Pre-compute per-wire topological depth using the same algorithm as
 	// r1cs_characterize. We walk constraints in declaration order, but
 	// here we also walk hint instructions and assign a depth to each
