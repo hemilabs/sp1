@@ -47,11 +47,18 @@ import (
 	sp1 "github.com/succinctlabs/sp1-recursion-gnark/sp1"
 )
 
-// ---------------- Solve plan format v1 ----------------
+// ---------------- Solve plan format ----------------
+//
+// Two versions are supported:
+//   v1 (Phase 1): minimal CPU-friendly. R1Cs stored as raw L/R/O term
+//                 lists; loc determined at interpret time.
+//   v2 (Phase 2): adds per-R1C GPU-friendly metadata (loc, out_wire,
+//                 out_coeff_idx) determined by a dry-run at emit time.
+//                 The GPU kernel reads loc directly without scanning.
 //
 // Header (28 bytes, little-endian throughout):
 //   magic[4]            "SPS1"
-//   version[u32]        1
+//   version[u32]        1 or 2
 //   nbPublic[u32]       includes the ONE wire
 //   nbSecret[u32]
 //   nbInternal[u32]
@@ -67,12 +74,18 @@ import (
 //   for each instruction:
 //     kind[u8]  0 = R1C, 1 = HINT
 //
-//     R1C:
+//     R1C (v1):
 //       L_count[u32], then L_count × (CID[u32], VID[u32])
 //       R_count[u32], then R_count × (CID[u32], VID[u32])
 //       O_count[u32], then O_count × (CID[u32], VID[u32])
 //
-//     HINT:
+//     R1C (v2): same as v1 followed by:
+//       loc[u8]            0 = verify-only, 1 = L, 2 = R, 3 = O
+//       out_coeff_idx[u32] coeff of the unset term (for div-by-coeff);
+//                          unused if loc == 0
+//       out_wire_id[u32]   wire to compute; unused if loc == 0
+//
+//     HINT (both versions identical):
 //       hintID[u32]
 //       nInputs[u32]
 //       per input: count[u32], then count × (CID[u32], VID[u32])
@@ -87,7 +100,8 @@ import (
 
 const (
 	planMagic   = "SPS1"
-	planVersion = 1
+	planV1      = 1
+	planV2      = 2
 	kindR1C     = 0
 	kindHint    = 1
 )
@@ -101,7 +115,12 @@ func main() {
 		if len(os.Args) != 4 {
 			usage()
 		}
-		emit(os.Args[2], os.Args[3])
+		emit(os.Args[2], os.Args[3], planV1)
+	case "emit-v2":
+		if len(os.Args) != 4 {
+			usage()
+		}
+		emit(os.Args[2], os.Args[3], planV2)
 	case "interpret":
 		if len(os.Args) != 6 {
 			usage()
@@ -112,6 +131,11 @@ func main() {
 			usage()
 		}
 		roundtrip(os.Args[2], os.Args[3])
+	case "roundtrip-v2":
+		if len(os.Args) != 4 {
+			usage()
+		}
+		roundtripV2(os.Args[2], os.Args[3])
 	default:
 		usage()
 	}
@@ -119,9 +143,11 @@ func main() {
 
 func usage() {
 	fmt.Fprintln(os.Stderr, "Usage:")
-	fmt.Fprintln(os.Stderr, "  r1cs_solve_plan emit       <build_dir> <out_solve_plan.bin>")
-	fmt.Fprintln(os.Stderr, "  r1cs_solve_plan interpret  <build_dir> <solve_plan.bin> <witness.json> <out_wire_values.bin>")
-	fmt.Fprintln(os.Stderr, "  r1cs_solve_plan roundtrip  <build_dir> <witness.json>")
+	fmt.Fprintln(os.Stderr, "  r1cs_solve_plan emit          <build_dir> <out_solve_plan.bin>")
+	fmt.Fprintln(os.Stderr, "  r1cs_solve_plan emit-v2       <build_dir> <out_solve_plan.bin>")
+	fmt.Fprintln(os.Stderr, "  r1cs_solve_plan interpret     <build_dir> <solve_plan.bin> <witness.json> <out_wire_values.bin>")
+	fmt.Fprintln(os.Stderr, "  r1cs_solve_plan roundtrip     <build_dir> <witness.json>")
+	fmt.Fprintln(os.Stderr, "  r1cs_solve_plan roundtrip-v2  <build_dir> <witness.json>")
 	os.Exit(1)
 }
 
@@ -148,7 +174,7 @@ func loadR1CS(buildDir string) *cs.R1CS {
 	return r
 }
 
-func emit(buildDir, outPath string) {
+func emit(buildDir, outPath string, version uint32) {
 	r := loadR1CS(buildDir)
 
 	out, err := os.Create(outPath)
@@ -168,17 +194,16 @@ func emit(buildDir, outPath string) {
 
 	// Header
 	must(w.Write([]byte(planMagic)))
-	mustU32(w, planVersion)
+	mustU32(w, version)
 	mustU32(w, uint32(r.GetNbPublicVariables()))
 	mustU32(w, uint32(r.GetNbSecretVariables()))
 	mustU32(w, uint32(r.NbInternalVariables))
 	mustU32(w, uint32(len(r.Coefficients)))
 
-	// Count first so we can write nbInstructions in the header.
 	nbInstr := r.GetNbInstructions()
 	mustU32(w, uint32(nbInstr))
 
-	// Coefficient table — fr.Element is [4]uint64; write as raw little-endian.
+	// Coefficient table.
 	for i := range r.Coefficients {
 		var buf [32]byte
 		for limb := 0; limb < 4; limb++ {
@@ -187,11 +212,29 @@ func emit(buildDir, outPath string) {
 		must(w.Write(buf[:]))
 	}
 
+	// For v2, dry-run the solver to determine per-constraint loc +
+	// out_wire metadata. This walks the same instruction stream, marks
+	// hint outputs as "defined", and for each R1C records which of its
+	// L/R/O linear expressions contains the unset wire (if any).
+	var nbWires int
+	var solved []bool
+	if version >= planV2 {
+		nbWires = r.NbInternalVariables + r.GetNbPublicVariables() + r.GetNbSecretVariables()
+		solved = make([]bool, nbWires)
+		// Wire 0 (ONE) + public + secret are pre-defined.
+		nbInputs := r.GetNbPublicVariables() + r.GetNbSecretVariables()
+		for i := 0; i < nbInputs; i++ {
+			solved[i] = true
+		}
+	}
+
 	t0 := time.Now()
 	hintBP, _ := r.Blueprints[hintBpID].(constraint.BlueprintHint)
 	var hm constraint.HintMapping
 
 	emittedR1C, emittedHint := 0, 0
+	verifyOnly := 0
+	locL, locR, locO := 0, 0, 0
 	for i := 0; i < nbInstr; i++ {
 		pi := r.Instructions[i]
 		inst := pi.Unpack(&r.System)
@@ -212,12 +255,15 @@ func emit(buildDir, outPath string) {
 			}
 			mustU32(w, hm.OutputRange.Start)
 			mustU32(w, hm.OutputRange.End)
+			if solved != nil {
+				for w := hm.OutputRange.Start; w < hm.OutputRange.End; w++ {
+					solved[w] = true
+				}
+			}
 			emittedHint++
 			continue
 		}
 
-		// Otherwise must be an R1C (BlueprintR1C). We don't expect any
-		// other blueprint in this circuit, but bail loudly if we see one.
 		r1c, ok := bp.(constraint.BlueprintR1C)
 		if !ok {
 			fail("instruction %d uses unexpected blueprint %T (id=%d)", i, bp, pi.BlueprintID)
@@ -229,9 +275,63 @@ func emit(buildDir, outPath string) {
 		writeLE(w, c.R)
 		writeLE(w, c.O)
 		emittedR1C++
+
+		if solved == nil {
+			continue
+		}
+
+		// v2: scan L/R/O for the (at most one) unset wire and emit loc + out info.
+		var (
+			loc          uint8 = 0
+			outCoeffIdx  uint32
+			outWireID    uint32
+		)
+		findUnset := func(le constraint.LinearExpression, candidate uint8) {
+			for _, t := range le {
+				vid := uint32(t.WireID())
+				if t.IsConstant() || int(vid) >= len(solved) {
+					continue
+				}
+				if !solved[vid] {
+					if loc != 0 {
+						fail("R1C #%d has multiple unsolved wires (vid=%d after loc=%d wire=%d)",
+							emittedR1C, vid, loc, outWireID)
+					}
+					loc = candidate
+					outCoeffIdx = uint32(t.CoeffID())
+					outWireID = vid
+				}
+			}
+		}
+		findUnset(c.L, 1)
+		findUnset(c.R, 2)
+		findUnset(c.O, 3)
+
+		must1(w.WriteByte(loc))
+		mustU32(w, outCoeffIdx)
+		mustU32(w, outWireID)
+
+		if loc != 0 {
+			solved[outWireID] = true
+		}
+
+		switch loc {
+		case 0:
+			verifyOnly++
+		case 1:
+			locL++
+		case 2:
+			locR++
+		case 3:
+			locO++
+		}
 	}
-	fmt.Fprintf(os.Stderr, "[plan] emitted %d R1Cs + %d hints in %s\n",
-		emittedR1C, emittedHint, time.Since(t0))
+	if version >= planV2 {
+		fmt.Fprintf(os.Stderr, "[plan] v2 loc distribution: L=%d R=%d O=%d verify-only=%d\n",
+			locL, locR, locO, verifyOnly)
+	}
+	fmt.Fprintf(os.Stderr, "[plan] emitted %d R1Cs + %d hints in %s (version=%d)\n",
+		emittedR1C, emittedHint, time.Since(t0), version)
 }
 
 func writeLE(w io.Writer, le constraint.LinearExpression) {
@@ -271,6 +371,7 @@ func interpret(buildDir, planPath, witnessPath, outWirePath string) {
 
 // loadPlanHeader reads the header + coefficient table.
 type planHeader struct {
+	version        uint32
 	nbPublic       uint32
 	nbSecret       uint32
 	nbInternal     uint32
@@ -294,10 +395,11 @@ func readPlanHeader(planPath string) (*planHeader, *bufio.Reader, *os.File) {
 		fail("bad plan magic %q", magic)
 	}
 	version := readU32(r)
-	if version != planVersion {
+	if version != planV1 && version != planV2 {
 		fail("unsupported plan version %d", version)
 	}
 	h := &planHeader{
+		version:        version,
 		nbPublic:       readU32(r),
 		nbSecret:       readU32(r),
 		nbInternal:     readU32(r),
@@ -385,6 +487,27 @@ func interpretPlan(r1cs *cs.R1CS, planPath, witnessPath string) []fr.Element {
 			a, _ := evalLE(1)
 			b, _ := evalLE(2)
 			c, _ := evalLE(3)
+
+			// v2 records loc + out info after the LRO terms; for the
+			// interpreter we recompute live, so cross-check against the
+			// recorded values when present (cheap regression check).
+			if h.version >= planV2 {
+				recLoc, err := br.ReadByte()
+				if err != nil {
+					fail("read v2 loc: %v", err)
+				}
+				recCoeff := readU32(br)
+				recWire := readU32(br)
+				if recLoc != unsetLoc {
+					fail("R1C %d: v2 loc=%d but interpret loc=%d", instIdx, recLoc, unsetLoc)
+				}
+				if unsetLoc != 0 {
+					if recCoeff != unset.cid || recWire != unset.vid {
+						fail("R1C %d: v2 (cid=%d vid=%d) != interpret (cid=%d vid=%d)",
+							instIdx, recCoeff, recWire, unset.cid, unset.vid)
+					}
+				}
+			}
 
 			if unsetLoc == 0 {
 				// All wires solved — verify a*b == c.
@@ -501,6 +624,14 @@ func divByCoeff(wire *fr.Element, cid uint32, coeffs []fr.Element) {
 // ---------------- roundtrip ----------------
 
 func roundtrip(buildDir, witnessPath string) {
+	roundtripVersion(buildDir, witnessPath, planV1)
+}
+
+func roundtripV2(buildDir, witnessPath string) {
+	roundtripVersion(buildDir, witnessPath, planV2)
+}
+
+func roundtripVersion(buildDir, witnessPath string, version uint32) {
 	tmp, err := os.CreateTemp("", "solve_plan-*.bin")
 	if err != nil {
 		fail("temp: %v", err)
@@ -508,7 +639,7 @@ func roundtrip(buildDir, witnessPath string) {
 	tmp.Close()
 	defer os.Remove(tmp.Name())
 
-	emit(buildDir, tmp.Name())
+	emit(buildDir, tmp.Name(), version)
 
 	r := loadR1CS(buildDir)
 
