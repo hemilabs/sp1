@@ -148,6 +148,11 @@ func main() {
 			usage()
 		}
 		makeWitnessInit(os.Args[2], os.Args[3], os.Args[4])
+	case "emit-abc-reference":
+		if len(os.Args) != 5 {
+			usage()
+		}
+		emitAbcReference(os.Args[2], os.Args[3], os.Args[4])
 	case "prep-hints":
 		if len(os.Args) != 5 {
 			usage()
@@ -194,6 +199,7 @@ func usage() {
 	fmt.Fprintln(os.Stderr, "  r1cs_solve_plan prep-full-prod <build_dir> <witness.json> <out_dir>  (production: hints not pre-baked)")
 	fmt.Fprintln(os.Stderr, "  r1cs_solve_plan prep-circuit-prod <build_dir> <out_dir>  (per-circuit; cacheable)")
 	fmt.Fprintln(os.Stderr, "  r1cs_solve_plan make-witness-init <build_dir> <witness.json> <out_path>  (per-prove; fast)")
+	fmt.Fprintln(os.Stderr, "  r1cs_solve_plan emit-abc-reference <build_dir> <witness.json> <out_dir>  (gnark gold A/B/C)")
 	fmt.Fprintln(os.Stderr, "  r1cs_solve_plan prep-hints    <build_dir> <witness.json> <out_dir>")
 	fmt.Fprintln(os.Stderr, "  r1cs_solve_plan interpret     <build_dir> <solve_plan.bin> <witness.json> <out_wire_values.bin>")
 	fmt.Fprintln(os.Stderr, "  r1cs_solve_plan roundtrip     <build_dir> <witness.json>")
@@ -898,6 +904,7 @@ func emitProdCircuit(r *cs.R1CS, outDir string) {
 		loc uint8
 		outCoeffID uint32
 		outWireID  uint32
+		declIdx    uint32 // original declaration order (for solution.A indexing)
 	}
 
 	nbInstr := r.GetNbInstructions()
@@ -912,6 +919,7 @@ func emitProdCircuit(r *cs.R1CS, outDir string) {
 	}
 	maxLayer := int32(0)
 	unmappedKinds := map[string]int{}
+	r1cDeclCount := uint32(0)
 
 	for i := 0; i < nbInstr; i++ {
 		pi := r.Instructions[i]
@@ -1009,7 +1017,9 @@ func emitProdCircuit(r *cs.R1CS, outDir string) {
 			O:          append(constraint.LinearExpression{}, c.O...),
 			loc:        loc,
 			outCoeffID: outCoeff,
+			declIdx:    r1cDeclCount,
 		}
+		r1cDeclCount++
 		if newWire >= 0 {
 			m.outWireID = uint32(newWire)
 		}
@@ -1051,13 +1061,17 @@ func emitProdCircuit(r *cs.R1CS, outDir string) {
 		f.Close()
 	}
 
-	// Per-layer R1C descs + terms
+	// Per-layer R1C descs + terms.
+	// Also emit a desc_decl_idx.bin mapping layered-index → declaration-index,
+	// used by the kernel to write A/B/C at the gnark-equivalent index.
 	df, _ := os.Create(outDir + "/layers_descs.bin")
 	dbw := bufio.NewWriterSize(df, 1<<20)
 	tf, _ := os.Create(outDir + "/layers_terms.bin")
 	tbw := bufio.NewWriterSize(tf, 1<<20)
 	idxF, _ := os.Create(outDir + "/layers.idx")
 	ibw := bufio.NewWriterSize(idxF, 1<<20)
+	declF, _ := os.Create(outDir + "/desc_decl_idx.bin")
+	declBw := bufio.NewWriterSize(declF, 1<<20)
 	mustU32(ibw, uint32(nbLayers))
 
 	var totalDescs uint64 = 0
@@ -1095,12 +1109,14 @@ func emitProdCircuit(r *cs.R1CS, outDir string) {
 			mustU32(dbw, m.outWireID)
 			must1(dbw.WriteByte(m.loc))
 			must1(dbw.WriteByte(0)); must1(dbw.WriteByte(0)); must1(dbw.WriteByte(0))
+			mustU32(declBw, m.declIdx)
 		}
 		totalDescs += uint64(len(ms))
 	}
 	dbw.Flush(); df.Close()
 	tbw.Flush(); tf.Close()
 	ibw.Flush(); idxF.Close()
+	declBw.Flush(); declF.Close()
 
 	// Per-layer hint stream
 	hxF, _ := os.Create(outDir + "/hints.idx")
@@ -2418,6 +2434,57 @@ func roundtripVersion(buildDir, witnessPath string, version uint32) {
 		os.Exit(1)
 	}
 	fmt.Fprintf(os.Stderr, "[plan] PASS — %d wires match byte-for-byte\n", len(mine))
+}
+
+// emitAbcReference runs gnark.Solve and writes solution_a/b/c.bin in
+// the canonical-LE format that the existing Rust loader expects.
+// Used to validate the GPU kernel's A/B/C output byte-for-byte.
+func emitAbcReference(buildDir, witnessPath, outDir string) {
+	r := loadR1CS(buildDir)
+	if err := os.MkdirAll(outDir, 0o755); err != nil {
+		fail("mkdir out: %v", err)
+	}
+	witnessFile, err := os.ReadFile(witnessPath)
+	if err != nil {
+		fail("read witness: %v", err)
+	}
+	var witnessInput sp1.WitnessInput
+	if err := json.Unmarshal(witnessFile, &witnessInput); err != nil {
+		fail("unmarshal witness: %v", err)
+	}
+	assignment := sp1.NewCircuit(witnessInput)
+	witness, err := frontend.NewWitness(&assignment, ecc.BN254.ScalarField())
+	if err != nil {
+		fail("new witness: %v", err)
+	}
+	t0 := time.Now()
+	sol, err := r.Solve(witness)
+	if err != nil {
+		fail("gnark solve: %v", err)
+	}
+	rsol := sol.(*cs.R1CSSolution)
+	fmt.Fprintf(os.Stderr, "[plan] gnark Solve in %s (W=%d, A=%d)\n",
+		time.Since(t0), len(rsol.W), len(rsol.A))
+
+	// Write canonical LE (same layout as writeFrFile)
+	writeCanonical := func(path string, elems []fr.Element) {
+		f, _ := os.Create(path)
+		bw := bufio.NewWriterSize(f, 1<<20)
+		var buf [32]byte
+		for i := range elems {
+			raw := elems[i].Bytes() // big-endian canonical
+			for j := 0; j < 32; j++ {
+				buf[j] = raw[31-j]
+			}
+			bw.Write(buf[:])
+		}
+		bw.Flush()
+		f.Close()
+	}
+	writeCanonical(outDir+"/solution_a.bin", rsol.A)
+	writeCanonical(outDir+"/solution_b.bin", rsol.B)
+	writeCanonical(outDir+"/solution_c.bin", rsol.C)
+	fmt.Fprintf(os.Stderr, "[plan] wrote gold A/B/C reference to %s\n", outDir)
 }
 
 func gnarkSolveReference(r *cs.R1CS, witnessPath string) []fr.Element {

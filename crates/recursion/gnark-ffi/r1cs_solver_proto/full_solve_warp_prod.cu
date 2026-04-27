@@ -476,6 +476,45 @@ process_R1C_warp(int lane, const R1CDesc& d,
 // =====================================================================
 // Cooperative kernel
 // =====================================================================
+// Post-solve A/B/C-emit: one warp per R1C, all wires now solved. Writes
+// out_a[idx]/out_b[idx]/out_c[idx] in CANONICAL little-endian Fr (matches
+// gnark's `writeFrFile` format that the existing Rust loader expects).
+//
+// `start_idx` is the global descriptor index where this layer's R1Cs begin
+// in the descs array; we use the layer dispatch loop (in the kernel below)
+// to write at the same global index.
+__device__ __forceinline__ void
+emit_abc_warp(int lane, const R1CDesc& d,
+              const Term* terms, const Fr* coeffs, const Fr* wires,
+              Fr* out_a, Fr* out_b, Fr* out_c, uint32_t out_idx) {
+    Fr a_part = fr_zero(), b_part = fr_zero(), c_part = fr_zero();
+    for (uint32_t i = lane; i < d.L_cnt; i += 32) {
+        Term t = terms[d.L_off + i];
+        a_part = a_part + coeffs[t.cid] * wires[t.vid];
+    }
+    for (uint32_t i = lane; i < d.R_cnt; i += 32) {
+        Term t = terms[d.R_off + i];
+        b_part = b_part + coeffs[t.cid] * wires[t.vid];
+    }
+    for (uint32_t i = lane; i < d.O_cnt; i += 32) {
+        Term t = terms[d.O_off + i];
+        c_part = c_part + coeffs[t.cid] * wires[t.vid];
+    }
+    Fr a_mont = warp_reduce_fr(a_part);
+    Fr b_mont = warp_reduce_fr(b_part);
+    Fr c_mont = warp_reduce_fr(c_part);
+    if (lane != 0) return;
+
+    // Convert Mont -> canonical via mont mul with canonical 1.
+    Fr one_canonical;
+    auto* op = reinterpret_cast<uint32_t*>(&one_canonical);
+    op[0] = 1;
+    for (int i = 1; i < 8; ++i) op[i] = 0;
+    out_a[out_idx] = a_mont * one_canonical;
+    out_b[out_idx] = b_mont * one_canonical;
+    out_c[out_idx] = c_mont * one_canonical;
+}
+
 __global__ void persistent_solve_prod_kernel(
     const LayerEntry*     layers,
     const LayerHintEntry* hint_layers,
@@ -487,6 +526,10 @@ __global__ void persistent_solve_prod_kernel(
     const Term*           hint_le_terms,
     const Fr*             coeffs,
     Fr*                   wires,
+    Fr*                   out_a,    // nullable — if non-null, written post-solve
+    Fr*                   out_b,
+    Fr*                   out_c,
+    const uint32_t*       desc_decl_idx,  // layered idx -> declaration idx
     int*                  error_flag) {
     cg::grid_group g = cg::this_grid();
     int lane = threadIdx.x & 31;
@@ -514,6 +557,21 @@ __global__ void persistent_solve_prod_kernel(
             process_R1C_warp(lane,
                 descs[e.descs_off + i], terms, coeffs, wires,
                 error_flag, (uint32_t)e.descs_off + i);
+        }
+        g.sync();
+    }
+
+    // Phase 9 post-solve A/B/C emit — one warp per R1C, grid-strided over
+    // ALL constraints (not by layer). All wires are now populated, so we
+    // get the full A[i]/B[i]/C[i] sums. Writes canonical-form Fr to match
+    // gnark's writeFrFile output that the existing Rust loader reads.
+    if (out_a != nullptr) {
+        uint32_t total = (uint32_t)layers[n_layers - 1].descs_off +
+                         layers[n_layers - 1].n_descs;
+        for (uint32_t i = warp_id; i < total; i += n_warps) {
+            uint32_t out_idx = desc_decl_idx[i];  // gnark declaration order
+            emit_abc_warp(lane, descs[i], terms, coeffs, wires,
+                          out_a, out_b, out_c, out_idx);
         }
         g.sync();
     }
@@ -545,7 +603,8 @@ int main(int argc, char** argv) {
     const char* env_initial = getenv("PROD_INITIAL");
     const char* env_out     = getenv("PROD_OUT_WIRES");
 
-    auto coeffs_bytes   = rd(dir + "/coeffs.bin");
+    auto coeffs_bytes        = rd(dir + "/coeffs.bin");
+    auto desc_decl_idx_bytes = rd(dir + "/desc_decl_idx.bin");
     auto initial_bytes  = env_initial ? rd(env_initial) : rd(dir + "/wires_initial.bin");
     bool has_expected = !env_out;  // production mode skips expected diff
     std::vector<uint8_t> expected_bytes;
@@ -610,6 +669,16 @@ int main(int argc, char** argv) {
     fprintf(stderr, "[prod] %zu hint input LEs, %zu hint input terms\n",
             le_offsets.size() - 1, le_terms_flat.size());
 
+    // A/B/C output: only allocate when requested.
+    const char* env_out_a = getenv("PROD_OUT_A");
+    const char* env_out_b = getenv("PROD_OUT_B");
+    const char* env_out_c = getenv("PROD_OUT_C");
+    bool emit_abc = (env_out_a != nullptr) || (env_out_b != nullptr) || (env_out_c != nullptr);
+
+    size_t n_descs = descs_bytes.size() / sizeof(R1CDesc);
+    fprintf(stderr, "[prod] %zu R1Cs (post-solve A/B/C %s)\n",
+            n_descs, emit_abc ? "ENABLED" : "disabled");
+
     // Allocate device buffers
     Fr *d_coeffs, *d_wires;
     Term *d_terms, *d_le_terms;
@@ -619,6 +688,8 @@ int main(int argc, char** argv) {
     int *d_err;
     LayerEntry *d_layers;
     LayerHintEntry *d_hint_layers;
+    Fr *d_out_a = nullptr, *d_out_b = nullptr, *d_out_c = nullptr;
+    uint32_t *d_desc_decl_idx = nullptr;
 
     CUDA_CHECK(cudaMalloc(&d_coeffs,  coeffs_bytes.size()));
     CUDA_CHECK(cudaMalloc(&d_terms,   terms_bytes.size()));
@@ -630,6 +701,17 @@ int main(int argc, char** argv) {
     CUDA_CHECK(cudaMalloc(&d_hint_calls, hint_calls_bytes.size()));
     CUDA_CHECK(cudaMalloc(&d_le_offsets, le_offsets.size() * sizeof(uint32_t)));
     CUDA_CHECK(cudaMalloc(&d_le_terms, le_terms_flat.size() * sizeof(Term)));
+    if (emit_abc) {
+        CUDA_CHECK(cudaMalloc(&d_out_a, n_descs * sizeof(Fr)));
+        CUDA_CHECK(cudaMalloc(&d_out_b, n_descs * sizeof(Fr)));
+        CUDA_CHECK(cudaMalloc(&d_out_c, n_descs * sizeof(Fr)));
+        CUDA_CHECK(cudaMalloc(&d_desc_decl_idx, desc_decl_idx_bytes.size()));
+        CUDA_CHECK(cudaMemcpy(d_desc_decl_idx, desc_decl_idx_bytes.data(),
+                              desc_decl_idx_bytes.size(), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemset(d_out_a, 0, n_descs * sizeof(Fr)));
+        CUDA_CHECK(cudaMemset(d_out_b, 0, n_descs * sizeof(Fr)));
+        CUDA_CHECK(cudaMemset(d_out_c, 0, n_descs * sizeof(Fr)));
+    }
 
     auto upload_t0 = std::chrono::steady_clock::now();
     CUDA_CHECK(cudaMemcpy(d_coeffs, coeffs_bytes.data(), coeffs_bytes.size(), cudaMemcpyHostToDevice));
@@ -668,7 +750,10 @@ int main(int argc, char** argv) {
         &d_layers, &d_hint_layers, &nb_layers,
         &d_descs, &d_terms,
         &d_hint_calls, &d_le_offsets, &d_le_terms,
-        &d_coeffs, &d_wires, &d_err
+        &d_coeffs, &d_wires,
+        &d_out_a, &d_out_b, &d_out_c,
+        &d_desc_decl_idx,
+        &d_err
     };
 
     auto solve_t0 = std::chrono::steady_clock::now();
@@ -689,6 +774,28 @@ int main(int argc, char** argv) {
 
     std::vector<uint8_t> got(initial_bytes.size());
     CUDA_CHECK(cudaMemcpy(got.data(), d_wires, initial_bytes.size(), cudaMemcpyDeviceToHost));
+
+    // Download + write A/B/C if requested
+    if (emit_abc) {
+        size_t abc_bytes = n_descs * sizeof(Fr);
+        std::vector<uint8_t> a_buf(abc_bytes), b_buf(abc_bytes), c_buf(abc_bytes);
+        CUDA_CHECK(cudaMemcpy(a_buf.data(), d_out_a, abc_bytes, cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(b_buf.data(), d_out_b, abc_bytes, cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(c_buf.data(), d_out_c, abc_bytes, cudaMemcpyDeviceToHost));
+        auto write_buf = [](const char* path, const std::vector<uint8_t>& buf) {
+            if (!path) return;
+            FILE* f = fopen(path, "wb");
+            if (!f) { fprintf(stderr, "[prod] open %s: %s\n", path, strerror(errno)); std::exit(6); }
+            if (fwrite(buf.data(), 1, buf.size(), f) != buf.size()) {
+                fprintf(stderr, "[prod] short write to %s\n", path); fclose(f); std::exit(6);
+            }
+            fclose(f);
+            fprintf(stderr, "[prod] wrote %zu bytes to %s\n", buf.size(), path);
+        };
+        write_buf(env_out_a, a_buf);
+        write_buf(env_out_b, b_buf);
+        write_buf(env_out_c, c_buf);
+    }
 
     if (env_out) {
         // Production mode: write wire vector to output path (no gold diff).
