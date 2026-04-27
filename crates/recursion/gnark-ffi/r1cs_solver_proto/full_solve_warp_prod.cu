@@ -529,16 +529,29 @@ static std::vector<uint8_t> rd(const std::string& p) {
     return v;
 }
 
+// Optional path overrides (all default to <dir>/<name>):
+//   PROD_INITIAL=/path/to/wires_initial.bin   (per-prove input)
+//   PROD_OUT_WIRES=/path/to/wire_values.bin   (per-prove output)
+// When PROD_OUT_WIRES is set, the kernel skips the wires_expected.bin
+// diff (production mode — no gold reference).
 int main(int argc, char** argv) {
     if (argc != 2) {
-        fprintf(stderr, "Usage: %s <prep_full_prod_dir>\n", argv[0]);
+        fprintf(stderr, "Usage: %s <prep_circuit_dir>\n", argv[0]);
+        fprintf(stderr, "  Env: PROD_INITIAL=<wires_initial.bin> PROD_OUT_WIRES=<out>\n");
         return 1;
     }
     std::string dir = argv[1];
 
+    const char* env_initial = getenv("PROD_INITIAL");
+    const char* env_out     = getenv("PROD_OUT_WIRES");
+
     auto coeffs_bytes   = rd(dir + "/coeffs.bin");
-    auto initial_bytes  = rd(dir + "/wires_initial.bin");
-    auto expected_bytes = rd(dir + "/wires_expected.bin");
+    auto initial_bytes  = env_initial ? rd(env_initial) : rd(dir + "/wires_initial.bin");
+    bool has_expected = !env_out;  // production mode skips expected diff
+    std::vector<uint8_t> expected_bytes;
+    if (has_expected) {
+        expected_bytes = rd(dir + "/wires_expected.bin");
+    }
     auto descs_bytes    = rd(dir + "/layers_descs.bin");
     auto terms_bytes    = rd(dir + "/layers_terms.bin");
     auto idx_bytes      = rd(dir + "/layers.idx");
@@ -676,6 +689,21 @@ int main(int argc, char** argv) {
 
     std::vector<uint8_t> got(initial_bytes.size());
     CUDA_CHECK(cudaMemcpy(got.data(), d_wires, initial_bytes.size(), cudaMemcpyDeviceToHost));
+
+    if (env_out) {
+        // Production mode: write wire vector to output path (no gold diff).
+        FILE* fo = fopen(env_out, "wb");
+        if (!fo) { fprintf(stderr, "[prod] open %s: %s\n", env_out, strerror(errno)); return 5; }
+        if (fwrite(got.data(), 1, got.size(), fo) != got.size()) {
+            fprintf(stderr, "[prod] short write to %s\n", env_out); fclose(fo); return 5;
+        }
+        fclose(fo);
+        fprintf(stderr, "[prod] wrote %zu wires (%zu bytes) to %s\n", n_wires, got.size(), env_out);
+        if (err_flag != 0) return 4;
+        return 0;
+    }
+
+    // Test mode: diff against gold.
     size_t mismatches = 0;
     long first_mm = -1;
     for (size_t i = 0; i < n_wires; ++i) {
@@ -686,7 +714,6 @@ int main(int argc, char** argv) {
     }
     if (mismatches > 0) {
         fprintf(stderr, "[prod] FAIL — %zu mismatches; first wire %ld\n", mismatches, first_mm);
-        // Dump first mismatching wire bytes for diagnosis.
         const uint8_t* g_ = got.data() + first_mm * 32;
         const uint8_t* e_ = expected_bytes.data() + first_mm * 32;
         fprintf(stderr, "       got: ");

@@ -28,6 +28,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
@@ -137,6 +138,16 @@ func main() {
 			usage()
 		}
 		prepFullProd(os.Args[2], os.Args[3], os.Args[4])
+	case "prep-circuit-prod":
+		if len(os.Args) != 4 {
+			usage()
+		}
+		prepCircuitProd(os.Args[2], os.Args[3])
+	case "make-witness-init":
+		if len(os.Args) != 5 {
+			usage()
+		}
+		makeWitnessInit(os.Args[2], os.Args[3], os.Args[4])
 	case "prep-hints":
 		if len(os.Args) != 5 {
 			usage()
@@ -181,6 +192,8 @@ func usage() {
 	fmt.Fprintln(os.Stderr, "  r1cs_solve_plan prep-layer    <build_dir> <witness.json> <out_dir> [layer_id|widest]")
 	fmt.Fprintln(os.Stderr, "  r1cs_solve_plan prep-full     <build_dir> <witness.json> <out_dir>")
 	fmt.Fprintln(os.Stderr, "  r1cs_solve_plan prep-full-prod <build_dir> <witness.json> <out_dir>  (production: hints not pre-baked)")
+	fmt.Fprintln(os.Stderr, "  r1cs_solve_plan prep-circuit-prod <build_dir> <out_dir>  (per-circuit; cacheable)")
+	fmt.Fprintln(os.Stderr, "  r1cs_solve_plan make-witness-init <build_dir> <witness.json> <out_path>  (per-prove; fast)")
 	fmt.Fprintln(os.Stderr, "  r1cs_solve_plan prep-hints    <build_dir> <witness.json> <out_dir>")
 	fmt.Fprintln(os.Stderr, "  r1cs_solve_plan interpret     <build_dir> <solve_plan.bin> <witness.json> <out_wire_values.bin>")
 	fmt.Fprintln(os.Stderr, "  r1cs_solve_plan roundtrip     <build_dir> <witness.json>")
@@ -799,6 +812,419 @@ func prepFull(buildDir, witnessPath, outDir string) {
 	mf.Close()
 	fmt.Fprintf(os.Stderr, "[plan] prep-full done in %s; outDir=%s\n",
 		time.Since(t0), outDir)
+}
+
+// readKey scans simple "key=value" lines and returns the int value
+// of `key`. Returns 0 if not found. (Used by makeWitnessInit fast
+// path to skip the 20s R1CS load.)
+func readKey(text, key string) int {
+	for _, line := range bytes.Split([]byte(text), []byte("\n")) {
+		s := string(line)
+		if i := indexEq(s); i > 0 {
+			if s[:i] == key {
+				var v int
+				fmt.Sscanf(s[i+1:], "%d", &v)
+				return v
+			}
+		}
+	}
+	return 0
+}
+func indexEq(s string) int {
+	for i := 0; i < len(s); i++ {
+		if s[i] == '=' {
+			return i
+		}
+	}
+	return -1
+}
+
+// ---------------- prep-circuit-prod / make-witness-init ----------------
+//
+// prepCircuitProd: per-circuit prep that emits everything the GPU
+// solver needs EXCEPT the per-prove wires_initial.bin. Cacheable
+// alongside the existing PK cache (shipped earlier this session).
+//
+// makeWitnessInit: per-prove fast path that produces wires_initial.bin
+// from a witness JSON. Reads only the R1CS to know nbInputs/nbWires;
+// no Solve, no interpret.
+//
+// Composition with the GPU kernel:
+//   one-time per circuit: prep-circuit-prod  (slow, ~50s, cached)
+//   per prove:            make-witness-init  (~ms, just bytes)
+//                       + GPU kernel run     (~1.1s on 5090)
+
+func prepCircuitProd(buildDir, outDir string) {
+	r := loadR1CS(buildDir)
+	if err := os.MkdirAll(outDir, 0o755); err != nil {
+		fail("mkdir out: %v", err)
+	}
+
+	t0 := time.Now()
+	emitProdCircuit(r, outDir)
+	// Also write a copy of the meta into buildDir so the per-prove
+	// make-witness-init fast path can find it without ever having to
+	// load the R1CS again.
+	src, err := os.ReadFile(outDir + "/circuit_meta.txt")
+	if err == nil {
+		_ = os.WriteFile(buildDir+"/_circuit_meta.txt", src, 0o644)
+	}
+	fmt.Fprintf(os.Stderr, "[plan] prep-circuit-prod done in %s; outDir=%s\n",
+		time.Since(t0), outDir)
+}
+
+// emitProdCircuit emits everything in the prod-prep layout that does
+// NOT depend on the witness: coeffs.bin, layers.idx, layers_descs.bin,
+// layers_terms.bin, hints.idx, layers_hints.bin, hint_in_les.bin,
+// circuit_meta.txt. wires_initial.bin and wires_expected.bin are NOT
+// written here.
+func emitProdCircuit(r *cs.R1CS, outDir string) {
+	nbWires := r.NbInternalVariables + r.GetNbPublicVariables() + r.GetNbSecretVariables()
+	wireDepth := make([]int32, nbWires)
+	for i := range wireDepth {
+		wireDepth[i] = -1
+	}
+	nbInputs := r.GetNbPublicVariables() + r.GetNbSecretVariables()
+	for i := 0; i < nbInputs; i++ {
+		wireDepth[i] = 0
+	}
+	hintBpID, hintFound := findHintBlueprint(r)
+	hintBP, _ := r.Blueprints[hintBpID].(constraint.BlueprintHint)
+	var hm constraint.HintMapping
+
+	type r1cMeta struct {
+		layer int32
+		L, R, O constraint.LinearExpression
+		loc uint8
+		outCoeffID uint32
+		outWireID  uint32
+	}
+
+	nbInstr := r.GetNbInstructions()
+	allR1Cs := make([]*r1cMeta, 0, nbInstr)
+	allHints := make([]*hintMeta, 0)
+	hintOutputWires := make(map[uint32]bool)
+	r1cOutputWires := make(map[uint32]bool)
+
+	solved := make([]bool, nbWires)
+	for i := 0; i < nbInputs; i++ {
+		solved[i] = true
+	}
+	maxLayer := int32(0)
+	unmappedKinds := map[string]int{}
+
+	for i := 0; i < nbInstr; i++ {
+		pi := r.Instructions[i]
+		inst := pi.Unpack(&r.System)
+		var d int32 = 0
+		processVID := func(vid uint32) {
+			if int(vid) >= len(wireDepth) || wireDepth[vid] < 0 {
+				return
+			}
+			if wireDepth[vid] > d {
+				d = wireDepth[vid]
+			}
+		}
+		if hintFound && pi.BlueprintID == hintBpID {
+			hm.Inputs = hm.Inputs[:0]
+			hintBP.DecompressHint(&hm, inst)
+			for _, le := range hm.Inputs {
+				for _, t := range le {
+					if !t.IsConstant() {
+						processVID(uint32(t.WireID()))
+					}
+				}
+			}
+			thisDepth := d + 1
+			for w := hm.OutputRange.Start; w < hm.OutputRange.End; w++ {
+				if int(w) < len(wireDepth) {
+					wireDepth[w] = thisDepth
+					solved[w] = true
+					hintOutputWires[w] = true
+				}
+			}
+			if thisDepth > maxLayer {
+				maxLayer = thisDepth
+			}
+			name := r.MHintsDependencies[hm.HintID]
+			kind, ok := hintNameToKind[name]
+			if !ok {
+				unmappedKinds[name]++
+				kind = 255
+			}
+			cpInputs := make([]constraint.LinearExpression, len(hm.Inputs))
+			for j, le := range hm.Inputs {
+				cpInputs[j] = append(constraint.LinearExpression{}, le...)
+			}
+			allHints = append(allHints, &hintMeta{
+				layer:    thisDepth,
+				kind:     kind,
+				inputs:   cpInputs,
+				outStart: hm.OutputRange.Start,
+				outEnd:   hm.OutputRange.End,
+			})
+			continue
+		}
+		bp := r.Blueprints[pi.BlueprintID]
+		r1c, _ := bp.(constraint.BlueprintR1C)
+		var c constraint.R1C
+		r1c.DecompressR1C(&c, inst)
+		var newWire int32 = -1
+		var loc uint8 = 0
+		var outCoeff uint32 = 0
+		processLE := func(le constraint.LinearExpression, locCandidate uint8) {
+			for _, t := range le {
+				vid := int32(t.WireID())
+				if vid < 0 || t.IsConstant() || int(vid) >= len(wireDepth) {
+					continue
+				}
+				if !solved[vid] {
+					if loc != 0 {
+						continue
+					}
+					loc = locCandidate
+					newWire = vid
+					outCoeff = uint32(t.CoeffID())
+				} else if wireDepth[vid] > d {
+					d = wireDepth[vid]
+				}
+			}
+		}
+		processLE(c.L, 1)
+		processLE(c.R, 2)
+		processLE(c.O, 3)
+		thisDepth := d + 1
+		if newWire >= 0 {
+			wireDepth[newWire] = thisDepth
+			solved[newWire] = true
+			r1cOutputWires[uint32(newWire)] = true
+		}
+		if thisDepth > maxLayer {
+			maxLayer = thisDepth
+		}
+		m := &r1cMeta{
+			layer:      thisDepth,
+			L:          append(constraint.LinearExpression{}, c.L...),
+			R:          append(constraint.LinearExpression{}, c.R...),
+			O:          append(constraint.LinearExpression{}, c.O...),
+			loc:        loc,
+			outCoeffID: outCoeff,
+		}
+		if newWire >= 0 {
+			m.outWireID = uint32(newWire)
+		}
+		allR1Cs = append(allR1Cs, m)
+	}
+	if len(unmappedKinds) > 0 {
+		for n, c := range unmappedKinds {
+			fmt.Fprintf(os.Stderr, "[plan] WARNING: unmapped hint kind %q (%d calls)\n", n, c)
+		}
+		fail("unmapped hint kinds present; add to hintNameToKind")
+	}
+
+	nbLayers := int(maxLayer) + 1
+	fmt.Fprintf(os.Stderr,
+		"[plan] %d layers; %d hint-output wires; %d R1C-output wires; %d hint calls\n",
+		nbLayers, len(hintOutputWires), len(r1cOutputWires), len(allHints))
+
+	byLayer := make([][]*r1cMeta, nbLayers)
+	for _, m := range allR1Cs {
+		byLayer[m.layer] = append(byLayer[m.layer], m)
+	}
+	hintsByLayer := make([][]*hintMeta, nbLayers)
+	for _, h := range allHints {
+		hintsByLayer[h.layer] = append(hintsByLayer[h.layer], h)
+	}
+
+	// Coefficients
+	{
+		f, _ := os.Create(outDir + "/coeffs.bin")
+		bw := bufio.NewWriterSize(f, 1<<20)
+		var buf [32]byte
+		for i := range r.Coefficients {
+			for limb := 0; limb < 4; limb++ {
+				binary.LittleEndian.PutUint64(buf[limb*8:], r.Coefficients[i][limb])
+			}
+			bw.Write(buf[:])
+		}
+		bw.Flush()
+		f.Close()
+	}
+
+	// Per-layer R1C descs + terms
+	df, _ := os.Create(outDir + "/layers_descs.bin")
+	dbw := bufio.NewWriterSize(df, 1<<20)
+	tf, _ := os.Create(outDir + "/layers_terms.bin")
+	tbw := bufio.NewWriterSize(tf, 1<<20)
+	idxF, _ := os.Create(outDir + "/layers.idx")
+	ibw := bufio.NewWriterSize(idxF, 1<<20)
+	mustU32(ibw, uint32(nbLayers))
+
+	var totalDescs uint64 = 0
+	var totalTerms uint64 = 0
+	for _, ms := range byLayer {
+		mustU32(ibw, uint32(len(ms)))
+		mustU64(ibw, totalDescs)
+		mustU64(ibw, totalTerms)
+		for _, m := range ms {
+			lOff := uint32(totalTerms)
+			lCnt := uint32(len(m.L))
+			for _, t := range m.L {
+				mustU32(tbw, uint32(t.CoeffID()))
+				mustU32(tbw, uint32(t.WireID()))
+			}
+			totalTerms += uint64(lCnt)
+			rOff := uint32(totalTerms)
+			rCnt := uint32(len(m.R))
+			for _, t := range m.R {
+				mustU32(tbw, uint32(t.CoeffID()))
+				mustU32(tbw, uint32(t.WireID()))
+			}
+			totalTerms += uint64(rCnt)
+			oOff := uint32(totalTerms)
+			oCnt := uint32(len(m.O))
+			for _, t := range m.O {
+				mustU32(tbw, uint32(t.CoeffID()))
+				mustU32(tbw, uint32(t.WireID()))
+			}
+			totalTerms += uint64(oCnt)
+			mustU32(dbw, lOff); mustU32(dbw, lCnt)
+			mustU32(dbw, rOff); mustU32(dbw, rCnt)
+			mustU32(dbw, oOff); mustU32(dbw, oCnt)
+			mustU32(dbw, m.outCoeffID)
+			mustU32(dbw, m.outWireID)
+			must1(dbw.WriteByte(m.loc))
+			must1(dbw.WriteByte(0)); must1(dbw.WriteByte(0)); must1(dbw.WriteByte(0))
+		}
+		totalDescs += uint64(len(ms))
+	}
+	dbw.Flush(); df.Close()
+	tbw.Flush(); tf.Close()
+	ibw.Flush(); idxF.Close()
+
+	// Per-layer hint stream
+	hxF, _ := os.Create(outDir + "/hints.idx")
+	hxBw := bufio.NewWriterSize(hxF, 1<<20)
+	mustU32(hxBw, uint32(nbLayers))
+	chF, _ := os.Create(outDir + "/layers_hints.bin")
+	chBw := bufio.NewWriterSize(chF, 1<<20)
+	leF, _ := os.Create(outDir + "/hint_in_les.bin")
+	leBw := bufio.NewWriterSize(leF, 1<<20)
+
+	var totalCalls uint64 = 0
+	var totalLEs uint32 = 0
+	for _, hs := range hintsByLayer {
+		mustU32(hxBw, uint32(len(hs)))
+		mustU64(hxBw, totalCalls)
+		for _, h := range hs {
+			must1(chBw.WriteByte(h.kind))
+			must1(chBw.WriteByte(0)); must1(chBw.WriteByte(0)); must1(chBw.WriteByte(0))
+			mustU32(chBw, uint32(len(h.inputs)))
+			mustU32(chBw, h.outEnd-h.outStart)
+			mustU32(chBw, totalLEs)
+			mustU32(chBw, h.outStart)
+			for _, le := range h.inputs {
+				mustU32(leBw, uint32(len(le)))
+				for _, t := range le {
+					mustU32(leBw, uint32(t.CoeffID()))
+					mustU32(leBw, uint32(t.WireID()))
+				}
+				totalLEs++
+			}
+		}
+		totalCalls += uint64(len(hs))
+	}
+	hxBw.Flush(); hxF.Close()
+	chBw.Flush(); chF.Close()
+	leBw.Flush(); leF.Close()
+
+	mf, _ := os.Create(outDir + "/circuit_meta.txt")
+	fmt.Fprintf(mf, "n_wires=%d\n", nbWires)
+	fmt.Fprintf(mf, "n_inputs=%d\n", nbInputs)
+	fmt.Fprintf(mf, "n_coefficients=%d\n", len(r.Coefficients))
+	fmt.Fprintf(mf, "n_layers=%d\n", nbLayers)
+	fmt.Fprintf(mf, "n_descs=%d\n", totalDescs)
+	fmt.Fprintf(mf, "n_terms=%d\n", totalTerms)
+	fmt.Fprintf(mf, "n_hint_calls=%d\n", totalCalls)
+	fmt.Fprintf(mf, "n_hint_input_les=%d\n", totalLEs)
+	fmt.Fprintf(mf, "production=true\n")
+	mf.Close()
+	fmt.Fprintf(os.Stderr,
+		"[plan] %d total descs across %d layers, %d total terms; %d hint calls, %d input LEs\n",
+		totalDescs, nbLayers, totalTerms, totalCalls, totalLEs)
+}
+
+// makeWitnessInit produces a wires_initial.bin file from a witness JSON.
+// Layout matches what `prep-full-prod` emits in production mode:
+//   wires[0] = ONE = 1 (BN254 Fr Montgomery form)
+//   wires[1..nbInputs] = witness public + secret in Mont form
+//   wires[nbInputs..] = zero (GPU kernel will fill these)
+//
+// PRODUCTION FAST PATH: reads `circuit_meta.txt` at <build_dir>/_circuit_meta.txt
+// (or alongside) for nbWires/nbInputs to skip the 20-second R1CS load.
+// Falls back to loadR1CS if the meta file is absent.
+func makeWitnessInit(buildDir, witnessPath, outPath string) {
+	t0 := time.Now()
+	// Set CONSTRAINTS_JSON env so NewCircuit can parse the witness.
+	os.Setenv("CONSTRAINTS_JSON", buildDir+"/constraints.json")
+	os.Setenv("GROTH16", "1")
+
+	// Try fast path: read circuit_meta.txt if it sits alongside.
+	// Path priority: <build_dir>/_circuit_meta.txt → <build_dir>/circuit_meta.txt → fallback.
+	var nbWires, nbInputs int
+	tryMeta := func(p string) bool {
+		b, err := os.ReadFile(p)
+		if err != nil {
+			return false
+		}
+		nbWires = readKey(string(b), "n_wires")
+		nbInputs = readKey(string(b), "n_inputs")
+		return nbWires > 0 && nbInputs > 0
+	}
+	if !tryMeta(buildDir+"/_circuit_meta.txt") &&
+		!tryMeta(buildDir+"/circuit_meta.txt") {
+		fmt.Fprintf(os.Stderr, "[plan] no circuit_meta.txt found; loading R1CS for sizes\n")
+		r := loadR1CS(buildDir)
+		nbWires = r.NbInternalVariables + r.GetNbPublicVariables() + r.GetNbSecretVariables()
+		nbInputs = r.GetNbPublicVariables() + r.GetNbSecretVariables()
+	}
+
+	witnessVec := loadWitnessAsFrVector(witnessPath)
+	expectedSize := nbInputs - 1 // ONE wire is implicit
+	if len(witnessVec) != expectedSize {
+		fail("witness size %d != expected %d", len(witnessVec), expectedSize)
+	}
+
+	f, err := os.Create(outPath)
+	if err != nil {
+		fail("create %s: %v", outPath, err)
+	}
+	bw := bufio.NewWriterSize(f, 1<<20)
+	var buf [32]byte
+	// wire 0: ONE
+	var one fr.Element
+	one.SetOne()
+	for limb := 0; limb < 4; limb++ {
+		binary.LittleEndian.PutUint64(buf[limb*8:], one[limb])
+	}
+	bw.Write(buf[:])
+	// wires 1..nbInputs: witness inputs in declaration order
+	for i := 0; i < expectedSize; i++ {
+		for limb := 0; limb < 4; limb++ {
+			binary.LittleEndian.PutUint64(buf[limb*8:], witnessVec[i][limb])
+		}
+		bw.Write(buf[:])
+	}
+	// remaining wires: zero
+	var zero [32]byte
+	for i := nbInputs; i < nbWires; i++ {
+		bw.Write(zero[:])
+	}
+	bw.Flush()
+	f.Close()
+	fmt.Fprintf(os.Stderr,
+		"[plan] make-witness-init: wrote %d wires (%d initial + %d zero) in %s; outPath=%s\n",
+		nbWires, nbInputs, nbWires-nbInputs, time.Since(t0), outPath)
 }
 
 // ---------------- prep-full-prod ----------------
