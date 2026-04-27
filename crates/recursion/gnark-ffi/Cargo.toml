@@ -52,6 +52,10 @@ required-features = ["native"]
 name = "bench_plonk"
 required-features = ["native", "cuda"]
 
+[[example]]
+name = "bench_phase11"
+required-features = ["native", "cuda"]
+
 # Subprocess helper invoked by sp1-prover's recursion task to run the GPU
 # Groth16 final wrap in a clean child process. Necessary because the parent
 # process holds persistent HIP/CUDA contexts from the shard prover that
