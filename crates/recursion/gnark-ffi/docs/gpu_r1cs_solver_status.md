@@ -140,25 +140,113 @@ session (assumes hardware iteration on 7900 XTX is available):
      was wrong and the project bottleneck is field arithmetic, not
      dispatch.
 
-## Phase 3 — hint kernels   □ NOT STARTED
+## Phase 3 — hint kernels   ✓ COMPLETE (HIP, all 6 kinds PASS)
 
-Per Phase 0 finding, only 6 kinds:
-- `bits.nBits` — bit decomposition (1→30 wires per call avg)
-- `koalabear.SplitLimbsHint` — limb split (1→2)
-- `solver.InvZeroHint` — BN254 Fr modular inverse (2→1)
-- `koalabear.ReduceHint` — KoalaBear range reduction (6→2)
-- `koalabear.InvFHint` — KoalaBear modular inverse (5→1)
-- `koalabear.InvEHint` — KoalaBear extension inverse (4→4)
+Standalone HIP kernels in
+`crates/recursion/gnark-ffi/r1cs_solver_proto/hint_kernels.cu`.
+Differential test against gnark CPU outputs (captured via
+`r1cs_solve_plan prep-hints` which overrides each registered hint to
+record (inputs, outputs) per call from a real Solve).
 
-All trivial GPU-wise. Existing `bn254_t.cuh::inv()` (Fermat-based)
-covers `InvZeroHint`. The KoalaBear ones need a `kb31_t::inv()` and
-extension-field inverse.
+Results on 7900 XTX, all 453,141 hint calls from one solve:
 
-## Phase 4 — wire kernel + hints into layered dispatcher   □ NOT STARTED
+| Kind | Calls | Kernel time | Result |
+|---|---:|---:|---|
+| `bits.nBits` | 227,113 | 1.09 ms | ✓ PASS |
+| `solver.InvZeroHint` | 86,199 | 5.63 ms | ✓ PASS |
+| `koalabear.SplitLimbs` | 86,199 | 0.05 ms | ✓ PASS |
+| `koalabear.ReduceHint` | 51,528 | 0.04 ms | ✓ PASS |
+| `koalabear.InvFHint` | 1,974 | 0.04 ms | ✓ PASS |
+| `koalabear.InvEHint` | 128 | 0.05 ms | ✓ PASS |
+| **Total** | **453,141** | **~7 ms** | **PASS** |
 
-## Phase 5 — CUDA Graphs / HIP Graphs   □ NOT STARTED
+Implementation notes worth carrying forward:
+- `InvF` initially failed because I took only the low 64 bits of the
+  Fr input before `mod KB_P`. Inputs are full 256-bit values; need
+  `divrem_256_by_u32` (mirrors gnark's `big.Int.Mod()`).
+- `InvZeroHint` uses `bn254_t::inv()` (Fermat) — per-thread safe,
+  unlike sppark's warp-cooperative `mont_t::reciprocal()`.
+- `InvE` uses tower-field arithmetic; CUDA port would mirror the
+  same code with `kb_*` helpers (already pure C, no warp ops).
+- All kernels take **pre-evaluated** Fr inputs, not raw LE terms.
+  Integrating into the layered solver requires an LE-eval prologue
+  per kernel (or one shared input-eval kernel per layer).
 
-## Phase 6 — production rollout   □ NOT STARTED
+## Phase 4 — full layered solve   ✓ COMPLETE (with pre-baked hints)
+
+The Phase 4 prototype runs the GPU constraint solve layer-by-layer
+on all 3 GPUs and produces wire vectors byte-for-byte identical to
+gnark. **Hints are pre-baked into `wires_initial.bin` by the Go
+side** (running gnark Solve once); the GPU only computes R1C-defined
+wires.
+
+Best results: 5090 + CUDA Graphs at **2722 ms** (vs 5400 ms CPU).
+
+## Phase 5 — Graphs + dispatch optimization   ✓ COMPLETE
+
+CUDA Graphs save ~50–450 ms on 4090/5090; HIP Graphs do not help on
+RDNA3 (instantiate at 135 K nodes segfaults; partial graphs show no
+per-launch shrink). Empirical raw launch overhead on 7900 XTX is
+~3 µs/launch, but per-layer cost is ~22 µs because each layer must
+finish before the next starts (sequential dependency).
+
+## Phase 6 — production rollout   □ BLOCKED on architectural decision
+
+**The Phase 4 measurement is misleading for production.** It assumes
+hints are pre-resolved in `wires_initial.bin`, which the Go test
+generates by running gnark Solve. In production, we don't have that
+luxury — we'd need to either:
+
+1. **Run hints on GPU layer-by-layer** alongside constraints. The
+   hint kernels exist (Phase 3) and are fast (~7 ms total kernel
+   time), but adding a per-layer hint launch on top of the constraint
+   launch doubles dispatch overhead from 135 K to 270 K launches —
+   measured at 745 ms vs 425 ms for empty kernels, so the GPU-side
+   wall increase is bounded but the per-layer SYNC cost stays.
+2. **Run hints on CPU between GPU layers**. Each round-trip costs
+   ~50 µs CPU↔GPU sync × 135 K layers = 6.7 s — net regression.
+3. **Run gnark Solve in parallel with GPU prep**, take whichever
+   finishes — bounded below by 5400 ms gnark Solve time. No win.
+
+The path that breaks this is a **cooperative-grid persistent kernel**
+(one `cudaLaunchCooperativeKernel` that processes ALL layers
+serially in-kernel via grid sync). Per-layer overhead drops to
+~1–5 µs of grid sync. Compute upper-bound is ~50–200 ms. This would
+unlock the 1-second projection from the spike — but cooperative
+kernels require careful design (limited block count = limited
+parallelism for wide layers; needs persistent block scheduling) and
+HIP support varies.
+
+### Recommendation
+
+Three concrete paths the team can pick from:
+
+| Path | Effort | Per-prove savings | Risk |
+|---|---|---|---|
+| **(a) Ship hybrid**: GPU wide layers (50 ms compute), CPU tail | ~3-5 days | ~2 s (5400 → 3400 ms) | low |
+| **(b) Cooperative-kernel full GPU** | 2-3 weeks | ~3.5-4 s (5400 → 1500 ms) | medium-high — needs careful design + per-arch validation |
+| **(c) Skip — focus elsewhere** | 0 | 0 | accept the 50% CPU floor |
+
+**The prototype + Phase 3 hint kernels validate that all the
+underlying primitives work**; the question is whether the
+orchestration cost is worth the engineering investment. The PK cache
+already shipped (~50 s on iter 2+ proves) is the bigger lever for
+less work.
+
+### Files this work touched (all under `crates/recursion/gnark-ffi/`):
+
+- `go/sp1/r1cs_hint_census/main.go` — Phase 0 census tool
+- `go/sp1/r1cs_solve_plan/main.go` — emitter + interpreter +
+  prep-full + prep-hints + roundtrip tests
+- `r1cs_solver_proto/eval_constraints.cu` — single-layer kernel
+- `r1cs_solver_proto/full_solve.cu` — naive layered HIP solve
+- `r1cs_solver_proto/full_solve_graph.cu` — HIP Graphs (negative)
+- `r1cs_solver_proto/full_solve_hybrid.cu` — persistent-kernel
+  small-layer batching
+- `r1cs_solver_proto/full_solve_cuda.cu` — naive + CUDA Graphs
+- `r1cs_solver_proto/hint_kernels.cu` — all 6 hint kernels
+- `docs/gpu_r1cs_solver_plan.md` — original implementation plan
+- `docs/gpu_r1cs_solver_status.md` — this status doc
 
 ---
 
