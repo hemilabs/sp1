@@ -96,8 +96,11 @@ fn try_release_parent_gpu_memory() -> bool {
         ("libamdhip64.so.6", "hipDeviceReset"),
         ("libamdhip64.so.5", "hipDeviceReset"),
     ];
-    let groups: [&[(&str, &str)]; 2] =
-        if cuda_first { [cuda_candidates, hip_candidates] } else { [hip_candidates, cuda_candidates] };
+    let groups: [&[(&str, &str)]; 2] = if cuda_first {
+        [cuda_candidates, hip_candidates]
+    } else {
+        [hip_candidates, cuda_candidates]
+    };
 
     for group in groups {
         for (libname, fname) in group {
@@ -111,12 +114,7 @@ fn try_release_parent_gpu_memory() -> bool {
             let Ok(reset_fn) = sym else { continue };
             // SAFETY: signature matches; calling once with no args.
             let rc = unsafe { reset_fn() };
-            tracing::info!(
-                "Released parent GPU memory via {}::{} (rc={})",
-                libname,
-                fname,
-                rc
-            );
+            tracing::info!("Released parent GPU memory via {}::{} (rc={})", libname, fname, rc);
             return true;
         }
     }
@@ -206,10 +204,7 @@ fn resolve_gpu_dir(vkey_hash_hex: &str) -> ResolvedGpuDir {
             }
         } else {
             if cdir.exists() {
-                tracing::warn!(
-                    "Removing partial PK cache at {} (no sentinel)",
-                    cdir.display()
-                );
+                tracing::warn!("Removing partial PK cache at {} (no sentinel)", cdir.display());
                 let _ = std::fs::remove_dir_all(&cdir);
             }
             std::fs::create_dir_all(&cdir).expect("create PK cache dir");
@@ -223,12 +218,7 @@ fn resolve_gpu_dir(vkey_hash_hex: &str) -> ResolvedGpuDir {
     } else {
         let td = shm_tempdir();
         let path = td.path().to_path_buf();
-        ResolvedGpuDir {
-            path,
-            cache_hit: false,
-            cache_dir: None,
-            _per_prove_tempdir: Some(td),
-        }
+        ResolvedGpuDir { path, cache_hit: false, cache_dir: None, _per_prove_tempdir: Some(td) }
     }
 }
 
@@ -263,6 +253,194 @@ fn resolve_helper_path(name: &str) -> std::path::PathBuf {
         }
     }
     std::path::PathBuf::from(name)
+}
+
+/// Locate the `r1cs_solve_plan` Go binary used by the GPU R1CS solver path
+/// (Phase 11). Priority:
+///   1. `SP1_R1CS_SOLVE_PLAN` env var (absolute path)
+///   2. Alongside the current executable
+///   3. `$PATH` lookup
+///
+/// Returns the path candidate; the caller decides whether to require it.
+#[cfg(feature = "native")]
+fn resolve_r1cs_solve_plan_path() -> std::path::PathBuf {
+    if let Ok(p) = std::env::var("SP1_R1CS_SOLVE_PLAN") {
+        return std::path::PathBuf::from(p);
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let candidate = dir.join("r1cs_solve_plan");
+            if candidate.exists() {
+                return candidate;
+            }
+        }
+    }
+    std::path::PathBuf::from("r1cs_solve_plan")
+}
+
+/// Cache directory for `r1cs_solve_plan prep-circuit-prod` artifacts (used
+/// by the GPU R1CS solver). One directory per circuit (keyed by vkey hash).
+/// Layout under `/dev/shm` (or `$SP1_GPU_R1CS_PREP_CACHE`):
+///   sp1_groth16_prep_circuit_<vkey_hash_hex>/
+///     coeffs.bin, layers.idx, layers_descs.bin, layers_terms.bin,
+///     hints.idx, layers_hints.bin, hint_in_les.bin, desc_decl_idx.bin,
+///     circuit_meta.txt
+///     .sp1_prep_circuit_complete  ← sentinel
+#[cfg(feature = "native")]
+fn prep_circuit_cache_dir(vkey_hash_hex: &str) -> Option<std::path::PathBuf> {
+    if std::env::var_os("SP1_GPU_R1CS_PREP_CACHE_DISABLE").is_some() {
+        return None;
+    }
+    let root = std::env::var("SP1_GPU_R1CS_PREP_CACHE").ok().unwrap_or_else(|| {
+        if std::path::Path::new("/dev/shm").exists() {
+            "/dev/shm".to_string()
+        } else {
+            std::env::temp_dir().to_string_lossy().into_owned()
+        }
+    });
+    Some(std::path::PathBuf::from(root).join(format!("sp1_groth16_prep_circuit_{vkey_hash_hex}")))
+}
+
+#[cfg(feature = "native")]
+const PREP_CIRCUIT_SENTINEL: &str = ".sp1_prep_circuit_complete";
+
+/// Resolved prep-circuit-dir for the GPU R1CS path. Mirror of
+/// `ResolvedGpuDir` but for the prep-circuit-prod artifacts.
+#[cfg(feature = "native")]
+struct ResolvedPrepCircuitDir {
+    path: std::path::PathBuf,
+    cache_hit: bool,
+    cache_dir: Option<std::path::PathBuf>,
+    _per_prove_tempdir: Option<tempfile::TempDir>,
+}
+
+/// Resolve the prep-circuit-dir, applying the per-vk cache. On hit: returns
+/// the stable cache path. On miss: creates the directory and the caller MUST
+/// run `r1cs_solve_plan prep-circuit-prod` then call `mark_prep_circuit_complete`.
+#[cfg(feature = "native")]
+fn resolve_prep_circuit_dir(vkey_hash_hex: &str) -> ResolvedPrepCircuitDir {
+    let cache_dir = prep_circuit_cache_dir(vkey_hash_hex);
+    if let Some(cdir) = cache_dir {
+        let sentinel = cdir.join(PREP_CIRCUIT_SENTINEL);
+        if sentinel.exists() {
+            tracing::info!(
+                "Using cached GPU R1CS prep-circuit-dir at {} (sentinel present)",
+                cdir.display()
+            );
+            ResolvedPrepCircuitDir {
+                path: cdir.clone(),
+                cache_hit: true,
+                cache_dir: Some(cdir),
+                _per_prove_tempdir: None,
+            }
+        } else {
+            if cdir.exists() {
+                tracing::warn!(
+                    "Removing partial prep-circuit cache at {} (no sentinel)",
+                    cdir.display()
+                );
+                let _ = std::fs::remove_dir_all(&cdir);
+            }
+            std::fs::create_dir_all(&cdir).expect("create prep-circuit cache dir");
+            ResolvedPrepCircuitDir {
+                path: cdir.clone(),
+                cache_hit: false,
+                cache_dir: Some(cdir),
+                _per_prove_tempdir: None,
+            }
+        }
+    } else {
+        let td = shm_tempdir();
+        let path = td.path().to_path_buf();
+        ResolvedPrepCircuitDir {
+            path,
+            cache_hit: false,
+            cache_dir: None,
+            _per_prove_tempdir: Some(td),
+        }
+    }
+}
+
+#[cfg(feature = "native")]
+fn mark_prep_circuit_complete(resolved: &ResolvedPrepCircuitDir) {
+    if let Some(ref cdir) = resolved.cache_dir {
+        if let Err(e) = std::fs::write(cdir.join(PREP_CIRCUIT_SENTINEL), b"ok\n") {
+            tracing::warn!("failed to write prep-circuit cache sentinel: {e}");
+        }
+    }
+}
+
+/// Materialize the prep-circuit-prod artifacts for `build_dir` into the
+/// cache and produce the per-prove `wires_initial.bin`. Returns `Some(prep_dir,
+/// wires_initial_path)` when the GPU R1CS solver path is ready to be used,
+/// or `None` if anything failed (caller falls back to gnark.Solve).
+#[cfg(feature = "native")]
+fn try_prepare_gpu_r1cs_inputs(
+    build_dir: &Path,
+    vkey_hash_hex: &str,
+    witness_path: &Path,
+) -> Option<(std::path::PathBuf, tempfile::NamedTempFile)> {
+    let r1cs_bin = resolve_r1cs_solve_plan_path();
+
+    let prep_resolved = resolve_prep_circuit_dir(vkey_hash_hex);
+    if !prep_resolved.cache_hit {
+        tracing::info!(
+            "Running r1cs_solve_plan prep-circuit-prod (cache miss) for {}...",
+            prep_resolved.path.display()
+        );
+        let t0 = std::time::Instant::now();
+        let status = std::process::Command::new(&r1cs_bin)
+            .arg("prep-circuit-prod")
+            .arg(build_dir)
+            .arg(&prep_resolved.path)
+            .status();
+        match status {
+            Ok(s) if s.success() => {
+                tracing::info!("prep-circuit-prod completed in {:?}", t0.elapsed());
+                mark_prep_circuit_complete(&prep_resolved);
+            }
+            Ok(s) => {
+                tracing::warn!(
+                    "prep-circuit-prod failed (exit {s:?}) using {}; falling back to gnark.Solve",
+                    r1cs_bin.display()
+                );
+                return None;
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "failed to spawn r1cs_solve_plan {}: {e}; falling back to gnark.Solve. \
+                     Set SP1_R1CS_SOLVE_PLAN to the binary path or place it next to the current \
+                     executable.",
+                    r1cs_bin.display()
+                );
+                return None;
+            }
+        }
+    }
+
+    let wires_init = shm_named_tempfile();
+    tracing::info!("Running r1cs_solve_plan make-witness-init...");
+    let t0 = std::time::Instant::now();
+    let status = std::process::Command::new(&r1cs_bin)
+        .arg("make-witness-init")
+        .arg(build_dir)
+        .arg(witness_path)
+        .arg(wires_init.path())
+        .status();
+    match status {
+        Ok(s) if s.success() => {
+            tracing::info!("make-witness-init completed in {:?}", t0.elapsed());
+            Some((prep_resolved.path, wires_init))
+        }
+        Ok(s) => {
+            tracing::warn!("make-witness-init failed (exit {s:?}); falling back to gnark.Solve");
+            None
+        }
+        Err(e) => {
+            tracing::warn!("failed to spawn r1cs_solve_plan: {e}; falling back to gnark.Solve");
+            None
+        }
+    }
 }
 
 /// A prover that can generate proofs with the Groth16 protocol using bindings to Gnark.
@@ -467,12 +645,32 @@ impl Groth16Bn254Prover {
             mark_cache_complete(&resolved);
         }
 
-        tracing::info!("Solving R1CS and exporting witness...");
-        export_groth16_gpu_witness(
-            build_dir_str,
-            witness_file.path().to_str().unwrap(),
-            gpu_dir_str,
+        // Step 2.5 (Phase 11): if the in-process GPU R1CS solver is enabled,
+        // skip gnark.Solve and prepare prep-circuit-prod cache + per-prove
+        // wires_initial.bin. CUDA-only — HIP backend always falls back to
+        // gnark.Solve since the Phase 7 kernel hangs on RDNA3.
+        let backend_is_cuda = matches!(
+            std::env::var("SP1_GPU_BACKEND").ok().as_deref(),
+            Some("cuda") | Some("nvidia")
         );
+        let want_gpu_r1cs =
+            std::env::var("SP1_GPU_R1CS_SOLVER").as_deref() == Ok("gpu") && backend_is_cuda;
+        let gpu_r1cs_inputs = if want_gpu_r1cs {
+            try_prepare_gpu_r1cs_inputs(build_dir, &vkey_hash_hex, witness_file.path())
+        } else {
+            None
+        };
+
+        if gpu_r1cs_inputs.is_none() {
+            tracing::info!("Solving R1CS and exporting witness (gnark.Solve)...");
+            export_groth16_gpu_witness(
+                build_dir_str,
+                witness_file.path().to_str().unwrap(),
+                gpu_dir_str,
+            );
+        } else {
+            tracing::info!("Skipping gnark.Solve — using in-process GPU R1CS solver");
+        }
 
         // Step 3: invoke the helper subprocess. Locate it in the same
         // directory as the current executable; fall back to PATH.
@@ -510,13 +708,17 @@ impl Groth16Bn254Prover {
             .arg(&vkey_hash_hex)
             .arg("--out")
             .arg(out_file.path());
+        // Phase 11: when the GPU R1CS solver was prepared above, point the
+        // helper at the prep-circuit cache + the per-prove wires_initial.bin
+        // so it builds witness data in-process instead of disk-loading the
+        // gnark-solved files (which we did not write in this branch).
+        if let Some((ref prep_dir, ref wires_init)) = gpu_r1cs_inputs {
+            cmd.arg("--prep-circuit-dir").arg(prep_dir);
+            cmd.arg("--wires-initial").arg(wires_init.path());
+        }
         // CUDA builds need GLV forced off; HIP builds let auto-detect
-        // pick. Detect via the parent's runtime backend env var (the
-        // helper inherits the same SASS / arch as the parent process).
-        let backend_is_cuda = matches!(
-            std::env::var("SP1_GPU_BACKEND").ok().as_deref(),
-            Some("cuda") | Some("nvidia")
-        );
+        // pick. (`backend_is_cuda` was computed above for the GPU R1CS
+        // dispatch.)
         if backend_is_cuda {
             if std::env::var_os("SP1_GPU_GLV").is_none() {
                 cmd.env("SP1_GPU_GLV", "0");
@@ -525,15 +727,14 @@ impl Groth16Bn254Prover {
                 cmd.env("SP1_GPU_G2_GLV", "0");
             }
         }
-        let status = cmd.status()
-            .unwrap_or_else(|e| {
-                panic!(
-                    "failed to spawn GPU Groth16 helper {helper_path:?}: {e}. \
+        let status = cmd.status().unwrap_or_else(|e| {
+            panic!(
+                "failed to spawn GPU Groth16 helper {helper_path:?}: {e}. \
                      Either build the `groth16_gpu_helper` binary (cargo build \
                      --release -p sp1-recursion-gnark-ffi --features native,cuda) \
                      or set SP1_GROTH16_GPU_HELPER to its path."
-                )
-            });
+            )
+        });
         if !status.success() {
             panic!("GPU Groth16 helper exited non-zero: {status:?}");
         }
@@ -620,10 +821,7 @@ mod pk_cache_tests {
         std::fs::remove_file(cache_path.join(PK_CACHE_SENTINEL)).unwrap();
         let r3 = resolve_gpu_dir(key);
         assert!(!r3.cache_hit, "missing sentinel must force a miss");
-        assert!(
-            !r3.path.join("pk_dummy.bin").exists(),
-            "partial cache must have been wiped"
-        );
+        assert!(!r3.path.join("pk_dummy.bin").exists(), "partial cache must have been wiped");
 
         // Cleanup env var so we don't leak into other tests.
         std::env::remove_var("SP1_GROTH16_PK_CACHE");
@@ -641,6 +839,41 @@ mod pk_cache_tests {
         // mark_cache_complete is a no-op when there is no cache_dir.
         mark_cache_complete(&r);
         std::env::remove_var("SP1_GROTH16_PK_CACHE_DISABLE");
+    }
+
+    /// Prep-circuit cache mirrors the PK cache lifecycle: miss → complete →
+    /// hit, plus partial-cache wipe when the sentinel is missing.
+    #[test]
+    fn resolve_prep_circuit_dir_miss_complete_hit() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::env::set_var("SP1_GPU_R1CS_PREP_CACHE", tmp.path());
+        std::env::remove_var("SP1_GPU_R1CS_PREP_CACHE_DISABLE");
+
+        let key = "deadbeef_prep_unit_test";
+
+        let r1 = resolve_prep_circuit_dir(key);
+        assert!(!r1.cache_hit, "first call must be a miss");
+        assert!(r1.path.exists(), "miss path must be a real directory");
+        assert!(
+            !r1.path.join(PREP_CIRCUIT_SENTINEL).exists(),
+            "sentinel must not exist before mark_prep_circuit_complete"
+        );
+        std::fs::write(r1.path.join("coeffs.bin"), b"pretend coeffs").unwrap();
+        mark_prep_circuit_complete(&r1);
+        assert!(r1.path.join(PREP_CIRCUIT_SENTINEL).exists(), "sentinel write failed");
+        let cache_path = r1.path.clone();
+
+        let r2 = resolve_prep_circuit_dir(key);
+        assert!(r2.cache_hit, "second call must be a hit");
+        assert_eq!(r2.path, cache_path);
+        assert!(r2.path.join("coeffs.bin").exists(), "cached file must survive");
+
+        std::fs::remove_file(cache_path.join(PREP_CIRCUIT_SENTINEL)).unwrap();
+        let r3 = resolve_prep_circuit_dir(key);
+        assert!(!r3.cache_hit, "missing sentinel must force a miss");
+        assert!(!r3.path.join("coeffs.bin").exists(), "partial cache must have been wiped");
+
+        std::env::remove_var("SP1_GPU_R1CS_PREP_CACHE");
     }
 }
 
