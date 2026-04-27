@@ -20,6 +20,18 @@
 //!   --out <path>            Where to write the JSON-serialized
 //!                           Groth16Bn254Proof.
 //!
+//! Optional GPU R1CS solver mode (CUDA only — Phase 11):
+//!   --prep-circuit-dir <p>  Directory with prep-circuit-prod artifacts
+//!                           (coeffs.bin, layers_*.bin, hints*.bin, ...).
+//!   --wires-initial <p>     Per-prove wires_initial.bin (n_wires × 32 bytes,
+//!                           Mont form: ONE + witness public + secret + zeros).
+//!   When BOTH are provided, the helper runs the GPU R1CS solver in-process
+//!   instead of loading wire_values/solution_a/b/c from --gpu-dir. This skips
+//!   the parent's gnark.Solve shell-out (~5.4 s on CPU) and produces witness
+//!   data via the Phase 8 cooperative kernel (~1.4 s on RTX 5090). On HIP or
+//!   when the GPU solver fails to initialize, the helper falls back to the
+//!   disk-load path so callers still see correct behavior.
+//!
 //! Exit codes: 0 success, 1 prover failure, 2 file I/O failure, 3 bad CLI.
 
 use std::path::PathBuf;
@@ -38,6 +50,15 @@ struct Args {
     vkey_hash_hex: String,
     #[arg(long)]
     out: PathBuf,
+    /// Optional: directory with prep-circuit-prod artifacts. When set
+    /// together with --wires-initial, the helper runs the in-process
+    /// GPU R1CS solver and skips the disk-loaded witness data.
+    #[arg(long)]
+    prep_circuit_dir: Option<PathBuf>,
+    /// Optional: per-prove wires_initial.bin, sibling input to
+    /// --prep-circuit-dir. Required for the in-process solver path.
+    #[arg(long)]
+    wires_initial: Option<PathBuf>,
 }
 
 // Subset of GnarkWitness (crates/recursion/gnark-ffi/src/witness.rs) —
@@ -63,12 +84,11 @@ fn main() {
             std::process::exit(2);
         });
 
-    eprintln!("[groth16-gpu-helper] loading witness data from {gpu_dir_str}");
-    let witness_data = sp1_gpu_groth16::types::Groth16WitnessData::load(gpu_dir_str)
-        .unwrap_or_else(|e| {
-            eprintln!("[groth16-gpu-helper] failed to load Groth16WitnessData: {e}");
-            std::process::exit(2);
-        });
+    let witness_data = load_witness_data(
+        gpu_dir_str,
+        args.prep_circuit_dir.as_deref(),
+        args.wires_initial.as_deref(),
+    );
 
     eprintln!("[groth16-gpu-helper] reading public inputs from {}", args.witness_json.display());
     let witness_json = std::fs::read_to_string(&args.witness_json).unwrap_or_else(|e| {
@@ -140,4 +160,73 @@ fn main() {
     });
 
     eprintln!("[groth16-gpu-helper] wrote proof to {}", args.out.display());
+}
+
+/// Produce `Groth16WitnessData` either from the in-process GPU R1CS solver
+/// (when `prep_circuit_dir` and `wires_initial` are both provided and the
+/// solver initializes successfully) or from the legacy disk-load path.
+///
+/// On failure of the GPU path we fall back to the disk-load path so the
+/// caller's gnark.Solve-produced wire_values/solution_a/b/c can still be
+/// consumed. This keeps the helper backward-compatible.
+fn load_witness_data(
+    gpu_dir_str: &str,
+    prep_circuit_dir: Option<&std::path::Path>,
+    wires_initial: Option<&std::path::Path>,
+) -> sp1_gpu_groth16::types::Groth16WitnessData {
+    if let (Some(prep), Some(wires)) = (prep_circuit_dir, wires_initial) {
+        match try_gpu_r1cs_solver(prep, wires) {
+            Ok(wd) => {
+                eprintln!("[groth16-gpu-helper] witness produced via in-process GPU R1CS solver");
+                return wd;
+            }
+            Err(e) => {
+                eprintln!(
+                    "[groth16-gpu-helper] WARN: GPU R1CS solver path failed ({e}); \
+                     falling back to disk-load. The parent must have already run \
+                     gnark.Solve and exported wire_values.bin / solution_*.bin into \
+                     --gpu-dir for the fallback to succeed."
+                );
+            }
+        }
+    }
+    eprintln!("[groth16-gpu-helper] loading witness data from {gpu_dir_str}");
+    sp1_gpu_groth16::types::Groth16WitnessData::load(gpu_dir_str).unwrap_or_else(|e| {
+        eprintln!("[groth16-gpu-helper] failed to load Groth16WitnessData: {e}");
+        std::process::exit(2);
+    })
+}
+
+/// Try to produce `Groth16WitnessData` via the in-process GPU R1CS solver.
+/// Available only on CUDA builds; HIP returns an immediate `Err` so the
+/// caller falls back to the disk-load path.
+#[cfg(feature = "cuda")]
+fn try_gpu_r1cs_solver(
+    prep_circuit_dir: &std::path::Path,
+    wires_initial_path: &std::path::Path,
+) -> anyhow::Result<sp1_gpu_groth16::types::Groth16WitnessData> {
+    use sp1_gpu_groth16::r1cs_solver::Groth16R1csSolver;
+
+    let t0 = std::time::Instant::now();
+    let solver = Groth16R1csSolver::new(prep_circuit_dir)?;
+    eprintln!(
+        "[groth16-gpu-helper] r1cs solver init: {:?} ({} wires, {} constraints)",
+        t0.elapsed(),
+        solver.n_wires(),
+        solver.n_constraints()
+    );
+
+    let wires = std::fs::read(wires_initial_path)?;
+    let t1 = std::time::Instant::now();
+    let wd = solver.solve_to_witness_data(&wires)?;
+    eprintln!("[groth16-gpu-helper] r1cs solver solve: {:?}", t1.elapsed());
+    Ok(wd)
+}
+
+#[cfg(not(feature = "cuda"))]
+fn try_gpu_r1cs_solver(
+    _prep_circuit_dir: &std::path::Path,
+    _wires_initial_path: &std::path::Path,
+) -> anyhow::Result<sp1_gpu_groth16::types::Groth16WitnessData> {
+    Err(anyhow::anyhow!("GPU R1CS solver requires the cuda feature"))
 }
