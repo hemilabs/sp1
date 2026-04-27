@@ -75,7 +75,39 @@ by layer for GPU launch.
 - `max width = 1,258,343` instructions in a single layer
 - 82 wide layers (≥10K instructions) cover 4,791,027 / 16.4M (29.2 %)
 
-## Phase 2-B — HIP eval_constraints kernel + Rust loader   □ NOT STARTED
+## Phase 2-B — HIP eval_constraints kernel   ✓ COMPLETE (HIP & CUDA)
+
+Standalone HIP + CUDA prototypes in
+`crates/recursion/gnark-ffi/r1cs_solver_proto/`:
+
+- `eval_constraints.cu` — single-layer test (HIP)
+- `full_solve.cu` — full layered solve (HIP)
+- `full_solve_graph.cu` — HIP Graphs experiment (does not help on RDNA3)
+- `full_solve_hybrid.cu` — small-layer batching with persistent kernel
+- `full_solve_cuda.cu` — CUDA port (4090 + 5090); uses sppark `fr_t`
+  with an in-file Fermat `fr_inv_fermat()` because sppark's
+  `mont_t::reciprocal()` is warp-cooperative and unsafe per-thread
+
+The Go side dumps test data via `r1cs_solve_plan prep-full
+<build_dir> <witness.json> <out_dir>`.
+
+**Cross-GPU results on SP1 100K SHA256 R1CS** (15.96 M descs across
+135 K layers; CPU gnark baseline 5400 ms):
+
+| GPU | Backend | Naive | + Graphs | Upload | Result |
+|---|---|---:|---:|---:|---|
+| RTX 5090 | CUDA | 2790 ms | **2722 ms** | 334 ms | ✓ PASS |
+| RTX 4090 | CUDA | 3301 ms | 2852 ms | 250 ms | ✓ PASS |
+| 7900 XTX | HIP | 3667 ms | n/a | 920 ms | ✓ PASS |
+
+All three produce wire vectors byte-for-byte identical to gnark.
+Best speedup: ~2× on 5090 (5400 ms → 2722 ms). Upload is one-time
+per circuit.
+
+**Phase 5 (CUDA Graphs) finding**: graphs help marginally on CUDA
+(50-450 ms) but do not unlock the bigger speedup the spike hoped
+for, because the sequential layer dependency is the binding
+constraint, not dispatch. RDNA3 graphs do not help at all.
 
 This is where GPU code begins. Concrete next steps for the next
 session (assumes hardware iteration on 7900 XTX is available):
