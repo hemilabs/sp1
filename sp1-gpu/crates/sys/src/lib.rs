@@ -23,6 +23,7 @@ pub mod merkle_tree;
 pub mod mle;
 pub mod msm;
 pub mod plonk;
+pub mod r1cs;
 pub mod reduce;
 pub mod runtime;
 pub mod scan;

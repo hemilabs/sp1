@@ -116,6 +116,7 @@ if(USE_HIP)
     add_subdirectory(lib/zerocheck)
     add_subdirectory(lib/msm)
     add_subdirectory(lib/plonk)
+    add_subdirectory(lib/r1cs)  # CUDA-only at the source-file level (HIP build is a no-op)
 
     # Sppark sources -- compile as HIP (they include cuda2hip.hpp via __HIPCC__ guard)
     add_library(sppark_objs OBJECT
@@ -177,6 +178,7 @@ if(USE_HIP)
         $<TARGET_OBJECTS:zerocheck_objs>
         $<TARGET_OBJECTS:msm_objs>
         $<TARGET_OBJECTS:plonk_objs>
+        $<TARGET_OBJECTS:r1cs_objs>
         $<TARGET_OBJECTS:ntt_bn254_objs>
         $<TARGET_OBJECTS:sppark_objs>
     )
@@ -314,6 +316,7 @@ else()
     add_subdirectory(lib/zerocheck)
     add_subdirectory(lib/msm)
     add_subdirectory(lib/plonk)
+    add_subdirectory(lib/r1cs)
 
     # Sppark sources (external library, kept separate)
     # These are C++ files that need CUDA headers
@@ -344,6 +347,7 @@ else()
         $<TARGET_OBJECTS:zerocheck_objs>
         $<TARGET_OBJECTS:msm_objs>
         $<TARGET_OBJECTS:plonk_objs>
+        $<TARGET_OBJECTS:r1cs_objs>
         $<TARGET_OBJECTS:ntt_bn254_objs>
         $<TARGET_OBJECTS:sppark_objs>
     )
