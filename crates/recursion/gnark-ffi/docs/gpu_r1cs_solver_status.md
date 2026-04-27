@@ -190,7 +190,41 @@ per-launch shrink). Empirical raw launch overhead on 7900 XTX is
 ~3 µs/launch, but per-layer cost is ~22 µs because each layer must
 finish before the next starts (sequential dependency).
 
-## Phase 7 — warp-cooperative LE   ✓ COMPLETE — UNLOCKED
+## Phase 8 — production-realistic with inline hints   ✓ PASS
+
+`r1cs_solver_proto/full_solve_warp_prod.cu` runs the full GPU R1CS
+solve **without any CPU hint pre-baking** — the GPU runs both R1Cs
+AND all 6 hint kinds inline within the cooperative kernel. Plus a
+new Go subcommand `prep-full-prod` emits matching test data.
+
+Results on SP1 100K SHA256 R1CS, **production equivalent**:
+
+| GPU | Solve time | vs CPU 5400 ms | Stability |
+|---|---:|---:|---:|
+| RTX 5090 | **1126 ms** | **4.79×** | ±2 ms (3 runs) |
+| RTX 4090 | **1140 ms** | **4.74×** | ±0 ms (3 runs) |
+| 7900 XTX | (HIP variant deferred) | — | — |
+
+The Phase 7 575 ms was a kernel-speed measurement that ASSUMED hint
+outputs were already in `wires_initial.bin`. Phase 8 adds the hint
+compute back: ~550 ms incremental cost for running all 453 K hint
+calls on GPU. The 1126 ms is the real cost of replacing gnark Solve.
+
+Hint dispatch within the cooperative kernel:
+1. One thread per hint call (n_inputs is small, avg ~1)
+2. grid_sync
+3. One warp per R1C with warp-cooperative LE accumulate
+4. grid_sync
+5. Repeat per layer
+
+Key correctness fix: the canonical→Montgomery conversion in
+`fr_from_u64` and `ReduceHint`'s `q` output uses `ALT_BN128_rRR`
+(R² mod r), not `ALT_BN128_rone` (R mod r). The latter gives
+identity in Mont mul, not the conversion we want.
+
+Commit: `9adcbeb42`.
+
+## Phase 7 — warp-cooperative LE   ✓ COMPLETE — UNLOCKED (kernel speed)
 
 The 17-agent review of the Phase 6 negative finding identified a
 misdiagnosis: the ~22 µs per-layer cost was NOT grid sync (which is
