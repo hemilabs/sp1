@@ -190,7 +190,38 @@ per-launch shrink). Empirical raw launch overhead on 7900 XTX is
 ~3 µs/launch, but per-layer cost is ~22 µs because each layer must
 finish before the next starts (sequential dependency).
 
-## Phase 6 — production rollout   □ BLOCKED — cooperative kernels also do not unlock
+## Phase 7 — warp-cooperative LE   ✓ COMPLETE — UNLOCKED
+
+The 17-agent review of the Phase 6 negative finding identified a
+misdiagnosis: the ~22 µs per-layer cost was NOT grid sync (which is
+~6 µs) but **single-thread Fr arithmetic** on width-1 layers, where
+ONE thread evaluates ~42 LE terms in serial while 6,143 threads idle.
+
+**Fix in `r1cs_solver_proto/full_solve_warp.cu`**:
+- Dispatch one R1C per WARP (32 lanes) instead of per thread
+- Lanes split L+R+O term lists in stride-32, partial sums per accumulator
+- Warp-reduce via `__shfl_xor` on each Montgomery limb
+- Lane 0 finalizes (a*b - c, divide out_coeff, write wire)
+- `bn254_t::inv()` made `__noinline__` to keep cold-path Fermat out of
+  the hot kernel's register footprint
+
+**Results on SP1 100K SHA256 R1CS:**
+
+| GPU | Phase 6 cooperative | Phase 7 warp | Speedup vs CPU 5400 ms |
+|---|---:|---:|---:|
+| RTX 5090 | 2766 ms | **575 ms** | **9.4×** |
+| RTX 4090 | 2722 ms | **594 ms** | **9.1×** |
+| 7900 XTX | 3351 ms | (HIP hangs — deferred) | — |
+
+Both CUDA targets exceed the spike's original ~1 s projection.
+Optimal config: bps=1, blk=256.
+
+The HIP port `full_solve_warp_hip.cu` builds clean but hangs on
+gfx1100; suspect interaction between wave32 `__shfl_xor` lowering to
+`ds_bpermute_b32` (LDS-routed) and the cooperative kernel scheduler.
+RDNA3 GPU was wedged from prior tests during diagnosis. Defer.
+
+## Phase 6 — superseded
 
 **The Phase 4 measurement is misleading for production.** It assumes
 hints are pre-resolved in `wires_initial.bin`, which the Go test
