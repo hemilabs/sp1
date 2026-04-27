@@ -18,13 +18,11 @@
 //!
 //! Skips with a clear message if any prerequisite is missing.
 //!
-//! KNOWN FLAKE: this bench can produce a non-verifying proof on either
-//! path (~1/3 fail rate observed on 5090). The failure is independent of
-//! Phase 11 — both the legacy gnark.Solve path and the GPU R1CS path
-//! fail at similar rates. The underlying bug is in the GPU prover
-//! (suspected sppark MSM internal state); see
-//! `project_groth16_prover_flake.md` in MEMORY.md. Re-run the bench
-//! until both verifies pass; timings are valid only when both pass.
+//! Note: an earlier ~1/3 verify-fail flake on RTX 5090 / 4090 was traced
+//! to sppark's `add_unsafe` collision case in the G1 MSM accumulate
+//! kernel (see project_groth16_prover_flake.md). Fixed in commit
+//! `abb37906c` by switching G1's accumulate inner loop to the safe
+//! `add` formula. Bench numbers below are now stable.
 
 #[cfg(all(feature = "native", feature = "cuda"))]
 fn main() {
