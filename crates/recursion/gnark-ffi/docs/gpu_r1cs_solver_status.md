@@ -190,7 +190,7 @@ per-launch shrink). Empirical raw launch overhead on 7900 XTX is
 ~3 µs/launch, but per-layer cost is ~22 µs because each layer must
 finish before the next starts (sequential dependency).
 
-## Phase 6 — production rollout   □ BLOCKED on architectural decision
+## Phase 6 — production rollout   □ BLOCKED — cooperative kernels also do not unlock
 
 **The Phase 4 measurement is misleading for production.** It assumes
 hints are pre-resolved in `wires_initial.bin`, which the Go test
@@ -208,24 +208,51 @@ luxury — we'd need to either:
 3. **Run gnark Solve in parallel with GPU prep**, take whichever
    finishes — bounded below by 5400 ms gnark Solve time. No win.
 
-The path that breaks this is a **cooperative-grid persistent kernel**
-(one `cudaLaunchCooperativeKernel` that processes ALL layers
-serially in-kernel via grid sync). Per-layer overhead drops to
-~1–5 µs of grid sync. Compute upper-bound is ~50–200 ms. This would
-unlock the 1-second projection from the spike — but cooperative
-kernels require careful design (limited block count = limited
-parallelism for wide layers; needs persistent block scheduling) and
-HIP support varies.
+### Cooperative-grid kernel — TESTED, did not unlock the spike's projection
+
+Implemented in `full_solve_coop.cu` (HIP) + `full_solve_coop_cuda.cu`
+(CUDA). Single `[hip|cuda]LaunchCooperativeKernel` processes all
+135 K layers serially via `grid_group::sync()` between layers. All
+3 GPUs PASS correctness end-to-end.
+
+| Backend / GPU | Naive layered | Cooperative best |
+|---|---:|---:|
+| HIP / 7900 XTX | 3667 ms | 3351 ms (−316 ms) |
+| CUDA / RTX 4090 | 3301 ms | 3330 ms (~tie) |
+| CUDA / RTX 5090 | 2790 ms | 2765 ms (−25 ms) |
+
+The unlock did not appear. Bare grid sync on 7900 XTX measures
+~0.7 µs at 48 blocks (135 K syncs ≈ 95 ms). Wide-layer compute alone
+is 20 ms. Total expected ≈ 120 ms — but actual cooperative solve is
+~3 s. The per-layer cost in the real kernel is ~22 µs even with
+1 launch (= same as the naive layered solver's per-launch cost).
+
+Likely cause: thread-arrival variance at grid sync (heterogeneous
+work per layer — most layers have 1–3 active threads of a 6 K-thread
+grid) plus memory-access stalls that don't pipeline across the
+serial layer dependency. The bare sync test had threads synchronized
+at the same instruction with no compute between, which hid these
+costs.
 
 ### Recommendation
 
-Three concrete paths the team can pick from:
+The full GPU R1CS solver is **not viable as a production replacement
+for gnark Solve on this circuit shape**. The deep-tail layer
+distribution (135 K layers, most with 1–3 R1Cs) means per-layer
+overhead — under any GPU dispatch architecture we've tested —
+dominates the solve time and prevents the spike's projected ~1 s
+solve from being achievable.
+
+Two viable paths from here:
 
 | Path | Effort | Per-prove savings | Risk |
 |---|---|---|---|
-| **(a) Ship hybrid**: GPU wide layers (50 ms compute), CPU tail | ~3-5 days | ~2 s (5400 → 3400 ms) | low |
-| **(b) Cooperative-kernel full GPU** | 2-3 weeks | ~3.5-4 s (5400 → 1500 ms) | medium-high — needs careful design + per-arch validation |
-| **(c) Skip — focus elsewhere** | 0 | 0 | accept the 50% CPU floor |
+| **(a) Hybrid GPU wide + CPU tail** | ~3-5 days | small (~80 ms — CPU tail still dominates gnark Solve) | low |
+| **(c) Skip — focus elsewhere** | 0 | 0 | accept gnark CPU baseline |
+
+The PK cache (already shipped) saves ~50 s on iter 2+ proves. That
+remains the highest-leverage Groth16 wrap optimization available
+without circuit-shape changes.
 
 **The prototype + Phase 3 hint kernels validate that all the
 underlying primitives work**; the question is whether the
@@ -244,6 +271,8 @@ less work.
 - `r1cs_solver_proto/full_solve_hybrid.cu` — persistent-kernel
   small-layer batching
 - `r1cs_solver_proto/full_solve_cuda.cu` — naive + CUDA Graphs
+- `r1cs_solver_proto/full_solve_coop.cu` — HIP cooperative-grid
+- `r1cs_solver_proto/full_solve_coop_cuda.cu` — CUDA cooperative-grid
 - `r1cs_solver_proto/hint_kernels.cu` — all 6 hint kernels
 - `docs/gpu_r1cs_solver_plan.md` — original implementation plan
 - `docs/gpu_r1cs_solver_status.md` — this status doc
