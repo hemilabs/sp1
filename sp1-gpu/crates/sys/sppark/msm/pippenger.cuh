@@ -235,7 +235,21 @@ void accumulate(bucket_h buckets_[], uint32_t nwins, uint32_t wbits,
                     bucket = p;
                     bucket.cneg(digit >> 31);
                 } else {
-                    bucket.add_unsafe(p, digit >> 31);
+                    // SP1: G1 uses safe `add` (handles P==±Q collisions
+                    // correctly); G2 keeps `add_unsafe` because the safe
+                    // formula's Fp2 instantiation overflows ptxas register
+                    // budget. The Ar G1 MSM (N=12.7M, filtered SRS) shows
+                    // ~30 % proof verify fail rate without this — see
+                    // project_groth16_prover_flake.md.
+                    // Using sizeof for the dispatch because not all
+                    // mont_t instantiations expose `degree` as a true
+                    // constexpr; sizeof is always compile-time and the
+                    // ratio cleanly separates G1 (128 B) from G2 (256 B).
+                    if constexpr (sizeof(bucket_t) <= 128) {
+                        bucket.add(p, digit >> 31);
+                    } else {
+                        bucket.add_unsafe(p, digit >> 31);
+                    }
                 }
             }
 

@@ -209,15 +209,6 @@ fn test_groth16_e2e_via_in_process_r1cs_solver() {
     eprintln!("Building Groth16Prover...");
     let prover = sp1_gpu_groth16::prover::Groth16Prover::new(proving_data);
 
-    eprintln!("Generating Groth16 proof...");
-    let t = std::time::Instant::now();
-    let proof = prover.prove(&witness_data).expect("GPU prove");
-    let prove_elapsed = t.elapsed();
-    eprintln!("Proof generated in {prove_elapsed:?}");
-
-    let proof_bytes = proof.to_solidity_bytes();
-    assert_eq!(proof_bytes.len(), 256);
-
     let public_inputs_be: [[u8; 32]; 5] = [
         decimal_to_be32(&gnark_witness.vkey_hash),
         decimal_to_be32(&gnark_witness.committed_values_digest),
@@ -225,22 +216,46 @@ fn test_groth16_e2e_via_in_process_r1cs_solver() {
         decimal_to_be32(&gnark_witness.vk_root),
         decimal_to_be32(&gnark_witness.proof_nonce),
     ];
-
     let groth16_vk_bytes = std::fs::read(&vk_path).expect("read vk");
 
-    eprintln!("Verifying via sp1-verifier...");
-    let t = std::time::Instant::now();
-    let result = sp1_verifier::Groth16Verifier::verify_gnark_proof(
-        &proof_bytes,
-        &public_inputs_be,
-        &groth16_vk_bytes,
-    );
-    let verify_elapsed = t.elapsed();
-    match &result {
-        Ok(()) => eprintln!("sp1-verifier: PASS (in {verify_elapsed:?})"),
-        Err(e) => eprintln!("sp1-verifier: FAIL — {e:?}"),
+    // Run prove() N times in a loop to characterize the prover flake.
+    // Default is 1 (= legacy behavior). Set SP1_E2E_REPEATS=N to amortize
+    // the slow PK load + Groth16Prover::new across multiple proves.
+    let n_repeats: usize =
+        std::env::var("SP1_E2E_REPEATS").ok().and_then(|s| s.parse().ok()).unwrap_or(1);
+    eprintln!("Generating {n_repeats} Groth16 proof(s)...");
+    let mut n_pass = 0usize;
+    let mut n_fail = 0usize;
+    let mut prove_elapsed = std::time::Duration::ZERO;
+    for iter in 0..n_repeats {
+        let t = std::time::Instant::now();
+        let proof = prover.prove(&witness_data).expect("GPU prove");
+        let elapsed = t.elapsed();
+        if iter == 0 {
+            prove_elapsed = elapsed;
+        }
+        let proof_bytes = proof.to_solidity_bytes();
+        assert_eq!(proof_bytes.len(), 256);
+        let result = sp1_verifier::Groth16Verifier::verify_gnark_proof(
+            &proof_bytes,
+            &public_inputs_be,
+            &groth16_vk_bytes,
+        );
+        match &result {
+            Ok(()) => {
+                n_pass += 1;
+                eprintln!("  iter {iter}: prove {elapsed:?} sp1-verifier: PASS");
+            }
+            Err(e) => {
+                n_fail += 1;
+                eprintln!("  iter {iter}: prove {elapsed:?} sp1-verifier: FAIL — {e:?}");
+            }
+        }
     }
-    result.expect("GPU R1CS-solved proof failed gnark verification");
+    eprintln!("[multi-iter] {n_pass}/{n_repeats} pass, {n_fail}/{n_repeats} fail");
+    if n_repeats == 1 {
+        assert_eq!(n_pass, 1, "GPU R1CS-solved proof failed gnark verification");
+    }
 
     eprintln!(
         "Phase 11 in-process GPU R1CS → Groth16 prove → gnark verify: SUCCESS ({prove_elapsed:?} prove)"
