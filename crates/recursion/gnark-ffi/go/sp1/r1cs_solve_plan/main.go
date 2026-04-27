@@ -126,11 +126,22 @@ func main() {
 			usage()
 		}
 		emitLayers(os.Args[2], os.Args[3])
-	case "prep-layer":
+	case "prep-full":
 		if len(os.Args) != 5 {
 			usage()
 		}
-		prepLayer(os.Args[2], os.Args[3], os.Args[4])
+		prepFull(os.Args[2], os.Args[3], os.Args[4])
+	case "prep-layer":
+		if len(os.Args) < 5 || len(os.Args) > 6 {
+			usage()
+		}
+		layerID := int32(-1) // -1 = pick widest
+		if len(os.Args) == 6 {
+			var x int
+			fmt.Sscanf(os.Args[5], "%d", &x)
+			layerID = int32(x)
+		}
+		prepLayer(os.Args[2], os.Args[3], os.Args[4], layerID)
 	case "interpret":
 		if len(os.Args) != 6 {
 			usage()
@@ -156,7 +167,8 @@ func usage() {
 	fmt.Fprintln(os.Stderr, "  r1cs_solve_plan emit          <build_dir> <out_solve_plan.bin>")
 	fmt.Fprintln(os.Stderr, "  r1cs_solve_plan emit-v2       <build_dir> <out_solve_plan.bin>")
 	fmt.Fprintln(os.Stderr, "  r1cs_solve_plan emit-layers   <build_dir> <out_layers.bin>")
-	fmt.Fprintln(os.Stderr, "  r1cs_solve_plan prep-layer    <build_dir> <witness.json> <out_dir>")
+	fmt.Fprintln(os.Stderr, "  r1cs_solve_plan prep-layer    <build_dir> <witness.json> <out_dir> [layer_id|widest]")
+	fmt.Fprintln(os.Stderr, "  r1cs_solve_plan prep-full     <build_dir> <witness.json> <out_dir>")
 	fmt.Fprintln(os.Stderr, "  r1cs_solve_plan interpret     <build_dir> <solve_plan.bin> <witness.json> <out_wire_values.bin>")
 	fmt.Fprintln(os.Stderr, "  r1cs_solve_plan roundtrip     <build_dir> <witness.json>")
 	fmt.Fprintln(os.Stderr, "  r1cs_solve_plan roundtrip-v2  <build_dir> <witness.json>")
@@ -354,6 +366,291 @@ func writeLE(w io.Writer, le constraint.LinearExpression) {
 	}
 }
 
+// ---------------- prep-full ----------------
+//
+// Dumps everything the standalone HIP driver needs to perform a full
+// layered solve (Phase 4 prototype):
+//
+//   coeffs.bin              all coefficients
+//   wires_initial.bin       wires at start: ONE + witness + all hint outputs
+//                           (R1C-defined wires are zero)
+//   wires_expected.bin      wires after solve (Phase 1 interpreter output)
+//   layers.idx              per-layer (n_descs, descs_off, terms_off)
+//   layers_descs.bin        all per-layer R1C descriptors concatenated
+//   layers_terms.bin        all per-layer terms concatenated
+//   meta.txt                summary
+//
+// The C++ driver loops over layers: read the (descs_off, n_descs) for
+// layer i, launch the eval_constraints kernel, advance.
+
+func prepFull(buildDir, witnessPath, outDir string) {
+	r := loadR1CS(buildDir)
+	if err := os.MkdirAll(outDir, 0o755); err != nil {
+		fail("mkdir out: %v", err)
+	}
+
+	t0 := time.Now()
+	tmp, _ := os.CreateTemp("", "solve_plan-*.bin")
+	tmp.Close()
+	defer os.Remove(tmp.Name())
+	emit(buildDir, tmp.Name(), planV2)
+	wires := interpretPlan(r, tmp.Name(), witnessPath)
+	fmt.Fprintf(os.Stderr, "[plan] reference solve in %s\n", time.Since(t0))
+
+	nbWires := r.NbInternalVariables + r.GetNbPublicVariables() + r.GetNbSecretVariables()
+	wireDepth := make([]int32, nbWires)
+	for i := range wireDepth {
+		wireDepth[i] = -1
+	}
+	nbInputs := r.GetNbPublicVariables() + r.GetNbSecretVariables()
+	for i := 0; i < nbInputs; i++ {
+		wireDepth[i] = 0
+	}
+	hintBpID, hintFound := findHintBlueprint(r)
+	hintBP, _ := r.Blueprints[hintBpID].(constraint.BlueprintHint)
+	var hm constraint.HintMapping
+
+	type r1cMeta struct {
+		layer int32
+		L, R, O constraint.LinearExpression
+		loc uint8
+		outCoeffID uint32
+		outWireID  uint32
+	}
+
+	nbInstr := r.GetNbInstructions()
+	allR1Cs := make([]*r1cMeta, 0, nbInstr)
+	hintOutputWires := make(map[uint32]bool) // wires defined by hints
+	r1cOutputWires := make(map[uint32]bool)  // wires defined by R1Cs (loc != 0)
+
+	solved := make([]bool, nbWires)
+	for i := 0; i < nbInputs; i++ {
+		solved[i] = true
+	}
+	maxLayer := int32(0)
+
+	for i := 0; i < nbInstr; i++ {
+		pi := r.Instructions[i]
+		inst := pi.Unpack(&r.System)
+		var d int32 = 0
+		processVID := func(vid uint32) {
+			if int(vid) >= len(wireDepth) || wireDepth[vid] < 0 {
+				return
+			}
+			if wireDepth[vid] > d {
+				d = wireDepth[vid]
+			}
+		}
+		if hintFound && pi.BlueprintID == hintBpID {
+			hm.Inputs = hm.Inputs[:0]
+			hintBP.DecompressHint(&hm, inst)
+			for _, le := range hm.Inputs {
+				for _, t := range le {
+					if !t.IsConstant() {
+						processVID(uint32(t.WireID()))
+					}
+				}
+			}
+			thisDepth := d + 1
+			for w := hm.OutputRange.Start; w < hm.OutputRange.End; w++ {
+				if int(w) < len(wireDepth) {
+					wireDepth[w] = thisDepth
+					solved[w] = true
+					hintOutputWires[w] = true
+				}
+			}
+			if thisDepth > maxLayer {
+				maxLayer = thisDepth
+			}
+			continue
+		}
+		bp := r.Blueprints[pi.BlueprintID]
+		r1c, _ := bp.(constraint.BlueprintR1C)
+		var c constraint.R1C
+		r1c.DecompressR1C(&c, inst)
+		var newWire int32 = -1
+		var loc uint8 = 0
+		var outCoeff uint32 = 0
+		processLE := func(le constraint.LinearExpression, locCandidate uint8) {
+			for _, t := range le {
+				vid := int32(t.WireID())
+				if vid < 0 || t.IsConstant() || int(vid) >= len(wireDepth) {
+					continue
+				}
+				if !solved[vid] {
+					if loc != 0 {
+						continue
+					}
+					loc = locCandidate
+					newWire = vid
+					outCoeff = uint32(t.CoeffID())
+				} else if wireDepth[vid] > d {
+					d = wireDepth[vid]
+				}
+			}
+		}
+		processLE(c.L, 1)
+		processLE(c.R, 2)
+		processLE(c.O, 3)
+		thisDepth := d + 1
+		if newWire >= 0 {
+			wireDepth[newWire] = thisDepth
+			solved[newWire] = true
+			r1cOutputWires[uint32(newWire)] = true
+		}
+		if thisDepth > maxLayer {
+			maxLayer = thisDepth
+		}
+		m := &r1cMeta{
+			layer:      thisDepth,
+			L:          append(constraint.LinearExpression{}, c.L...),
+			R:          append(constraint.LinearExpression{}, c.R...),
+			O:          append(constraint.LinearExpression{}, c.O...),
+			loc:        loc,
+			outCoeffID: outCoeff,
+		}
+		if newWire >= 0 {
+			m.outWireID = uint32(newWire)
+		}
+		allR1Cs = append(allR1Cs, m)
+	}
+
+	nbLayers := int(maxLayer) + 1
+	fmt.Fprintf(os.Stderr, "[plan] %d layers; %d hint-output wires; %d R1C-output wires\n",
+		nbLayers, len(hintOutputWires), len(r1cOutputWires))
+
+	// Group R1Cs by layer
+	byLayer := make([][]*r1cMeta, nbLayers)
+	for _, m := range allR1Cs {
+		byLayer[m.layer] = append(byLayer[m.layer], m)
+	}
+
+	// Coefficients
+	{
+		f, _ := os.Create(outDir + "/coeffs.bin")
+		bw := bufio.NewWriterSize(f, 1<<20)
+		var buf [32]byte
+		for i := range r.Coefficients {
+			for limb := 0; limb < 4; limb++ {
+				binary.LittleEndian.PutUint64(buf[limb*8:], r.Coefficients[i][limb])
+			}
+			bw.Write(buf[:])
+		}
+		bw.Flush()
+		f.Close()
+	}
+
+	// Initial wires (witness + all hint outputs; R1C-defined wires zeroed).
+	// Expected wires.
+	{
+		ef, _ := os.Create(outDir + "/wires_expected.bin")
+		ew := bufio.NewWriterSize(ef, 1<<20)
+		ifc, _ := os.Create(outDir + "/wires_initial.bin")
+		iw := bufio.NewWriterSize(ifc, 1<<20)
+		var buf [32]byte
+		for i := range wires {
+			for limb := 0; limb < 4; limb++ {
+				binary.LittleEndian.PutUint64(buf[limb*8:], wires[i][limb])
+			}
+			ew.Write(buf[:])
+			if r1cOutputWires[uint32(i)] {
+				var zero [32]byte
+				iw.Write(zero[:])
+			} else {
+				iw.Write(buf[:])
+			}
+		}
+		ew.Flush()
+		iw.Flush()
+		ef.Close()
+		ifc.Close()
+	}
+
+	// Per-layer descs + terms, concatenated.
+	df, _ := os.Create(outDir + "/layers_descs.bin")
+	dbw := bufio.NewWriterSize(df, 1<<20)
+	tf, _ := os.Create(outDir + "/layers_terms.bin")
+	tbw := bufio.NewWriterSize(tf, 1<<20)
+	idxF, _ := os.Create(outDir + "/layers.idx")
+	ibw := bufio.NewWriterSize(idxF, 1<<20)
+	mustU32(ibw, uint32(nbLayers))
+
+	var totalDescs uint64 = 0
+	var totalTerms uint64 = 0
+	for _, ms := range byLayer {
+		// idx entry: n_descs, descs_off, terms_off
+		mustU32(ibw, uint32(len(ms)))
+		mustU64(ibw, totalDescs)
+		mustU64(ibw, totalTerms)
+		for _, m := range ms {
+			lOff := uint32(totalTerms)
+			lCnt := uint32(len(m.L))
+			for _, t := range m.L {
+				mustU32(tbw, uint32(t.CoeffID()))
+				mustU32(tbw, uint32(t.WireID()))
+			}
+			totalTerms += uint64(lCnt)
+			rOff := uint32(totalTerms)
+			rCnt := uint32(len(m.R))
+			for _, t := range m.R {
+				mustU32(tbw, uint32(t.CoeffID()))
+				mustU32(tbw, uint32(t.WireID()))
+			}
+			totalTerms += uint64(rCnt)
+			oOff := uint32(totalTerms)
+			oCnt := uint32(len(m.O))
+			for _, t := range m.O {
+				mustU32(tbw, uint32(t.CoeffID()))
+				mustU32(tbw, uint32(t.WireID()))
+			}
+			totalTerms += uint64(oCnt)
+			mustU32(dbw, lOff)
+			mustU32(dbw, lCnt)
+			mustU32(dbw, rOff)
+			mustU32(dbw, rCnt)
+			mustU32(dbw, oOff)
+			mustU32(dbw, oCnt)
+			mustU32(dbw, m.outCoeffID)
+			mustU32(dbw, m.outWireID)
+			must1(dbw.WriteByte(m.loc))
+			must1(dbw.WriteByte(0))
+			must1(dbw.WriteByte(0))
+			must1(dbw.WriteByte(0))
+		}
+		totalDescs += uint64(len(ms))
+	}
+	dbw.Flush()
+	df.Close()
+	tbw.Flush()
+	tf.Close()
+	ibw.Flush()
+	idxF.Close()
+
+	fmt.Fprintf(os.Stderr, "[plan] %d total descs across %d layers, %d total terms\n",
+		totalDescs, nbLayers, totalTerms)
+
+	// Meta
+	mf, _ := os.Create(outDir + "/meta.txt")
+	fmt.Fprintf(mf, "build_dir=%s\n", buildDir)
+	fmt.Fprintf(mf, "witness=%s\n", witnessPath)
+	fmt.Fprintf(mf, "n_wires=%d\n", len(wires))
+	fmt.Fprintf(mf, "n_coefficients=%d\n", len(r.Coefficients))
+	fmt.Fprintf(mf, "n_layers=%d\n", nbLayers)
+	fmt.Fprintf(mf, "n_descs=%d\n", totalDescs)
+	fmt.Fprintf(mf, "n_terms=%d\n", totalTerms)
+	mf.Close()
+	fmt.Fprintf(os.Stderr, "[plan] prep-full done in %s; outDir=%s\n",
+		time.Since(t0), outDir)
+}
+
+func mustU64(w io.Writer, v uint64) {
+	var buf [8]byte
+	binary.LittleEndian.PutUint64(buf[:], v)
+	if _, err := w.Write(buf[:]); err != nil {
+		fail("write u64: %v", err)
+	}
+}
+
 // ---------------- prep-layer ----------------
 //
 // Dumps the inputs + expected outputs for a single layer's R1C-only
@@ -369,7 +666,7 @@ func writeLE(w io.Writer, le constraint.LinearExpression) {
 //   wires_expected.bin  full wire vector from the CPU interpreter (gold)
 //   meta.txt            human-readable summary (n_descs, n_terms, n_wires, …)
 
-func prepLayer(buildDir, witnessPath, outDir string) {
+func prepLayer(buildDir, witnessPath, outDir string, requestedLayer int32) {
 	r := loadR1CS(buildDir)
 	if err := os.MkdirAll(outDir, 0o755); err != nil {
 		fail("mkdir out: %v", err)
@@ -508,17 +805,27 @@ func prepLayer(buildDir, witnessPath, outDir string) {
 		}
 	}
 
-	// Pick the widest R1C-only layer.
-	pickLayer := int32(-1)
+	// Pick layer: requested or widest with computable R1Cs.
+	var pickLayer int32 = -1
 	pickWidth := 0
-	for l, n := range layerCount {
-		if n > pickWidth {
-			pickWidth = n
-			pickLayer = l
+	if requestedLayer >= 0 {
+		pickLayer = requestedLayer
+		pickWidth = layerCount[requestedLayer]
+		if pickWidth == 0 {
+			fmt.Fprintf(os.Stderr,
+				"[plan] WARNING: requested layer %d has 0 computable R1Cs\n",
+				requestedLayer)
 		}
-	}
-	if pickLayer < 0 {
-		fail("no layer with computable R1Cs found?")
+	} else {
+		for l, n := range layerCount {
+			if n > pickWidth {
+				pickWidth = n
+				pickLayer = l
+			}
+		}
+		if pickLayer < 0 {
+			fail("no layer with computable R1Cs found?")
+		}
 	}
 	fmt.Fprintf(os.Stderr, "[plan] picked layer %d with %d computable R1Cs\n",
 		pickLayer, pickWidth)
