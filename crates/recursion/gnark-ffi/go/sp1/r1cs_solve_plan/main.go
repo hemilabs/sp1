@@ -34,6 +34,7 @@ import (
 	"io"
 	"math/big"
 	"os"
+	"sync"
 	"time"
 
 	"github.com/consensys/gnark-crypto/ecc"
@@ -131,6 +132,11 @@ func main() {
 			usage()
 		}
 		prepFull(os.Args[2], os.Args[3], os.Args[4])
+	case "prep-hints":
+		if len(os.Args) != 5 {
+			usage()
+		}
+		prepHints(os.Args[2], os.Args[3], os.Args[4])
 	case "prep-layer":
 		if len(os.Args) < 5 || len(os.Args) > 6 {
 			usage()
@@ -169,6 +175,7 @@ func usage() {
 	fmt.Fprintln(os.Stderr, "  r1cs_solve_plan emit-layers   <build_dir> <out_layers.bin>")
 	fmt.Fprintln(os.Stderr, "  r1cs_solve_plan prep-layer    <build_dir> <witness.json> <out_dir> [layer_id|widest]")
 	fmt.Fprintln(os.Stderr, "  r1cs_solve_plan prep-full     <build_dir> <witness.json> <out_dir>")
+	fmt.Fprintln(os.Stderr, "  r1cs_solve_plan prep-hints    <build_dir> <witness.json> <out_dir>")
 	fmt.Fprintln(os.Stderr, "  r1cs_solve_plan interpret     <build_dir> <solve_plan.bin> <witness.json> <out_wire_values.bin>")
 	fmt.Fprintln(os.Stderr, "  r1cs_solve_plan roundtrip     <build_dir> <witness.json>")
 	fmt.Fprintln(os.Stderr, "  r1cs_solve_plan roundtrip-v2  <build_dir> <witness.json>")
@@ -364,6 +371,151 @@ func writeLE(w io.Writer, le constraint.LinearExpression) {
 		mustU32(w, uint32(t.CoeffID()))
 		mustU32(w, uint32(t.WireID()))
 	}
+}
+
+// ---------------- prep-hints ----------------
+//
+// For each hint kind in the circuit, dump (input Fr values, expected
+// output Fr values) pairs gathered from a real solve. This isolates
+// the per-kind hint kernel test from the layered solver.
+//
+// Output (under outDir):
+//   meta.txt
+//   hint_<kind>/
+//     inputs.bin             flat per-call: n_inputs[u32] then n_inputs Fr values
+//     outputs.bin            flat per-call: n_outputs[u32] then n_outputs Fr values
+//     n_calls.bin            uint32 count of calls
+//
+// (Each call's inputs are EVALUATED — i.e., the hint kernel does NOT
+// re-evaluate LEs; the test feeds it pre-computed Fr values. This
+// keeps the kernel test focused on the hint's internal arithmetic.)
+//
+// The kernel under test is per-call: takes n_inputs Fr values, writes
+// n_outputs Fr values. Output is written to a separate buffer; test
+// compares against expected.
+
+func prepHints(buildDir, witnessPath, outDir string) {
+	r := loadR1CS(buildDir)
+	if err := os.MkdirAll(outDir, 0o755); err != nil {
+		fail("mkdir out: %v", err)
+	}
+
+	// Run gnark.Solve with a hint registry that *also* records each
+	// hint call's inputs/outputs alongside running the real hint.
+	witnessFile, err := os.ReadFile(witnessPath)
+	if err != nil {
+		fail("read witness: %v", err)
+	}
+	var witnessInput sp1.WitnessInput
+	if err := json.Unmarshal(witnessFile, &witnessInput); err != nil {
+		fail("unmarshal witness: %v", err)
+	}
+	assignment := sp1.NewCircuit(witnessInput)
+	witness, err := frontend.NewWitness(&assignment, ecc.BN254.ScalarField())
+	if err != nil {
+		fail("witness: %v", err)
+	}
+
+	type captured struct {
+		inputs  []*big.Int
+		outputs []*big.Int
+	}
+	var mu sync.Mutex
+	bykind := make(map[solver.HintID][]captured)
+	overrideOpts := make([]solver.Option, 0)
+	for hid := range r.MHintsDependencies {
+		hidCopy := hid
+		fn := solver.GetRegisteredHint(hid)
+		if fn == nil {
+			fail("hint %d not registered", hid)
+		}
+		wrap := func(q *big.Int, in []*big.Int, out []*big.Int) error {
+			if err := fn(q, in, out); err != nil {
+				return err
+			}
+			capIn := make([]*big.Int, len(in))
+			for i := range in {
+				capIn[i] = new(big.Int).Set(in[i])
+			}
+			capOut := make([]*big.Int, len(out))
+			for i := range out {
+				capOut[i] = new(big.Int).Set(out[i])
+			}
+			mu.Lock()
+			bykind[hidCopy] = append(bykind[hidCopy], captured{capIn, capOut})
+			mu.Unlock()
+			return nil
+		}
+		overrideOpts = append(overrideOpts, solver.OverrideHint(hid, wrap))
+	}
+	t0 := time.Now()
+	_, err = r.Solve(witness, overrideOpts...)
+	if err != nil {
+		fail("solve: %v", err)
+	}
+	fmt.Fprintf(os.Stderr, "[plan] solve+capture took %s\n", time.Since(t0))
+
+	// Write per-kind captures.
+	mf, _ := os.Create(outDir + "/meta.txt")
+	for hid, calls := range bykind {
+		name := r.MHintsDependencies[hid]
+		safe := safeName(name)
+		dir := outDir + "/hint_" + safe
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			fail("mkdir %s: %v", dir, err)
+		}
+		fmt.Fprintf(mf, "%s\thid=%d\tcalls=%d\n", name, hid, len(calls))
+
+		nf, _ := os.Create(dir + "/n_calls.bin")
+		mustU32(nf, uint32(len(calls)))
+		nf.Close()
+
+		// inputs.bin
+		inF, _ := os.Create(dir + "/inputs.bin")
+		ibw := bufio.NewWriterSize(inF, 1<<20)
+		// outputs.bin
+		outF, _ := os.Create(dir + "/outputs.bin")
+		obw := bufio.NewWriterSize(outF, 1<<20)
+		var fr_buf [32]byte
+		writeBigAsFr := func(w io.Writer, b *big.Int) {
+			var fe fr.Element
+			fe.SetBigInt(b)
+			for limb := 0; limb < 4; limb++ {
+				binary.LittleEndian.PutUint64(fr_buf[limb*8:], fe[limb])
+			}
+			w.Write(fr_buf[:])
+		}
+		for _, c := range calls {
+			mustU32(ibw, uint32(len(c.inputs)))
+			for _, in := range c.inputs {
+				writeBigAsFr(ibw, in)
+			}
+			mustU32(obw, uint32(len(c.outputs)))
+			for _, o := range c.outputs {
+				writeBigAsFr(obw, o)
+			}
+		}
+		ibw.Flush()
+		obw.Flush()
+		inF.Close()
+		outF.Close()
+		fmt.Fprintf(os.Stderr, "[plan] %-60s %6d calls\n", name, len(calls))
+	}
+	mf.Close()
+	fmt.Fprintf(os.Stderr, "[plan] prep-hints done; outDir=%s\n", outDir)
+}
+
+func safeName(s string) string {
+	r := make([]byte, 0, len(s))
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') {
+			r = append(r, c)
+		} else {
+			r = append(r, '_')
+		}
+	}
+	return string(r)
 }
 
 // ---------------- prep-full ----------------
