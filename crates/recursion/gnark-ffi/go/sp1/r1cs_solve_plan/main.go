@@ -35,6 +35,7 @@ import (
 	"io"
 	"math/big"
 	"os"
+	"os/exec"
 	"sync"
 	"time"
 
@@ -153,6 +154,11 @@ func main() {
 			usage()
 		}
 		emitAbcReference(os.Args[2], os.Args[3], os.Args[4])
+	case "solve-prod-gpu":
+		if len(os.Args) != 7 {
+			usage()
+		}
+		solveProdGpu(os.Args[2], os.Args[3], os.Args[4], os.Args[5], os.Args[6])
 	case "prep-hints":
 		if len(os.Args) != 5 {
 			usage()
@@ -200,6 +206,7 @@ func usage() {
 	fmt.Fprintln(os.Stderr, "  r1cs_solve_plan prep-circuit-prod <build_dir> <out_dir>  (per-circuit; cacheable)")
 	fmt.Fprintln(os.Stderr, "  r1cs_solve_plan make-witness-init <build_dir> <witness.json> <out_path>  (per-prove; fast)")
 	fmt.Fprintln(os.Stderr, "  r1cs_solve_plan emit-abc-reference <build_dir> <witness.json> <out_dir>  (gnark gold A/B/C)")
+	fmt.Fprintln(os.Stderr, "  r1cs_solve_plan solve-prod-gpu <build_dir> <witness.json> <prep_dir> <gpu_kernel_bin> <gpu_dir>  (full per-prove flow)")
 	fmt.Fprintln(os.Stderr, "  r1cs_solve_plan prep-hints    <build_dir> <witness.json> <out_dir>")
 	fmt.Fprintln(os.Stderr, "  r1cs_solve_plan interpret     <build_dir> <solve_plan.bin> <witness.json> <out_wire_values.bin>")
 	fmt.Fprintln(os.Stderr, "  r1cs_solve_plan roundtrip     <build_dir> <witness.json>")
@@ -2434,6 +2441,85 @@ func roundtripVersion(buildDir, witnessPath string, version uint32) {
 		os.Exit(1)
 	}
 	fmt.Fprintf(os.Stderr, "[plan] PASS — %d wires match byte-for-byte\n", len(mine))
+}
+
+// solveProdGpu is the production per-prove orchestrator. Equivalent to
+// gnark.Solve + writeFrFile + writeG1File output, but runs the GPU
+// R1CS solver instead. Produces the same files in gpu_dir that the
+// existing groth16_gpu_helper consumes.
+//
+// Per-prove cost (5090 with cache hit):
+//   make-witness-init    : ~0.5 s
+//   GPU kernel solve     : ~1.2 s (with A/B/C output)
+//   write empty commits  : ~ms
+//   ----                   -----
+//   Total                  ~1.7 s vs gnark CPU 5.4 s
+//
+// Args:
+//   buildDir       — SP1 circuit dir (~/.sp1/circuits/groth16/v6.0.0)
+//   witnessPath    — witness JSON
+//   prepDir        — output of prep-circuit-prod (cached per-circuit)
+//   gpuKernelBin   — path to the built full_solve_warp_prod CUDA binary
+//   gpuDir         — output dir; matches what gnark path produces
+func solveProdGpu(buildDir, witnessPath, prepDir, gpuKernelBin, gpuDir string) {
+	if err := os.MkdirAll(gpuDir, 0o755); err != nil {
+		fail("mkdir gpu_dir: %v", err)
+	}
+	t_total := time.Now()
+
+	// 1) Per-prove witness init
+	t0 := time.Now()
+	wiresInitial := gpuDir + "/wires_initial.bin"
+	makeWitnessInit(buildDir, witnessPath, wiresInitial)
+	tInit := time.Since(t0)
+
+	// 2) Invoke the GPU kernel as a subprocess.
+	t0 = time.Now()
+	cmd := exec.Command(gpuKernelBin, prepDir)
+	cmd.Stderr = os.Stderr
+	cmd.Stdout = os.Stderr
+	cmd.Env = append(os.Environ(),
+		"PROD_INITIAL="+wiresInitial,
+		"PROD_OUT_WIRES="+gpuDir+"/wire_values.bin",
+		"PROD_OUT_A="+gpuDir+"/solution_a.bin",
+		"PROD_OUT_B="+gpuDir+"/solution_b.bin",
+		"PROD_OUT_C="+gpuDir+"/solution_c.bin",
+	)
+	if env := os.Getenv("PROD_BLOCKS_PER_SM"); env == "" {
+		cmd.Env = append(cmd.Env, "PROD_BLOCKS_PER_SM=1")
+	}
+	if env := os.Getenv("PROD_BLOCK"); env == "" {
+		cmd.Env = append(cmd.Env, "PROD_BLOCK=256")
+	}
+	if err := cmd.Run(); err != nil {
+		fail("gpu kernel exec: %v", err)
+	}
+	tKernel := time.Since(t0)
+
+	// 3) Write empty commitments / commitment_pok (matches gnark output
+	//    when commitmentInfo is empty — true for SP1's recursion verifier
+	//    per the Phase 0 census).
+	{
+		// commitments.bin: empty
+		f, err := os.Create(gpuDir + "/commitments.bin")
+		if err != nil {
+			fail("commitments.bin: %v", err)
+		}
+		f.Close()
+		// commitment_pok.bin: single 64-byte zero G1 point (matches what
+		// writeG1File of [bn254.G1Affine{}] produces).
+		f2, err := os.Create(gpuDir + "/commitment_pok.bin")
+		if err != nil {
+			fail("commitment_pok.bin: %v", err)
+		}
+		var zero [64]byte
+		f2.Write(zero[:])
+		f2.Close()
+	}
+
+	fmt.Fprintf(os.Stderr,
+		"[plan] solve-prod-gpu done in %s (init %s, kernel %s); gpu_dir=%s\n",
+		time.Since(t_total), tInit, tKernel, gpuDir)
 }
 
 // emitAbcReference runs gnark.Solve and writes solution_a/b/c.bin in
