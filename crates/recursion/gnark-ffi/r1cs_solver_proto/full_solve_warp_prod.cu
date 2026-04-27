@@ -151,10 +151,14 @@ __device__ __forceinline__ Fr fr_from_u64(uint64_t v) {
     // static const vec256 ALT_BN128_rone = {
     //   0xd35d438dc58f0d9d, 0x0a78eb28f5c70b3d, 0x666ea36f7879462c, 0x0e0a77c19a07df2f
     // };
-    q[0] = 0xc58f0d9d; q[1] = 0xd35d438d;
-    q[2] = 0xf5c70b3d; q[3] = 0x0a78eb28;
-    q[4] = 0x7879462c; q[5] = 0x666ea36f;
-    q[6] = 0x9a07df2f; q[7] = 0x0e0a77c1;
+    // Use ALT_BN128_rRR (R^2 mod r) so canonical * rRR (mont mul) = canonical * R = canonical in Mont form.
+    // From sppark/ff/alt_bn128.hpp:
+    //   TO_CUDA_T(0x1bb8e645ae216da7), TO_CUDA_T(0x53fe3ab1e35c59e3),
+    //   TO_CUDA_T(0x8c49833d53bb8085), TO_CUDA_T(0x0216d0b17f4e44a5)
+    q[0] = 0xae216da7; q[1] = 0x1bb8e645;
+    q[2] = 0xe35c59e3; q[3] = 0x53fe3ab1;
+    q[4] = 0x53bb8085; q[5] = 0x8c49833d;
+    q[6] = 0x7f4e44a5; q[7] = 0x0216d0b1;
     return canonical * R_mont;
 }
 
@@ -338,13 +342,14 @@ process_one_hint(const HintCall& h,
         // multi-limb is harder. Easier: produce a Montgomery representation
         // by multiplying by ONE_MONT (which is R mod r). We do that the
         // same way as fr_from_u64 but for the full 8-limb value.
-        Fr R_mont;
-        auto* rp = reinterpret_cast<uint32_t*>(&R_mont);
-        rp[0] = 0xc58f0d9d; rp[1] = 0xd35d438d;
-        rp[2] = 0xf5c70b3d; rp[3] = 0x0a78eb28;
-        rp[4] = 0x7879462c; rp[5] = 0x666ea36f;
-        rp[6] = 0x9a07df2f; rp[7] = 0x0e0a77c1;
-        wires[out0]     = q * R_mont;
+        Fr rRR;
+        auto* rp = reinterpret_cast<uint32_t*>(&rRR);
+        // ALT_BN128_rRR (R^2 mod r): converts canonical → Mont via mont mul.
+        rp[0] = 0xae216da7; rp[1] = 0x1bb8e645;
+        rp[2] = 0xe35c59e3; rp[3] = 0x53fe3ab1;
+        rp[4] = 0x53bb8085; rp[5] = 0x8c49833d;
+        rp[6] = 0x7f4e44a5; rp[7] = 0x0216d0b1;
+        wires[out0]     = q * rRR;
         wires[out0 + 1] = fr_from_u64((uint64_t)r_limb);
         break;
     }
