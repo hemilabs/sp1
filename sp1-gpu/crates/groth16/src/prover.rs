@@ -1040,16 +1040,45 @@ impl Groth16Prover {
             let ar = ar_msm.add(&g1_alpha.to_jacobian()).add(&r_delta);
             eprintln!("[T] 5a. Ar MSM (N={}): {:?}", wire_values_a.len(), t.elapsed());
             g1_msm_ark_verify("Ar", &self.data.pk_g1_a, wire_values_a, &ar_msm);
+            // SP1: G2 MSM concurrency option. Default spawns G2 in a worker
+            // thread to overlap with G1 MSMs (saves ~350 ms wall time on
+            // 5090). Set SP1_GROTH16_SERIALIZE_G2=1 to compute G2 sequentially
+            // after G1 — useful for diagnostic isolation of races between
+            // sppark's gpu_t singleton streams used by both G1 and G2
+            // contexts. Empirically the serial path produces the same ~4 %
+            // residual proof-verify fail rate as the parallel path, so the
+            // residual flake (post-Ar-add-safe fix) lives somewhere else.
+            // See project_groth16_prover_flake.md.
+            let serialize_g2 =
+                std::env::var("SP1_GROTH16_SERIALIZE_G2").ok().as_deref() == Some("1");
             std::thread::scope(|scope| {
-                let g2_handle = scope.spawn(|| {
+                // Closure that does the G2 work (extracted so it can run
+                // either in a spawned thread or synchronously on main).
+                let g2_compute = || {
                     let bs2_msm = g2_msm_gpu(g2_b, &wire_values_b)
                         .unwrap_or_else(|| g2_msm_ark(&self.data.pk_g2_b_ark, &wire_values_b));
+                    if std::env::var("GROTH16_G2_VERIFY").ok().as_deref() == Some("1") {
+                        let cpu = g2_msm_ark(&self.data.pk_g2_b_ark, &wire_values_b);
+                        let gpu_aff = bs2_msm.to_affine();
+                        let cpu_aff = cpu.to_affine();
+                        let ok = gpu_aff.x.c0 == cpu_aff.x.c0
+                            && gpu_aff.x.c1 == cpu_aff.x.c1
+                            && gpu_aff.y.c0 == cpu_aff.y.c0
+                            && gpu_aff.y.c1 == cpu_aff.y.c1;
+                        eprintln!(
+                            "[groth16 G2 MSM verify N={}] gpu_vs_cpu: {}",
+                            wire_values_b.len(),
+                            if ok { "MATCH" } else { "MISMATCH" }
+                        );
+                    }
                     let s_bytes = s.to_le_bytes();
                     let mut s_arr = [0u8; 32];
                     s_arr.copy_from_slice(&s_bytes);
                     let s_g2_delta = g2_delta.to_jacobian().scalar_mul(&s_arr);
                     bs2_msm.add(&s_g2_delta).add(&g2_beta.to_jacobian())
-                });
+                };
+                let g2_handle: Option<_> =
+                    if serialize_g2 { None } else { Some(scope.spawn(g2_compute)) };
 
                 let t = std::time::Instant::now();
                 let bs1_msm = self.persistent_g1_b.msm(&wire_values_b);
@@ -1068,12 +1097,39 @@ impl Groth16Prover {
                     HResult::Host(h) => self.persistent_g1_z.msm(&h[..size_h]),
                 };
                 eprintln!("[T] 5d. Krs2 MSM (N={}): {:?}", size_h, t.elapsed());
-                if let HResult::Host(h) = &h_result {
-                    g1_msm_ark_verify("Krs2", &self.data.pk_g1_z, &h[..size_h], &krs2_msm);
+                match &h_result {
+                    HResult::Host(h) => {
+                        g1_msm_ark_verify("Krs2", &self.data.pk_g1_z, &h[..size_h], &krs2_msm);
+                    }
+                    HResult::Device(dh) => {
+                        if std::env::var("GROTH16_G1_VERIFY").ok().as_deref() == Some("1") {
+                            let mut h_host = vec![Fr::ZERO; size_h];
+                            let err = unsafe {
+                                sp1_gpu_sys::runtime::cuda_mem_copy_device_to_host(
+                                    h_host.as_mut_ptr() as *mut std::ffi::c_void,
+                                    dh.ptr as *const std::ffi::c_void,
+                                    size_h * std::mem::size_of::<Fr>(),
+                                )
+                            };
+                            if err == unsafe { sp1_gpu_sys::runtime::CUDA_SUCCESS_CSL } {
+                                g1_msm_ark_verify("Krs2", &self.data.pk_g1_z, &h_host, &krs2_msm);
+                            } else {
+                                eprintln!(
+                                    "[WARN] Krs2 device verify (thread::scope branch): D2H copy failed, skipping"
+                                );
+                            }
+                        }
+                    }
                 }
 
                 let t_join = std::time::Instant::now();
-                let bs2 = g2_handle.join().expect("G2 MSM thread panicked");
+                let bs2 = if let Some(handle) = g2_handle {
+                    handle.join().expect("G2 MSM thread panicked")
+                } else {
+                    // Sequential G2 path (SP1_GROTH16_SERIALIZE_G2=1) runs
+                    // after all G1 MSMs to avoid sharing sppark gpu_t streams.
+                    g2_compute()
+                };
                 eprintln!(
                     "[T] 6. G2 MSM (GPU, N={}): total={:?}, join_wait={:?}",
                     wire_values_b.len(),
