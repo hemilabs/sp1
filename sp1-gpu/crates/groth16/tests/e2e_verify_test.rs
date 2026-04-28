@@ -227,6 +227,15 @@ fn test_groth16_e2e_via_in_process_r1cs_solver() {
     let mut n_pass = 0usize;
     let mut n_fail = 0usize;
     let mut prove_elapsed = std::time::Duration::ZERO;
+    // For SP1_E2E_DUMP_PROOFS=1: keep the bytes of the first PASS proof
+    // and diff every FAIL proof against it. With GROTH16_ZERO_BLIND=1
+    // the proof should be byte-deterministic, so any difference points
+    // directly at the bug. Diff is per 32-byte word so the 8 words of
+    // the 256-byte Solidity proof (Ar.X, Ar.Y, Bs.X1, Bs.X0, Bs.Y1,
+    // Bs.Y0, Krs.X, Krs.Y) are individually labelled.
+    let dump_proofs = std::env::var("SP1_E2E_DUMP_PROOFS").as_deref() == Ok("1");
+    let mut reference_bytes: Option<Vec<u8>> = None;
+    let labels = ["Ar.X", "Ar.Y", "Bs.X1", "Bs.X0", "Bs.Y1", "Bs.Y0", "Krs.X", "Krs.Y"];
     for iter in 0..n_repeats {
         let t = std::time::Instant::now();
         let proof = prover.prove(&witness_data).expect("GPU prove");
@@ -245,10 +254,36 @@ fn test_groth16_e2e_via_in_process_r1cs_solver() {
             Ok(()) => {
                 n_pass += 1;
                 eprintln!("  iter {iter}: prove {elapsed:?} sp1-verifier: PASS");
+                if dump_proofs && reference_bytes.is_none() {
+                    reference_bytes = Some(proof_bytes.clone());
+                    eprintln!("  iter {iter}: captured reference proof bytes");
+                }
             }
             Err(e) => {
                 n_fail += 1;
                 eprintln!("  iter {iter}: prove {elapsed:?} sp1-verifier: FAIL — {e:?}");
+                if dump_proofs {
+                    if let Some(ref reference) = reference_bytes {
+                        let mut diff_words = Vec::new();
+                        for w in 0..8 {
+                            let lo = w * 32;
+                            let hi = lo + 32;
+                            if proof_bytes[lo..hi] != reference[lo..hi] {
+                                diff_words.push(labels[w]);
+                            }
+                        }
+                        eprintln!(
+                            "  iter {iter}: proof DIFFERS at words: {}",
+                            if diff_words.is_empty() {
+                                "(none — proof matches reference but verify still failed?)".to_string()
+                            } else {
+                                diff_words.join(", ")
+                            }
+                        );
+                    } else {
+                        eprintln!("  iter {iter}: no reference proof yet (iter 0 also failed)");
+                    }
+                }
             }
         }
     }

@@ -235,20 +235,23 @@ void accumulate(bucket_h buckets_[], uint32_t nwins, uint32_t wbits,
                     bucket = p;
                     bucket.cneg(digit >> 31);
                 } else {
-                    // SP1: G1 uses safe `add` (handles P==±Q collisions
-                    // correctly); G2 keeps `add_unsafe` because the safe
-                    // formula's Fp2 instantiation overflows ptxas register
-                    // budget. The Ar G1 MSM (N=12.7M, filtered SRS) shows
-                    // ~30 % proof verify fail rate without this — see
-                    // project_groth16_prover_flake.md.
-                    // Using sizeof for the dispatch because not all
-                    // mont_t instantiations expose `degree` as a true
-                    // constexpr; sizeof is always compile-time and the
-                    // ratio cleanly separates G1 (128 B) from G2 (256 B).
+                    // SP1: G1 uses inlined safe `add`; G2 uses `uadd` which
+                    // is the register-frugal safe variant (state-machine
+                    // style A*B reuse — see xyzz_t.hpp:527 + the comment at
+                    // batch_addition.cuh:114 ".add() triggers spills").
+                    // Both replace the original `add_unsafe` to fix the
+                    // P==±Q collision case that was producing wrong bucket
+                    // sums. Without this, the Ar G1 MSM and the Bs2 G2 MSM
+                    // each had a residual ~3 % verify-fail rate. See
+                    // project_groth16_prover_flake.md. Using sizeof for the
+                    // dispatch because not all mont_t instantiations expose
+                    // `degree` as a true constexpr; sizeof is always
+                    // compile-time and cleanly separates G1 (128 B) from
+                    // G2 (256 B).
                     if constexpr (sizeof(bucket_t) <= 128) {
                         bucket.add(p, digit >> 31);
                     } else {
-                        bucket.add_unsafe(p, digit >> 31);
+                        bucket.uadd(p, digit >> 31);
                     }
                 }
             }
