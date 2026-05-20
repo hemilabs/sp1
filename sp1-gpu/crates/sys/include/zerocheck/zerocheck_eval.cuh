@@ -35,7 +35,7 @@ struct JaggedConstraintFolder {
             return K::zero();
         case 1:
             return K(idx);
-        case 2:
+        case 2: {
             K zeroPrepVal = K::load(data, preprocessed_ptr + idx * height + (rowIdx << 1));
             K onePrepVal = K::load(data, preprocessed_ptr + idx * height + (rowIdx << 1 | 1));
             K result = zeroPrepVal;
@@ -59,10 +59,12 @@ struct JaggedConstraintFolder {
                     break;
             }
             return result;
-        case 4:
+        }
+        case 4: {
             K zeroMainVal = K::load(data, main_ptr + idx * height + (rowIdx << 1));
             K oneMainVal = K::load(data, main_ptr + idx * height + (rowIdx << 1 | 1));
-            result = zeroMainVal;
+            K result = zeroMainVal;
+            K multi_diff;
             switch (eval_point) {
                 case 0:
                     break;
@@ -82,6 +84,7 @@ struct JaggedConstraintFolder {
                     break;
             }
             return result;
+        }
         case 9:
             return K(felt_t::load(publicValues, idx));
         default:

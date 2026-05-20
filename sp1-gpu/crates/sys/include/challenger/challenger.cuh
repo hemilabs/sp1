@@ -297,9 +297,17 @@ class MultiField32Challenger {
             original_buffer_sizes[j] = buffer_sizes[j];
         }
 
-        __shared__ bn254_t shared_sponge_state[WIDTH];
-        __shared__ kb31_t shared_input_buffer[INPUT_BUFFER_SIZE];
-        __shared__ kb31_t shared_output_buffer[OUTPUT_BUFFER_SIZE];
+        // HIP/clang disallows __shared__ initialization of types with
+        // non-trivial constructors. Use raw byte storage + reinterpret_cast.
+        __shared__ __align__(alignof(bn254_t))
+            char shared_sponge_state_raw[sizeof(bn254_t) * WIDTH];
+        __shared__ __align__(alignof(kb31_t))
+            char shared_input_buffer_raw[sizeof(kb31_t) * INPUT_BUFFER_SIZE];
+        __shared__ __align__(alignof(kb31_t))
+            char shared_output_buffer_raw[sizeof(kb31_t) * OUTPUT_BUFFER_SIZE];
+        bn254_t* shared_sponge_state = reinterpret_cast<bn254_t*>(shared_sponge_state_raw);
+        kb31_t* shared_input_buffer = reinterpret_cast<kb31_t*>(shared_input_buffer_raw);
+        kb31_t* shared_output_buffer = reinterpret_cast<kb31_t*>(shared_output_buffer_raw);
 
         if (threadIdx.x == 0) {
             for (size_t j = 0; j < WIDTH; j++) {
