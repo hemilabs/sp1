@@ -5,7 +5,7 @@ mod error;
 mod event;
 mod global;
 mod mle;
-mod pinned;
+pub mod pinned;
 mod scan;
 mod stream;
 pub mod sync;

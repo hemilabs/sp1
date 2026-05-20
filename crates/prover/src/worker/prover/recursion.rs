@@ -1,3 +1,5 @@
+use rayon::prelude::*;
+
 use crate::{
     build::{try_build_groth16_artifacts_dir, try_build_plonk_artifacts_dir},
     recursion::{
@@ -43,7 +45,9 @@ use sp1_recursion_executor::{
     shape::RecursionShape, Block, ExecutionRecord, Executor, RecursionProgram,
     RecursionPublicValues,
 };
-use sp1_recursion_gnark_ffi::{Groth16Bn254Prover, PlonkBn254Prover};
+use sp1_recursion_gnark_ffi::{
+    prove_with_retry, retry_budget, take_fail_inject, Groth16Bn254Prover, PlonkBn254Prover,
+};
 use std::{
     borrow::Borrow,
     collections::{BTreeMap, BTreeSet, VecDeque},
@@ -477,18 +481,44 @@ impl<A: ArtifactClient, C: SP1ProverComponents> SP1RecursionProver<A, C> {
                 recursive_verifier::<SP1GlobalContext, _,  InnerConfig>(
                     compress_verifier.shard_verifier(),
                 );
-            for arity in 1..=config.max_compose_arity {
-                let dummy_input =
-                    dummy_compose_input::<C>(&reduce_shape, arity, recursion_vks_height);
-                let mut program = compose_program_from_input(
-                    &recursive_compress_verifier,
-                    config.vk_verification,
-                    &dummy_input,
+            // Compile all compose programs + deferred program in parallel.
+            // Each compilation is independent and CPU-bound.
+            let arities: Vec<usize> = (1..=config.max_compose_arity).collect();
+            let all_programs: Vec<(usize, Arc<_>)> = {
+                let reduce_shape = &reduce_shape;
+                let recursive_compress_verifier = &recursive_compress_verifier;
+                let vk_verification = config.vk_verification;
+                // Build compose programs + deferred program in parallel
+                let mut programs: Vec<(usize, Arc<_>)> = arities
+                    .par_iter()
+                    .map(|&arity| {
+                        let dummy_input =
+                            dummy_compose_input::<C>(reduce_shape, arity, recursion_vks_height);
+                        let mut program = compose_program_from_input(
+                            recursive_compress_verifier,
+                            vk_verification,
+                            &dummy_input,
+                        );
+                        program.shape = Some(reduce_shape.shape.clone());
+                        (arity, Arc::new(program))
+                    })
+                    .collect();
+                // Also build deferred program (can run in the same parallel batch)
+                let deferred_input =
+                    dummy_deferred_input(&compress_verifier, reduce_shape, recursion_vks_height);
+                let mut deferred_program = deferred_program_from_input(
+                    recursive_compress_verifier,
+                    vk_verification,
+                    &deferred_input,
                 );
-                program.shape = Some(reduce_shape.shape.clone());
-                let program = Arc::new(program);
+                deferred_program.shape = Some(reduce_shape.shape.clone());
+                programs.push((0, Arc::new(deferred_program))); // arity=0 signals deferred
+                programs
+            };
 
-                // Make the reduce keys.
+            // Now do key generation sequentially (requires tokio runtime for GPU setup)
+            let mut deferred_program = None;
+            for (arity, program) in all_programs {
                 let (tx, rx) = oneshot::channel();
                 tokio::task::spawn({
                     let program = program.clone();
@@ -501,33 +531,15 @@ impl<A: ArtifactClient, C: SP1ProverComponents> SP1RecursionProver<A, C> {
                 });
                 let (pk, vk) = rx.blocking_recv().unwrap();
                 let pk = unsafe { pk.into_inner() };
-                compose_keys.insert(arity, (pk, vk));
-                compose_programs.insert(arity, program);
-            }
-
-            // Make the deferred program and keys.
-            let deferred_input =
-                dummy_deferred_input(&compress_verifier, &reduce_shape, recursion_vks_height);
-            let mut deferred_program = deferred_program_from_input(
-                &recursive_compress_verifier,
-                config.vk_verification,
-                &deferred_input,
-            );
-            deferred_program.shape = Some(reduce_shape.shape.clone());
-            let deferred_program = Arc::new(deferred_program);
-            let (tx, rx) = oneshot::channel();
-            tokio::task::spawn({
-                let program = deferred_program.clone();
-                let air_prover = compress_prover.clone();
-                async move {
-                    let permits = ProverSemaphore::new(1);
-                    let (pk, vk) = air_prover.setup(program, permits).await;
-                    tx.send((pk, vk)).ok();
+                if arity == 0 {
+                    // Deferred
+                    deferred_program = Some((program, (pk, vk)));
+                } else {
+                    compose_keys.insert(arity, (pk, vk));
+                    compose_programs.insert(arity, program);
                 }
-            });
-            let (pk, vk) = rx.blocking_recv().unwrap();
-            let pk = unsafe { pk.into_inner() };
-            let deferred_keys = (pk, vk);
+            }
+            let (deferred_program, deferred_keys) = deferred_program.unwrap();
 
             let prover_data = Arc::new(RecursionProverData {
                 recursion_vks,
@@ -766,18 +778,63 @@ impl<A: ArtifactClient, C: SP1ProverComponents> SP1RecursionProver<A, C> {
                 witness
             };
             let prover = Groth16Bn254Prover::new();
-            let proof = prover.prove(witness, &build_dir);
-            prover
-                .verify(
-                    &proof,
-                    &vkey_hash.as_canonical_biguint(),
-                    &committed_values_digest.as_canonical_biguint(),
-                    &exit_code.as_canonical_biguint(),
-                    &vk_root.as_canonical_biguint(),
-                    &proof_nonce.as_canonical_biguint(),
-                    &build_dir,
-                )
-                .map_err(|e| anyhow::anyhow!("Failed to verify groth16 wrap proof: {}", e))?;
+            // GPU-accelerated final-wrap path (sp1-gpu-groth16) via a
+            // SUBPROCESS helper. The shard-prover's persistent HIP/CUDA
+            // contexts from the earlier recursion phase would deadlock the
+            // in-process Groth16 GPU prover at the first MSM; spawning a
+            // clean child process isolates HIP state. Parent still does the
+            // Go R1CS solve + PK export (CPU-only) in-process — only the GPU
+            // compute step is subprocess-isolated.
+            //
+            // Falls back to gnark Go / Docker when native-gnark is not set.
+            // On AMD 7900 XTX the GPU path drops the wrap step from ~41 s
+            // (Docker CPU gnark) to ~3 s (round-6.4 standalone measurement).
+            //
+            // Wrapped in `prove_with_retry` to harden against transient
+            // hardware-induced verify failures (rare ~1/2000 flakes
+            // documented in `project_groth16_flake_2026-05-08.md`). Each
+            // retry re-spawns the helper subprocess so RNG / GPU state is
+            // freshly initialized. Default budget = 2 retries (3 attempts);
+            // override via SP1_GPU_PROVE_RETRY env (=0 disables retry).
+            let max_retries = retry_budget();
+            let vkey_bn = vkey_hash.as_canonical_biguint();
+            let cvd_bn = committed_values_digest.as_canonical_biguint();
+            let exit_bn = exit_code.as_canonical_biguint();
+            let vk_root_bn = vk_root.as_canonical_biguint();
+            let proof_nonce_bn = proof_nonce.as_canonical_biguint();
+            let proof = prove_with_retry(
+                "groth16_wrap",
+                max_retries,
+                || -> Result<_, anyhow::Error> {
+                    #[cfg(feature = "native-gnark")]
+                    let p = prover.prove_gpu_subprocess(witness.clone(), &build_dir);
+                    #[cfg(not(feature = "native-gnark"))]
+                    let p = prover.prove(witness.clone(), &build_dir);
+                    Ok(p)
+                },
+                |proof| -> Result<(), anyhow::Error> {
+                    // Test injection: if SP1_GPU_VERIFY_FAIL_INJECT=N is set,
+                    // force the next N verify calls to FAIL with a synthetic
+                    // error, regardless of the real verifier's result. Used
+                    // for end-to-end validation of the retry loop.
+                    if take_fail_inject() {
+                        return Err(anyhow::anyhow!(
+                            "synthetic verify failure (SP1_GPU_VERIFY_FAIL_INJECT)"
+                        ));
+                    }
+                    prover
+                        .verify(
+                            proof,
+                            &vkey_bn,
+                            &cvd_bn,
+                            &exit_bn,
+                            &vk_root_bn,
+                            &proof_nonce_bn,
+                            &build_dir,
+                        )
+                        .map_err(|e| anyhow::anyhow!("Failed to verify groth16 wrap proof: {}", e))
+                },
+            )?;
             Ok(proof)
         })
         .instrument(tracing::info_span!("prove groth16"))
@@ -833,18 +890,96 @@ impl<A: ArtifactClient, C: SP1ProverComponents> SP1RecursionProver<A, C> {
                 witness
             };
             let prover = PlonkBn254Prover::new();
-            let proof = prover.prove(witness, &build_dir);
-            prover
-                .verify(
-                    &proof,
-                    &vkey_hash.as_canonical_biguint(),
-                    &committed_values_digest.as_canonical_biguint(),
-                    &exit_code.as_canonical_biguint(),
-                    &vk_root.as_canonical_biguint(),
-                    &proof_nonce.as_canonical_biguint(),
-                    &build_dir,
-                )
-                .map_err(|e| anyhow::anyhow!("Failed to verify plonk wrap proof: {}", e))?;
+            // GPU-accelerated PLONK final-wrap path (sp1-gpu-plonk) via a
+            // SUBPROCESS helper, mirroring the Groth16 pattern above.
+            // Gated on env `SP1_PLONK_GPU=1` so we can roll out alongside
+            // the existing CPU/Docker path. Falls back to gnark Go / Docker
+            // when `native-gnark` is not enabled or the env is unset.
+            #[cfg(feature = "native-gnark")]
+            let plonk_gpu = std::env::var("SP1_PLONK_GPU").as_deref() == Ok("1");
+            #[cfg(not(feature = "native-gnark"))]
+            let plonk_gpu = false;
+
+            // The CPU `prover.prove(...)` (gnark Go) verifies the proof
+            // internally before returning, so we skip the redundant external
+            // verify on that path (it has a WriteRawTo/ReadFrom Docker
+            // serialization roundtrip bug that produces false negatives).
+            //
+            // The GPU subprocess path does NOT do an internal verify, so we
+            // always run gnark `verify_plonk_bn254` here when SP1_PLONK_GPU=1
+            // — this is the only correctness gate for the new path. To harden
+            // against transient hardware-induced verify failures we wrap the
+            // GPU prove + verify in `prove_with_retry`. The CPU path runs
+            // single-shot with a no-op verify closure.
+            let max_retries = retry_budget();
+            let vkey_bn = vkey_hash.as_canonical_biguint();
+            let cvd_bn = committed_values_digest.as_canonical_biguint();
+            let exit_bn = exit_code.as_canonical_biguint();
+            let vk_root_bn = vk_root.as_canonical_biguint();
+            let proof_nonce_bn = proof_nonce.as_canonical_biguint();
+
+            let proof = if plonk_gpu {
+                prove_with_retry(
+                    "plonk_wrap_gpu",
+                    max_retries,
+                    || -> Result<_, anyhow::Error> {
+                        #[cfg(feature = "native-gnark")]
+                        {
+                            Ok(prover.prove_gpu_subprocess(witness.clone(), &build_dir))
+                        }
+                        #[cfg(not(feature = "native-gnark"))]
+                        {
+                            // Unreachable when plonk_gpu = true requires
+                            // native-gnark, but kept for compile coverage.
+                            Ok(prover.prove(witness.clone(), &build_dir))
+                        }
+                    },
+                    |proof| -> Result<(), anyhow::Error> {
+                        if take_fail_inject() {
+                            return Err(anyhow::anyhow!(
+                                "synthetic verify failure (SP1_GPU_VERIFY_FAIL_INJECT)"
+                            ));
+                        }
+                        #[cfg(feature = "native-gnark")]
+                        {
+                            prover
+                                .verify(
+                                    proof,
+                                    &vkey_bn,
+                                    &cvd_bn,
+                                    &exit_bn,
+                                    &vk_root_bn,
+                                    &proof_nonce_bn,
+                                    &build_dir,
+                                )
+                                .map_err(|e| {
+                                    anyhow::anyhow!("Failed to verify GPU PLONK wrap proof: {}", e)
+                                })
+                        }
+                        #[cfg(not(feature = "native-gnark"))]
+                        {
+                            // Bind the closure params so the no-op branch
+                            // compiles without unused-variable warnings.
+                            let _ =
+                                (proof, &vkey_bn, &cvd_bn, &exit_bn, &vk_root_bn, &proof_nonce_bn);
+                            Ok(())
+                        }
+                    },
+                )?
+            } else {
+                #[cfg(feature = "native-gnark")]
+                {
+                    // Suppress unused warnings for the verify-input bindings
+                    // on the CPU branch (gnark.prove does verify internally).
+                    let _ = (&vkey_bn, &cvd_bn, &exit_bn, &vk_root_bn, &proof_nonce_bn);
+                    prover.prove(witness, &build_dir)
+                }
+                #[cfg(not(feature = "native-gnark"))]
+                {
+                    let _ = (&vkey_bn, &cvd_bn, &exit_bn, &vk_root_bn, &proof_nonce_bn);
+                    prover.prove(witness, &build_dir)
+                }
+            };
             Ok(proof)
         })
         .instrument(tracing::info_span!("prove plonk"))

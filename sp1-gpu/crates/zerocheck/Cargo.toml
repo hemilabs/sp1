@@ -14,6 +14,8 @@ sp1-gpu-cudart = { workspace = true }
 sp1-gpu-air = { workspace = true }
 sp1-gpu-utils = { workspace = true }
 sp1-gpu-tracegen = { workspace = true }
+sp1-gpu-challenger = { workspace = true }
+sp1-gpu-jagged-sumcheck = { workspace = true }
 
 # slop
 slop-air = { workspace = true }

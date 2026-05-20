@@ -236,14 +236,53 @@ struct MultiFieldHasherState : public HasherState<Params, Hasher_t> {
         if (overhangSize > 0) {
             F_t value =
                 poseidon2_bn254_3::reduceKoalaBear(overhang, nullptr, overhangSize, 0, 1, 0);
-            absorb(hasher, &value, 1);
+            this->absorb(hasher, &value, 1);
         }
         HasherState<Params, Hasher_t>::finalize(hasher, out);
     }
 };
 
 using KoalaBearHasher = StaticHasher<poseidon2_kb31_16::KoalaBear>;
+#ifndef __HIPCC__
 using Bn254Hasher = StaticHasher<poseidon2_bn254_3::Bn254>;
+#else
+// HIP: StaticHasher's `static constexpr` pointer-to-__constant__ pattern fails without
+// -fgpu-rdc (disabled for performance). DeviceInitHasher initializes round constants at
+// device runtime instead of constexpr time — __constant__ addresses are valid on device.
+template <typename Params>
+class DeviceInitHasher : public Hasher<Params> {
+    using F_t = typename Params::F_t;
+    using pF_t = typename Params::pF_t;
+    using Hasher_t = Hasher<Params>;
+    using RoundConstants_t = RoundConstants<Params>;
+
+  public:
+    RoundConstants_t roundConstants;
+
+    __device__ DeviceInitHasher() : roundConstants{
+        Params::INTERNAL_ROUND_CONSTANTS,
+        Params::EXTERNAL_ROUND_CONSTANTS,
+        Params::MAT_INTERNAL_DIAG_M1,
+        Params::MONTY_INVERSE
+    } {}
+
+    __device__ void permute(F_t in[Params::WIDTH], F_t out[Params::WIDTH]) {
+        Hasher_t::permute(in, out, roundConstants);
+    }
+
+    __device__ void compress(
+        F_t left[Params::DIGEST_WIDTH],
+        F_t right[Params::DIGEST_WIDTH],
+        F_t out[Params::DIGEST_WIDTH]) {
+        Hasher_t::compress(left, right, out, roundConstants);
+    }
+
+    __device__ void hash(F_t* in, size_t nIn, F_t out[Params::DIGEST_WIDTH]) {
+        Hasher_t::hash(in, nIn, out, roundConstants);
+    }
+};
+using Bn254Hasher = DeviceInitHasher<poseidon2_bn254_3::Bn254>;
+#endif
 
 class KoalaBearHasherState : public HasherState<poseidon2_kb31_16::KoalaBear, KoalaBearHasher> {
   public:

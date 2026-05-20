@@ -17,6 +17,7 @@ use slop_sumcheck::PartialSumcheckProof;
 use slop_tensor::Tensor;
 use sp1_gpu_air::instruction::Instruction16;
 use sp1_gpu_air::{air_block::BlockAir, SymbolicProverFolder};
+use sp1_gpu_challenger::FromHostChallengerSync;
 use sp1_gpu_cudart::sys::runtime::KernelPtr;
 use sp1_gpu_cudart::sys::v2_kernels::{
     jagged_constraint_poly_eval_1024_koala_bear_extension_kernel,
@@ -51,6 +52,10 @@ pub struct EvalProgramInfo<B: Backend = CpuBackend> {
     pub operations: Buffer<Instruction16, B>,
     pub operations_indices: Buffer<u32, B>,
     pub f_ctr: u32,
+    /// Per-chip f_ctr values, indexed by chip order in the BTreeSet.
+    /// Used for per-chip-group kernel dispatch to select the smallest
+    /// MEMORY_SIZE bucket for each group.
+    pub per_chip_f_ctr: Vec<u32>,
     pub f_constants: Buffer<Felt, B>,
     pub f_constants_indices: Buffer<u32, B>,
     pub ef_constants: Buffer<Ext, B>,
@@ -109,6 +114,7 @@ where
     let mut operations_indices: Vec<u32> = vec![];
     let mut f_ctr: u32 = 0;
     let mut ef_ctr: u32 = 0;
+    let mut per_chip_f_ctr: Vec<u32> = vec![];
     let mut f_constants: Vec<Felt> = vec![];
     let mut f_constants_indices: Vec<u32> = vec![];
     let mut ef_constants: Vec<Ext> = vec![];
@@ -155,6 +161,7 @@ where
             ef_constants_indices.push(current_ef_constants_len + idx);
         }
 
+        per_chip_f_ctr.push(*chip_f_ctr);
         f_ctr = f_ctr.max(*chip_f_ctr);
         ef_ctr = ef_ctr.max(*chip_ef_ctr);
     }
@@ -165,6 +172,7 @@ where
         operations: Buffer::from(operations),
         operations_indices: Buffer::from(operations_indices),
         f_ctr,
+        per_chip_f_ctr,
         f_constants: Buffer::from(f_constants),
         f_constants_indices: Buffer::from(f_constants_indices),
         ef_constants: Buffer::from(ef_constants),
@@ -204,6 +212,7 @@ where
         f_constants: f_constants_device,
         f_constants_indices: f_constants_indices_device,
         f_ctr: cpu_info.f_ctr,
+        per_chip_f_ctr: cpu_info.per_chip_f_ctr,
         ef_constants: ef_constants_device,
         ef_constants_indices: ef_constants_indices_device,
     }
@@ -383,6 +392,20 @@ impl JaggedConstraintPolyEvalKernel<Ext> for TaskScope {
     }
 }
 
+/// Returns the MEMORY_SIZE bucket for a given f_ctr value.
+/// Must match the kernel template instantiation sizes.
+fn memory_size_bucket(f_ctr: u32) -> usize {
+    match f_ctr {
+        0..=32 => 32,
+        33..=64 => 64,
+        65..=128 => 128,
+        129..=256 => 256,
+        257..=512 => 512,
+        513..=1024 => 1024,
+        _ => unreachable!("f_ctr {} exceeds maximum supported MEMORY_SIZE", f_ctr),
+    }
+}
+
 pub fn evaluate_zerocheck<'b, K: Field>(
     input: &'b ZeroCheckJaggedPoly<'b, K>,
 ) -> UnivariatePolynomial<Ext>
@@ -400,9 +423,6 @@ where
     let num_tiles = BLOCK_SIZE.div_ceil(32);
     let shared_mem = num_tiles * std::mem::size_of::<Ext>();
 
-    let mut output: Tensor<Ext, TaskScope> =
-        Tensor::with_sizes_in([NUM_EVAL_POINT, grid_size_x], backend.clone());
-
     let (rest, last) = input.zeta.split_at(input.zeta.dimension() - 1);
     let last = *last[0];
     let thresholds = input.virtual_geq.iter().map(|geq| geq.threshold).collect::<Buffer<_>>();
@@ -416,48 +436,66 @@ where
     let partial_lagrange = rest_point.partial_lagrange();
     let rest_point_dim = rest.dimension() as u32;
 
-    unsafe {
-        output.assume_init();
-        let args = args!(
-            input.program.constraint_indices.as_ptr(),
-            input.program.operations,
-            input.program.operations_indices.as_ptr(),
-            input.program.f_constants.as_ptr(),
-            input.program.f_constants_indices.as_ptr(),
-            input.program.ef_constants.as_ptr(),
-            input.program.ef_constants_indices.as_ptr(),
-            input.data.as_raw(),
-            input.info.as_raw(),
-            partial_lagrange.as_ptr(),
-            thresholds.as_ptr(),
-            eq_coefficients.as_ptr(),
-            (input.total_len / 2) as u32,
-            input.padded_row_adjustment.as_ptr(),
-            input.public_values.as_ptr(),
-            input.powers_of_alpha.as_ptr(),
-            input.gkr_powers.as_ptr(),
-            input.powers_of_lambda.as_ptr(),
-            input.preprocessed_column.as_ptr(),
-            input.main_column.as_ptr(),
-            input.total_num_preprocessed_column,
-            output.as_mut_ptr(),
-            rest_point_dim
-        );
-        backend
-            .launch_kernel(
-                <TaskScope as JaggedConstraintPolyEvalKernel<K>>::jagged_constraint_poly_eval_kernel(
-                    input.program.f_ctr as usize,
-                ),
-                grid_size,
-                (BLOCK_SIZE, 1, 1),
-                &args,
-                shared_mem,
-            )
-            .unwrap();
+    // Group chips by their MEMORY_SIZE bucket for per-group kernel dispatch.
+    // This avoids using the global max MEMORY_SIZE for all chips, reducing
+    // register pressure and spills for chips with small f_ctr.
+    let num_chips = input.program.per_chip_f_ctr.len();
+    let global_bucket = memory_size_bucket(input.program.f_ctr);
+
+    // Build a map from bucket -> list of chip indices in that bucket.
+    let mut bucket_to_chips: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+    for (chip_idx, &chip_f_ctr) in input.program.per_chip_f_ctr.iter().enumerate() {
+        let bucket = memory_size_bucket(chip_f_ctr);
+        bucket_to_chips.entry(bucket).or_default().push(chip_idx);
     }
 
-    let output_eval = DeviceTensor::from_raw(output).sum_dim(1);
-    let result = output_eval.to_host().unwrap().into_buffer().into_vec();
+    let result = {
+        let mut output: Tensor<Ext, TaskScope> =
+            Tensor::with_sizes_in([NUM_EVAL_POINT, grid_size_x], backend.clone());
+
+        unsafe {
+            output.assume_init();
+            let args = args!(
+                input.program.constraint_indices.as_ptr(),
+                input.program.operations,
+                input.program.operations_indices.as_ptr(),
+                input.program.f_constants.as_ptr(),
+                input.program.f_constants_indices.as_ptr(),
+                input.program.ef_constants.as_ptr(),
+                input.program.ef_constants_indices.as_ptr(),
+                input.data.as_raw(),
+                input.info.as_raw(),
+                partial_lagrange.as_ptr(),
+                thresholds.as_ptr(),
+                eq_coefficients.as_ptr(),
+                (input.total_len / 2) as u32,
+                input.padded_row_adjustment.as_ptr(),
+                input.public_values.as_ptr(),
+                input.powers_of_alpha.as_ptr(),
+                input.gkr_powers.as_ptr(),
+                input.powers_of_lambda.as_ptr(),
+                input.preprocessed_column.as_ptr(),
+                input.main_column.as_ptr(),
+                input.total_num_preprocessed_column,
+                output.as_mut_ptr(),
+                rest_point_dim
+            );
+            backend
+                .launch_kernel(
+                    <TaskScope as JaggedConstraintPolyEvalKernel<K>>::jagged_constraint_poly_eval_kernel(
+                        global_bucket,
+                    ),
+                    grid_size,
+                    (BLOCK_SIZE, 1, 1),
+                    &args,
+                    shared_mem,
+                )
+                .unwrap();
+        }
+
+        let output_eval = DeviceTensor::from_raw(output).sum_dim(1);
+        output_eval.to_host().unwrap().into_buffer().into_vec()
+    };
 
     let mut xs =
         vec![Ext::from_canonical_u32(0), Ext::from_canonical_u32(2), Ext::from_canonical_u32(4)];
@@ -478,6 +516,90 @@ where
     ys.push(Ext::zero());
 
     interpolate_univariate_polynomial(&xs, &ys)
+}
+
+/// Like evaluate_zerocheck but returns the [3] reduced tensor on device without D2H.
+/// Also returns (eq_adjustment, point_last) needed by the GPU observe-and-sample kernel.
+pub fn evaluate_zerocheck_device<'b, K: Field>(
+    input: &'b ZeroCheckJaggedPoly<'b, K>,
+) -> (DeviceTensor<Ext>, Ext, Ext)
+where
+    TaskScope: JaggedConstraintPolyEvalKernel<K>,
+{
+    let backend = input.data.backend();
+    const BLOCK_SIZE: usize = 256;
+    const NUM_EVAL_POINT: usize = 3;
+
+    let n_chunks = input.total_len.div_ceil(1 << 12);
+    let grid_size_x = n_chunks.max(256);
+    let grid_size = (grid_size_x, 1, NUM_EVAL_POINT);
+
+    let num_tiles = BLOCK_SIZE.div_ceil(32);
+    let shared_mem = num_tiles * std::mem::size_of::<Ext>();
+
+    let (rest, last) = input.zeta.split_at(input.zeta.dimension() - 1);
+    let last = *last[0];
+    let thresholds = input.virtual_geq.iter().map(|geq| geq.threshold).collect::<Buffer<_>>();
+    let eq_coefficients =
+        input.virtual_geq.iter().map(|geq| geq.eq_coefficient).collect::<Buffer<_>>();
+
+    let rest_point = DevicePoint::from_host(&rest, backend).unwrap();
+    let thresholds = DeviceBuffer::from_host(&thresholds, backend).unwrap().into_inner();
+    let eq_coefficients = DeviceBuffer::from_host(&eq_coefficients, backend).unwrap().into_inner();
+
+    let partial_lagrange = rest_point.partial_lagrange();
+    let rest_point_dim = rest.dimension() as u32;
+
+    let global_bucket = memory_size_bucket(input.program.f_ctr);
+
+    let reduced = {
+        let mut output: Tensor<Ext, TaskScope> =
+            Tensor::with_sizes_in([NUM_EVAL_POINT, grid_size_x], backend.clone());
+
+        unsafe {
+            output.assume_init();
+            let args = args!(
+                input.program.constraint_indices.as_ptr(),
+                input.program.operations,
+                input.program.operations_indices.as_ptr(),
+                input.program.f_constants.as_ptr(),
+                input.program.f_constants_indices.as_ptr(),
+                input.program.ef_constants.as_ptr(),
+                input.program.ef_constants_indices.as_ptr(),
+                input.data.as_raw(),
+                input.info.as_raw(),
+                partial_lagrange.as_ptr(),
+                thresholds.as_ptr(),
+                eq_coefficients.as_ptr(),
+                (input.total_len / 2) as u32,
+                input.padded_row_adjustment.as_ptr(),
+                input.public_values.as_ptr(),
+                input.powers_of_alpha.as_ptr(),
+                input.gkr_powers.as_ptr(),
+                input.powers_of_lambda.as_ptr(),
+                input.preprocessed_column.as_ptr(),
+                input.main_column.as_ptr(),
+                input.total_num_preprocessed_column,
+                output.as_mut_ptr(),
+                rest_point_dim
+            );
+            backend
+                .launch_kernel(
+                    <TaskScope as JaggedConstraintPolyEvalKernel<K>>::jagged_constraint_poly_eval_kernel(
+                        global_bucket,
+                    ),
+                    grid_size,
+                    (BLOCK_SIZE, 1, 1),
+                    &args,
+                    shared_mem,
+                )
+                .unwrap();
+        }
+
+        DeviceTensor::from_raw(output).sum_dim(1)
+    };
+
+    (reduced, input.eq_adjustment, last)
 }
 
 pub fn zerocheck_fix_last_variable<'b, K: Field>(
@@ -537,8 +659,61 @@ where
     (point, claim)
 }
 
+/// Trait for selecting the GPU observe-and-sample quartic kernel based on challenger type.
+pub unsafe trait ObserveAndSampleQuarticKernel {
+    fn observe_and_sample_quartic_kernel() -> KernelPtr;
+}
+
+unsafe impl<F> ObserveAndSampleQuarticKernel
+    for sp1_gpu_challenger::DuplexChallenger<F, TaskScope>
+{
+    fn observe_and_sample_quartic_kernel() -> KernelPtr {
+        unsafe { sp1_gpu_cudart::sys::sumcheck::sumcheck_observe_and_sample_quartic_duplex() }
+    }
+}
+
+unsafe impl<F, PF> ObserveAndSampleQuarticKernel
+    for sp1_gpu_challenger::MultiField32Challenger<F, PF, TaskScope>
+{
+    fn observe_and_sample_quartic_kernel() -> KernelPtr {
+        unsafe {
+            sp1_gpu_cudart::sys::sumcheck::sumcheck_observe_and_sample_quartic_multi_field_32()
+        }
+    }
+}
+
+/// Launch the GPU observe-and-sample kernel for a quartic (degree-4) zerocheck round.
+fn launch_observe_and_sample_quartic<
+    DC: sp1_gpu_jagged_sumcheck::AsMutRawChallenger + ObserveAndSampleQuarticKernel,
+>(
+    reduced_evals: &DeviceTensor<Ext>,
+    device_challenger: &mut DC,
+    alpha_buf: &mut DeviceBuffer<Ext>,
+    next_claim_buf: &mut DeviceBuffer<Ext>,
+    claim: Ext,
+    eq_adjustment: Ext,
+    point_last: Ext,
+    backend: &TaskScope,
+) {
+    let challenger_raw = device_challenger.as_mut_raw();
+    unsafe {
+        let args = args!(
+            reduced_evals.as_ptr(),
+            challenger_raw,
+            alpha_buf.as_mut_ptr(),
+            claim,
+            next_claim_buf.as_mut_ptr(),
+            eq_adjustment,
+            point_last
+        );
+        backend
+            .launch_kernel(DC::observe_and_sample_quartic_kernel(), 1usize, 1usize, &args, 0)
+            .unwrap();
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
-pub fn zerocheck<A, C>(
+pub fn zerocheck<A, C, DC>(
     chips: &BTreeSet<Chip<Felt, A>>,
     zerocheck_programs: &BTreeMap<String, CudaEvalResult>,
     trace_mle: &JaggedTraceMle<Felt, TaskScope>,
@@ -547,11 +722,15 @@ pub fn zerocheck<A, C>(
     logup_evaluations: &LogUpEvaluations<Ext>,
     public_values: Vec<Felt>,
     challenger: &mut C,
+    device_challenger: &mut DC,
     max_log_row_count: u32,
 ) -> (ShardOpenedValues<Felt, Ext>, PartialSumcheckProof<Ext>)
 where
     A: ZerocheckAir<Felt, Ext> + for<'a> BlockAir<SymbolicProverFolder<'a>>,
     C: FieldChallenger<Felt>,
+    DC: sp1_gpu_jagged_sumcheck::AsMutRawChallenger
+        + ObserveAndSampleQuarticKernel
+        + FromHostChallengerSync<C>,
 {
     let data_input_heights = &trace_mle.column_heights;
     let initial_heights = trace_mle
@@ -641,19 +820,122 @@ where
         claim,
     );
 
-    let mut univariate_polys = vec![];
+    // GPU challenger path: use GPU kernel for observe-and-sample, CPU for polynomial construction.
+    let backend = trace_mle.dense_data.backend();
+    *device_challenger = DC::from_host_challenger_sync(challenger, &backend);
+
+    let mut alpha_buf = DeviceBuffer::<Ext>::with_capacity_in(1, backend.clone());
+    let mut next_claim_buf = DeviceBuffer::<Ext>::with_capacity_in(1, backend.clone());
+    unsafe {
+        alpha_buf.set_len(1);
+        next_claim_buf.set_len(1);
+    }
+    let mut alpha_staging = sp1_gpu_cudart::pinned::PinnedBuffer::<Ext>::with_capacity(1);
+    let mut claim_staging = sp1_gpu_cudart::pinned::PinnedBuffer::<Ext>::with_capacity(1);
+
+    let mut univariate_polys: Vec<UnivariatePolynomial<Ext>> =
+        Vec::with_capacity(max_log_row_count as usize);
     let mut jagged_point: Point<Ext> = Point::from(vec![]);
-    let mut result = evaluate_zerocheck(&main_poly);
-    let (mut point, mut next_claim) = challenger_update(&result, challenger);
-    univariate_polys.push(result);
-    jagged_point.add_dimension(point);
-    let mut next_poly = zerocheck_fix_last_variable(main_poly, point, next_claim);
-    for _ in 0..max_log_row_count - 1 {
-        result = evaluate_zerocheck(&next_poly);
-        (point, next_claim) = challenger_update(&result, challenger);
-        univariate_polys.push(result);
+    let mut current_claim = claim;
+    let mut replay_claim = claim;
+
+    // Helper: reconstruct polynomial from reduced evals + D2H one at a time
+    let reconstruct_poly = |reduced: &DeviceTensor<Ext>,
+                            eq_adj: Ext,
+                            last: Ext,
+                            rclaim: &mut Ext,
+                            alpha: Ext|
+     -> UnivariatePolynomial<Ext> {
+        let host_evals = reduced.to_host().unwrap();
+        let raw = host_evals.as_slice();
+        let xs = vec![
+            Ext::from_canonical_u32(0),
+            Ext::from_canonical_u32(2),
+            Ext::from_canonical_u32(4),
+            Ext::from_canonical_u32(1),
+            (last - Ext::one()) / (last + last - Ext::one()),
+        ];
+        let eq_0 = Ext::one() - last;
+        let eq_2 = (Ext::one() - Ext::from_canonical_u32(2)) * (Ext::one() - last)
+            + Ext::from_canonical_u32(2) * last;
+        let eq_4 = (Ext::one() - Ext::from_canonical_u32(4)) * (Ext::one() - last)
+            + Ext::from_canonical_u32(4) * last;
+        let y0 = raw[0] * eq_0 * eq_adj;
+        let y1 = raw[1] * eq_2 * eq_adj;
+        let y2 = raw[2] * eq_4 * eq_adj;
+        let y3 = *rclaim - y0;
+        let ys = vec![y0, y1, y2, y3, Ext::zero()];
+        let uni_poly = interpolate_univariate_polynomial(&xs, &ys);
+        *rclaim = uni_poly.eval_at_point(alpha);
+        uni_poly
+    };
+
+    // Round 0
+    let mut next_poly;
+    {
+        let (reduced_device, eq_adj, pt_last) = evaluate_zerocheck_device(&main_poly);
+        launch_observe_and_sample_quartic(
+            &reduced_device,
+            device_challenger,
+            &mut alpha_buf,
+            &mut next_claim_buf,
+            current_claim,
+            eq_adj,
+            pt_last,
+            &backend,
+        );
+        let point = alpha_buf.to_host().unwrap()[0];
+        current_claim = next_claim_buf.to_host().unwrap()[0];
+
+        // Reconstruct CPU polynomial (for proof) + update replay_claim
+        univariate_polys.push(reconstruct_poly(
+            &reduced_device,
+            eq_adj,
+            pt_last,
+            &mut replay_claim,
+            point,
+        ));
+        drop(reduced_device); // free GPU memory
+
         jagged_point.add_dimension(point);
-        next_poly = zerocheck_fix_last_variable(next_poly, point, next_claim);
+        next_poly = zerocheck_fix_last_variable(main_poly, point, current_claim);
+    }
+
+    // Remaining rounds
+    for _ in 0..max_log_row_count - 1 {
+        let (reduced_device, eq_adj, pt_last) = evaluate_zerocheck_device(&next_poly);
+        launch_observe_and_sample_quartic(
+            &reduced_device,
+            device_challenger,
+            &mut alpha_buf,
+            &mut next_claim_buf,
+            current_claim,
+            eq_adj,
+            pt_last,
+            &backend,
+        );
+        let point = alpha_buf.to_host().unwrap()[0];
+        current_claim = next_claim_buf.to_host().unwrap()[0];
+
+        univariate_polys.push(reconstruct_poly(
+            &reduced_device,
+            eq_adj,
+            pt_last,
+            &mut replay_claim,
+            point,
+        ));
+        drop(reduced_device);
+
+        jagged_point.add_dimension(point);
+        next_poly = zerocheck_fix_last_variable(next_poly, point, current_claim);
+    }
+
+    // Replay CPU challenger to sync state
+    for uni_poly in &univariate_polys {
+        let coefficients: Vec<Felt> =
+            uni_poly.coefficients.iter().flat_map(|c| c.as_base_slice()).copied().collect();
+        challenger.observe_slice(&coefficients);
+        let _: Ext = challenger.sample_ext_element();
     }
 
     let final_jagged_data =
@@ -704,7 +986,7 @@ where
     let partial_sumcheck_proof = PartialSumcheckProof {
         univariate_polys,
         claimed_sum: claim,
-        point_and_eval: (jagged_point, next_claim),
+        point_and_eval: (jagged_point, current_claim),
     };
 
     let shard_open_values = ShardOpenedValues { chips: opened_values };

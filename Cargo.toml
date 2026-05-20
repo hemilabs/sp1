@@ -81,6 +81,8 @@ members = [
   "sp1-gpu/crates/logup_gkr",
   "sp1-gpu/crates/merkle_tree",
   "sp1-gpu/crates/perf",
+  "sp1-gpu/crates/plonk",
+  "sp1-gpu/crates/groth16",
   "sp1-gpu/crates/prover_components",
   "sp1-gpu/crates/shard_prover",
   "sp1-gpu/crates/sys",
@@ -94,6 +96,8 @@ resolver = "2"
 
 [profile.release]
 opt-level = 3
+lto = "thin"
+codegen-units = 16
 
 [profile.bench]
 opt-level = 3

@@ -88,6 +88,24 @@ impl<T: DeviceCopy> DeviceBuffer<T> {
         Ok(host_vec)
     }
 
+    /// Copy device buffer into a pre-allocated pinned staging buffer and return the value.
+    /// Avoids per-call Vec allocation and uses pinned memory for faster DMA transfers.
+    /// The pinned buffer must have capacity >= self.len().
+    /// Synchronizes the stream to ensure the DMA transfer completes before returning.
+    pub fn to_host_pinned<'a>(
+        &self,
+        staging: &'a mut crate::pinned::PinnedBuffer<T>,
+    ) -> Result<&'a [T], CopyError> {
+        let len = self.buf.len();
+        assert!(staging.capacity() >= len, "pinned staging buffer too small");
+        unsafe {
+            self.copy_to_host_slice(&mut staging.as_mut_slice()[..len])?;
+        }
+        // Sync the stream to ensure the async DMA to pinned memory is complete.
+        self.buf.backend().synchronize_blocking().map_err(|_| CopyError)?;
+        Ok(unsafe { std::slice::from_raw_parts(staging.as_ptr(), len) })
+    }
+
     pub fn len(&self) -> usize {
         self.buf.len()
     }

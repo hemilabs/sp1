@@ -1,5 +1,7 @@
 
+#ifndef __HIPCC__
 #include <cuda.h>
+#endif
 
 #if defined(FEATURE_BLS12_381)
 #include <ff/bls12-381.hpp>
@@ -65,33 +67,39 @@ extern "C" rustCudaError_t batch_coset_dft(
     const auto gen_powers = NTTParameters::all()[NTT::gpu_id()].partial_group_gen_powers;
 
     try {
+        // Phase 1: LDE_spread for all columns (per-column, writes to separate output regions).
         for (size_t c = 0; c < poly_count; c++) {
-
-            NTT::bit_rev(
-                &d_out[(c + 1) * ext_domain_size - domain_size],
-                &d_in[c * domain_size],
-                lg_domain_size,
-                stream);
-
             NTT::LDE_launch(
                 stream,
                 &d_out[c * ext_domain_size],
-                &d_out[(c + 1) * ext_domain_size - domain_size],
+                &d_in[c * domain_size],
                 gen_powers,
                 lg_domain_size,
                 lg_blowup,
                 true,
-                shift);
+                shift,
+                false,  // ext_pow
+                true);  // input_natural_order: read in[bit_rev(idx)] instead of in[idx]
+        }
 
-            NTT::Base_dev_ptr(
+        // Phase 2: Batch NTT across all columns in a single kernel launch.
+        // This uses sppark's batch API which launches a 2D grid with blockIdx.y
+        // indexing different columns, processing all polynomials in parallel.
+        if (poly_count > 0) {
+            NTT::Base_dev_ptr_batch(
                 stream,
-                &d_out[c * ext_domain_size],
+                d_out,
                 lg_domain_size + lg_blowup,
                 NTT::InputOutputOrder::RN,
                 NTT::Direction::forward,
-                NTT::Type::standard);
+                NTT::Type::standard,
+                poly_count,
+                ext_domain_size);
+        }
 
-            if (bit_rev_output) {
+        // Phase 3: Bit-reversal for all columns (per-column).
+        if (bit_rev_output) {
+            for (size_t c = 0; c < poly_count; c++) {
                 NTT::bit_rev(
                     &d_out[c * ext_domain_size],
                     &d_out[c * ext_domain_size],
@@ -233,15 +241,15 @@ batch_NTT(fr_t* d_inout, uint32_t lg_domain_size, uint32_t poly_count, const cud
     uint32_t domain_size = 1U << lg_domain_size;
 
     try {
-        for (size_t c = 0; c < poly_count; c++) {
-            NTT::Base_dev_ptr(
-                stream,
-                &d_inout[c * domain_size],
-                lg_domain_size,
-                NTT::InputOutputOrder::NN,
-                NTT::Direction::forward,
-                NTT::Type::standard);
-        }
+        NTT::Base_dev_ptr_batch(
+            stream,
+            d_inout,
+            lg_domain_size,
+            NTT::InputOutputOrder::NN,
+            NTT::Direction::forward,
+            NTT::Type::standard,
+            poly_count,
+            domain_size);
     } catch (const cudaError_t& e) {
         CUDA_OK(e);
     }
@@ -277,15 +285,15 @@ batch_iNTT(fr_t* d_inout, uint32_t lg_domain_size, uint32_t poly_count, const cu
     uint32_t domain_size = 1U << lg_domain_size;
 
     try {
-        for (size_t c = 0; c < poly_count; c++) {
-            NTT::Base_dev_ptr(
-                stream,
-                &d_inout[c * domain_size],
-                lg_domain_size,
-                NTT::InputOutputOrder::NN,
-                NTT::Direction::inverse,
-                NTT::Type::standard);
-        }
+        NTT::Base_dev_ptr_batch(
+            stream,
+            d_inout,
+            lg_domain_size,
+            NTT::InputOutputOrder::NN,
+            NTT::Direction::inverse,
+            NTT::Type::standard,
+            poly_count,
+            domain_size);
     } catch (const cudaError_t& e) {
         CUDA_OK(e);
     }

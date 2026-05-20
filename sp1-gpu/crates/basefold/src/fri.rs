@@ -275,7 +275,7 @@ where
             scope.clone(),
         );
 
-        let mut folded_codeword = Tensor::<GC::F, TaskScope>::zeros_in(
+        let mut folded_codeword = Tensor::<GC::F, TaskScope>::with_sizes_in(
             [<GC::EF as AbstractExtensionField<GC::F>>::D, folded_height << self.config.log_blowup],
             scope.clone(),
         );

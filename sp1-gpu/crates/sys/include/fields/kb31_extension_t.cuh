@@ -1,7 +1,11 @@
 #pragma once
 
 #include "fields/kb31_t.cuh"
+#ifdef __HIPCC__
+#include "fields/ptx_portable.cuh"
+#else
 #include "fields/ptx.cuh"
+#endif
 
 static constexpr size_t W_INT = 3; // The value of W in the kb31 field, used for multiplication
 
@@ -103,6 +107,96 @@ class kb31_extension_t {
     }
 
     __device__ __forceinline__ kb31_extension_t& operator*=(const kb31_extension_t b) {
+#ifdef __HIPCC__
+        // Karatsuba extension multiply for F[x]/(x^4 - W), W=3.
+        // Uses 2-level Karatsuba: 9 base-field multiplies instead of 16.
+        // Split: P = (a0+a1*x) + (a2+a3*x)*x^2 = P_lo + P_hi*y, y=x^2
+        //        Q = (b0+b1*x) + (b2+b3*x)*x^2 = Q_lo + Q_hi*y
+        // Product mod y^2-W: (P_lo*Q_lo + W*P_hi*Q_hi) + ((P_lo+P_hi)*(Q_lo+Q_hi) - P_lo*Q_lo - P_hi*Q_hi)*y
+        // Each degree-1 multiply uses Karatsuba: 3 muls instead of 4.
+        kb31_t a0 = value[0], a1 = value[1], a2 = value[2], a3 = value[3];
+        kb31_t b0 = b.value[0], b1 = b.value[1], b2 = b.value[2], b3 = b.value[3];
+
+        #define MUL(x, y) (kb31_t)((x) * (y))
+        // W-multiply: x*3 = x+x+x (2 full-rate adds vs 1 quarter-rate mul on RDNA3)
+        #define MULW(x) ((x) + (x) + (x))
+
+        // P_lo * Q_lo = (a0+a1*x)*(b0+b1*x): Karatsuba with 3 muls
+        kb31_t m0 = MUL(a0, b0);           // a0*b0
+        kb31_t m1 = MUL(a1, b1);           // a1*b1
+        kb31_t m01 = MUL(a0 + a1, b0 + b1); // (a0+a1)*(b0+b1)
+        // P_lo*Q_lo = m0 + (m01-m0-m1)*x + m1*x^2
+
+        // P_hi * Q_hi = (a2+a3*x)*(b2+b3*x): Karatsuba with 3 muls
+        kb31_t m2 = MUL(a2, b2);           // a2*b2
+        kb31_t m3 = MUL(a3, b3);           // a3*b3
+        kb31_t m23 = MUL(a2 + a3, b2 + b3); // (a2+a3)*(b2+b3)
+        // P_hi*Q_hi = m2 + (m23-m2-m3)*x + m3*x^2
+
+        // (P_lo+P_hi) * (Q_lo+Q_hi): Karatsuba with 3 muls
+        kb31_t s0 = a0 + a2, s1 = a1 + a3;
+        kb31_t t0 = b0 + b2, t1 = b1 + b3;
+        kb31_t n0 = MUL(s0, t0);           // (a0+a2)*(b0+b2)
+        kb31_t n1 = MUL(s1, t1);           // (a1+a3)*(b1+b3)
+        kb31_t n01 = MUL(s0 + s1, t0 + t1); // (a0+a1+a2+a3)*(b0+b1+b2+b3)
+
+        // Total: 9 base-field multiplies
+
+        // Assemble P_lo*Q_lo coefficients (degree-2 poly in x):
+        // lo0 = m0, lo1 = m01-m0-m1, lo2 = m1
+        kb31_t lo1 = m01 - m0 - m1;
+
+        // Assemble P_hi*Q_hi coefficients:
+        // hi0 = m2, hi1 = m23-m2-m3, hi2 = m3
+        kb31_t hi1 = m23 - m2 - m3;
+
+        // Assemble (P_lo+P_hi)*(Q_lo+Q_hi) coefficients:
+        // mid0 = n0, mid1 = n01-n0-n1, mid2 = n1
+        kb31_t mid1 = n01 - n0 - n1;
+
+        // R_lo = P_lo*Q_lo + W * P_hi*Q_hi (mod x^2 in the y-layer, but we track x-coefficients)
+        //   coefficients: [lo0 + W*hi0, lo1 + W*hi1, lo2 + W*hi2]
+        //   But lo2 + W*hi2 is the x^2 coefficient of R_lo, which in the full poly is x^2 * y^0 = x^2
+        // R_hi = mid - lo - hi (Karatsuba difference), coefficients:
+        //   [n0-m0-m2, mid1-lo1-hi1, n1-m1-m3]
+        //   But the x^2 coefficient of R_hi is (n1-m1-m3), which in the full poly is x^2 * y = x^4 = W
+
+        // Full product coefficients in x (before reduction mod x^4-W):
+        // c0 = lo0 + W*hi0 (constant of R_lo*1)... wait, need to be more careful.
+        // R_lo = [lo0, lo1, lo2] as polynomial in x, R_hi = [r0, r1, r2] in x
+        // Product = R_lo + R_hi*x^2, so:
+        //   x^0: lo0                      x^1: lo1
+        //   x^2: lo2 + r0                 x^3: r1
+        //   x^4: r2 -> reduces to W*r2 added to x^0
+        // Plus W * P_hi*Q_hi is part of R_lo. Let me redo:
+
+        // Actually the outer Karatsuba gives:
+        // Result_y0 = P_lo*Q_lo + W * P_hi*Q_hi  (polynomial in x, degree 2)
+        // Result_y1 = (P_lo+P_hi)*(Q_lo+Q_hi) - P_lo*Q_lo - P_hi*Q_hi (polynomial in x, degree 2)
+        // Full = Result_y0 + Result_y1 * y = Result_y0 + Result_y1 * x^2
+
+        // Result_y0 in x: [m0 + W*m2, lo1 + W*hi1, m1 + W*m3]
+        kb31_t ry0_0 = m0 + MULW(m2);
+        kb31_t ry0_1 = lo1 + MULW(hi1);
+        kb31_t ry0_2 = m1 + MULW(m3);
+
+        // Result_y1 in x: [n0-m0-m2, mid1-lo1-hi1, n1-m1-m3]
+        kb31_t ry1_0 = n0 - m0 - m2;
+        kb31_t ry1_1 = mid1 - lo1 - hi1;
+        kb31_t ry1_2 = n1 - m1 - m3;
+
+        // Full polynomial = ry0 + ry1 * x^2:
+        // x^0: ry0_0,  x^1: ry0_1,  x^2: ry0_2 + ry1_0,  x^3: ry1_1
+        // x^4: ry1_2 -> reduces to W*ry1_2 added to x^0
+        value[0] = ry0_0 + MULW(ry1_2);
+        value[1] = ry0_1;
+        value[2] = ry0_2 + ry1_0;
+        value[3] = ry1_1;
+
+        #undef MULW
+        #undef MUL
+        return *this;
+#else // !__HIPCC__ (CUDA optimized path)
         uint32_t x0 = value[0].val, x1 = value[1].val, x2 = value[2].val, x3 = value[3].val,
                  y0 = b.value[0].val, y1 = b.value[1].val, y2 = b.value[2].val, y3 = b.value[3].val;
 
@@ -216,6 +310,7 @@ class kb31_extension_t {
         value[3] = x3 >= MOD ? x3 - MOD : x3;
 
         return *this;
+#endif
     }
 
     __device__ __forceinline__ kb31_extension_t& operator*=(const kb31_t b) {
@@ -256,7 +351,7 @@ class kb31_extension_t {
 
     __device__ __forceinline__ kb31_extension_t frobenius() {
         kb31_t z0 = kb31_t(2113994754);
-        kb31_t z = z0;
+        kb31_t z = kb31_t::one();
         kb31_extension_t result;
         for (size_t i = 0; i < D; i++) {
             result.value[i] = value[i] * z;
@@ -277,7 +372,7 @@ class kb31_extension_t {
         for (size_t i = 1; i < D; i++) {
             g += a.value[i] * b.value[4 - i];
         }
-        g *= kb31_t(11);
+        g *= kb31_t((int)W_INT);
         g += a.value[0] * b.value[0];
         return f * g.reciprocal();
     }
@@ -308,6 +403,12 @@ class kb31_extension_t {
 
     __device__ __forceinline__ kb31_extension_t
     interpolateLinear(const kb31_extension_t one, const kb31_extension_t zero) const {
+#ifdef __HIPCC__
+        // HIP-safe: use schoolbook multiply via kb31_t operators
+        kb31_extension_t diff = one - zero;
+        kb31_extension_t result = *this * diff + zero;
+        return result;
+#else
         uint32_t x0 = value[0].val, x1 = value[1].val, x2 = value[2].val, x3 = value[3].val,
                  y0 = one.value[0].val - zero.value[0].val,
                  y1 = one.value[1].val - zero.value[1].val,
@@ -450,10 +551,18 @@ class kb31_extension_t {
         retval.value[2].val = x2;
         retval.value[3].val = x3;
         return retval;
+#endif
     }
 
     __device__ __forceinline__ kb31_extension_t
     interpolateLinear(const kb31_t one, const kb31_t zero) const {
+#ifdef __HIPCC__
+        // HIP-safe: use schoolbook multiply via kb31_t operators
+        kb31_t diff = one - zero;
+        kb31_extension_t result = *this * diff;
+        result.value[0] += zero;
+        return result;
+#else
         uint32_t x0 = value[0].val, x1 = value[1].val, x2 = value[2].val, x3 = value[3].val,
                  y0 = one.val - zero.val, y1, y2, y3;
 
@@ -533,5 +642,6 @@ class kb31_extension_t {
         retval.value[2].val = x2;
         retval.value[3].val = x3;
         return retval;
+#endif
     }
 };

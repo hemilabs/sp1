@@ -34,12 +34,17 @@ pub fn local_gpu_opts() -> (SP1CoreOpts, bool) {
     // Get the amount of memory on the GPU.
     let gpu_memory_gb: usize = (((cuda_memory_info().unwrap().1 as f64) / gb).ceil() as usize) + 4;
 
-    if gpu_memory_gb < 24 {
-        panic!("Unsupported GPU memory: {gpu_memory_gb}, must be at least 24GB");
+    if gpu_memory_gb < 16 {
+        panic!("Unsupported GPU memory: {gpu_memory_gb}, must be at least 16GB");
     }
 
-    let shard_threshold = if gpu_memory_gb <= 30 {
-        ELEMENT_THRESHOLD - (1 << 26) - (1 << 25)
+    // Shard threshold tiers based on GPU memory.
+    // Note: gpu_memory_gb = ceil(actual_vram_gb) + 4, so 24GB GPUs report as 28, 16GB as 20.
+    // 24GB GPUs (e.g. 7900 XTX) can use the full threshold — the VRAM cost is only +0.57GB
+    // over the reduced threshold, well within budget. Fewer shards = less fixed overhead.
+    let shard_threshold = if gpu_memory_gb <= 20 {
+        // 16GB GPUs (e.g. RX 9070 XT): ~134M elements per shard to fit in VRAM.
+        ELEMENT_THRESHOLD - (1 << 28)
     } else {
         ELEMENT_THRESHOLD
     };

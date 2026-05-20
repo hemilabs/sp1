@@ -116,7 +116,13 @@ class KoalaBear {
         for (int i = 0; i < WIDTH; i++) {
             sum64 += static_cast<uint64_t>(state[i].val);
         }
-        const F_t sum = kb31_t(static_cast<uint32_t>(sum64 % kb31_t::MOD)) * MONTY_INVERSE;
+        // Reduce sum64 mod p without 64-bit division.
+        // sum64 < 16*p < 2^35. Use: 2^31 ≡ 2^24-1 (mod p).
+        uint32_t _lo = static_cast<uint32_t>(sum64 & 0x7FFFFFFF);
+        uint32_t _hi = static_cast<uint32_t>(sum64 >> 31);
+        uint32_t _s = _lo + (_hi << 24) - _hi;
+        if (_s >= kb31_t::MOD) _s -= kb31_t::MOD;
+        const F_t sum = kb31_t(_s) * MONTY_INVERSE;
         for (int i = 0; i < WIDTH; i++) {
             state[i] *= MAT_INTERNAL_DIAG_M1[i];
             state[i] += sum;
@@ -160,7 +166,18 @@ __device__ void absorbRow(
     size_t width,
     size_t height,
     HasherState_t* state) {
-    for (int j = 0; j < width; j++) {
+    constexpr int RATE = poseidon2_kb31_16::constants::RATE; // 8
+    int j = 0;
+    // Fast path: absorb RATE elements at a time, call permute directly.
+    // Avoids per-element branch checking in absorb().
+    for (; j + RATE <= (int)width; j += RATE) {
+        for (int k = 0; k < RATE; k++) {
+            (*state).data[k] = in[(j + k) * height + rowIdx];
+        }
+        hasher.permute((*state).data, (*state).data);
+    }
+    // Handle remaining elements (< RATE)
+    for (; j < (int)width; j++) {
         kb31_t* row = &in[j * height + rowIdx];
         (*state).absorb(hasher, row, 1);
     }

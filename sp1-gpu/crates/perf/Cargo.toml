@@ -57,11 +57,17 @@ tracing-opentelemetry = "^0.24"
 tracing-subscriber = "0.3.19"
 
 [features]
+default = ["native-gnark"]
 bigint-rug = [
     "sp1-core-executor/bigint-rug",
     "sp1-core-machine/bigint-rug",
     "sp1-gpu-prover/bigint-rug",
 ]
+# Enable the GPU-accelerated Groth16 final wrap via sp1-gpu-groth16 + Go FFI
+# to solve R1CS. The GPU prove step runs in a subprocess helper
+# (`groth16_gpu_helper`) to avoid deadlocking against the shard-prover's
+# persistent HIP/CUDA contexts held in this process. Falls back to gnark Go
+# / Docker when not enabled.
 native-gnark = ["sp1-prover/native-gnark"]
 groth16-cuda = ["sp1-recursion-gnark-ffi/groth16-cuda"]
 experimental = ["sp1-prover/experimental", "sp1-gpu-prover/experimental"]
