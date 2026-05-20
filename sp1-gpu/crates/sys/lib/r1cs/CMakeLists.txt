@@ -1,6 +1,4 @@
 # R1CS solver kernel: drop-in replacement for gnark.Solve.
-# CUDA only — see crates/recursion/gnark-ffi/r1cs_solver_proto/full_solve_warp_hip.cu
-# for the HIP variant (currently blocked on RDNA3 wave32 / ds_bpermute interaction).
 if(NOT USE_HIP)
     # Cooperative kernel needs -rdc=true so that grid_group::sync() resolves
     # against the cooperative-launch device runtime.
@@ -16,9 +14,12 @@ if(NOT USE_HIP)
         $<$<COMPILE_LANGUAGE:CUDA>:-rdc=true>
     )
 else()
-    # HIP: stub returning "unsupported" so callers can fall back to gnark.
+    # HIP: ship the HIP-ported R1CS solver (`r1cs_solver.hip.cu`). Phase E
+    # PLONK SCS solver demonstrated cooperative-grid + warp-coop work on
+    # RDNA3; this port re-attempts the Groth16 R1CS variant.
     add_library(r1cs_objs OBJECT
-        r1cs_solver_hip_stub.cu
+        r1cs_solver.hip.cu
     )
-    set_source_files_properties(r1cs_solver_hip_stub.cu PROPERTIES LANGUAGE HIP)
+    target_link_libraries(r1cs_objs PRIVATE sp1_gpu_bn254)
+    set_source_files_properties(r1cs_solver.hip.cu PROPERTIES LANGUAGE HIP)
 endif()

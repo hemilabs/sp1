@@ -47,7 +47,9 @@ use sp1_recursion_executor::{
     shape::RecursionShape, Block, ExecutionRecord, Executor, RecursionProgram,
     RecursionPublicValues,
 };
-use sp1_recursion_gnark_ffi::{Groth16Bn254Prover, PlonkBn254Prover};
+use sp1_recursion_gnark_ffi::{
+    prove_with_retry, retry_budget, take_fail_inject, Groth16Bn254Prover, PlonkBn254Prover,
+};
 use std::{
     borrow::Borrow,
     collections::{BTreeMap, BTreeSet, VecDeque},
@@ -770,21 +772,52 @@ impl<A: ArtifactClient, C: SP1ProverComponents> SP1RecursionProver<A, C> {
             // Falls back to gnark Go / Docker when native-gnark is not set.
             // On AMD 7900 XTX the GPU path drops the wrap step from ~41 s
             // (Docker CPU gnark) to ~3 s (round-6.4 standalone measurement).
-            #[cfg(feature = "native-gnark")]
-            let proof = prover.prove_gpu_subprocess(witness, &build_dir);
-            #[cfg(not(feature = "native-gnark"))]
-            let proof = prover.prove(witness, &build_dir);
-            prover
-                .verify(
-                    &proof,
-                    &vkey_hash.as_canonical_biguint(),
-                    &committed_values_digest.as_canonical_biguint(),
-                    &exit_code.as_canonical_biguint(),
-                    &vk_root.as_canonical_biguint(),
-                    &proof_nonce.as_canonical_biguint(),
-                    &build_dir,
-                )
-                .map_err(|e| anyhow::anyhow!("Failed to verify groth16 wrap proof: {}", e))?;
+            //
+            // Wrapped in `prove_with_retry` to harden against transient
+            // hardware-induced verify failures (rare ~1/2000 flakes
+            // documented in `project_groth16_flake_2026-05-08.md`). Each
+            // retry re-spawns the helper subprocess so RNG / GPU state is
+            // freshly initialized. Default budget = 2 retries (3 attempts);
+            // override via SP1_GPU_PROVE_RETRY env (=0 disables retry).
+            let max_retries = retry_budget();
+            let vkey_bn = vkey_hash.as_canonical_biguint();
+            let cvd_bn = committed_values_digest.as_canonical_biguint();
+            let exit_bn = exit_code.as_canonical_biguint();
+            let vk_root_bn = vk_root.as_canonical_biguint();
+            let proof_nonce_bn = proof_nonce.as_canonical_biguint();
+            let proof = prove_with_retry(
+                "groth16_wrap",
+                max_retries,
+                || -> Result<_, anyhow::Error> {
+                    #[cfg(feature = "native-gnark")]
+                    let p = prover.prove_gpu_subprocess(witness.clone(), &build_dir);
+                    #[cfg(not(feature = "native-gnark"))]
+                    let p = prover.prove(witness.clone(), &build_dir);
+                    Ok(p)
+                },
+                |proof| -> Result<(), anyhow::Error> {
+                    // Test injection: if SP1_GPU_VERIFY_FAIL_INJECT=N is set,
+                    // force the next N verify calls to FAIL with a synthetic
+                    // error, regardless of the real verifier's result. Used
+                    // for end-to-end validation of the retry loop.
+                    if take_fail_inject() {
+                        return Err(anyhow::anyhow!(
+                            "synthetic verify failure (SP1_GPU_VERIFY_FAIL_INJECT)"
+                        ));
+                    }
+                    prover
+                        .verify(
+                            proof,
+                            &vkey_bn,
+                            &cvd_bn,
+                            &exit_bn,
+                            &vk_root_bn,
+                            &proof_nonce_bn,
+                            &build_dir,
+                        )
+                        .map_err(|e| anyhow::anyhow!("Failed to verify groth16 wrap proof: {}", e))
+                },
+            )?;
             Ok(proof)
         })
         .instrument(tracing::info_span!("prove groth16"))
@@ -845,21 +878,96 @@ impl<A: ArtifactClient, C: SP1ProverComponents> SP1RecursionProver<A, C> {
                 witness
             };
             let prover = PlonkBn254Prover::new();
-            // TODO(plonk-gpu): PLONK final wrap still uses gnark Go / Docker.
-            // A prove_gpu equivalent is NOT YET available because:
-            //   1. No ExportPlonkGpuWitness FFI analog to ExportGroth16GpuWitness.
-            //   2. The sp1-gpu-plonk prover has a known correctness bug: the
-            //      re-derived selector commitments (Ql/Qr/Qm/Qo/Qk) don't match
-            //      the VK-stored ones, failing gnark pairing verification. See
-            //      memory `project_plonk_bug_rootcause.md` for the root-cause
-            //      analysis (nbPublic mismatch at export-time vs VK-build-time).
-            // Once those land, mirror the Groth16 pattern above with
-            // `prover.prove_gpu(witness, &build_dir)` under `cfg(feature =
-            // "native-gnark")`.
-            let proof = prover.prove(witness, &build_dir);
-            // Note: ProvePlonk (Go) already verifies internally before returning.
-            // The external verify via Docker has a WriteRawTo/ReadFrom serialization
-            // roundtrip bug that causes false negatives. Skip the redundant check.
+            // GPU-accelerated PLONK final-wrap path (sp1-gpu-plonk) via a
+            // SUBPROCESS helper, mirroring the Groth16 pattern above.
+            // Gated on env `SP1_PLONK_GPU=1` so we can roll out alongside
+            // the existing CPU/Docker path. Falls back to gnark Go / Docker
+            // when `native-gnark` is not enabled or the env is unset.
+            #[cfg(feature = "native-gnark")]
+            let plonk_gpu = std::env::var("SP1_PLONK_GPU").as_deref() == Ok("1");
+            #[cfg(not(feature = "native-gnark"))]
+            let plonk_gpu = false;
+
+            // The CPU `prover.prove(...)` (gnark Go) verifies the proof
+            // internally before returning, so we skip the redundant external
+            // verify on that path (it has a WriteRawTo/ReadFrom Docker
+            // serialization roundtrip bug that produces false negatives).
+            //
+            // The GPU subprocess path does NOT do an internal verify, so we
+            // always run gnark `verify_plonk_bn254` here when SP1_PLONK_GPU=1
+            // — this is the only correctness gate for the new path. To harden
+            // against transient hardware-induced verify failures we wrap the
+            // GPU prove + verify in `prove_with_retry`. The CPU path runs
+            // single-shot with a no-op verify closure.
+            let max_retries = retry_budget();
+            let vkey_bn = vkey_hash.as_canonical_biguint();
+            let cvd_bn = committed_values_digest.as_canonical_biguint();
+            let exit_bn = exit_code.as_canonical_biguint();
+            let vk_root_bn = vk_root.as_canonical_biguint();
+            let proof_nonce_bn = proof_nonce.as_canonical_biguint();
+
+            let proof = if plonk_gpu {
+                prove_with_retry(
+                    "plonk_wrap_gpu",
+                    max_retries,
+                    || -> Result<_, anyhow::Error> {
+                        #[cfg(feature = "native-gnark")]
+                        {
+                            Ok(prover.prove_gpu_subprocess(witness.clone(), &build_dir))
+                        }
+                        #[cfg(not(feature = "native-gnark"))]
+                        {
+                            // Unreachable when plonk_gpu = true requires
+                            // native-gnark, but kept for compile coverage.
+                            Ok(prover.prove(witness.clone(), &build_dir))
+                        }
+                    },
+                    |proof| -> Result<(), anyhow::Error> {
+                        if take_fail_inject() {
+                            return Err(anyhow::anyhow!(
+                                "synthetic verify failure (SP1_GPU_VERIFY_FAIL_INJECT)"
+                            ));
+                        }
+                        #[cfg(feature = "native-gnark")]
+                        {
+                            prover
+                                .verify(
+                                    proof,
+                                    &vkey_bn,
+                                    &cvd_bn,
+                                    &exit_bn,
+                                    &vk_root_bn,
+                                    &proof_nonce_bn,
+                                    &build_dir,
+                                )
+                                .map_err(|e| {
+                                    anyhow::anyhow!("Failed to verify GPU PLONK wrap proof: {}", e)
+                                })
+                        }
+                        #[cfg(not(feature = "native-gnark"))]
+                        {
+                            // Bind the closure params so the no-op branch
+                            // compiles without unused-variable warnings.
+                            let _ =
+                                (proof, &vkey_bn, &cvd_bn, &exit_bn, &vk_root_bn, &proof_nonce_bn);
+                            Ok(())
+                        }
+                    },
+                )?
+            } else {
+                #[cfg(feature = "native-gnark")]
+                {
+                    // Suppress unused warnings for the verify-input bindings
+                    // on the CPU branch (gnark.prove does verify internally).
+                    let _ = (&vkey_bn, &cvd_bn, &exit_bn, &vk_root_bn, &proof_nonce_bn);
+                    prover.prove(witness, &build_dir)
+                }
+                #[cfg(not(feature = "native-gnark"))]
+                {
+                    let _ = (&vkey_bn, &cvd_bn, &exit_bn, &vk_root_bn, &proof_nonce_bn);
+                    prover.prove(witness, &build_dir)
+                }
+            };
             Ok(proof)
         })
         .instrument(tracing::info_span!("prove plonk"))

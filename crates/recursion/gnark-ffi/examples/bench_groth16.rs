@@ -99,6 +99,11 @@ fn main() {
     // Run our GPU path first so we always get its numbers even if Icicle crashes
     // on a later iteration (Icicle has a known flaky multi-proof re-entry bug).
     let mut gpu_times = Vec::with_capacity(iterations);
+    // Per-iter PASS/FAIL accumulators for stability sweep (used under cuda feature).
+    #[cfg(feature = "cuda")]
+    let mut gpu_pass = 0usize;
+    #[cfg(feature = "cuda")]
+    let mut gpu_fail = 0usize;
     #[cfg(feature = "cuda")]
     let gpu_proof: Option<Groth16Bn254Proof> = {
         let gpu_label = "Ours (sp1-gpu-groth16 + sppark)";
@@ -191,9 +196,41 @@ fn main() {
             last = Some(Groth16Bn254Proof {
                 public_inputs,
                 encoded_proof: encoded_proof_hex,
-                raw_proof: raw_proof_hex,
+                raw_proof: raw_proof_hex.clone(),
                 groth16_vkey_hash: [0; 32], // not relevant for the benchmark
             });
+
+            // Per-iter gnark verify (BENCH_VERIFY_EACH=1) for stability sweeps.
+            if std::env::var("BENCH_VERIFY_EACH").ok().as_deref() == Some("1") {
+                match sp1_recursion_gnark_ffi::ffi::verify_groth16_bn254(
+                    build_dir.to_str().unwrap(),
+                    &raw_proof_hex,
+                    &gnark_witness.vkey_hash,
+                    &gnark_witness.committed_values_digest,
+                    &gnark_witness.exit_code,
+                    &gnark_witness.vk_root,
+                    &gnark_witness.proof_nonce,
+                ) {
+                    Ok(()) => {
+                        gpu_pass += 1;
+                        eprintln!("[BENCH_VERIFY_EACH] iter {}: PASS", i + 1);
+                    }
+                    Err(e) => {
+                        gpu_fail += 1;
+                        eprintln!("[BENCH_VERIFY_EACH] iter {}: FAIL -- {e}", i + 1);
+                        // Dump raw bytes for offline byte-diff investigation.
+                        let dump = format!("/tmp/bench_groth16_fail_iter_{}.hex", i + 1);
+                        let _ = std::fs::write(&dump, &raw_proof_hex);
+                        eprintln!("[BENCH_VERIFY_EACH] iter {}: raw_proof dumped to {dump}", i + 1);
+                    }
+                }
+            }
+        }
+        if std::env::var("BENCH_VERIFY_EACH").ok().as_deref() == Some("1") {
+            eprintln!(
+                "[BENCH_VERIFY_EACH] SUMMARY: pass={gpu_pass} fail={gpu_fail} total={}",
+                gpu_pass + gpu_fail
+            );
         }
         last
     };
@@ -205,10 +242,13 @@ fn main() {
 
     // Now run the Go/Icicle path. Icicle may crash on later iterations — catch
     // the panic so we still emit our summary for the iterations that succeeded.
+    // Set BENCH_GPU_ONLY=1 to skip the (slow) Go baseline — useful for stability sweeps.
+    let bench_gpu_only = std::env::var("BENCH_GPU_ONLY").ok().as_deref() == Some("1");
+    let go_iters = if bench_gpu_only { 0 } else { iterations };
     println!();
-    let mut go_times = Vec::with_capacity(iterations);
+    let mut go_times = Vec::with_capacity(go_iters);
     let mut go_proof: Option<Groth16Bn254Proof> = None;
-    for i in 0..iterations {
+    for i in 0..go_iters {
         let witness_temp = shm_named_tempfile();
         std::fs::write(witness_temp.path(), &witness_json).expect("write witness");
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -253,14 +293,13 @@ fn main() {
             eprintln!("raw_proof: IDENTICAL");
         } else {
             eprintln!("raw_proof: DIFFERENT (expected — random r,s)");
-            let regions: &[(&str, usize, usize)] = &[
-                ("Ar  (G1)", 0, 64),
-                ("Bs  (G2)", 64, 192),
-                ("Krs (G1)", 192, 256),
-            ];
+            let regions: &[(&str, usize, usize)] =
+                &[("Ar  (G1)", 0, 64), ("Bs  (G2)", 64, 192), ("Krs (G1)", 192, 256)];
             for &(name, start, end) in regions {
                 let end = end.min(go_bytes.len()).min(gpu_bytes.len());
-                if start >= end { continue; }
+                if start >= end {
+                    continue;
+                }
                 if go_bytes[start..end] == gpu_bytes[start..end] {
                     eprintln!("  {name}: identical");
                 } else {
@@ -279,8 +318,10 @@ fn main() {
 
     // G1 on-curve check
     let p = BigUint::parse_bytes(
-        b"30644e72e131a029b85045b68181585d97816a916871ca8d3c208c16d87cfd47", 16,
-    ).unwrap();
+        b"30644e72e131a029b85045b68181585d97816a916871ca8d3c208c16d87cfd47",
+        16,
+    )
+    .unwrap();
     let b_coeff = BigUint::from(3u64);
     let check_g1 = |label: &str, name: &str, data: &[u8]| {
         let x = BigUint::from_bytes_be(&data[..32]);
@@ -303,8 +344,12 @@ fn main() {
         if let Some(proof) = proof_opt {
             let bytes = hex::decode(&proof.raw_proof).expect("decode hex");
             eprintln!("=== {label} proof on-curve checks ===");
-            if bytes.len() >= 64 { check_g1(label, "Ar", &bytes[0..64]); }
-            if bytes.len() >= 256 { check_g1(label, "Krs", &bytes[192..256]); }
+            if bytes.len() >= 64 {
+                check_g1(label, "Ar", &bytes[0..64]);
+            }
+            if bytes.len() >= 256 {
+                check_g1(label, "Krs", &bytes[192..256]);
+            }
             // Commitments + CommitmentPok
             if bytes.len() > 260 {
                 let n_c = u32::from_be_bytes(bytes[256..260].try_into().unwrap()) as usize;
@@ -313,10 +358,10 @@ fn main() {
                 if bytes.len() >= tail_needed {
                     for i in 0..n_c {
                         let off = 260 + i * 64;
-                        check_g1(label, &format!("Commit[{i}]"), &bytes[off..off+64]);
+                        check_g1(label, &format!("Commit[{i}]"), &bytes[off..off + 64]);
                     }
                     let pok_off = 260 + n_c * 64;
-                    check_g1(label, "CommitPok", &bytes[pok_off..pok_off+64]);
+                    check_g1(label, "CommitPok", &bytes[pok_off..pok_off + 64]);
                 }
             }
         }
@@ -332,12 +377,8 @@ fn main() {
 
         // Helper: convert our BN254G1Affine (Montgomery u32 limbs) to arkworks G1Affine
         let our_g1_to_ark = |p: &sp1_gpu_groth16::BN254G1Affine| -> ArkG1 {
-            let x = ArkFq::new_unchecked(BigInt(
-                sp1_gpu_groth16::Fq::from_bn254fq_raw(&p.x).0,
-            ));
-            let y = ArkFq::new_unchecked(BigInt(
-                sp1_gpu_groth16::Fq::from_bn254fq_raw(&p.y).0,
-            ));
+            let x = ArkFq::new_unchecked(BigInt(sp1_gpu_groth16::Fq::from_bn254fq_raw(&p.x).0));
+            let y = ArkFq::new_unchecked(BigInt(sp1_gpu_groth16::Fq::from_bn254fq_raw(&p.y).0));
             ArkG1::new_unchecked(x, y)
         };
 
@@ -430,7 +471,9 @@ fn main() {
         our_gen_bytes.extend_from_slice(&gen_raw[0..64]); // Ar = generator
 
         if g1_gen_bytes == our_gen_bytes {
-            eprintln!("  TEST 1 (generator serialization): PASS -- our write_g1_be matches gnark format");
+            eprintln!(
+                "  TEST 1 (generator serialization): PASS -- our write_g1_be matches gnark format"
+            );
         } else {
             eprintln!("  TEST 1 (generator serialization): FAIL");
             eprintln!("    ark bytes: {}", hex::encode(&g1_gen_bytes));
@@ -446,15 +489,16 @@ fn main() {
             build_dir.to_str().unwrap(),
             gpu_data_dir_str,
         );
-        let pk = sp1_gpu_groth16::types::Groth16ProvingData::load(gpu_data_dir_str)
-            .expect("load pk");
+        let pk =
+            sp1_gpu_groth16::types::Groth16ProvingData::load(gpu_data_dir_str).expect("load pk");
 
         // alpha through roundtrip: BN254G1Affine -> G1Affine -> G1Jacobian -> G1Affine -> BN254G1Affine
         let alpha_g1aff = sp1_gpu_groth16::G1Affine::from_bn254(&pk.pk_g1_alpha);
         let alpha_jac = alpha_g1aff.to_jacobian();
         let alpha_rt = alpha_jac.to_affine().to_bn254();
 
-        if alpha_rt.x.limbs == pk.pk_g1_alpha.x.limbs && alpha_rt.y.limbs == pk.pk_g1_alpha.y.limbs {
+        if alpha_rt.x.limbs == pk.pk_g1_alpha.x.limbs && alpha_rt.y.limbs == pk.pk_g1_alpha.y.limbs
+        {
             eprintln!("  TEST 2 (alpha Jac roundtrip): PASS");
         } else {
             eprintln!("  TEST 2 (alpha Jac roundtrip): FAIL");
@@ -470,7 +514,8 @@ fn main() {
         // We can't recompute the full MSM here, but we CAN verify:
         //   proof.Ar serialization == arkworks(proof.Ar_point) serialization
         // i.e., does our BN254G1Affine -> gnark bytes match arkworks -> gnark bytes?
-        let gpu_bytes = hex::decode(&gpu_proof.as_ref().unwrap().raw_proof).expect("decode gpu hex");
+        let gpu_bytes =
+            hex::decode(&gpu_proof.as_ref().unwrap().raw_proof).expect("decode gpu hex");
 
         // Parse the serialized Ar bytes back as a gnark G1 point
         // and compare with arkworks
@@ -536,7 +581,10 @@ fn main() {
                 let gpu_ar_y = ArkFq::from_be_bytes_mod_order(&gpu_bytes[32..64]);
                 let gpu_ar = ArkG1::new_unchecked(gpu_ar_x, gpu_ar_y);
 
-                eprintln!("  TEST 5a (Ar go vs gpu): {}", if go_ar == gpu_ar { "MATCH" } else { "MISMATCH" });
+                eprintln!(
+                    "  TEST 5a (Ar go vs gpu): {}",
+                    if go_ar == gpu_ar { "MATCH" } else { "MISMATCH" }
+                );
                 if go_ar != gpu_ar {
                     eprintln!("    Go  Ar.x: {}", go_ar_x);
                     eprintln!("    GPU Ar.x: {}", gpu_ar_x);
@@ -547,7 +595,10 @@ fn main() {
             // Parse Go's Bs (G2) at bytes 64..192 vs GPU's
             if go_bytes.len() >= 192 && gpu_bytes.len() >= 192 {
                 let bs_match = go_bytes[64..192] == gpu_bytes[64..192];
-                eprintln!("  TEST 5b (Bs go vs gpu): {}", if bs_match { "MATCH" } else { "MISMATCH" });
+                eprintln!(
+                    "  TEST 5b (Bs go vs gpu): {}",
+                    if bs_match { "MATCH" } else { "MISMATCH" }
+                );
                 if !bs_match {
                     eprintln!("    Go  Bs: {}", hex::encode(&go_bytes[64..192]));
                     eprintln!("    GPU Bs: {}", hex::encode(&gpu_bytes[64..192]));
@@ -563,7 +614,10 @@ fn main() {
                 let gpu_krs_y = ArkFq::from_be_bytes_mod_order(&gpu_bytes[224..256]);
                 let gpu_krs = ArkG1::new_unchecked(gpu_krs_x, gpu_krs_y);
 
-                eprintln!("  TEST 5c (Krs go vs gpu): {}", if go_krs == gpu_krs { "MATCH" } else { "MISMATCH" });
+                eprintln!(
+                    "  TEST 5c (Krs go vs gpu): {}",
+                    if go_krs == gpu_krs { "MATCH" } else { "MISMATCH" }
+                );
                 if go_krs != gpu_krs {
                     eprintln!("    Go  Krs.x: {}", go_krs_x);
                     eprintln!("    GPU Krs.x: {}", gpu_krs_x);
@@ -574,7 +628,10 @@ fn main() {
             // Tail (commitments + pok)
             if go_bytes.len() > 256 && gpu_bytes.len() > 256 {
                 let tail_match = go_bytes[256..] == gpu_bytes[256..];
-                eprintln!("  TEST 5d (tail go vs gpu): {}", if tail_match { "MATCH" } else { "MISMATCH" });
+                eprintln!(
+                    "  TEST 5d (tail go vs gpu): {}",
+                    if tail_match { "MATCH" } else { "MISMATCH" }
+                );
             }
         }
 
@@ -582,8 +639,8 @@ fn main() {
         // e(Ar, Bs) * e(-Krs, delta) * e(-pubInputs, gamma) = e(alpha, beta)
         // Without public inputs: e(Ar, Bs) * e(-Krs, delta) ?= e(alpha, beta)
         {
-            use ark_ec::pairing::Pairing;
             use ark_bn254::Bn254;
+            use ark_ec::pairing::Pairing;
 
             // Parse Ar from GPU proof bytes
             let ar_x = ArkFq::from_be_bytes_mod_order(&gpu_bytes[0..32]);
@@ -595,10 +652,8 @@ fn main() {
             let bs_x_a0 = ArkFq::from_be_bytes_mod_order(&gpu_bytes[96..128]);
             let bs_y_a1 = ArkFq::from_be_bytes_mod_order(&gpu_bytes[128..160]);
             let bs_y_a0 = ArkFq::from_be_bytes_mod_order(&gpu_bytes[160..192]);
-            let proof_bs = ArkG2::new_unchecked(
-                ArkFq2::new(bs_x_a0, bs_x_a1),
-                ArkFq2::new(bs_y_a0, bs_y_a1),
-            );
+            let proof_bs =
+                ArkG2::new_unchecked(ArkFq2::new(bs_x_a0, bs_x_a1), ArkFq2::new(bs_y_a0, bs_y_a1));
 
             // Parse Krs from GPU proof bytes
             let krs_x = ArkFq::from_be_bytes_mod_order(&gpu_bytes[192..224]);
@@ -618,10 +673,7 @@ fn main() {
             eprintln!("    beta on_curve: {}", beta_pk.is_on_curve());
             eprintln!("    delta on_curve: {}", delta_pk.is_on_curve());
 
-            let lhs = Bn254::multi_pairing(
-                [proof_ar, (-proof_krs).into()],
-                [proof_bs, delta_pk],
-            );
+            let lhs = Bn254::multi_pairing([proof_ar, (-proof_krs).into()], [proof_bs, delta_pk]);
             let rhs = Bn254::pairing(alpha_pk, beta_pk);
             eprintln!("    e(Ar,Bs)*e(-Krs,delta) == e(alpha,beta): {}", lhs == rhs);
             if lhs != rhs {
@@ -650,16 +702,18 @@ fn main() {
                         ArkFq::from_be_bytes_mod_order(&go_bytes[192..224]),
                         ArkFq::from_be_bytes_mod_order(&go_bytes[224..256]),
                     );
-                    let go_lhs = Bn254::multi_pairing(
-                        [go_ar, (-go_krs).into()],
-                        [go_bs, delta_pk],
+                    let go_lhs = Bn254::multi_pairing([go_ar, (-go_krs).into()], [go_bs, delta_pk]);
+                    eprintln!(
+                        "    Go proof: e(Ar,Bs)*e(-Krs,delta) == e(alpha,beta): {}",
+                        go_lhs == rhs
                     );
-                    eprintln!("    Go proof: e(Ar,Bs)*e(-Krs,delta) == e(alpha,beta): {}", go_lhs == rhs);
                     // KEY TEST: if both proofs are valid, their LHS must be equal
                     // (both equal e(alpha,beta) * e(pubInputSum,gamma))
                     eprintln!("    GPU LHS == Go LHS: {}", lhs == go_lhs);
                     if lhs != go_lhs {
-                        eprintln!("    *** BUG CONFIRMED: GPU proof's pairing value differs from Go's");
+                        eprintln!(
+                            "    *** BUG CONFIRMED: GPU proof's pairing value differs from Go's"
+                        );
                         eprintln!("    GPU LHS: {:?}", lhs);
                         eprintln!("    Go  LHS: {:?}", go_lhs);
                     }
@@ -672,21 +726,27 @@ fn main() {
     // Go gnark verification (last — may abort on invalid proofs)
     // ========================================================================
     let vkey_hash = gnark_witness.vkey_hash.parse::<BigUint>().expect("parse vkey_hash");
-    let committed_values_digest = gnark_witness.committed_values_digest
-        .parse::<BigUint>().expect("parse committed_values_digest");
+    let committed_values_digest = gnark_witness
+        .committed_values_digest
+        .parse::<BigUint>()
+        .expect("parse committed_values_digest");
     let exit_code_bu = gnark_witness.exit_code.parse::<BigUint>().expect("parse exit_code");
     let vk_root_bu = gnark_witness.vk_root.parse::<BigUint>().expect("parse vk_root");
     let proof_nonce_bu = gnark_witness.proof_nonce.parse::<BigUint>().expect("parse proof_nonce");
 
-    let groth16_vkey_hash =
-        sp1_recursion_gnark_ffi::Groth16Bn254Prover::get_vkey_hash(&build_dir);
+    let groth16_vkey_hash = sp1_recursion_gnark_ffi::Groth16Bn254Prover::get_vkey_hash(&build_dir);
 
     if let Some(go) = go_proof.as_ref() {
         let mut pf = go.clone();
         pf.groth16_vkey_hash = groth16_vkey_hash;
         match sp1_recursion_gnark_ffi::Groth16Bn254Prover::new().verify(
-            &pf, &vkey_hash, &committed_values_digest,
-            &exit_code_bu, &vk_root_bu, &proof_nonce_bu, &build_dir,
+            &pf,
+            &vkey_hash,
+            &committed_values_digest,
+            &exit_code_bu,
+            &vk_root_bu,
+            &proof_nonce_bu,
+            &build_dir,
         ) {
             Ok(()) => eprintln!("[Go]  gnark verify: PASS"),
             Err(e) => eprintln!("[Go]  gnark verify: FAIL -- {e}"),

@@ -110,6 +110,53 @@ func ExportPlonkData(dataDir string, outputDir string) {
 	}
 	fmt.Printf("Exported %d BSB22 polys in %s\n", len(trace.Qcp), time.Since(start))
 
+	// Export VK selector commitments (so the Rust prover doesn't have to
+	// re-derive them from the PK polynomials — re-deriving has been observed
+	// to give DIFFERENT commitments than what's in the VK because NewTrace
+	// sees a different `len(spr.Public)` than the original VK build did.
+	// See project_plonk_bug_rootcause.md.
+	//
+	// File layout (binary, all G1 points uncompressed 64 bytes LE):
+	//   [0..64)   : Ql commit
+	//   [64..128) : Qr commit
+	//   [128..192): Qm commit
+	//   [192..256): Qo commit
+	//   [256..320): Qk commit
+	//   [320..384): S[0] commit (s1 in our naming)
+	//   [384..448): S[1] commit
+	//   [448..512): S[2] commit
+	//   [512..516): num_qcp (u32 LE)
+	//   [516..   ): num_qcp × 64 bytes Qcp commits
+	start = time.Now()
+	vkCommitsFile, err := os.Create(outputDir + "/vk_selector_commits.bin")
+	if err != nil {
+		panic(err)
+	}
+	{
+		writeG1 := func(p bn254.G1Affine) {
+			raw := p.RawBytes()
+			buf := make([]byte, 64)
+			reverseBytes(buf[:32], raw[:32])
+			reverseBytes(buf[32:], raw[32:])
+			vkCommitsFile.Write(buf)
+		}
+		writeG1(pk_bn254.Vk.Ql)
+		writeG1(pk_bn254.Vk.Qr)
+		writeG1(pk_bn254.Vk.Qm)
+		writeG1(pk_bn254.Vk.Qo)
+		writeG1(pk_bn254.Vk.Qk)
+		writeG1(pk_bn254.Vk.S[0])
+		writeG1(pk_bn254.Vk.S[1])
+		writeG1(pk_bn254.Vk.S[2])
+		nqcp := uint32(len(pk_bn254.Vk.Qcp))
+		binary.Write(vkCommitsFile, binary.LittleEndian, nqcp)
+		for i := uint32(0); i < nqcp; i++ {
+			writeG1(pk_bn254.Vk.Qcp[i])
+		}
+	}
+	vkCommitsFile.Close()
+	fmt.Printf("Exported VK selector commitments in %s\n", time.Since(start))
+
 	// Export domain info
 	domainInfoFile, err := os.Create(outputDir + "/plonk_domain_info.bin")
 	if err != nil {

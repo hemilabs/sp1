@@ -49,6 +49,14 @@ struct bn254_fq2_t {
     // __noinline__ is LOAD-BEARING for occupancy. Do not remove without a
     // matching VGPR-budget redesign.
     __device__ __noinline__ bn254_fq2_t operator*(const bn254_fq2_t& b) const {
+        // 2026-05-20 EXPERIMENT REVERTED: tried `bn254_fq_mul_pair(c0, b.c0, v0,
+        // c1, b.c1, v1)` to interleave the two CIOS state machines and hide
+        // RDNA3's 4-cycle v_mad_u64_u32 dep latency. Despite G2's `__noinline__`
+        // pushing the callee frame separation, G2 MSM regressed +332 ms
+        // (962 → 1294 ms on 7900 XTX G16 100K). The two parallel CIOS state
+        // machines (~18 u32 each in registers = 36 u32 → 18 VGPRs) blow the
+        // 96-VGPR per-wave target that round-3 painstakingly established.
+        // Same VGPR-cliff lesson as round-3 G1 inline-Karatsuba (project_groth16_amd_round3).
         bn254_fq_t v0 = c0 * b.c0;
         bn254_fq_t v1 = c1 * b.c1;
         // H1 lazy reduction (aggressive variant, round-6 experiment):

@@ -596,6 +596,104 @@ pub(crate) mod gpu_ntt {
         (coeffs, DeviceBuffer { ptr: d_out, _len: big_n, _bytes: byte_size_4n })
     }
 
+    /// Same as `gpu_ifft_then_coset_fft_to_device_from_device` but ALSO returns a
+    /// DeviceBuffer holding the N-element canonical coefficients (Phase C variant).
+    /// See `gpu_ifft_then_coset_fft_to_device_keep_canonical` for context.
+    #[allow(dead_code)]
+    pub fn gpu_ifft_then_coset_fft_to_device_from_device_keep_canonical(
+        d_src: *const c_void,
+        lg_n: u32,
+        lg_4n: u32,
+    ) -> (Vec<Fr>, DeviceBuffer, DeviceBuffer) {
+        ensure_initialized();
+
+        let n = 1usize << lg_n;
+        let big_n = 1usize << lg_4n;
+        assert_eq!(big_n, 4 * n);
+
+        let elem_size = std::mem::size_of::<Fr>();
+        let byte_size_n = n * elem_size;
+        let byte_size_4n = big_n * elem_size;
+        let stream = unsafe { sp1_gpu_sys::runtime::DEFAULT_STREAM };
+
+        let d_scratch = get_device_buffer(byte_size_4n);
+        let err = unsafe {
+            sp1_gpu_sys::runtime::cuda_mem_copy_device_to_device(d_scratch, d_src, byte_size_n)
+        };
+        if err != unsafe { sp1_gpu_sys::runtime::CUDA_SUCCESS_CSL } {
+            panic!("D2D failed (from_device keep_canonical)");
+        }
+        let err = unsafe { sp1_gpu_sys::dft_bn254::batch_iNTT_bn254(d_scratch, lg_n, 1, stream) };
+        if err != unsafe { sp1_gpu_sys::runtime::CUDA_SUCCESS_CSL } {
+            panic!("GPU iNTT failed (from_device keep_canonical)");
+        }
+
+        let mut d_canonical: *mut c_void = std::ptr::null_mut();
+        let err = unsafe {
+            sp1_gpu_sys::runtime::cuda_malloc(&mut d_canonical as *mut _, byte_size_n)
+        };
+        if err != unsafe { sp1_gpu_sys::runtime::CUDA_SUCCESS_CSL } {
+            panic!("cuda_malloc failed for d_canonical (from_device keep_canonical)");
+        }
+        let err = unsafe {
+            sp1_gpu_sys::runtime::cuda_mem_copy_device_to_device(
+                d_canonical,
+                d_scratch,
+                byte_size_n,
+            )
+        };
+        if err != unsafe { sp1_gpu_sys::runtime::CUDA_SUCCESS_CSL } {
+            panic!("D2D copy for d_canonical failed (from_device keep_canonical)");
+        }
+
+        let mut coeffs = Vec::with_capacity(n);
+        unsafe {
+            coeffs.set_len(n);
+        }
+        coeffs.par_chunks_mut(128).for_each(|chunk| unsafe {
+            std::ptr::write_volatile(&mut chunk[0] as *mut Fr, Fr::ZERO);
+        });
+        let err = unsafe {
+            sp1_gpu_sys::runtime::cuda_mem_copy_device_to_host(
+                coeffs.as_mut_ptr() as *mut c_void,
+                d_scratch,
+                byte_size_n,
+            )
+        };
+        if err != unsafe { sp1_gpu_sys::runtime::CUDA_SUCCESS_CSL } {
+            panic!("D2H failed (from_device keep_canonical)");
+        }
+
+        let err = unsafe {
+            sp1_gpu_sys::runtime::cuda_mem_set(
+                (d_scratch as *mut u8).add(byte_size_n) as *mut c_void,
+                0,
+                byte_size_4n - byte_size_n,
+            )
+        };
+        if err != unsafe { sp1_gpu_sys::runtime::CUDA_SUCCESS_CSL } {
+            panic!("cuda_mem_set failed for zero-pad (from_device keep_canonical)");
+        }
+        let err =
+            unsafe { sp1_gpu_sys::dft_bn254::batch_coset_NTT_bn254(d_scratch, lg_4n, 1, stream) };
+        if err != unsafe { sp1_gpu_sys::runtime::CUDA_SUCCESS_CSL } {
+            panic!("GPU coset NTT failed (from_device keep_canonical)");
+        }
+
+        let d_out = d_scratch;
+        {
+            let mut buf = BUFFER_CACHE.lock().unwrap();
+            buf.ptr = std::ptr::null_mut();
+            buf.capacity_bytes = 0;
+        }
+
+        (
+            coeffs,
+            DeviceBuffer { ptr: d_canonical, _len: n, _bytes: byte_size_n },
+            DeviceBuffer { ptr: d_out, _len: big_n, _bytes: byte_size_4n },
+        )
+    }
+
     #[allow(dead_code)]
     pub fn gpu_ifft_then_coset_fft_to_device(
         evals: &[Fr],
@@ -678,6 +776,120 @@ pub(crate) mod gpu_ntt {
         }
 
         (coeffs, DeviceBuffer { ptr: d_out, _len: big_n, _bytes: byte_size_4n })
+    }
+
+    /// Like `gpu_ifft_then_coset_fft_to_device` but ALSO returns a separate
+    /// `DeviceBuffer` holding the N-element canonical-form coefficients (after
+    /// iFFT, before coset NTT overwrites the scratch buffer). Used by PLONK
+    /// Round 5 GPU lincomb (Phase C) so L/R/O/Z canonical coeffs can be read
+    /// directly from device pointers instead of re-uploaded per prove (saves
+    /// 4 × 1 GiB H2D at N=2^25 = ~0.34 s on CUDA / ~1.18 s on HIP per prove).
+    ///
+    /// Extra cost: one device-side `cuda_malloc` of `byte_size_n` (~1 GiB at
+    /// N=2^25) + one D2D copy of the same size (≈ 25 ms on HBM). The host
+    /// `coeffs` Vec is still returned for downstream consumers that read on
+    /// the CPU (Round 4 evals, etc).
+    #[allow(dead_code)]
+    pub fn gpu_ifft_then_coset_fft_to_device_keep_canonical(
+        evals: &[Fr],
+        lg_n: u32,
+        lg_4n: u32,
+    ) -> (Vec<Fr>, DeviceBuffer, DeviceBuffer) {
+        ensure_initialized();
+
+        let n = 1usize << lg_n;
+        let big_n = 1usize << lg_4n;
+        assert_eq!(evals.len(), n);
+        assert_eq!(big_n, 4 * n);
+
+        let elem_size = std::mem::size_of::<Fr>();
+        let byte_size_n = n * elem_size;
+        let byte_size_4n = big_n * elem_size;
+        let stream = unsafe { sp1_gpu_sys::runtime::DEFAULT_STREAM };
+
+        let d_scratch = get_device_buffer(byte_size_4n);
+        let err = unsafe {
+            sp1_gpu_sys::runtime::cuda_mem_copy_host_to_device(
+                d_scratch,
+                evals.as_ptr() as *const c_void,
+                byte_size_n,
+            )
+        };
+        if err != unsafe { sp1_gpu_sys::runtime::CUDA_SUCCESS_CSL } {
+            panic!("H2D failed for fused ifft+coset_fft (keep_canonical)");
+        }
+        let err = unsafe { sp1_gpu_sys::dft_bn254::batch_iNTT_bn254(d_scratch, lg_n, 1, stream) };
+        if err != unsafe { sp1_gpu_sys::runtime::CUDA_SUCCESS_CSL } {
+            panic!("GPU iNTT failed (keep_canonical)");
+        }
+
+        // Allocate a separate device buffer and D2D-copy the canonical N-element
+        // coefficients before the coset NTT overwrites d_scratch.
+        let mut d_canonical: *mut c_void = std::ptr::null_mut();
+        let err = unsafe {
+            sp1_gpu_sys::runtime::cuda_malloc(&mut d_canonical as *mut _, byte_size_n)
+        };
+        if err != unsafe { sp1_gpu_sys::runtime::CUDA_SUCCESS_CSL } {
+            panic!("cuda_malloc failed for d_canonical (keep_canonical)");
+        }
+        let err = unsafe {
+            sp1_gpu_sys::runtime::cuda_mem_copy_device_to_device(
+                d_canonical,
+                d_scratch,
+                byte_size_n,
+            )
+        };
+        if err != unsafe { sp1_gpu_sys::runtime::CUDA_SUCCESS_CSL } {
+            panic!("D2D copy failed for d_canonical (keep_canonical)");
+        }
+
+        // Download host coeffs (consumers like Round 4 evals still read on CPU).
+        let mut coeffs = Vec::with_capacity(n);
+        unsafe {
+            coeffs.set_len(n);
+        }
+        coeffs.par_chunks_mut(128).for_each(|chunk| unsafe {
+            std::ptr::write_volatile(&mut chunk[0] as *mut Fr, Fr::ZERO);
+        });
+        let err = unsafe {
+            sp1_gpu_sys::runtime::cuda_mem_copy_device_to_host(
+                coeffs.as_mut_ptr() as *mut c_void,
+                d_scratch,
+                byte_size_n,
+            )
+        };
+        if err != unsafe { sp1_gpu_sys::runtime::CUDA_SUCCESS_CSL } {
+            panic!("D2H failed for coefficients (keep_canonical)");
+        }
+
+        let err = unsafe {
+            sp1_gpu_sys::runtime::cuda_mem_set(
+                (d_scratch as *mut u8).add(byte_size_n) as *mut c_void,
+                0,
+                byte_size_4n - byte_size_n,
+            )
+        };
+        if err != unsafe { sp1_gpu_sys::runtime::CUDA_SUCCESS_CSL } {
+            panic!("cuda_mem_set failed for zero-pad (keep_canonical)");
+        }
+        let err =
+            unsafe { sp1_gpu_sys::dft_bn254::batch_coset_NTT_bn254(d_scratch, lg_4n, 1, stream) };
+        if err != unsafe { sp1_gpu_sys::runtime::CUDA_SUCCESS_CSL } {
+            panic!("GPU coset NTT failed (keep_canonical)");
+        }
+
+        let d_out = d_scratch;
+        {
+            let mut buf = BUFFER_CACHE.lock().unwrap();
+            buf.ptr = std::ptr::null_mut();
+            buf.capacity_bytes = 0;
+        }
+
+        (
+            coeffs,
+            DeviceBuffer { ptr: d_canonical, _len: n, _bytes: byte_size_n },
+            DeviceBuffer { ptr: d_out, _len: big_n, _bytes: byte_size_4n },
+        )
     }
 
     /// Fused iFFT + coset FFT returning BOTH coefficients AND coset evals to host.

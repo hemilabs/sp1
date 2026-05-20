@@ -17,6 +17,8 @@ pub const POSEIDON2_ELF: &[u8] =
     include_bytes!("../../prover_components/programs/poseidon2/riscv64im-succinct-zkvm-elf");
 pub const MIXED_OPS_ELF: &[u8] =
     include_bytes!("../../prover_components/programs/mixed-ops/riscv64im-succinct-zkvm-elf");
+pub const SHA2_LOOP_ELF: &[u8] =
+    include_bytes!("../../prover_components/programs/sha2-loop/riscv64im-succinct-zkvm-elf");
 pub const RSP_ELF: &[u8] = include_bytes!("../programs/rsp/elf/rsp-client");
 
 pub fn get_program_and_input(program: String, param: String) -> (Vec<u8>, SP1Stdin) {
@@ -50,6 +52,11 @@ pub fn get_program_and_input(program: String, param: String) -> (Vec<u8>, SP1Std
             let n = param.parse::<u32>().unwrap_or(100000);
             stdin.write(&n);
             return (MIXED_OPS_ELF.to_vec(), stdin);
+        } else if program_path == "sha2-loop" {
+            let mut stdin = SP1Stdin::new();
+            let n = param.parse::<u32>().unwrap_or(1000);
+            stdin.write(&n);
+            return (SHA2_LOOP_ELF.to_vec(), stdin);
         } else if program_path == "rsp" {
             let mut stdin = SP1Stdin::new();
             let client_input_path = format!("sp1-gpu/crates/perf/programs/rsp/input/{param}.bin");

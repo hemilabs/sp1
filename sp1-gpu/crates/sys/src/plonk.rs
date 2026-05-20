@@ -27,6 +27,17 @@ extern "C" {
         h_s2_evals: *const c_void,
         h_s3_evals: *const c_void,
         h_xm1n_inv: *const c_void,
+        // Optional device-resident static arrays (PlonkStaticCache).
+        // When non-null, the kernel reads from device and skips H2D for that
+        // slot. Pass null to fall back to host-streaming.
+        d_ql_evals: *const c_void,
+        d_qr_evals: *const c_void,
+        d_qm_evals: *const c_void,
+        d_qo_evals: *const c_void,
+        d_s1_evals: *const c_void,
+        d_s2_evals: *const c_void,
+        d_s3_evals: *const c_void,
+        d_xm1n_inv: *const c_void,
         // Omega lookup tables on host
         h_lo_table: *const c_void,
         h_hi_table: *const c_void,
@@ -90,6 +101,63 @@ extern "C" {
         h_zh_val_4: *const c_void,
     ) -> CudaRustError;
 
+    /// Streamed quotient evaluation with folded-in PLONK Phase D2 blinding fix-up.
+    ///
+    /// Identical to `sp1_plonk_quotient_eval_streamed` except that the host
+    /// arrays for `l/r/o/z/z_shifted` are passed UN-fixed-up (the pre-blinding
+    /// coset evals); the kernel applies the additive delta on the fly. This
+    /// avoids the rayon-host fix-up (~2.1 s on 7900 XTX HIP) at the cost of
+    /// ~6 extra mont muls per thread — kernel work, not PCIe-bound.
+    ///
+    /// Blinding scalar layout (all Fr in Montgomery form):
+    /// - L/R/O are degree 1: bp_X(x) = a + b*x.
+    /// - Z is degree 2:      bp_Z(x) = a + b*x + c*x^2.
+    /// - `omega_n` is the N-th root of unity (= `omega_4N^4`); used to advance
+    ///   coset_pt by 4 for the z_shifted fix-up.
+    pub fn sp1_plonk_quotient_eval_streamed_blinded(
+        d_output: *mut c_void,
+        h_ql_evals: *const c_void,
+        h_qr_evals: *const c_void,
+        h_qm_evals: *const c_void,
+        h_qo_evals: *const c_void,
+        h_qk_plus_pi: *const c_void,
+        h_s1_evals: *const c_void,
+        h_s2_evals: *const c_void,
+        h_s3_evals: *const c_void,
+        h_xm1n_inv: *const c_void,
+        h_l_evals: *const c_void,
+        h_r_evals: *const c_void,
+        h_o_evals: *const c_void,
+        h_z_evals: *const c_void,
+        h_z_shifted: *const c_void,
+        h_lo_table: *const c_void,
+        h_hi_table: *const c_void,
+        lo_len: usize,
+        hi_len: usize,
+        big_n: usize,
+        h_alpha: *const c_void,
+        h_beta: *const c_void,
+        h_gamma: *const c_void,
+        h_k1: *const c_void,
+        h_k2: *const c_void,
+        h_alpha_sq: *const c_void,
+        h_one_mont: *const c_void,
+        h_coset_shift: *const c_void,
+        h_zh_inv_4: *const c_void,
+        h_zh_val_4: *const c_void,
+        // Blinding scalars (Fr Montgomery, single elements).
+        h_bp_l_a: *const c_void,
+        h_bp_l_b: *const c_void,
+        h_bp_r_a: *const c_void,
+        h_bp_r_b: *const c_void,
+        h_bp_o_a: *const c_void,
+        h_bp_o_b: *const c_void,
+        h_bp_z_a: *const c_void,
+        h_bp_z_b: *const c_void,
+        h_bp_z_c: *const c_void,
+        h_omega_n: *const c_void,
+    ) -> CudaRustError;
+
     /// GPU polynomial evaluation at a single point via hierarchical Horner.
     /// Coefficients must be on device. Result is downloaded to host.
     pub fn bn254_gpu_poly_eval(
@@ -97,6 +165,19 @@ extern "C" {
         n: u32,
         h_x: *const c_void,
         h_result: *mut c_void,
+    ) -> CudaRustError;
+
+    /// Multi-poly Fr linear combination on device:
+    ///   d_result[i] = Σ_j d_polys[j][i] * d_scalars[j]  for i in 0..n
+    /// Per-poly length bounded by `d_poly_lens[j]` (entries past `len[j]`
+    /// contribute zero). All inputs must be Mont-form on device.
+    pub fn bn254_gpu_fr_lincomb(
+        d_result: *mut c_void,
+        d_polys_ptrs: *const *const c_void,
+        d_scalars: *const c_void,
+        d_poly_lens: *const c_void,
+        n_polys: u32,
+        n: u32,
     ) -> CudaRustError;
 
     /// BN254 H polynomial pointwise: d_a[i] = (d_a[i] * d_b[i] - d_c[i]) * den
@@ -124,6 +205,41 @@ extern "C" {
     /// in-place on GPU. Each element is multiplied by R² mod r. Used by compute_h
     /// to convert raw BN254Fr data uploaded from host without CPU conversion.
     pub fn bn254_canonical_to_mont(d: *mut c_void, n: usize);
+
+    /// PLONK Phase D2 — additive blinding fix-up on a coset-eval buffer.
+    ///
+    /// Adds `bp(coset_pt_i) · (coset_pt_i^n − 1)` to each entry of `d_evals`
+    /// in place, for `i in 0..big_n`. This avoids re-running the coset NTT
+    /// after the L/R/O/Z canonical-form blinding splice.
+    ///
+    /// Inputs:
+    /// - `d_evals` — device pointer to 4N coset evals (Fr Montgomery).
+    /// - `h_lo_table`, `h_hi_table` — host pointers to the omega lookup tables
+    ///   (same arrays the quotient kernel uses; uploaded internally per call).
+    /// - `h_coset_shift` — host pointer to a single Fr (k1 = coset_shift).
+    /// - `h_bp_a`, `h_bp_b`, `h_bp_c` — host pointers to single Fr scalars.
+    ///   `h_bp_c` is read only when `degree == 2`; pass any non-null pointer
+    ///   when `degree == 1`.
+    /// - `h_zh_val_4` — host pointer to 4 Fr (the period-4 cyclic
+    ///   `coset_pt^n − 1`; same array the quotient kernel uses).
+    /// - `degree` — 1 (L/R/O wires) or 2 (Z grand product).
+    /// - `big_n` — 4N coset domain size.
+    ///
+    /// Mirrors the per-point math used by `plonk_quotient_fused_kernel`.
+    pub fn sp1_plonk_blinding_fixup(
+        d_evals: *mut c_void,
+        h_lo_table: *const c_void,
+        h_hi_table: *const c_void,
+        lo_len: usize,
+        hi_len: usize,
+        h_coset_shift: *const c_void,
+        h_bp_a: *const c_void,
+        h_bp_b: *const c_void,
+        h_bp_c: *const c_void,
+        h_zh_val_4: *const c_void,
+        degree: i32,
+        big_n: u32,
+    ) -> CudaRustError;
 
     /// GPU-accelerated grand product (permutation polynomial Z) for BN254 PLONK.
     ///

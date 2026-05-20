@@ -91,67 +91,14 @@ rustCudaError_t sp1_bn254_g2_msm(void*       result,
     return CUDA_SUCCESS_CSL;
 }
 
-// ============================================================
-// Persistent G2 MSM Context (SRS pre-uploaded to GPU)
-// ============================================================
-
-using g2_msm_context_t = msm_t<bucket_t, point_t, affine_t, scalar_t>;
-
-extern "C"
-rustCudaError_t sp1_bn254_g2_msm_create(void** ctx_out,
-                                         const void* points,
-                                         size_t npoints,
-                                         size_t ffi_affine_sz)
-{
-    try {
-        auto* ctx = new g2_msm_context_t(
-            reinterpret_cast<const affine_t*>(points),
-            npoints, ffi_affine_sz);
-        *ctx_out = reinterpret_cast<void*>(ctx);
-        return CUDA_SUCCESS_CSL;
-    } catch (const cuda_error& e) {
-        *ctx_out = nullptr;
-        return rustCudaError_t{.message = "BN254 G2 MSM create failed"};
-    } catch (...) {
-        *ctx_out = nullptr;
-        return rustCudaError_t{.message = "BN254 G2 MSM create failed (unknown)"};
-    }
-}
-
-extern "C"
-rustCudaError_t sp1_bn254_g2_msm_invoke(void* ctx,
-                                         void* result,
-                                         size_t npoints,
-                                         const void* scalars,
-                                         bool mont)
-{
-    auto* msm = reinterpret_cast<g2_msm_context_t*>(ctx);
-    try {
-        RustError err = msm->invoke(
-            *reinterpret_cast<point_t*>(result),
-            (const affine_t*)nullptr, npoints,
-            reinterpret_cast<const scalar_t*>(scalars),
-            mont);
-        if (err.code != 0) {
-            if (err.message) free(err.message);
-            return rustCudaError_t{.message = "BN254 G2 MSM invoke failed"};
-        }
-        return CUDA_SUCCESS_CSL;
-    } catch (const cuda_error& e) {
-        return rustCudaError_t{.message = "BN254 G2 MSM invoke failed"};
-    } catch (...) {
-        return rustCudaError_t{.message = "BN254 G2 MSM invoke failed (unknown)"};
-    }
-}
-
-extern "C"
-void sp1_bn254_g2_msm_destroy(void* ctx)
-{
-    if (ctx) {
-        delete reinterpret_cast<g2_msm_context_t*>(ctx);
-    }
-}
-
+// ----------------------------------------------------------------
+// Persistent G2 MSM context lives in bn254_g2_msm_cuda.cu (port of the
+// HIP implementation). The sppark `msm_t<bucket_t, point_t, affine_t,
+// scalar_t>` *would* give us a persistent context but it routes through
+// the global gpu_t singleton's flipflop streams which deadlock against
+// the G1 PersistentMsm uses of the same singleton — see prover.rs:302.
+// We instead bring up an independent CUDA pipeline (own stream, own
+// buffers) that mirrors the HIP path.
 // ----------------------------------------------------------------
 // GLV stubs for CUDA: G2 GLV is HIP-only. Symbols must resolve at link
 // time so the shared Rust extern block compiles on both backends.

@@ -49,6 +49,30 @@ pub struct PlonkProvingData {
     pub s1: Vec<BN254Fr>,
     pub s2: Vec<BN254Fr>,
     pub s3: Vec<BN254Fr>,
+
+    /// VK-stored selector commitments (Ql, Qr, Qm, Qo, Qk, S0, S1, S2 in
+    /// Go-export order — same as `pk.Vk` in gnark). When present, the Rust
+    /// prover uses these instead of re-deriving from the Lagrange polynomials,
+    /// because re-deriving via NewTrace produces *different* selector commits
+    /// than what was originally committed at VK-build time. See
+    /// `project_plonk_bug_rootcause.md` for the analysis.
+    ///
+    /// Layout: `[ql, qr, qm, qo, qk, s_perm0, s_perm1, s_perm2]` followed by
+    /// the BSB22 Qcp commitments (one per `qcp` poly).
+    pub vk_selector_commits: Option<VkSelectorCommits>,
+}
+
+/// VK-stored selector commitments, parsed from `vk_selector_commits.bin`.
+pub struct VkSelectorCommits {
+    pub ql: BN254G1Affine,
+    pub qr: BN254G1Affine,
+    pub qm: BN254G1Affine,
+    pub qo: BN254G1Affine,
+    pub qk: BN254G1Affine,
+    /// Permutation commitments (gnark `S[0..3]`, our `s1, s2, s3`).
+    pub s_perm: [BN254G1Affine; 3],
+    /// BSB22 commitments (one per `qcp` polynomial).
+    pub qcp: Vec<BN254G1Affine>,
 }
 
 impl PlonkProvingData {
@@ -129,6 +153,19 @@ impl PlonkProvingData {
                 break;
             }
         }
+
+        // Optional: load VK selector commitments produced by the updated
+        // export_plonk_data.go. If the file isn't present (older export), the
+        // prover falls back to re-deriving commitments from the Lagrange
+        // polynomials.
+        let vk_selector_commits = {
+            let path = dir.join("vk_selector_commits.bin");
+            if path.exists() {
+                Some(parse_vk_selector_commits(&std::fs::read(&path)?)?)
+            } else {
+                None
+            }
+        };
 
         // Validate loaded vector sizes against domain_size
         anyhow::ensure!(
@@ -217,8 +254,59 @@ impl PlonkProvingData {
             s1,
             s2,
             s3,
+            vk_selector_commits,
         })
     }
+}
+
+/// Parse the `vk_selector_commits.bin` produced by `ExportPlonkData`.
+/// Layout: 8 × 64-byte uncompressed G1 (Ql, Qr, Qm, Qo, Qk, S[0..3]),
+/// then `u32 LE num_qcp`, then `num_qcp × 64 bytes` Qcp commits.
+fn parse_vk_selector_commits(buf: &[u8]) -> anyhow::Result<VkSelectorCommits> {
+    use crate::fields::Fq;
+    anyhow::ensure!(
+        buf.len() >= 8 * 64 + 4,
+        "vk_selector_commits.bin too short: {} bytes (need >= {})",
+        buf.len(),
+        8 * 64 + 4
+    );
+    // Same canonical→Montgomery conversion as `load_g1_points` above —
+    // the Go side writes coordinates as canonical LE bytes, our prover
+    // expects Montgomery-form Fq inside BN254G1Affine.
+    let read_g1 = |off: usize| -> anyhow::Result<BN254G1Affine> {
+        let mut canonical_x = crate::BN254Fq { limbs: [0; 8] };
+        let mut canonical_y = crate::BN254Fq { limbs: [0; 8] };
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                buf[off..].as_ptr(),
+                canonical_x.limbs.as_mut_ptr() as *mut u8,
+                32,
+            );
+            std::ptr::copy_nonoverlapping(
+                buf[off + 32..].as_ptr(),
+                canonical_y.limbs.as_mut_ptr() as *mut u8,
+                32,
+            );
+        }
+        let mont_x = Fq::from_bn254fq_canonical(&canonical_x);
+        let mont_y = Fq::from_bn254fq_canonical(&canonical_y);
+        Ok(BN254G1Affine { x: mont_x.to_bn254fq_raw(), y: mont_y.to_bn254fq_raw() })
+    };
+    let ql = read_g1(0)?;
+    let qr = read_g1(64)?;
+    let qm = read_g1(128)?;
+    let qo = read_g1(192)?;
+    let qk = read_g1(256)?;
+    let s0 = read_g1(320)?;
+    let s1 = read_g1(384)?;
+    let s2 = read_g1(448)?;
+    let nqcp_off = 512;
+    let nqcp = u32::from_le_bytes(buf[nqcp_off..nqcp_off + 4].try_into()?) as usize;
+    let mut qcp = Vec::with_capacity(nqcp);
+    for i in 0..nqcp {
+        qcp.push(read_g1(nqcp_off + 4 + i * 64)?);
+    }
+    Ok(VkSelectorCommits { ql, qr, qm, qo, qk, s_perm: [s0, s1, s2], qcp })
 }
 
 /// Per-proof witness data loaded from ExportSolvedWitness (Go side).

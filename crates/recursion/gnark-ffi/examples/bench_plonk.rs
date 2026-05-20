@@ -32,7 +32,11 @@ fn main() {
     println!();
 
     assert!(build_dir.exists(), "build_dir does not exist: {}", build_dir.display());
-    assert!(export_dir.exists(), "export_dir does not exist (run TestExportAll first): {}", export_dir.display());
+    assert!(
+        export_dir.exists(),
+        "export_dir does not exist (run TestExportAll first): {}",
+        export_dir.display()
+    );
 
     // Read plonk_witness.json to get the public inputs the SP1 circuit wires up.
     let witness_path = build_dir.join("plonk_witness.json");
@@ -79,27 +83,57 @@ fn main() {
             println!("--- End grand product diagnostic ---\n");
         }
 
-        println!("Generating PLONK proof on GPU...");
-        let t = Instant::now();
-        let proof = prover
-            .prove(
-                &witness.l,
-                &witness.r,
-                &witness.o,
-                &public_inputs,
-                &witness.bsb22_commitments,
-                &witness.bsb22_polys,
-            )
-            .expect("GPU prove failed");
-        let prove_elapsed = t.elapsed();
-        println!("  proof generated in {prove_elapsed:?}");
+        // Optional multi-iter loop. Useful for measuring cache-hit perf
+        // (e.g. PlonkStaticCache amortization across iters of the same
+        // PlonkProver instance). Set SP1_BENCH_PLONK_ITERS=N (default 1).
+        let n_iters: usize =
+            std::env::var("SP1_BENCH_PLONK_ITERS").ok().and_then(|s| s.parse().ok()).unwrap_or(1);
+
+        let mut proof_opt = None;
+        for it in 0..n_iters {
+            println!("Generating PLONK proof on GPU... (iter {}/{})", it + 1, n_iters);
+            let t = Instant::now();
+            let proof = prover
+                .prove(
+                    &witness.l,
+                    &witness.r,
+                    &witness.o,
+                    &public_inputs,
+                    &witness.bsb22_commitments,
+                    &witness.bsb22_polys,
+                )
+                .expect("GPU prove failed");
+            let prove_elapsed = t.elapsed();
+            println!("  proof generated in {prove_elapsed:?} (iter {})", it + 1);
+            proof_opt = Some(proof);
+        }
+        let proof = proof_opt.expect("at least one iter must run");
 
         let bytes = proof.to_bytes();
         let raw_bytes = proof.to_write_raw_bytes();
+        // Dump first 64 bytes of L commit (and full LRO) so callers can byte-diff
+        // OFF vs ON proof modes when validating Phase-1 ZK blinding.
+        println!("  L commit (first 64 bytes hex): {}", hex::encode(&bytes[0..64]));
+        println!("  R commit (first 64 bytes hex): {}", hex::encode(&bytes[64..128]));
+        println!("  O commit (first 64 bytes hex): {}", hex::encode(&bytes[128..192]));
+        println!("  Z commit (first 64 bytes hex): {}", hex::encode(&bytes[544..608]));
+        if let Ok(path) = std::env::var("SP1_BENCH_DUMP_PROOF") {
+            std::fs::write(&path, &bytes).expect("dump proof bytes");
+            println!("  dumped proof bytes -> {}", path);
+        }
         println!("  proof bytes: {} (expected 864 for 1 BSB22)", bytes.len());
         println!("  raw   bytes: {} (expected 904 for 1 BSB22)", raw_bytes.len());
         assert_eq!(bytes.len(), 864, "unexpected PLONK proof size");
         assert_eq!(raw_bytes.len(), 904, "unexpected WriteRawTo PLONK proof size");
+        // Dump proof bytes to a file when SP1_BENCH_DUMP_PROOF is set; useful
+        // for byte-diffing CUDA vs HIP proofs and triaging the sp1-verifier
+        // Rust-port mismatch on HIP (where gnark FFI verify passes but the
+        // Rust verifier rejects).
+        if let Ok(out) = std::env::var("SP1_BENCH_DUMP_PROOF") {
+            std::fs::write(&out, &bytes).expect("write proof dump");
+            std::fs::write(format!("{}.raw", out), &raw_bytes).expect("write raw dump");
+            println!("  proof dumped to {} (and {}.raw)", out, out);
+        }
         (bytes, raw_bytes)
     };
 
@@ -334,8 +368,14 @@ fn main() {
             Some(false) => println!("  [A]    sp1-verifier on GPU proof   : FAIL"),
             None => println!("  [A]    sp1-verifier on GPU proof   : SKIPPED"),
         }
-        println!("  [C.1]  Go FFI verify on CPU proof  : {}", if cpu_go_result.is_ok() { "PASS" } else { "FAIL" });
-        println!("  [C.2]  sp1-verifier on CPU proof   : {}", if cpu_rust_result.is_ok() { "PASS" } else { "FAIL" });
+        println!(
+            "  [C.1]  Go FFI verify on CPU proof  : {}",
+            if cpu_go_result.is_ok() { "PASS" } else { "FAIL" }
+        );
+        println!(
+            "  [C.2]  sp1-verifier on CPU proof   : {}",
+            if cpu_rust_result.is_ok() { "PASS" } else { "FAIL" }
+        );
         println!();
         match (gpu_ok, cpu_go_result.is_ok(), cpu_rust_result.is_ok()) {
             (_, false, _) => {

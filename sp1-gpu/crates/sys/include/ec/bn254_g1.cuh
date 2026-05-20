@@ -389,8 +389,38 @@ struct bn254_g1_xyzz_t {
         return r;
     }
 
-    // XYZZ + XYZZ full addition (11M + 2S)
-    // For merge kernel (combining partial sums).
+    // XYZZ doubling formula "dbl-2008-s-1" (a=0): 1M + 5S.
+    // U = 2*Y, V = U^2, W = U*V, S = X*V
+    // M = 3*X^2 + a*ZZ^2  (a=0: M = 3*X^2)
+    // X' = M^2 - 2*S
+    // Y' = M*(S - X') - W*Y
+    // ZZ' = V*ZZ
+    // ZZZ' = W*ZZZ
+    __device__ __forceinline__ bn254_g1_xyzz_t dbl() const {
+        bn254_g1_xyzz_t r;
+        if (is_infinity()) {
+            r.set_infinity();
+            return r;
+        }
+        bn254_fq_t U = Y.dbl();              // 2Y
+        bn254_fq_t V = U.sqr();              // V = U^2 (1S)
+        bn254_fq_t W = U * V;                // W = U*V (1M)
+        bn254_fq_t S = X * V;                // S = X*V (1M)
+        bn254_fq_t M = X.sqr().mul3();       // M = 3*X^2 (1S)
+        r.X = M.sqr() - S.dbl();             // X' = M^2 - 2S (1S)
+        r.Y = M * (S - r.X) - W * Y;         // Y' = M*(S-X') - W*Y (2M)
+        r.ZZ = V * ZZ;                       // ZZ' = V*ZZ (1M)
+        r.ZZZ = W * ZZZ;                     // ZZZ' = W*ZZZ (1M)
+        return r;
+    }
+
+    // XYZZ + XYZZ full addition (11M + 2S generic; up to 1M+5S extra in
+    // doubling fallback). Safe against P==±Q edge cases:
+    //   - If H == 0 and R == 0: P == Q, fall through to doubling formula.
+    //   - If H == 0 and R != 0: P == -Q, result is the point at infinity.
+    // Used for merge / running-sum reductions where same-point operands
+    // can occur (small-N MSMs, partial-sum trees that revisit equal
+    // intermediates).
     __device__ __forceinline__ bn254_g1_xyzz_t& operator+=(const bn254_g1_xyzz_t& other) {
         if (other.is_infinity()) return *this;
         if (is_infinity()) {
@@ -405,6 +435,18 @@ struct bn254_g1_xyzz_t {
 
         bn254_fq_t H = U2 - U1;
         bn254_fq_t R = S2 - S1;
+
+        // Edge cases: P == ±Q  (U1 == U2 means same affine x).
+        if (H.is_zero()) {
+            if (R.is_zero()) {
+                // P == Q: dispatch to XYZZ doubling.
+                *this = this->dbl();
+                return *this;
+            }
+            // P == -Q: result is the point at infinity.
+            set_infinity();
+            return *this;
+        }
 
         bn254_fq_t H_sq = H.sqr();              // H^2        (1S)
         bn254_fq_t H_cu = H_sq * H;             // H^3        (1M)

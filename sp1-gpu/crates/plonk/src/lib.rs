@@ -20,6 +20,7 @@
 //! Round 5: Batch KZG opening proof
 //! ```
 
+pub mod blinding;
 pub mod domain;
 pub mod fields;
 pub mod g1;
@@ -28,6 +29,8 @@ pub mod kzg;
 pub mod polynomial;
 pub mod proof;
 pub mod prover;
+pub mod solver;
+pub mod static_cache;
 pub mod transcript;
 pub mod types;
 

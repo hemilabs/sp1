@@ -28,6 +28,13 @@ anyhow = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
 sp1-gpu-groth16 = { path = "../../../sp1-gpu/crates/groth16" }
+# Optional: pulled in only when the `cuda` feature is enabled. The
+# CPU-fallback path in `sp1-gpu-plonk` (when its own `cuda` feature is off)
+# does not compile cleanly today; making the dep optional avoids requiring
+# the CPU build path for downstream crates that depend on
+# `sp1-recursion-gnark-ffi` without the `cuda` feature (e.g. the production
+# `node` binary in sp1-gpu-perf, which only enables `cuda` for the helper).
+sp1-gpu-plonk = { path = "../../../sp1-gpu/crates/plonk", optional = true }
 clap = { workspace = true, features = ["derive"], optional = true }
 libloading = { version = "0.8", optional = true }
 
@@ -41,7 +48,6 @@ ark-bn254 = { version = "0.5", default-features = false, features = ["std", "cur
 ark-ec = { version = "0.5", default-features = false, features = ["parallel"] }
 ark-ff = { version = "0.5", default-features = false, features = ["parallel"] }
 ark-serialize = { version = "0.5", default-features = false }
-sp1-gpu-plonk = { path = "../../../sp1-gpu/crates/plonk" }
 sp1-verifier = { workspace = true, features = ["std"] }
 
 [[example]]
@@ -53,8 +59,23 @@ name = "bench_plonk"
 required-features = ["native", "cuda"]
 
 [[example]]
+name = "verify_plonk_helper"
+required-features = ["native", "cuda"]
+
+[[example]]
+name = "probe_plonk_g1"
+
+[[example]]
 name = "bench_phase11"
 required-features = ["native", "cuda"]
+
+[[example]]
+name = "bench_plonk_witness_worker"
+required-features = ["native"]
+
+[[example]]
+name = "bench_plonk_server"
+required-features = ["native"]
 
 # Subprocess helper invoked by sp1-prover's recursion task to run the GPU
 # Groth16 final wrap in a clean child process. Necessary because the parent
@@ -73,10 +94,21 @@ name = "groth16_gpu_helper"
 path = "src/bin/groth16_gpu_helper.rs"
 required-features = ["native", "cuda"]
 
+# Subprocess helper invoked by sp1-prover's recursion task to run the GPU
+# PLONK final wrap in a clean child process. Same rationale as the Groth16
+# helper above. The `cuda` feature gates the GPU-accelerated PLONK code paths
+# in `sp1-gpu-plonk` (despite the name, both HIP and CUDA backends are gated
+# by it; runtime backend is selected by SP1_GPU_BACKEND / sp1-gpu-sys
+# build.rs).
+[[bin]]
+name = "plonk_gpu_helper"
+path = "src/bin/plonk_gpu_helper.rs"
+required-features = ["native", "cuda"]
+
 [features]
 native = ["dep:clap", "dep:libloading"]
 groth16-cuda = []
-cuda = ["sp1-gpu-groth16/cuda", "sp1-gpu-plonk/cuda"]
+cuda = ["sp1-gpu-groth16/cuda", "dep:sp1-gpu-plonk", "sp1-gpu-plonk/cuda"]
 
 [lints]
 workspace = true

@@ -7,11 +7,22 @@
 #   types and hipCUB DeviceRadixSort (~2s/MSM at 2^25, correctness-first).
 
 if(NOT USE_HIP)
-    # CUDA: sppark MSM (production performance) — G1 and G2
+    # CUDA: sppark MSM (production performance) for G1 + the one-shot G2.
+    # bn254_g2_msm_cuda.cu owns the **persistent** G2 MSM context — a
+    # port of the HIP path with its own cudaStreams that bypass sppark's
+    # gpu_t singleton (which conflicts with G1 PersistentMsm contexts).
     add_library(msm_objs OBJECT
         bn254_msm_sppark.cu
         bn254_g2_msm_sppark.cu
+        bn254_g2_msm_cuda.cu
     )
+    # Allow per-build override of the G2 CUDA WBITS via env G2_CUDA_WBITS
+    # (compile-time constexpr; default 13 matches HIP).
+    if(DEFINED ENV{G2_CUDA_WBITS})
+        target_compile_definitions(msm_objs PRIVATE
+            G2_CUDA_WBITS_OVERRIDE=$ENV{G2_CUDA_WBITS})
+        message(STATUS "G2 CUDA WBITS override: $ENV{G2_CUDA_WBITS}")
+    endif()
     target_link_libraries(msm_objs PRIVATE sp1_gpu_bn254)
     # Add local msm/ dir to include path for msm_compat.cuh and blst_t.hpp
     target_include_directories(msm_objs PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})

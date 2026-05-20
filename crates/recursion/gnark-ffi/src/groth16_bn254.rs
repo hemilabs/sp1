@@ -647,14 +647,44 @@ impl Groth16Bn254Prover {
 
         // Step 2.5 (Phase 11): if the in-process GPU R1CS solver is enabled,
         // skip gnark.Solve and prepare prep-circuit-prod cache + per-prove
-        // wires_initial.bin. CUDA-only — HIP backend always falls back to
-        // gnark.Solve since the Phase 7 kernel hangs on RDNA3.
+        // wires_initial.bin.
+        //
+        // Dispatcher (`SP1_GPU_R1CS_SOLVER`):
+        //   - unset / `auto`: backend-aware default. ON for CUDA (since
+        //     2026-05-06 — see `project_groth16_r1cs_solver_default_on.md`).
+        //     ON for HIP (since 2026-05-10 — see
+        //     `project_groth16_r1cs_hip_reattempt.md`; the HIP variant of
+        //     the kernel landed alongside the PLONK SCS HIP port).
+        //   - `gpu`: force the in-process GPU R1CS solver on either backend.
+        //   - `cpu`: kill-switch — force gnark.Solve on any backend. Use
+        //     this to roll back if the GPU path regresses.
         let backend_is_cuda = matches!(
             std::env::var("SP1_GPU_BACKEND").ok().as_deref(),
             Some("cuda") | Some("nvidia")
         );
-        let want_gpu_r1cs =
-            std::env::var("SP1_GPU_R1CS_SOLVER").as_deref() == Ok("gpu") && backend_is_cuda;
+        let solver_env = std::env::var("SP1_GPU_R1CS_SOLVER").ok();
+        let solver_choice = solver_env.as_deref().unwrap_or("auto");
+        let want_gpu_r1cs = match solver_choice {
+            "gpu" => true,
+            "cpu" => false,
+            "auto" | "" => true,
+            other => {
+                tracing::warn!(
+                    "unknown SP1_GPU_R1CS_SOLVER={other:?}; expected one of \
+                     gpu / cpu / auto. Falling back to backend-aware default."
+                );
+                true
+            }
+        };
+        tracing::info!(
+            "[r1cs-solver] choice={} backend_is_cuda={} env={:?} (default-on for CUDA \
+             since 2026-05-06, default-on for HIP since 2026-05-10; \
+             set SP1_GPU_R1CS_SOLVER=cpu to roll back)",
+            if want_gpu_r1cs { "gpu" } else { "cpu" },
+            backend_is_cuda,
+            solver_env.as_deref().unwrap_or("<unset>")
+        );
+
         let gpu_r1cs_inputs = if want_gpu_r1cs {
             try_prepare_gpu_r1cs_inputs(build_dir, &vkey_hash_hex, witness_file.path())
         } else {

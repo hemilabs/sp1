@@ -228,6 +228,43 @@ pub fn export_groth16_gpu_witness(data_dir: &str, witness_path: &str, output_dir
     }
 }
 
+/// Export PLONK proving data (SRS, selectors, permutation polys) as flat
+/// binary files for the GPU PLONK prover. Mirrors `ExportPlonkData` (Go).
+pub fn export_plonk_gpu_data(data_dir: &str, output_dir: &str) {
+    let data_dir_cstring = CString::new(data_dir).expect("CString::new failed");
+    let output_dir_cstring = CString::new(output_dir).expect("CString::new failed");
+    unsafe {
+        let err = bind::ExportPlonkGpuData(
+            data_dir_cstring.as_ptr() as *mut c_char,
+            output_dir_cstring.as_ptr() as *mut c_char,
+        );
+        if !err.is_null() {
+            let msg = ptr_to_string_freed(err);
+            panic!("ExportPlonkGpuData failed: {msg}");
+        }
+    }
+}
+
+/// Solve the PLONK SCS and export per-proof witness data (L/R/O wires +
+/// BSB22 polys + commitments) for the GPU PLONK prover. Mirrors
+/// `ExportSolvedWitness` (Go).
+pub fn export_plonk_gpu_witness(data_dir: &str, witness_path: &str, output_dir: &str) {
+    let data_dir_cstring = CString::new(data_dir).expect("CString::new failed");
+    let witness_path_cstring = CString::new(witness_path).expect("CString::new failed");
+    let output_dir_cstring = CString::new(output_dir).expect("CString::new failed");
+    unsafe {
+        let err = bind::ExportPlonkGpuWitness(
+            data_dir_cstring.as_ptr() as *mut c_char,
+            witness_path_cstring.as_ptr() as *mut c_char,
+            output_dir_cstring.as_ptr() as *mut c_char,
+        );
+        if !err.is_null() {
+            let msg = ptr_to_string_freed(err);
+            panic!("ExportPlonkGpuWitness failed: {msg}");
+        }
+    }
+}
+
 pub fn prove_groth16_bn254(data_dir: &str, witness_path: &str) -> Groth16Bn254Proof {
     match prove(ProofSystem::Groth16, data_dir, witness_path) {
         ProofResult::Groth16(proof) => unsafe { groth16_bn254_proof_from_raw(proof) },
