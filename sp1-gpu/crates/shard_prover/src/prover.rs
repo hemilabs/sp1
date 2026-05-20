@@ -17,8 +17,7 @@ use sp1_gpu_cudart::PinnedBuffer;
 use sp1_gpu_cudart::{DeviceMle, DevicePoint, TaskScope};
 use sp1_gpu_jagged_assist::prove_jagged_evaluation_sync;
 use sp1_gpu_jagged_sumcheck::{
-    generate_jagged_sumcheck_poly, jagged_sumcheck_gpu_challenger, AsMutRawChallenger,
-    ObserveAndSampleKernel,
+    generate_jagged_sumcheck_poly, jagged_sumcheck, AsMutRawChallenger, ObserveAndSampleKernel,
 };
 use sp1_gpu_jagged_tracegen::{full_tracegen_permit, main_tracegen_permit, CudaShardProverData};
 use sp1_gpu_logup_gkr::{
