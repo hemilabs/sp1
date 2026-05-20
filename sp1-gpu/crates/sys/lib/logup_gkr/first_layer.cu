@@ -5,7 +5,7 @@
 #include "sum_and_reduce/reduce.cuh"
 #include "tracegen/jagged_tracegen/jagged.cuh"
 
-__global__ void logupGkrFixLastVariableFirstCircuitLayer(
+SP1_KERNEL void logupGkrFixLastVariableFirstCircuitLayer(
     const JaggedMle<JaggedFirstGkrLayer> inputJaggedMle,
     JaggedMle<JaggedGkrLayer> outputJaggedMle,
     ext_t alpha) {
@@ -17,7 +17,7 @@ __global__ void logupGkrFixLastVariableFirstCircuitLayer(
     }
 }
 
-__global__ void fixAndSumFirstCircuitLayer(
+SP1_KERNEL void fixAndSumFirstCircuitLayer(
     ext_t* __restrict__ univariate_result,
     const JaggedMle<JaggedFirstGkrLayer> inputJaggedMle,
     JaggedMle<JaggedGkrLayer> outputJaggedMle,
@@ -81,7 +81,7 @@ __global__ void fixAndSumFirstCircuitLayer(
     }
 }
 
-__global__ void logupGkrSumAsPolyFirstCircuitLayer(
+SP1_KERNEL void logupGkrSumAsPolyFirstCircuitLayer(
     ext_t* __restrict__ result,
     const JaggedMle<JaggedFirstGkrLayer> inputJaggedMle,
     const ext_t* __restrict__ eqRow,
@@ -153,7 +153,7 @@ __global__ void logupGkrSumAsPolyFirstCircuitLayer(
     }
 }
 
-__global__ void LogUpFirstLayerTransitionKernel(
+SP1_KERNEL void LogUpFirstLayerTransitionKernel(
     const JaggedMle<JaggedFirstGkrLayer> inputJaggedMle,
     JaggedMle<JaggedGkrLayer> outputJaggedMle) {
 

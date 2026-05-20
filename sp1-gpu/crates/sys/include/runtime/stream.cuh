@@ -1,7 +1,15 @@
 #pragma once
 
 #include "runtime/exception.cuh"
+
+#ifdef __HIPCC__
+#include <hip/hip_runtime.h>
+using cudaStream_t = hipStream_t;
+using cudaEvent_t = hipEvent_t;
+typedef void* nvtxDomainHandle_t;
+#else
 #include <nvtx3/nvToolsExt.h>
+#endif
 
 extern "C" rustCudaError_t cuda_device_synchronize();
 
@@ -13,11 +21,11 @@ extern "C" uint64_t nvtx_range_start(char* message);
 
 extern "C" void nvtx_range_end(uint64_t id);
 
-extern "C" uint64_t nvtx_range_start(char* message);
-
 // Cuda events.
 
 extern "C" rustCudaError_t cuda_event_create(cudaEvent_t* event);
+
+extern "C" rustCudaError_t cuda_event_create_timing(cudaEvent_t* event);
 
 extern "C" rustCudaError_t cuda_event_destroy(cudaEvent_t event);
 
@@ -29,7 +37,11 @@ extern "C" rustCudaError_t cuda_event_elapsed_time(float* ms, cudaEvent_t start,
 
 // Cuda streams.
 
+#ifdef __HIPCC__
+extern "C" const cudaStream_t DEFAULT_STREAM;
+#else
 extern "C" const cudaStream_t DEFAULT_STREAM = cudaStreamDefault;
+#endif
 
 extern "C" rustCudaError_t cuda_stream_create(cudaStream_t* stream);
 

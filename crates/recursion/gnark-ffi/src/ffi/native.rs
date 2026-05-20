@@ -5,12 +5,8 @@
 //! Although we cast to *mut c_char because the Go signatures can't be immutable, the Go functions
 //! should not modify the strings.
 
-use crate::{Groth16Bn254Proof, PlonkBn254Proof, SP1_CIRCUIT_VERSION};
-use cfg_if::cfg_if;
-use std::{
-    ffi::{c_char, CStr, CString},
-    mem::forget,
-};
+use crate::{Groth16Bn254Proof, PlonkBn254Proof};
+use std::ffi::{c_char, CStr, CString};
 
 #[allow(warnings, clippy::all)]
 mod bind {
@@ -196,6 +192,77 @@ pub fn test_plonk_bn254(witness_json: &str, constraints_json: &str) {
 
 pub fn build_groth16_bn254(data_dir: &str) {
     build(ProofSystem::Groth16, data_dir)
+}
+
+/// Export Groth16 proving key as flat binary files for GPU prover.
+pub fn export_groth16_gpu_data(data_dir: &str, output_dir: &str) {
+    let data_dir_cstring = CString::new(data_dir).expect("CString::new failed");
+    let output_dir_cstring = CString::new(output_dir).expect("CString::new failed");
+    unsafe {
+        let err = bind::ExportGroth16GpuData(
+            data_dir_cstring.as_ptr() as *mut c_char,
+            output_dir_cstring.as_ptr() as *mut c_char,
+        );
+        if !err.is_null() {
+            let msg = ptr_to_string_freed(err);
+            panic!("ExportGroth16GpuData failed: {msg}");
+        }
+    }
+}
+
+/// Solve Groth16 R1CS and export witness data for GPU prover.
+pub fn export_groth16_gpu_witness(data_dir: &str, witness_path: &str, output_dir: &str) {
+    let data_dir_cstring = CString::new(data_dir).expect("CString::new failed");
+    let witness_path_cstring = CString::new(witness_path).expect("CString::new failed");
+    let output_dir_cstring = CString::new(output_dir).expect("CString::new failed");
+    unsafe {
+        let err = bind::ExportGroth16GpuWitness(
+            data_dir_cstring.as_ptr() as *mut c_char,
+            witness_path_cstring.as_ptr() as *mut c_char,
+            output_dir_cstring.as_ptr() as *mut c_char,
+        );
+        if !err.is_null() {
+            let msg = ptr_to_string_freed(err);
+            panic!("ExportGroth16GpuWitness failed: {msg}");
+        }
+    }
+}
+
+/// Export PLONK proving data (SRS, selectors, permutation polys) as flat
+/// binary files for the GPU PLONK prover. Mirrors `ExportPlonkData` (Go).
+pub fn export_plonk_gpu_data(data_dir: &str, output_dir: &str) {
+    let data_dir_cstring = CString::new(data_dir).expect("CString::new failed");
+    let output_dir_cstring = CString::new(output_dir).expect("CString::new failed");
+    unsafe {
+        let err = bind::ExportPlonkGpuData(
+            data_dir_cstring.as_ptr() as *mut c_char,
+            output_dir_cstring.as_ptr() as *mut c_char,
+        );
+        if !err.is_null() {
+            let msg = ptr_to_string_freed(err);
+            panic!("ExportPlonkGpuData failed: {msg}");
+        }
+    }
+}
+
+/// Solve the PLONK SCS and export per-proof witness data (L/R/O wires +
+/// BSB22 polys + commitments) for the GPU PLONK prover. Mirrors
+/// `ExportSolvedWitness` (Go).
+pub fn export_plonk_gpu_witness(data_dir: &str, witness_path: &str, output_dir: &str) {
+    let data_dir_cstring = CString::new(data_dir).expect("CString::new failed");
+    let witness_path_cstring = CString::new(witness_path).expect("CString::new failed");
+    let output_dir_cstring = CString::new(output_dir).expect("CString::new failed");
+    unsafe {
+        let err = bind::ExportPlonkGpuWitness(
+            data_dir_cstring.as_ptr() as *mut c_char,
+            witness_path_cstring.as_ptr() as *mut c_char,
+            output_dir_cstring.as_ptr() as *mut c_char,
+        );
+        if !err.is_null() {
+            let msg = ptr_to_string_freed(err);
+            panic!("ExportPlonkGpuWitness failed: {msg}");
+        }
+    }
 }
 
 pub fn prove_groth16_bn254(data_dir: &str, witness_path: &str) -> Groth16Bn254Proof {

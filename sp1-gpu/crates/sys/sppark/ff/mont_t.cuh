@@ -191,7 +191,10 @@ private:
         }
     };
 
-private:
+public:
+    // Made public (was private in SP1's fork) to allow jacobian_t::operator==
+    // which compares field elements via pointer-to-limbs access.
+    // risc0-sppark has this public; SP1's fork made it private.
     inline operator const uint32_t*() const             { return even;    }
     inline operator uint32_t*()                         { return even;    }
 
@@ -201,6 +204,12 @@ public:
     inline size_t len() const                           { return n;       }
 
     inline mont_t() {}
+    inline mont_t(int v)
+    {
+        even[0] = v;
+        for (size_t i = 1; i < n; i++)
+            even[i] = 0;
+    }
     inline mont_t(const uint32_t *p)
     {
         for (size_t i = 0; i < n; i++)
@@ -588,6 +597,9 @@ public:
                 p[i] = 0;
         }
     }
+
+    // Alias for SP1's NTT kernels which call set_to_zero() instead of zero()
+    inline __device__ void set_to_zero() { zero(); }
 
     friend inline mont_t czero(const mont_t& a, int set_z)
     {

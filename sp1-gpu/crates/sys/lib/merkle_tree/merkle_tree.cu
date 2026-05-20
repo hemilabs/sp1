@@ -4,7 +4,7 @@
 #include "poseidon2/poseidon2_bn254_3.cuh"
 
 template <typename Hasher_t, typename HashParams, typename HasherState_t>
-__global__ void leafHash(
+__global__ __launch_bounds__(256, 2) void leafHash(
     Hasher_t hasher,
     kb31_t* input,
     typename HashParams::F_t (*digests)[HashParams::DIGEST_WIDTH],
@@ -78,8 +78,15 @@ extern "C" void* leaf_hash_merkle_tree_bn254_kernel() {
         leafHash<poseidon2::Bn254Hasher, poseidon2_bn254_3::Bn254, poseidon2::Bn254HasherState>;
 }
 
+// Launched with 512 threads per block on CUDA (upstream's tuning, #2893), so no launch bound
+// there; HIP launches it with 128 and keeps the occupancy hint tuned for that.
 template <typename Hasher_t, typename HashParams, typename HasherState_t>
-__global__ void compress(
+#ifdef __HIPCC__
+__global__ __launch_bounds__(128, 2)
+#else
+__global__
+#endif
+void compress(
     Hasher_t hasher,
     typename HashParams::F_t (*digests)[HashParams::DIGEST_WIDTH],
     size_t layer_height) {
@@ -103,6 +110,39 @@ extern "C" void* compress_merkle_tree_koala_bear_16_kernel() {
 extern "C" void* compress_merkle_tree_bn254_kernel() {
     return (void*)
         compress<poseidon2::Bn254Hasher, poseidon2_bn254_3::Bn254, poseidon2::Bn254HasherState>;
+}
+
+// Batched compress: process multiple small tree layers in a single kernel launch.
+// Only safe when the entire work fits in one block (all layers have < block_dim nodes).
+template <typename Hasher_t, typename HashParams, typename HasherState_t>
+__global__ __launch_bounds__(128, 2) void compressBatched(
+    Hasher_t hasher,
+    typename HashParams::F_t (*digests)[HashParams::DIGEST_WIDTH],
+    size_t start_layer,  // highest layer (inclusive), e.g. 6
+    size_t end_layer     // lowest layer (inclusive), e.g. 0
+) {
+    for (int k = (int)start_layer; k >= (int)end_layer; k--) {
+        size_t layerLength = 1u << k;
+        if (threadIdx.x < layerLength) {
+            size_t idx = threadIdx.x + (layerLength - 1);
+            size_t leftIdx = (idx << 1) + 1;
+            size_t rightIdx = leftIdx + 1;
+            hasher.compress(digests[leftIdx], digests[rightIdx], digests[idx]);
+        }
+        __syncthreads();
+    }
+}
+
+extern "C" void* compress_batched_merkle_tree_koala_bear_16_kernel() {
+    return (void*)compressBatched<
+        poseidon2::KoalaBearHasher,
+        poseidon2_kb31_16::KoalaBear,
+        poseidon2::KoalaBearHasherState>;
+}
+
+extern "C" void* compress_batched_merkle_tree_bn254_kernel() {
+    return (void*)compressBatched<
+        poseidon2::Bn254Hasher, poseidon2_bn254_3::Bn254, poseidon2::Bn254HasherState>;
 }
 
 

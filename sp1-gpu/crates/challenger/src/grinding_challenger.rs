@@ -41,7 +41,7 @@ where
     let cpu_challenger: DuplexChallenger<F, _> = challenger.clone().into();
 
     let mut result = DeviceBuffer::with_capacity_in(1, scope.clone());
-    let mut found_flag = DeviceBuffer::<bool>::with_capacity_in(1, scope.clone());
+    let mut found_flag = DeviceBuffer::<bool>::from_host_slice(&[false], scope).unwrap();
     let mut gpu_challenger = cpu_challenger.to_device_sync(scope).unwrap();
 
     let block_dim: usize = 512;
@@ -50,7 +50,6 @@ where
 
     unsafe {
         result.assume_init();
-        found_flag.assume_init();
         let args = args!(
             gpu_challenger.as_mut_raw(),
             result.as_mut_ptr(),

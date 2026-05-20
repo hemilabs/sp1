@@ -1,0 +1,975 @@
+//! BN254 G1 elliptic curve operations.
+//!
+//! Implements Jacobian coordinate arithmetic for the BN254 curve y² = x³ + 3.
+//! Used for CPU-side Jacobian→affine conversion and CPU MSM fallback.
+
+use crate::fields::Fq;
+use crate::{BN254G1Affine, BN254G1Jacobian};
+
+/// G1 affine point with Fq coordinates (Montgomery form).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(C)]
+pub struct G1Affine {
+    pub x: Fq,
+    pub y: Fq,
+}
+
+/// G1 Jacobian point: (X, Y, Z) where affine (x,y) = (X/Z², Y/Z³).
+#[derive(Clone, Copy, Debug)]
+#[repr(C)]
+pub struct G1Jacobian {
+    pub x: Fq,
+    pub y: Fq,
+    pub z: Fq,
+}
+
+/// BN254 curve constant b = 3 (y² = x³ + 3, a = 0).
+#[cfg(test)]
+fn b_mont() -> Fq {
+    Fq::from_u64(3)
+}
+
+impl G1Affine {
+    /// Point at infinity (identity). Represented as (0, 0).
+    pub const INFINITY: Self = Self { x: Fq::ZERO, y: Fq::ZERO };
+
+    /// Check if this is the point at infinity.
+    pub fn is_infinity(&self) -> bool {
+        self.x.is_zero() && self.y.is_zero()
+    }
+
+    /// Convert to Jacobian coordinates: (X, Y, 1).
+    pub fn to_jacobian(&self) -> G1Jacobian {
+        if self.is_infinity() {
+            return G1Jacobian::INFINITY;
+        }
+        G1Jacobian { x: self.x, y: self.y, z: Fq::ONE }
+    }
+
+    /// Convert from BN254G1Affine (u32 limbs, Montgomery LE).
+    pub fn from_bn254(p: &BN254G1Affine) -> Self {
+        Self { x: Fq::from_bn254fq_raw(&p.x), y: Fq::from_bn254fq_raw(&p.y) }
+    }
+
+    /// Convert to BN254G1Affine (u32 limbs, Montgomery LE).
+    pub fn to_bn254(&self) -> BN254G1Affine {
+        BN254G1Affine { x: self.x.to_bn254fq_raw(), y: self.y.to_bn254fq_raw() }
+    }
+}
+
+impl G1Jacobian {
+    /// Point at infinity (identity): Z = 0.
+    pub const INFINITY: Self = Self { x: Fq::ONE, y: Fq::ONE, z: Fq::ZERO };
+
+    /// Check if this is the point at infinity.
+    pub fn is_infinity(&self) -> bool {
+        self.z.is_zero()
+    }
+
+    /// Convert to affine coordinates: (X/Z², Y/Z³).
+    pub fn to_affine(&self) -> G1Affine {
+        if self.is_infinity() {
+            return G1Affine::INFINITY;
+        }
+        let z_inv = self.z.inv();
+        let z_inv2 = z_inv * z_inv;
+        let z_inv3 = z_inv2 * z_inv;
+        G1Affine { x: self.x * z_inv2, y: self.y * z_inv3 }
+    }
+
+    /// Point doubling using "dbl-2009-l" formula (a=0 optimization).
+    /// Cost: 1M + 7S + additions.
+    pub fn double(&self) -> Self {
+        if self.is_infinity() {
+            return *self;
+        }
+
+        let a = self.x.square(); // X1²
+        let b = self.y.square(); // Y1²
+        let c = b.square(); // B² = Y1⁴
+
+        // D = 2·((X1+B)² - A - C) = 2·(2·X1·Y1²)
+        let xpb = self.x + b;
+        let d = (xpb.square() - a - c).double();
+
+        let e = a + a + a; // 3·A = 3·X1²
+        let f = e.square(); // E²
+
+        let x3 = f - d.double(); // F - 2·D
+        let y3 = e * (d - x3) - c.double().double().double(); // E·(D-X3) - 8·C
+        let z3 = (self.y + self.z).square() - b - self.z.square(); // (Y1+Z1)² - B - Z1²
+
+        Self { x: x3, y: y3, z: z3 }
+    }
+
+    /// Mixed addition: self + affine point. More efficient than full addition.
+    /// Cost: 7M + 4S (assumes Q.Z = 1).
+    pub fn add_affine(&self, q: &G1Affine) -> Self {
+        if q.is_infinity() {
+            return *self;
+        }
+        if self.is_infinity() {
+            return q.to_jacobian();
+        }
+
+        let z1z1 = self.z.square(); // Z1²
+        let u2 = q.x * z1z1; // X2·Z1²
+        let s2 = q.y * self.z * z1z1; // Y2·Z1·Z1²
+
+        let h = u2 - self.x; // U2 - X1
+        let r = (s2 - self.y).double(); // 2·(S2 - Y1)
+
+        // Edge case: when h=0, the formula degenerates
+        if h.is_zero() {
+            if r.is_zero() {
+                return self.double(); // P == Q
+            }
+            return Self::INFINITY; // P == -Q
+        }
+
+        let hh = h.square(); // H²
+        let i = hh.double().double(); // 4·H²
+        let j = h * i; // H·I
+        let v = self.x * i; // X1·I
+
+        let x3 = r.square() - j - v.double(); // r² - J - 2·V
+        let y3 = r * (v - x3) - (self.y * j).double(); // r·(V-X3) - 2·Y1·J
+        let z3 = (self.z + h).square() - z1z1 - hh; // (Z1+H)² - Z1² - H²
+
+        Self { x: x3, y: y3, z: z3 }
+    }
+
+    /// Full Jacobian addition: self + other.
+    /// Cost: 11M + 5S. Handles P == Q by calling double.
+    pub fn add(&self, other: &Self) -> Self {
+        if self.is_infinity() {
+            return *other;
+        }
+        if other.is_infinity() {
+            return *self;
+        }
+
+        let z1z1 = self.z.square();
+        let z2z2 = other.z.square();
+        let u1 = self.x * z2z2;
+        let u2 = other.x * z1z1;
+        let s1 = self.y * other.z * z2z2;
+        let s2 = other.y * self.z * z1z1;
+
+        let h = u2 - u1;
+        let r = (s2 - s1).double();
+
+        if h.is_zero() {
+            if r.is_zero() {
+                // P == Q
+                return self.double();
+            }
+            // P == -Q
+            return Self::INFINITY;
+        }
+
+        let i = h.double().square();
+        let j = h * i;
+        let v = u1 * i;
+
+        let x3 = r.square() - j - v.double();
+        let y3 = r * (v - x3) - (s1 * j).double();
+        let z3 = ((self.z + other.z).square() - z1z1 - z2z2) * h;
+
+        Self { x: x3, y: y3, z: z3 }
+    }
+
+    /// Scalar multiplication using double-and-add.
+    /// The scalar is in canonical form (non-Montgomery), as 4×u64 LE limbs.
+    pub fn scalar_mul(&self, scalar: &[u64; 4]) -> Self {
+        let mut result = Self::INFINITY;
+        let mut base = *self;
+
+        for &limb in scalar {
+            let mut s = limb;
+            for _ in 0..64 {
+                if s & 1 == 1 {
+                    result = result.add(&base);
+                }
+                base = base.double();
+                s >>= 1;
+            }
+        }
+        result
+    }
+
+    /// Convert from BN254G1Jacobian (u32 limbs, Montgomery LE).
+    pub fn from_bn254(p: &BN254G1Jacobian) -> Self {
+        Self {
+            x: Fq::from_bn254fq_raw(&p.x),
+            y: Fq::from_bn254fq_raw(&p.y),
+            z: Fq::from_bn254fq_raw(&p.z),
+        }
+    }
+
+    /// Convert to BN254G1Jacobian (u32 limbs, Montgomery LE).
+    pub fn to_bn254(&self) -> BN254G1Jacobian {
+        BN254G1Jacobian {
+            x: self.x.to_bn254fq_raw(),
+            y: self.y.to_bn254fq_raw(),
+            z: self.z.to_bn254fq_raw(),
+        }
+    }
+}
+
+/// CPU Multi-Scalar Multiplication (naive: sum of scalar multiplications).
+/// For testing only — production uses GPU MSM.
+///
+/// Computes: result = Σ scalars[i] · points[i]
+/// Scalars are in canonical form (non-Montgomery).
+pub fn cpu_msm(points: &[G1Affine], scalars: &[crate::fields::Fr]) -> G1Jacobian {
+    assert_eq!(points.len(), scalars.len());
+    let mut result = G1Jacobian::INFINITY;
+    for (point, scalar) in points.iter().zip(scalars.iter()) {
+        let canonical = scalar.to_canonical();
+        let p = point.to_jacobian().scalar_mul(&canonical);
+        result = result.add(&p);
+    }
+    result
+}
+
+/// GPU-accelerated MSM via sppark's Pippenger algorithm.
+/// Falls back to cpu_msm when the `cuda` feature is not enabled.
+///
+/// Points must be in Montgomery Fq form (as stored in BN254G1Affine).
+/// Scalars are converted to canonical form internally.
+pub fn msm(points: &[G1Affine], scalars: &[crate::fields::Fr]) -> G1Jacobian {
+    #[cfg(feature = "cuda")]
+    {
+        gpu_msm(points, scalars)
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        cpu_msm(points, scalars)
+    }
+}
+
+/// GPU MSM via sppark's sp1_bn254_msm.
+/// Converts G1Affine points and Fr scalars to the FFI format, calls GPU,
+/// and converts the result back to G1Jacobian.
+#[cfg(feature = "cuda")]
+fn gpu_msm(points: &[G1Affine], scalars: &[crate::fields::Fr]) -> G1Jacobian {
+    use crate::{BN254Fq, BN254G1Affine, BN254G1Jacobian};
+    use std::ffi::c_void;
+
+    assert_eq!(points.len(), scalars.len());
+    let n = points.len();
+    if n == 0 {
+        return G1Jacobian::INFINITY;
+    }
+
+    // Points: G1Affine (Fq as [u64;4]) → BN254G1Affine (BN254Fq as [u32;8]).
+    // Both are Montgomery form, identical byte layout on little-endian.
+    // Use zero-cost reinterpret via pointer cast (no allocation, no conversion).
+    // Safety: G1Affine has 2 × Fq([u64;4]) = 64 bytes, BN254G1Affine has 2 × BN254Fq([u32;8]) = 64 bytes.
+    // Both are #[repr(C)] with identical memory layout on LE platforms.
+    assert_eq!(std::mem::size_of::<G1Affine>(), std::mem::size_of::<BN254G1Affine>());
+    let points_ptr = points.as_ptr() as *const BN254G1Affine;
+
+    // Scalars: convert from Montgomery to canonical form for sppark (mont=false).
+    // This is N Montgomery multiplications but parallelized across CPU cores.
+    use rayon::prelude::*;
+    let bn_scalars: Vec<crate::BN254Fr> = scalars.par_iter().map(|s| s.to_bn254fr()).collect();
+    let scalars_ptr = bn_scalars.as_ptr();
+
+    // Call GPU MSM
+    let mut result = BN254G1Jacobian {
+        x: BN254Fq { limbs: [0; 8] },
+        y: BN254Fq { limbs: [0; 8] },
+        z: BN254Fq { limbs: [0; 8] },
+    };
+
+    let err = unsafe {
+        sp1_gpu_sys::msm::sp1_bn254_msm(
+            &mut result as *mut BN254G1Jacobian as *mut c_void,
+            points_ptr as *const c_void,
+            n,
+            scalars_ptr as *const c_void,
+            std::mem::size_of::<BN254G1Affine>(),
+        )
+    };
+
+    // Check for GPU errors.
+    if err != unsafe { sp1_gpu_sys::runtime::CUDA_SUCCESS_CSL } {
+        let msg = if err.message.is_null() {
+            "unknown GPU error".to_string()
+        } else {
+            unsafe { std::ffi::CStr::from_ptr(err.message) }.to_string_lossy().into_owned()
+        };
+        panic!("GPU MSM failed: {}", msg);
+    }
+
+    // Convert result back to G1Jacobian (Montgomery Fq coordinates)
+    G1Jacobian::from_bn254(&result)
+}
+
+/// Check if GLV endomorphism is enabled for G1 MSM.
+///
+/// Controlled by `SP1_GPU_GLV` env var:
+/// - "1" forces enabled
+/// - "0" forces disabled
+/// - unset: auto — enabled when total VRAM ≥ 14 GiB (lowered from the
+///   original 20 GiB threshold once the GLV working buffers were moved
+///   into a shared process-global pool).
+///
+/// Post-shared-pool VRAM budget on 9070 XT (16 GiB) during Groth16 prove:
+/// ```text
+///   4 × per-ctx expanded_points (2N × 64 B, pk_g1_a/b/k/z) ~ 7.7 GB
+///   + shared GLV working-buffer pool (sized for max N=16.8M)    ~ 1.5 GB
+///   + persistent G2 SRS + Bs1/Bs2 scratch                       ~ 1.9 GB
+///   + H-polynomial NTT working set                              ~ 1.5 GB
+///   + misc (d_scalars per ctx, buckets, …)                      ~ 1.0 GB
+///   ≈ 13.6 GB — fits with ~2 GB headroom.
+/// ```
+///
+/// Any card with strictly less than 14 GiB total VRAM will see GLV auto-
+/// disabled. RX 7900 XTX (24 GiB), RTX 4090 (24 GiB), RX 9070 XT (16 GiB)
+/// all qualify.
+#[cfg(feature = "cuda")]
+fn glv_enabled() -> bool {
+    static GLV: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *GLV.get_or_init(|| {
+        if let Ok(v) = std::env::var("SP1_GPU_GLV") {
+            let on = v != "0";
+            eprintln!(
+                "[MSM] GLV endomorphism {} (SP1_GPU_GLV={})",
+                if on { "enabled" } else { "disabled" },
+                v
+            );
+            return on;
+        }
+        // Auto-detect based on total VRAM. With the shared GLV pool
+        // (one-time ~1.5 GB instead of 4 × ~1.5 GB per-context), 14 GiB is
+        // enough headroom for all four G1 contexts + G2 + H.
+        let mut free: usize = 0;
+        let mut total: usize = 0;
+        let ok = unsafe {
+            sp1_gpu_sys::runtime::cuda_mem_get_info(&mut free as *mut _, &mut total as *mut _)
+                == sp1_gpu_sys::runtime::CUDA_SUCCESS_CSL
+        };
+        // VRAM math says 9070 XT (15.9 GB) should fit GLV after the
+        // shared pool (incl. d_scalars) refactor. Empirically it does
+        // not: Ar/Bs1 succeed but Krs slows by ~750ms (allocator
+        // pressure) and Krs2 OOMs during d_expanded_points alloc. Likely
+        // ROCm allocator fragmentation — 4 contiguous ~2 GB blocks plus
+        // the 1.5 GB pool, 1.9 GB G2, and 1.5 GB H buffer is right at the
+        // 16 GB ceiling. Keep threshold at 20 GB so 7900 XTX stays GLV-on
+        // and 9070 XT falls back cleanly.
+        let enable = ok && total >= 20 * 1024 * 1024 * 1024; // ≥ 20 GiB
+        if ok {
+            eprintln!(
+                "[MSM] GLV auto: total VRAM = {:.1} GB, {}",
+                total as f64 / (1024.0 * 1024.0 * 1024.0),
+                if enable {
+                    "enabling GLV (shared working-buffer pool)"
+                } else {
+                    "disabling GLV (needs ≥ 20 GB)"
+                }
+            );
+        } else {
+            eprintln!("[MSM] GLV auto: could not query VRAM, defaulting to enabled");
+        }
+        ok.then_some(enable).unwrap_or(true)
+    })
+}
+
+/// Persistent MSM context with SRS pre-uploaded to GPU.
+/// On NVIDIA (sppark), the SRS points and working buffers are pre-allocated
+/// on the GPU once in new(). Each msm() call only uploads scalars.
+///
+/// When GLV is enabled (default, controlled by `SP1_GPU_GLV` env var),
+/// the MSM uses the BN254 endomorphism to halve scalar width from 254 to ~128 bits,
+/// reducing Pippenger windows from 20 to 10 at the cost of doubling the point count.
+#[cfg(feature = "cuda")]
+pub struct PersistentMsm {
+    ctx: *mut std::ffi::c_void,
+    npoints: usize,
+    use_glv: bool,
+}
+
+#[cfg(feature = "cuda")]
+unsafe impl Send for PersistentMsm {}
+#[cfg(feature = "cuda")]
+unsafe impl Sync for PersistentMsm {}
+
+#[cfg(feature = "cuda")]
+impl PersistentMsm {
+    pub fn npoints(&self) -> usize {
+        self.npoints
+    }
+
+    /// Create a persistent MSM context, uploading SRS points to GPU once.
+    /// Pre-allocates all working buffers to eliminate per-call hipMalloc overhead.
+    /// GLV endomorphism buffers are lazily allocated on first GLV invoke.
+    pub fn new(points: &[G1Affine]) -> Self {
+        use crate::BN254G1Affine;
+        use std::ffi::c_void;
+
+        let n = points.len();
+        assert_eq!(std::mem::size_of::<G1Affine>(), std::mem::size_of::<BN254G1Affine>());
+        let points_ptr = points.as_ptr() as *const BN254G1Affine;
+
+        let mut ctx: *mut c_void = std::ptr::null_mut();
+        let err = unsafe {
+            sp1_gpu_sys::msm::sp1_bn254_msm_create(
+                &mut ctx as *mut _,
+                points_ptr as *const c_void,
+                n,
+                std::mem::size_of::<BN254G1Affine>(),
+            )
+        };
+        if err != unsafe { sp1_gpu_sys::runtime::CUDA_SUCCESS_CSL } {
+            panic!("Failed to create persistent MSM context");
+        }
+
+        let use_glv = glv_enabled();
+
+        // Pre-size the shared GLV working-buffer pool now, while we still
+        // have plenty of free VRAM (before the G2 SRS / H-poly allocations
+        // fragment the heap). Growing it mid-prove would require freeing +
+        // reallocating ~1.5 GB, which is expensive and risks OOM if the
+        // fragmented heap can't satisfy the new request.
+        //
+        // The pool is process-global and lazily grows to fit the largest N
+        // ever requested, so each G1 context just calls this with its own
+        // N; the largest-one-first ordering isn't required, but the first
+        // call allocates (1.5 GB for N=16.8M) and subsequent calls are
+        // no-ops once alloc_n >= this ctx's n.
+        if use_glv {
+            let err = unsafe { sp1_gpu_sys::msm::sp1_bn254_glv_pool_reserve(n) };
+            if err != unsafe { sp1_gpu_sys::runtime::CUDA_SUCCESS_CSL } {
+                let msg = if err.message.is_null() {
+                    "unknown error".to_string()
+                } else {
+                    unsafe { std::ffi::CStr::from_ptr(err.message) }.to_string_lossy().into_owned()
+                };
+                panic!("Failed to pre-reserve GLV working-buffer pool: {}", msg);
+            }
+
+            // H3: Force the per-ctx GLV init at setup time, not lazily on
+            // first invoke. Saves ~70ms iter-1 penalty per context (endo
+            // expand + hipMalloc(2N) + hipFree of d_points/d_partial_sums/
+            // d_scalars).
+            let err = unsafe { sp1_gpu_sys::msm::sp1_bn254_msm_force_init_glv(ctx) };
+            if err != unsafe { sp1_gpu_sys::runtime::CUDA_SUCCESS_CSL } {
+                let msg = if err.message.is_null() {
+                    "unknown error".to_string()
+                } else {
+                    unsafe { std::ffi::CStr::from_ptr(err.message) }.to_string_lossy().into_owned()
+                };
+                panic!("Failed to force-init GLV for G1 ctx: {}", msg);
+            }
+        }
+
+        Self { ctx, npoints: n, use_glv }
+    }
+
+    /// Run MSM with pre-uploaded SRS. Only uploads scalars to GPU.
+    /// Uses the persistent invoke path with pre-allocated working buffers.
+    /// Scalars are passed in Montgomery form; the GPU converts to canonical
+    /// form via the mont_to_canonical_kernel (saves ~60ms CPU conversion per call).
+    ///
+    /// When GLV is enabled, dispatches to the GLV-accelerated path which
+    /// decomposes each 254-bit scalar into two ~128-bit halves via the BN254
+    /// endomorphism, halving the number of Pippenger windows (10 vs 20).
+    pub fn msm(&self, scalars: &[crate::fields::Fr]) -> G1Jacobian {
+        self.msm_with_next(scalars, None)
+    }
+
+    /// Kick off an async H2D upload of this MSM's scalars using the shared
+    /// GLV pool's SDMA copy_stream, so the scalar upload overlaps with any
+    /// compute already running on the default stream (typically the H
+    /// polynomial NTT kernels). The next `msm` / `msm_with_next` call on any
+    /// G1 context that uses the shared GLV pool picks up the pre-uploaded
+    /// scalars and skips its synchronous hipMemcpy (~130-160 ms hidden).
+    ///
+    /// This must be called from the **same host thread** that will invoke
+    /// the subsequent MSM. Cross-thread HIP ops serialize on RDNA3 and
+    /// regress timing badly — see `feedback_hip_cross_thread_gpu_ops.md`.
+    ///
+    /// Only meaningful on the GLV path (HIP/AMD). On the non-GLV / sppark
+    /// path this is a no-op because the scalar upload happens inside
+    /// sppark's own multi-stream pipeline.
+    pub fn preupload_scalars(&self, scalars: &[crate::fields::Fr]) {
+        if !self.use_glv {
+            return;
+        }
+        use std::ffi::c_void;
+        let n = scalars.len();
+        assert!(n <= self.npoints);
+        let err = unsafe {
+            sp1_gpu_sys::msm::sp1_bn254_msm_preupload_scalars(scalars.as_ptr() as *const c_void, n)
+        };
+        if err != unsafe { sp1_gpu_sys::runtime::CUDA_SUCCESS_CSL } {
+            let msg = if err.message.is_null() {
+                "unknown error".to_string()
+            } else {
+                unsafe { std::ffi::CStr::from_ptr(err.message) }.to_string_lossy().into_owned()
+            };
+            eprintln!("[WARN] preupload_scalars failed: {msg} — skipping overlap");
+        }
+    }
+
+    /// Run MSM with optional DMA/compute overlap for the NEXT MSM's scalars.
+    ///
+    /// If `next_scalars` is `Some(slice)`, the GPU starts uploading those
+    /// scalars on a dedicated SDMA stream while the current MSM's compute
+    /// kernels finish. The next `msm()` or `msm_with_next()` call picks up
+    /// the pre-uploaded scalars and skips its synchronous H2D copy, hiding
+    /// ~130-160ms of upload latency per MSM.
+    pub fn msm_with_next(
+        &self,
+        scalars: &[crate::fields::Fr],
+        next_scalars: Option<&[crate::fields::Fr]>,
+    ) -> G1Jacobian {
+        use crate::{BN254Fq, BN254G1Jacobian};
+        use std::ffi::c_void;
+
+        let n = scalars.len();
+        assert!(n <= self.npoints);
+
+        let mut result = BN254G1Jacobian {
+            x: BN254Fq { limbs: [0; 8] },
+            y: BN254Fq { limbs: [0; 8] },
+            z: BN254Fq { limbs: [0; 8] },
+        };
+
+        let (scalar_ptr, mont_flag) = (scalars.as_ptr() as *const c_void, true);
+        let (next_ptr, next_n) = match next_scalars {
+            Some(ns) => (ns.as_ptr() as *const c_void, ns.len()),
+            None => (std::ptr::null(), 0usize),
+        };
+        let err = if self.use_glv {
+            unsafe {
+                sp1_gpu_sys::msm::sp1_bn254_msm_invoke_glv(
+                    self.ctx,
+                    &mut result as *mut BN254G1Jacobian as *mut c_void,
+                    n,
+                    scalar_ptr,
+                    mont_flag,
+                    next_ptr,
+                    next_n,
+                )
+            }
+        } else {
+            unsafe {
+                sp1_gpu_sys::msm::sp1_bn254_msm_invoke(
+                    self.ctx,
+                    &mut result as *mut BN254G1Jacobian as *mut c_void,
+                    n,
+                    scalar_ptr,
+                    mont_flag,
+                )
+            }
+        };
+        if err != unsafe { sp1_gpu_sys::runtime::CUDA_SUCCESS_CSL } {
+            let msg = if err.message.is_null() {
+                "unknown error".to_string()
+            } else {
+                unsafe { std::ffi::CStr::from_ptr(err.message) }.to_string_lossy().into_owned()
+            };
+            panic!("Persistent MSM invoke failed: {}", msg);
+        }
+
+        G1Jacobian::from_bn254(&result)
+    }
+
+    /// MSM with scalars already on GPU device memory.
+    /// Skips the H2D scalar upload entirely — d_scalars must be a valid device pointer.
+    /// Scalars are in Montgomery form; the GPU converts via mont_to_canonical_kernel.
+    pub fn msm_device(&self, d_scalars: *const std::ffi::c_void, n: usize) -> G1Jacobian {
+        self.msm_device_with_next(d_scalars, n, None)
+    }
+
+    /// MSM with device scalars + optional concurrent H2D preupload.
+    ///
+    /// If `next_host_scalars` is `Some(slice)`, starts an async H2D upload of
+    /// those scalars on the SDMA copy_stream while the current MSM's compute
+    /// kernels run. The D2D scalar copy uses a GPU kernel (COMPUTE engine)
+    /// instead of hipMemcpy (SDMA engine), freeing the SDMA engine for the
+    /// concurrent upload. The next invoke that checks `next_upload_pending`
+    /// picks up the pre-uploaded scalars and skips its own H2D copy.
+    pub fn msm_device_with_next(
+        &self,
+        d_scalars: *const std::ffi::c_void,
+        n: usize,
+        next_host_scalars: Option<&[crate::fields::Fr]>,
+    ) -> G1Jacobian {
+        use crate::{BN254Fq, BN254G1Jacobian};
+        use std::ffi::c_void;
+
+        assert!(n <= self.npoints);
+
+        let mut result = BN254G1Jacobian {
+            x: BN254Fq { limbs: [0; 8] },
+            y: BN254Fq { limbs: [0; 8] },
+            z: BN254Fq { limbs: [0; 8] },
+        };
+
+        let (next_ptr, next_n) = match next_host_scalars {
+            Some(ns) => (ns.as_ptr() as *const c_void, ns.len()),
+            None => (std::ptr::null(), 0usize),
+        };
+
+        let err = if self.use_glv {
+            unsafe {
+                sp1_gpu_sys::msm::sp1_bn254_msm_invoke_glv_device(
+                    self.ctx,
+                    &mut result as *mut BN254G1Jacobian as *mut c_void,
+                    n,
+                    d_scalars,
+                    true,
+                    next_ptr,
+                    next_n,
+                )
+            }
+        } else {
+            // Non-GLV path doesn't support preupload — ignore next_host_scalars.
+            unsafe {
+                sp1_gpu_sys::msm::sp1_bn254_msm_invoke_device(
+                    self.ctx,
+                    &mut result as *mut BN254G1Jacobian as *mut c_void,
+                    n,
+                    d_scalars,
+                    true,
+                )
+            }
+        };
+        if err != unsafe { sp1_gpu_sys::runtime::CUDA_SUCCESS_CSL } {
+            let msg = if err.message.is_null() {
+                "unknown error".to_string()
+            } else {
+                unsafe { std::ffi::CStr::from_ptr(err.message) }.to_string_lossy().into_owned()
+            };
+            panic!("Persistent MSM invoke (device scalars) failed: {}", msg);
+        }
+
+        G1Jacobian::from_bn254(&result)
+    }
+
+    /// MSM with device scalars + GPU-side depadding.
+    /// Copies device scalars to internal buffer, zeros entries matching hot_values
+    /// on GPU, then runs MSM. Saves ~300ms H2D + ~70ms CPU clone per wire.
+    /// hot_values must be in Montgomery form (same as the scalars).
+    pub fn msm_device_depad(
+        &self,
+        d_scalars: *const std::ffi::c_void,
+        n: usize,
+        hot_values: &[crate::fields::Fr],
+    ) -> G1Jacobian {
+        use crate::{BN254Fq, BN254G1Jacobian};
+        use std::ffi::c_void;
+
+        assert!(n <= self.npoints);
+
+        let mut result = BN254G1Jacobian {
+            x: BN254Fq { limbs: [0; 8] },
+            y: BN254Fq { limbs: [0; 8] },
+            z: BN254Fq { limbs: [0; 8] },
+        };
+
+        let hot_ptr = if hot_values.is_empty() {
+            std::ptr::null()
+        } else {
+            hot_values.as_ptr() as *const c_void
+        };
+
+        let err = if self.use_glv {
+            unsafe {
+                sp1_gpu_sys::msm::sp1_bn254_msm_invoke_glv_device_depad(
+                    self.ctx,
+                    &mut result as *mut BN254G1Jacobian as *mut c_void,
+                    n,
+                    d_scalars,
+                    true,
+                    hot_ptr,
+                    hot_values.len() as i32,
+                )
+            }
+        } else {
+            unsafe {
+                sp1_gpu_sys::msm::sp1_bn254_msm_invoke_device_depad(
+                    self.ctx,
+                    &mut result as *mut BN254G1Jacobian as *mut c_void,
+                    n,
+                    d_scalars,
+                    true,
+                    hot_ptr,
+                    hot_values.len() as i32,
+                )
+            }
+        };
+        if err != unsafe { sp1_gpu_sys::runtime::CUDA_SUCCESS_CSL } {
+            let msg = if err.message.is_null() {
+                "unknown error".to_string()
+            } else {
+                unsafe { std::ffi::CStr::from_ptr(err.message) }.to_string_lossy().into_owned()
+            };
+            panic!("Persistent MSM invoke (device depad) failed: {}", msg);
+        }
+
+        G1Jacobian::from_bn254(&result)
+    }
+
+    /// MSM with pre-converted canonical BN254Fr scalars (skips to_bn254fr conversion).
+    /// Used for binary mask MSMs where scalars are known constants.
+    /// Note: always uses the non-GLV path since scalars are already canonical
+    /// and may not need full 254-bit decomposition.
+    pub fn msm_raw(&self, canonical_scalars: &[crate::BN254Fr]) -> G1Jacobian {
+        use crate::{BN254Fq, BN254G1Jacobian};
+        use std::ffi::c_void;
+
+        let n = canonical_scalars.len();
+        assert!(n <= self.npoints);
+
+        let mut result = BN254G1Jacobian {
+            x: BN254Fq { limbs: [0; 8] },
+            y: BN254Fq { limbs: [0; 8] },
+            z: BN254Fq { limbs: [0; 8] },
+        };
+
+        // GLV path also works for canonical scalars (mont=false skips conversion).
+        // But msm_raw is used for small binary-mask MSMs where GLV overhead
+        // may not be worthwhile. Use standard path.
+        let err = unsafe {
+            sp1_gpu_sys::msm::sp1_bn254_msm_invoke(
+                self.ctx,
+                &mut result as *mut BN254G1Jacobian as *mut c_void,
+                n,
+                canonical_scalars.as_ptr() as *const c_void,
+                false,
+            )
+        };
+        if err != unsafe { sp1_gpu_sys::runtime::CUDA_SUCCESS_CSL } {
+            let msg = if err.message.is_null() {
+                "unknown error".to_string()
+            } else {
+                unsafe { std::ffi::CStr::from_ptr(err.message) }.to_string_lossy().into_owned()
+            };
+            panic!("Persistent MSM raw invoke failed: {}", msg);
+        }
+
+        G1Jacobian::from_bn254(&result)
+    }
+}
+
+#[cfg(feature = "cuda")]
+impl Drop for PersistentMsm {
+    fn drop(&mut self) {
+        if !self.ctx.is_null() {
+            unsafe { sp1_gpu_sys::msm::sp1_bn254_msm_destroy(self.ctx) };
+            self.ctx = std::ptr::null_mut();
+        }
+    }
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// BN254 generator: G = (1, 2).
+    fn generator() -> G1Affine {
+        G1Affine { x: Fq::from_u64(1), y: Fq::from_u64(2) }
+    }
+
+    /// Verify the generator is on the curve: y² = x³ + 3.
+    #[test]
+    fn test_generator_on_curve() {
+        let g = generator();
+        let y2 = g.y.square();
+        let x3_plus_b = g.x.square() * g.x + b_mont();
+        assert_eq!(y2, x3_plus_b);
+    }
+
+    #[test]
+    fn test_double_generator() {
+        let g = generator().to_jacobian();
+        let g2 = g.double();
+        assert!(!g2.is_infinity());
+
+        // Verify 2G is on the curve
+        let g2a = g2.to_affine();
+        let y2 = g2a.y.square();
+        let x3_plus_b = g2a.x.square() * g2a.x + b_mont();
+        assert_eq!(y2, x3_plus_b);
+    }
+
+    #[test]
+    fn test_add_equals_double() {
+        let g = generator().to_jacobian();
+        let g_plus_g = g.add(&g);
+        let g_doubled = g.double();
+
+        let a1 = g_plus_g.to_affine();
+        let a2 = g_doubled.to_affine();
+        assert_eq!(a1, a2);
+    }
+
+    #[test]
+    fn test_mixed_add() {
+        let g_aff = generator();
+        let g_jac = g_aff.to_jacobian();
+        let g2_mixed = g_jac.add_affine(&g_aff);
+        let g2_full = g_jac.add(&g_jac);
+
+        assert_eq!(g2_mixed.to_affine(), g2_full.to_affine());
+    }
+
+    #[test]
+    fn test_add_infinity() {
+        let g = generator().to_jacobian();
+        let inf = G1Jacobian::INFINITY;
+
+        let r1 = g.add(&inf);
+        let r2 = inf.add(&g);
+        assert_eq!(r1.to_affine(), generator());
+        assert_eq!(r2.to_affine(), generator());
+    }
+
+    #[test]
+    fn test_point_negation() {
+        let g = generator();
+        let neg_g = G1Affine { x: g.x, y: -g.y };
+
+        // Verify -G is on the curve: y² = x³ + 3
+        let y2 = neg_g.y.square();
+        let x3_plus_b = neg_g.x.square() * neg_g.x + b_mont();
+        assert_eq!(y2, x3_plus_b);
+
+        // P + (-P) = infinity via full Jacobian add
+        let result = g.to_jacobian().add(&neg_g.to_jacobian());
+        assert!(result.is_infinity());
+
+        // P + (-P) = infinity via mixed add
+        let result_mixed = g.to_jacobian().add_affine(&neg_g);
+        assert!(result_mixed.is_infinity());
+    }
+
+    #[test]
+    fn test_g1_associativity() {
+        let g = generator().to_jacobian();
+        let g2 = g.double(); // 2G
+        let g3 = g2.add(&g); // 3G
+
+        // (G + 2G) + 3G  vs  G + (2G + 3G)
+        let lhs = g.add(&g2).add(&g3);
+        let rhs = g.add(&g2.add(&g3));
+        assert_eq!(lhs.to_affine(), rhs.to_affine());
+    }
+
+    #[test]
+    fn test_scalar_mul_one() {
+        let g = generator().to_jacobian();
+        let result = g.scalar_mul(&[1, 0, 0, 0]);
+        assert_eq!(result.to_affine(), generator());
+    }
+
+    #[test]
+    fn test_scalar_mul_two() {
+        let g = generator().to_jacobian();
+        let g2_scalar = g.scalar_mul(&[2, 0, 0, 0]);
+        let g2_add = g.double();
+        assert_eq!(g2_scalar.to_affine(), g2_add.to_affine());
+    }
+
+    #[test]
+    fn test_scalar_mul_three() {
+        let g = generator().to_jacobian();
+        let g3_scalar = g.scalar_mul(&[3, 0, 0, 0]);
+        let g3_add = g.double().add(&g);
+        assert_eq!(g3_scalar.to_affine(), g3_add.to_affine());
+    }
+
+    #[test]
+    fn test_scalar_mul_zero() {
+        let g = generator().to_jacobian();
+        let result = g.scalar_mul(&[0, 0, 0, 0]);
+        assert!(result.is_infinity());
+    }
+
+    #[test]
+    fn test_cpu_msm_simple() {
+        let g = generator();
+        let points = vec![g, g, g];
+        let scalars = vec![
+            crate::fields::Fr::from_u64(1),
+            crate::fields::Fr::from_u64(2),
+            crate::fields::Fr::from_u64(3),
+        ];
+        let result = cpu_msm(&points, &scalars);
+        // 1*G + 2*G + 3*G = 6*G
+        let expected = g.to_jacobian().scalar_mul(&[6, 0, 0, 0]);
+        assert_eq!(result.to_affine(), expected.to_affine());
+    }
+
+    #[test]
+    fn test_msm_dispatcher() {
+        // Test the msm() dispatcher (falls back to cpu_msm when cuda is not enabled)
+        let g = generator();
+        let points = vec![g, g, g];
+        let scalars = vec![
+            crate::fields::Fr::from_u64(1),
+            crate::fields::Fr::from_u64(2),
+            crate::fields::Fr::from_u64(3),
+        ];
+        let result = msm(&points, &scalars);
+        let expected = g.to_jacobian().scalar_mul(&[6, 0, 0, 0]);
+        assert_eq!(result.to_affine(), expected.to_affine());
+    }
+
+    #[test]
+    fn test_msm_empty() {
+        let result = msm(&[], &[]);
+        assert!(result.is_infinity());
+    }
+
+    #[test]
+    fn test_msm_single_point() {
+        let g = generator();
+        let result = msm(&[g], &[crate::fields::Fr::from_u64(5)]);
+        let expected = g.to_jacobian().scalar_mul(&[5, 0, 0, 0]);
+        assert_eq!(result.to_affine(), expected.to_affine());
+    }
+
+    #[test]
+    fn test_msm_matches_cpu_msm() {
+        // Verify dispatcher produces same result as direct cpu_msm call
+        let g = generator();
+        let g2 = g.to_jacobian().double().to_affine();
+        let g3 = g.to_jacobian().double().add(&g.to_jacobian()).to_affine();
+        let points = vec![g, g2, g3];
+        let scalars = vec![
+            crate::fields::Fr::from_u64(7),
+            crate::fields::Fr::from_u64(13),
+            crate::fields::Fr::from_u64(42),
+        ];
+        let msm_result = msm(&points, &scalars);
+        let cpu_result = cpu_msm(&points, &scalars);
+        assert_eq!(msm_result.to_affine(), cpu_result.to_affine());
+    }
+
+    #[test]
+    fn test_affine_jacobian_roundtrip() {
+        let g = generator();
+        let j = g.to_jacobian();
+        let a = j.to_affine();
+        assert_eq!(a, g);
+    }
+
+    #[test]
+    fn test_bn254_roundtrip() {
+        let g = generator();
+        let bn = g.to_bn254();
+        let recovered = G1Affine::from_bn254(&bn);
+        assert_eq!(recovered, g);
+    }
+}

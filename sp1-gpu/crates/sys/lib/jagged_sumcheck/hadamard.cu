@@ -7,14 +7,10 @@
 #include "sum_and_reduce/reduce.cuh"
 #include "config.cuh"
 #include "jagged_sumcheck/hadamard.cuh"
-
-#include <cooperative_groups.h>
-#include <cooperative_groups/reduce.h>
-
-namespace cg = cooperative_groups;
+#include "runtime/gpu_compat.cuh"
 
 template <typename F, typename EF>
-__global__ void hadamardSumAsPoly(
+SP1_KERNEL void hadamardSumAsPoly(
     EF* __restrict__ result,
     const F* __restrict__ base_mle,
     const EF* __restrict__ ext_mle,
@@ -60,7 +56,7 @@ __global__ void hadamardSumAsPoly(
 
 /// Note: this does not correclty handle padding.
 template <typename F, typename EF>
-__global__ void hadamardFixLastVariableAndSumAsPoly(
+SP1_KERNEL void hadamardFixLastVariableAndSumAsPoly(
     const F* base_input,
     const EF* ext_input,
     EF* __restrict base_output,

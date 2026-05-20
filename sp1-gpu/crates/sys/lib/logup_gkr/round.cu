@@ -6,7 +6,7 @@
 #include <cstdio>
 
 /// Currently not used.
-__global__ void fixLastVariableCircuitLayer(
+SP1_KERNEL void fixLastVariableCircuitLayer(
     ext_t* __restrict__ layer,
     const uint32_t* __restrict__ colIndex,
     const uint32_t* __restrict__ startIndices,
@@ -39,7 +39,7 @@ __global__ void fixLastVariableCircuitLayer(
     }
 }
 
-__global__ void sumAsPolyCircuitLayer(
+SP1_KERNEL void sumAsPolyCircuitLayer(
     ext_t* __restrict__ result,
     const JaggedMle<JaggedGkrLayer> inputJaggedMle,
     const ext_t* __restrict__ eqRow,
@@ -89,7 +89,7 @@ __global__ void sumAsPolyCircuitLayer(
     }
 }
 
-__global__ void firstSumAsPolyCircuitLayer(
+SP1_KERNEL void firstSumAsPolyCircuitLayer(
     ext_t* __restrict__ result,
     const JaggedMle<JaggedGkrLayer> inputJaggedMle,
     const ext_t* __restrict__ eqRow,
@@ -166,7 +166,7 @@ __global__ void firstSumAsPolyCircuitLayer(
     }
 }
 
-__global__ void fixLastVariableLastCircuitLayer(
+SP1_KERNEL void fixLastVariableLastCircuitLayer(
     const ext_t* __restrict__ layer,
     ext_t alpha,
     ext_t* __restrict__ output,
@@ -187,7 +187,7 @@ __global__ void fixLastVariableLastCircuitLayer(
     }
 }
 
-__global__ void sumAsPolyInteractionsLayer(
+SP1_KERNEL void sumAsPolyInteractionsLayer(
     ext_t* __restrict__ result,
     ext_t* __restrict__ layer,
     const ext_t* __restrict__ eqPoly,
@@ -224,8 +224,8 @@ __global__ void sumAsPolyInteractionsLayer(
     }
 }
 
-__global__ void fixLastVariableInteractionsLayer(
-    const ext_t* input,
+SP1_KERNEL void fixLastVariableInteractionsLayer(
+    const ext_t* __restrict__ input,
     ext_t* __restrict__ output,
     ext_t alpha,
     size_t height,
@@ -238,7 +238,7 @@ __global__ void fixLastVariableInteractionsLayer(
 
 
 // Invoke this one during normal circuit layers
-__global__ void fixAndSumCircuitLayer(
+SP1_KERNEL void fixAndSumCircuitLayer(
     ext_t* __restrict__ univariate_result,
     const JaggedMle<JaggedGkrLayer> inputJaggedMle,
     JaggedMle<JaggedGkrLayer> outputJaggedMle,
@@ -255,33 +255,31 @@ __global__ void fixAndSumCircuitLayer(
     for (size_t i = blockIdx.x * blockDim.x + threadIdx.x; i < inputJaggedMle.denseData.height >> 1;
          i += blockDim.x * gridDim.x) {
 
-        // Process one fixLastVariable. Since height is always even, this is guaranteed to not
-        // require any padding checks.
+        // Process fixLastVariable for both indices, keeping computed values in registers
+        // to avoid the write-then-read pattern through global memory.
         size_t firstIdx = i << 1;
-        inputJaggedMle.fixLastVariableUnchecked(outputJaggedMle, firstIdx, alpha);
+        CircuitValues cv1;
+        inputJaggedMle.fixLastVariableUncheckedWithValues(outputJaggedMle, firstIdx, alpha, cv1);
 
-        // The second fix_last_variable could by trying to process the end of the row. We are
-        // guaranteed to be able to access the end of this row, but we need to make sure that the
-        // next row has even length too.
         size_t secondIdx = firstIdx + 1;
-
+        CircuitValues cv2;
         size_t restrictedIndex =
-            inputJaggedMle.fixLastVariableTwoPadding(outputJaggedMle, secondIdx, alpha);
+            inputJaggedMle.fixLastVariableTwoPaddingWithValues(outputJaggedMle, secondIdx, alpha, cv2);
 
         size_t outputIndex = restrictedIndex >> 1;
 
-        // Now set up the sum_as_poly.
+        // Use the register-held values directly for sumAsPoly (no re-read from global memory).
         size_t colIdx = outputJaggedMle.colIndex[outputIndex];
         size_t startIdx = outputJaggedMle.startIndices[colIdx];
-        SumAsPolyResult result = sumAsPolyCircuitLayerInner(
-            outputJaggedMle.denseData.layer,
+        SumAsPolyResult result = sumAsPolyCircuitLayerFromValues(
+            cv1,
+            cv2,
             colIdx,
             startIdx,
+            outputIndex,
             eqRow,
             eqInteraction,
-            lambda,
-            outputJaggedMle.denseData.height,
-            outputIndex);
+            lambda);
 
         evalZero += result.evalZero;
         evalHalf += result.evalHalf;
@@ -306,7 +304,7 @@ __global__ void fixAndSumCircuitLayer(
 }
 
 // Invoke this one for the last circuit layer, when you transition to interactions.
-__global__ void fixAndSumLastCircuitLayer(
+SP1_KERNEL void fixAndSumLastCircuitLayer(
     ext_t* __restrict__ univariate_result,
     const JaggedGkrLayer inputJaggedMle,
     ext_t alpha,
@@ -396,14 +394,14 @@ __global__ void fixAndSumLastCircuitLayer(
 }
 
 // Invoke this one for interactions layers
-__global__ void fixAndSumInteractionsLayer(
+SP1_KERNEL void fixAndSumInteractionsLayer(
     ext_t* __restrict__ univariate_result,
-    const ext_t* input,
+    const ext_t* __restrict__ input,
     ext_t* __restrict__ output,
     ext_t alpha,
     size_t height,
     size_t outputHeight,
-    const ext_t* eqInteraction,
+    const ext_t* __restrict__ eqInteraction,
     const ext_t lambda) {
 
     ext_t evalZero = ext_t::zero();
@@ -417,25 +415,21 @@ __global__ void fixAndSumInteractionsLayer(
         size_t firstIdx = i << 1;
         size_t secondIdx = (i << 1) + 1;
 
-        // Fix last variable for the actual layer. TODO: this has some padding checks that aren't
-        // needed.
-        fixLastVariableInteractionsLayerInner(input, output, alpha, height, outputHeight, firstIdx);
+        // Fix last variable and keep values in registers to avoid write-then-read.
+        CircuitValues cv1 = fixLastVariableInteractionsLayerInnerWithValues(
+            input, output, alpha, height, outputHeight, firstIdx);
 
-        // Todo: instead of checking padding conditions twice here ad in sumAsPoly, we should do it
-        // once.
+        CircuitValues cv2;
         if (secondIdx < outputHeight) {
-            fixLastVariableInteractionsLayerInner(
-                input,
-                output,
-                alpha,
-                height,
-                outputHeight,
-                secondIdx);
+            cv2 = fixLastVariableInteractionsLayerInnerWithValues(
+                input, output, alpha, height, outputHeight, secondIdx);
+        } else {
+            cv2 = CircuitValues::paddingValues();
         }
 
-        // Now set up the sum_as_poly. Padding is handled in here.
+        // Compute sum_as_poly directly from register values, avoiding global memory re-read.
         SumAsPolyResult result =
-            sumAsPolyInteractionLayerInner(output, eqInteraction, lambda, outputHeight, i);
+            sumAsPolyInteractionLayerFromValues(cv1, cv2, eqInteraction, lambda, outputHeight, i);
 
         evalZero += result.evalZero;
         evalHalf += result.evalHalf;

@@ -1,10 +1,9 @@
 #include "jagged_sumcheck/jagged_sumcheck.cuh"
 #include "sum_and_reduce/reduce.cuh"
 #include "tracegen/jagged_tracegen/jagged.cuh"
+#include "runtime/gpu_compat.cuh"
 
 
-#include <cooperative_groups.h>
-#include <cooperative_groups/reduce.h>
 
 
 // Computes the two-round polynomial h(X, Y) = sum_i p(i, X, Y) * q(i, X, Y) on the grid
@@ -16,7 +15,7 @@
 // order: h(0,0), h(0,1), h(0,1/2), h(1,0), h(1,1/2), h(1/2,0), h(1/2,1), h(1/2,1/2).
 // Midpoint accumulators carry the unscaled pair sums: entries 2, 4, 5, 6 hold 4*h and
 // entry 7 holds 16*h; the host descales.
-__global__ void jaggedTwoRoundSumAsPoly(
+SP1_KERNEL void jaggedTwoRoundSumAsPoly(
     ext_t* evaluations,
     const JaggedMle<JaggedSumcheckData> inputJaggedMle) {
 
@@ -83,7 +82,7 @@ __global__ void jaggedTwoRoundSumAsPoly(
 // Folds the first two sumcheck challenges in one pass, materializing the (p, q) pair at a
 // quarter of the dense size (instead of half after one fold), and accumulates the round-3
 // univariate evaluations from the folded values while they are still in registers.
-__global__ void jaggedTwoRoundFixAndSum(
+SP1_KERNEL void jaggedTwoRoundFixAndSum(
     ext_t* evaluations,
     const JaggedMle<JaggedSumcheckData> inputJaggedMle,
     ext_t* output_p,
@@ -148,13 +147,13 @@ __global__ void jaggedTwoRoundFixAndSum(
     }
 }
 
-__global__ void paddedHadamardFixAndSum(
-    const ext_t* base_input,
-    const ext_t* ext_input,
-    ext_t* __restrict base_output,
-    ext_t* __restrict ext_output,
+SP1_KERNEL void paddedHadamardFixAndSum(
+    const ext_t* __restrict__ base_input,
+    const ext_t* __restrict__ ext_input,
+    ext_t* __restrict__ base_output,
+    ext_t* __restrict__ ext_output,
     ext_t alpha,
-    ext_t* univariate_result,
+    ext_t* __restrict__ univariate_result,
     size_t inputHeight) {
 
     size_t outputHeight = (inputHeight + 1) >> 1;

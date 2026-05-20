@@ -3381,6 +3381,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "mixed-ops-program"
+version = "1.1.0"
+dependencies = [
+ "sp1-zkvm",
+]
+
+[[package]]
+name = "mixed-ops-script"
+version = "1.1.0"
+dependencies = [
+ "sp1-build",
+ "sp1-sdk",
+]
+
+[[package]]
 name = "modular-bitfield"
 version = "0.11.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6903,6 +6918,7 @@ dependencies = [
  "num-bigint 0.4.6",
  "opentelemetry",
  "rand 0.8.5",
+ "rayon",
  "reqwest",
  "serde",
  "serde_json",

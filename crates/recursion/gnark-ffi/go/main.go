@@ -150,6 +150,50 @@ func FreeGroth16Bn254Proof(proof *C.C_Groth16Bn254Proof) {
 	C.free(unsafe.Pointer(proof))
 }
 
+//export ExportGroth16GpuData
+func ExportGroth16GpuData(dataDir *C.char, outputDir *C.char) (errStr *C.char) {
+	defer func() {
+		if r := recover(); r != nil {
+			errStr = C.CString(fmt.Sprintf("[groth16-export] panic: %v", r))
+		}
+	}()
+	sp1.ExportGroth16GpuData(C.GoString(dataDir), C.GoString(outputDir))
+	return nil
+}
+
+//export ExportGroth16GpuWitness
+func ExportGroth16GpuWitness(dataDir *C.char, witnessPath *C.char, outputDir *C.char) (errStr *C.char) {
+	defer func() {
+		if r := recover(); r != nil {
+			errStr = C.CString(fmt.Sprintf("[groth16-witness] panic: %v", r))
+		}
+	}()
+	sp1.ExportGroth16GpuWitness(C.GoString(dataDir), C.GoString(witnessPath), C.GoString(outputDir))
+	return nil
+}
+
+//export ExportPlonkGpuData
+func ExportPlonkGpuData(dataDir *C.char, outputDir *C.char) (errStr *C.char) {
+	defer func() {
+		if r := recover(); r != nil {
+			errStr = C.CString(fmt.Sprintf("[plonk-export] panic: %v", r))
+		}
+	}()
+	sp1.ExportPlonkData(C.GoString(dataDir), C.GoString(outputDir))
+	return nil
+}
+
+//export ExportPlonkGpuWitness
+func ExportPlonkGpuWitness(dataDir *C.char, witnessPath *C.char, outputDir *C.char) (errStr *C.char) {
+	defer func() {
+		if r := recover(); r != nil {
+			errStr = C.CString(fmt.Sprintf("[plonk-witness] panic: %v", r))
+		}
+	}()
+	sp1.ExportSolvedWitness(C.GoString(dataDir), C.GoString(witnessPath), C.GoString(outputDir))
+	return nil
+}
+
 //export BuildGroth16Bn254
 func BuildGroth16Bn254(dataDir *C.char) {
 	// Sanity check the required arguments have been provided.
