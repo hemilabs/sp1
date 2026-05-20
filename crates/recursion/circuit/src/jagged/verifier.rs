@@ -1,6 +1,6 @@
-use std::marker::PhantomData;
+use std::{iter::repeat_n, marker::PhantomData};
 
-use itertools::izip;
+use itertools::{izip, Itertools};
 use slop_algebra::AbstractField;
 use slop_jagged::{JaggedLittlePolynomialVerifierParams, JaggedSumcheckEvalProof};
 use slop_multilinear::{Mle, MleEval, Point};
@@ -8,7 +8,7 @@ use slop_sumcheck::PartialSumcheckProof;
 use sp1_primitives::{SP1ExtensionField, SP1Field};
 use sp1_recursion_compiler::{
     circuit::CircuitV2Builder,
-    ir::{Builder, Ext, Felt, SymbolicExt},
+    ir::{Builder, Ext, Felt, SymbolicExt, SymbolicFelt},
 };
 
 use crate::{
@@ -138,6 +138,30 @@ impl<SC: SP1FieldConfigVariable<C>, C: CircuitConfig> RecursiveJaggedPcsVerifier
             challenger,
         );
         builder.cycle_tracker_v2_exit();
+
+        // Check the prefix_sum_felts against the row counts.
+        let repeated_flattened_row_counts: Vec<Felt<SP1Field>> = proof
+            .row_counts
+            .iter()
+            .flatten()
+            .zip_eq(column_counts.iter().flatten())
+            .flat_map(|(row, col)| repeat_n(*row, *col))
+            .collect();
+
+        let mut acc: Felt<_> = builder.constant(SP1Field::zero());
+
+        for (row_count, expected) in
+            repeated_flattened_row_counts.iter().zip_eq(prefix_sum_felts.iter())
+        {
+            builder.assert_felt_eq(acc, *expected);
+            acc = builder.eval(acc + *row_count)
+        }
+        let mut final_area = SymbolicFelt::zero();
+        let two: Felt<_> = builder.constant(SP1Field::two());
+        for bit in proof.params.col_prefix_sums.iter().last().unwrap().iter() {
+            final_area = *bit + two * final_area;
+        }
+        builder.assert_felt_eq(acc, final_area);
 
         // Compute the expected evaluation of the dense trace polynomial.
         builder.assert_ext_eq(jagged_eval * *expected_eval, sumcheck_proof.point_and_eval.1);

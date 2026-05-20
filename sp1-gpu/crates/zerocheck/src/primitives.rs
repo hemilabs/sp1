@@ -2,14 +2,18 @@ use crate::data::{InfoBuffer, JaggedDenseInfo};
 use slop_algebra::{AbstractField, ExtensionField, Field};
 use slop_alloc::{Backend, Buffer, CpuBackend, HasBackend, Slice};
 use slop_commit::Rounds;
-use slop_multilinear::{Evaluations, MleEval, Point};
-use slop_tensor::Tensor;
+
+use slop_multilinear::{MleEval, Point};
+use slop_tensor::{Tensor, TensorView};
+
 use sp1_gpu_cudart::sys::runtime::KernelPtr;
 use sp1_gpu_cudart::sys::v2_kernels::{
     fix_last_variable_jagged_ext, fix_last_variable_jagged_felt, fix_last_variable_jagged_info,
     initialize_jagged_info,
 };
-use sp1_gpu_cudart::{args, DeviceBuffer, DevicePoint, DeviceTensor, TaskScope};
+use sp1_gpu_cudart::{
+    args, dot_along_dim_view, DeviceBuffer, DevicePoint, DeviceTensor, TaskScope,
+};
 use sp1_gpu_utils::{Ext, Felt, JaggedMle, JaggedTraceMle, TraceDenseData, TraceOffset};
 use std::collections::BTreeMap;
 use std::iter::once;
@@ -123,20 +127,39 @@ where
 
 #[inline(always)]
 pub fn evaluate_traces(traces: &JaggedTraceMle<Felt, TaskScope>, point: &Point<Ext>) -> Vec<Ext> {
-    let mut next_input_jagged_trace_mle =
-        evaluate_jagged_fix_last_variable(traces, *point.last().unwrap());
-    for alpha in point.iter().rev().skip(1) {
-        next_input_jagged_trace_mle =
-            evaluate_jagged_fix_last_variable(&next_input_jagged_trace_mle, *alpha);
+    let trace_data = traces.dense();
+    let backend = traces.backend();
+    let device_point = DevicePoint::from_host(point, backend).unwrap();
+    let partial_lagrange = device_point.partial_lagrange();
+    let total_cols = trace_data
+        .preprocessed_table_index
+        .values()
+        .chain(trace_data.main_table_index.values())
+        .map(|index| index.num_polys)
+        .sum::<usize>();
+    let mut result_buffer =
+        DeviceBuffer::with_capacity_in(total_cols, backend.clone()).into_inner();
+
+    let trace_ptr = trace_data.dense.as_ptr();
+    let chip_indices =
+        trace_data.preprocessed_table_index.values().chain(trace_data.main_table_index.values());
+    for index in chip_indices {
+        if index.dense_offset.start == index.dense_offset.end {
+            continue;
+        }
+        let chip_ptr = unsafe { trace_ptr.add(index.dense_offset.start) };
+        let chip_view = unsafe {
+            TensorView::from_raw_parts(
+                chip_ptr,
+                [index.num_polys, index.poly_size].try_into().unwrap(),
+                backend.clone(),
+            )
+        };
+        let result = dot_along_dim_view(chip_view, partial_lagrange.guts().as_view(), 1);
+        result_buffer.extend_from_device_slice(result.as_buffer()).unwrap();
     }
 
-    let host_dense = DeviceBuffer::from_raw(next_input_jagged_trace_mle.dense_data.dense.clone())
-        .to_host()
-        .unwrap()
-        .to_vec();
-
-    // Only every four elements is not padding.
-    host_dense.into_iter().step_by(4).collect::<Vec<_>>()
+    DeviceBuffer::from_raw(result_buffer).to_host().unwrap()
 }
 
 pub fn evaluate_jagged_columns(
@@ -166,7 +189,7 @@ pub fn evaluate_jagged_columns(
 
 pub fn initialize_jagged_dense_info(
     heights: Vec<u32>,
-    values: Vec<u32>,
+    values: Vec<u64>,
     backend: &TaskScope,
 ) -> JaggedDenseInfo<TaskScope> {
     let buffer_start_idx = once(0)
@@ -184,7 +207,7 @@ pub fn initialize_jagged_dense_info(
 
     let total_len = buffer_start_idx.last().unwrap() * 2;
     let info_buffer =
-        Buffer::<u32, TaskScope>::with_capacity_in(total_len as usize, backend.clone());
+        Buffer::<u64, TaskScope>::with_capacity_in(total_len as usize, backend.clone());
     let info_cols_buffer =
         Buffer::<u32, TaskScope>::with_capacity_in(total_len as usize / 2, backend.clone());
 
@@ -228,7 +251,7 @@ pub fn evaluate_jagged_info_fix_last_variable(
     let output_start_idx =
         DeviceBuffer::from_host(&buffer_start_idx, backend).unwrap().into_inner();
     let new_data =
-        Buffer::<u32, TaskScope>::with_capacity_in(new_total_length as usize, backend.clone());
+        Buffer::<u64, TaskScope>::with_capacity_in(new_total_length as usize, backend.clone());
     let new_cols = Buffer::<u32, TaskScope>::with_capacity_in(
         (new_total_length / 2) as usize,
         backend.clone(),
@@ -310,12 +333,12 @@ pub fn evaluate_jagged_mle_chunked<F: Field>(
     output_eval.into_inner()
 }
 
-/// Evaluates each chip at `stacked_point` and returns the evaluations in a `Rounds<Evaluations>` form.
+/// Evaluates each chip at `stacked_point` and returns the evaluations as `Rounds<Vec<MleEval>>`.
 /// Inserts padding for chips included in the smallest cluster, but not the actual trace.
 pub fn round_batch_evaluations(
     stacked_point: &Point<Ext>,
     jagged_trace_mle: &JaggedTraceMle<Felt, TaskScope>,
-) -> Rounds<Evaluations<Ext>> {
+) -> Rounds<Vec<MleEval<Ext>>> {
     let evaluations = evaluate_traces(jagged_trace_mle, stacked_point);
 
     fn mle_eval_from_slice<A: Backend>(slice: &Slice<Ext, A>, backend: &A) -> MleEval<Ext, A> {
@@ -351,10 +374,8 @@ pub fn round_batch_evaluations(
     }
 
     let preprocessed_host_evaluations =
-        preprocessed_host_evaluations.into_iter().collect::<Evaluations<_, _>>();
+        preprocessed_host_evaluations.into_iter().collect::<Vec<_>>();
 
-    // Skip the padding column, if it exists.
-    evals_so_far = jagged_trace_mle.dense().preprocessed_cols;
     let mut main_host_evaluations = Vec::new();
     for offset in jagged_trace_mle.dense().main_table_index.values() {
         if offset.poly_size == 0 {
@@ -373,7 +394,7 @@ pub fn round_batch_evaluations(
             evals_so_far += offset.num_polys;
         }
     }
-    let main_host_evaluations = main_host_evaluations.into_iter().collect::<Evaluations<_, _>>();
+    let main_host_evaluations = main_host_evaluations.into_iter().collect::<Vec<_>>();
 
     Rounds::from_iter([preprocessed_host_evaluations, main_host_evaluations])
 }

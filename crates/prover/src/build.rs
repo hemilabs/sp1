@@ -47,27 +47,69 @@ use crate::{
     SP1_CIRCUIT_VERSION,
 };
 
-pub(crate) fn get_or_create_plonk_artifacts_dev_build_dir(
+async fn get_or_create_plonk_artifacts_dev_build_dir(
     template_vk: &MachineVerifyingKey<SP1OuterGlobalContext>,
     template_proof: &ShardProof<SP1OuterGlobalContext, SP1PcsProofOuter>,
 ) -> Result<PathBuf> {
     let dev_dir = plonk_bn254_artifacts_dev_dir(template_vk)?;
     if dev_dir.exists() {
-        Ok(dev_dir)
+        return Ok(dev_dir);
+    }
+
+    // Try downloading pre-built artifacts from S3.
+    let serialized_vk = bincode::serialize(template_vk)?;
+    let artifact_name = format!("{}-plonk-dev", hex_prefix(sha256_hash(&serialized_vk)));
+    match try_download_dev_artifacts_from_s3(&artifact_name, &dev_dir).await {
+        Ok(()) => return Ok(dev_dir),
+        Err(e) => {
+            tracing::warn!("[sp1] failed to download plonk dev artifacts from S3: {e:#}. falling back to local build");
+        }
+    }
+
+    crate::build::try_build_plonk_bn254_artifacts_dev(template_vk, template_proof)
+}
+
+pub async fn try_build_plonk_artifacts_dir(
+    template_vk: &MachineVerifyingKey<SP1OuterGlobalContext>,
+    template_proof: &ShardProof<SP1OuterGlobalContext, SP1PcsProofOuter>,
+) -> Result<PathBuf> {
+    if use_development_mode() {
+        get_or_create_plonk_artifacts_dev_build_dir(template_vk, template_proof).await
     } else {
-        crate::build::try_build_plonk_bn254_artifacts_dev(template_vk, template_proof)
+        try_install_circuit_artifacts("plonk").await
     }
 }
 
-pub(crate) fn get_or_create_groth16_artifacts_dev_build_dir(
+async fn get_or_create_groth16_artifacts_dev_build_dir(
     template_vk: &MachineVerifyingKey<SP1OuterGlobalContext>,
     template_proof: &ShardProof<SP1OuterGlobalContext, SP1PcsProofOuter>,
 ) -> Result<PathBuf> {
     let dev_dir = groth16_bn254_artifacts_dev_dir(template_vk)?;
     if dev_dir.exists() {
-        Ok(dev_dir)
+        return Ok(dev_dir);
+    }
+
+    // Try downloading pre-built artifacts from S3.
+    let serialized_vk = bincode::serialize(template_vk)?;
+    let artifact_name = format!("{}-groth16-dev", hex_prefix(sha256_hash(&serialized_vk)));
+    match try_download_dev_artifacts_from_s3(&artifact_name, &dev_dir).await {
+        Ok(()) => return Ok(dev_dir),
+        Err(e) => {
+            tracing::warn!("[sp1] failed to download groth16 dev artifacts from S3: {e:#}. falling back to local build");
+        }
+    }
+
+    crate::build::try_build_groth16_bn254_artifacts_dev(template_vk, template_proof)
+}
+
+pub async fn try_build_groth16_artifacts_dir(
+    template_vk: &MachineVerifyingKey<SP1OuterGlobalContext>,
+    template_proof: &ShardProof<SP1OuterGlobalContext, SP1PcsProofOuter>,
+) -> Result<PathBuf> {
+    if use_development_mode() {
+        get_or_create_groth16_artifacts_dev_build_dir(template_vk, template_proof).await
     } else {
-        crate::build::try_build_groth16_bn254_artifacts_dev(template_vk, template_proof)
+        try_install_circuit_artifacts("groth16").await
     }
 }
 
@@ -129,6 +171,63 @@ pub(crate) fn groth16_bn254_artifacts_dev_dir(
 
 fn hex_prefix(input: Vec<u8>) -> String {
     format!("{:016x}", u64::from_be_bytes(input[..8].try_into().unwrap()))
+}
+
+/// Try to download pre-built dev artifacts from S3.
+///
+/// Downloads `s3://{bucket}/{artifact_name}.tar.gz`, extracts it to `build_dir`, and cleans up.
+/// On any failure, removes the `build_dir` and returns an error so callers can fall back to a
+/// local build.
+async fn try_download_dev_artifacts_from_s3(artifact_name: &str, build_dir: &Path) -> Result<()> {
+    let s3_uri = format!("s3://{DEV_CIRCUIT_ARTIFACTS_S3_BUCKET}/{artifact_name}.tar.gz");
+    let tar_path = build_dir.with_extension("tar.gz");
+
+    // Ensure the parent directory exists so `aws s3 cp` can write the file.
+    if let Some(parent) = tar_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    let tar_path_str = tar_path
+        .to_str()
+        .ok_or_else(|| anyhow!("failed to convert path to string: {:?}", tar_path))?;
+
+    // Download the tarball from S3.
+    tracing::info!("[sp1] attempting to download dev artifacts from {}", s3_uri);
+    let download_result = Command::new("aws")
+        .args(["s3", "cp", &s3_uri, tar_path_str])
+        .output()
+        .await
+        .context("failed to run `aws s3 cp`")?;
+
+    if !download_result.status.success() {
+        let _ = std::fs::remove_dir_all(build_dir);
+        let stderr = String::from_utf8_lossy(&download_result.stderr);
+        return Err(anyhow!("aws s3 cp failed: {}", stderr));
+    }
+
+    // Create the build directory and extract the tarball into it.
+    std::fs::create_dir_all(build_dir)?;
+    let build_dir_str = build_dir
+        .to_str()
+        .ok_or_else(|| anyhow!("failed to convert path to string: {:?}", build_dir))?;
+
+    let extract_result = Command::new("tar")
+        .args(["-Pxzf", tar_path_str, "-C", build_dir_str])
+        .output()
+        .await
+        .context("failed to run tar")?;
+
+    // Remove the tarball regardless of extraction outcome.
+    let _ = tokio::fs::remove_file(&tar_path).await;
+
+    if !extract_result.status.success() {
+        let _ = std::fs::remove_dir_all(build_dir);
+        let stderr = String::from_utf8_lossy(&extract_result.stderr);
+        return Err(anyhow!("tar extraction failed: {}", stderr));
+    }
+
+    tracing::info!("[sp1] successfully downloaded dev artifacts to {}", build_dir_str);
+    Ok(())
 }
 
 /// Build the plonk bn254 artifacts to the given directory for the given verification key and
@@ -326,6 +425,9 @@ fn build_outer_circuit(
     operations
 }
 
+/// The S3 bucket name for dev circuit artifacts.
+const DEV_CIRCUIT_ARTIFACTS_S3_BUCKET: &str = "sp1-circuit-artifacts-dev";
+
 /// The base URL for the S3 bucket containing the circuit artifacts.
 pub const CIRCUIT_ARTIFACTS_URL_BASE: &str = "https://sp1-circuits.s3-us-east-2.amazonaws.com";
 
@@ -471,14 +573,89 @@ pub async fn download_file(
 
 #[cfg(test)]
 mod tests {
+    #[cfg(not(feature = "mprotect"))]
+    use crate::build::hex_prefix;
     use sp1_core_executor::SP1Context;
-    use sp1_core_machine::utils::setup_logger;
+    use sp1_core_machine::{riscv::RiscvAir, utils::setup_logger};
+    #[cfg(not(feature = "mprotect"))]
+    use sp1_primitives::io::sha256_hash;
     use sp1_prover_types::network_base_types::ProofMode;
+    use tokio::process::Command;
 
     use crate::{
         verify::WRAP_VK_BYTES,
-        worker::{cpu_worker_builder, SP1LocalNodeBuilder},
+        worker::{cpu_worker_builder_with_machine, SP1LocalNodeBuilder},
     };
+
+    /// Uploads the dev artifact directory matching `{prefix}-{suffix}` to S3, where
+    /// `prefix` is the first 16 hex chars of `sha256(crates/prover/wrap_vk.bin)`.
+    async fn upload_dev_artifacts(suffix: &str) {
+        use sp1_primitives::io::sha256_hash;
+
+        let home_dir = dirs::home_dir().expect("home directory not found");
+        let circuits_dir = home_dir.join(".sp1").join("circuits");
+        assert!(
+            circuits_dir.exists(),
+            "circuits directory does not exist: {}",
+            circuits_dir.display()
+        );
+
+        // Compute the prefix from wrap_vk.bin, matching the CI download step.
+        let wrap_vk_bytes = WRAP_VK_BYTES;
+        let prefix = super::hex_prefix(sha256_hash(wrap_vk_bytes));
+
+        let dir_name = format!("{prefix}-{suffix}");
+        let dir_path = circuits_dir.join(&dir_name);
+        assert!(dir_path.is_dir(), "directory does not exist: {}", dir_path.display());
+
+        let tarball_name = format!("{dir_name}.tar.gz");
+        let tarball_path = circuits_dir.join(&tarball_name);
+        let tarball_path_str = tarball_path.to_str().unwrap();
+        let dir_path_str = dir_path.to_str().unwrap();
+
+        // Create a flat tarball using relative paths.
+        println!("creating tarball for {dir_name}...");
+        let tar_result = Command::new("tar")
+            .args(["-czf", tarball_path_str, "-C", dir_path_str, "."])
+            .output()
+            .await
+            .expect("failed to run tar");
+        assert!(
+            tar_result.status.success(),
+            "tar failed: {}",
+            String::from_utf8_lossy(&tar_result.stderr)
+        );
+
+        // Upload to S3.
+        let s3_uri = format!("s3://{}/{tarball_name}", super::DEV_CIRCUIT_ARTIFACTS_S3_BUCKET);
+        println!("uploading {tarball_name} to {s3_uri}...");
+        let upload_result = Command::new("aws")
+            .args(["s3", "cp", tarball_path_str, &s3_uri])
+            .output()
+            .await
+            .expect("failed to run aws s3 cp");
+        assert!(
+            upload_result.status.success(),
+            "aws s3 cp failed: {}",
+            String::from_utf8_lossy(&upload_result.stderr)
+        );
+
+        // Clean up local tarball.
+        std::fs::remove_file(&tarball_path).expect("failed to remove tarball");
+        println!("uploaded and cleaned up {tarball_name}");
+    }
+
+    #[tokio::test]
+    #[ignore = "manual: uploads groth16 dev artifacts to S3"]
+    async fn upload_groth16_dev_artifacts_to_s3() {
+        upload_dev_artifacts("groth16-dev").await;
+    }
+
+    #[tokio::test]
+    #[ignore = "manual: uploads plonk dev artifacts to S3"]
+    async fn upload_plonk_dev_artifacts_to_s3() {
+        upload_dev_artifacts("plonk-dev").await;
+    }
 
     #[tokio::test]
     #[ignore = "should be invoked when changing the wrap circuit"]
@@ -488,10 +665,13 @@ mod tests {
         let elf = test_artifacts::FIBONACCI_ELF;
 
         tracing::info!("initializing prover");
-        let client = SP1LocalNodeBuilder::from_worker_client_builder(cpu_worker_builder())
-            .build()
-            .await
-            .expect("failed to build client");
+        let machine = RiscvAir::machine();
+        let client = SP1LocalNodeBuilder::from_worker_client_builder(
+            cpu_worker_builder_with_machine(machine),
+        )
+        .build()
+        .await
+        .expect("failed to build client");
 
         tracing::info!("prove compressed");
         let stdin = sp1_core_machine::io::SP1Stdin::new();
@@ -509,9 +689,15 @@ mod tests {
         let wrap_vk_bytes = bincode::serialize(&wrap_vk).expect("failed to serialize wrap_vk");
         let wrapped_proof_bytes =
             bincode::serialize(&wrapped_proof).expect("failed to serialize wrapped_proof");
-        std::fs::write("wrap_vk.bin", wrap_vk_bytes).expect("failed to write wrap_vk.bin");
-        std::fs::write("wrapped_proof.bin", wrapped_proof_bytes)
-            .expect("failed to write wrapped_proof.bin");
+
+        #[cfg(feature = "mprotect")]
+        let (vk_path, proof_path) = ("wrap_vk_mprotect.bin", "wrapped_proof_mprotect.bin");
+        #[cfg(not(feature = "mprotect"))]
+        let (vk_path, proof_path) = ("wrap_vk.bin", "wrapped_proof.bin");
+
+        std::fs::write(vk_path, wrap_vk_bytes).expect("failed to write wrap_vk bytes");
+        std::fs::write(proof_path, wrapped_proof_bytes)
+            .expect("failed to write wrapped_proof bytes");
     }
 
     #[tokio::test]
@@ -519,15 +705,47 @@ mod tests {
         setup_logger();
 
         tracing::info!("initializing prover");
-        let client = SP1LocalNodeBuilder::from_worker_client_builder(cpu_worker_builder())
-            .build()
-            .await
-            .expect("failed to build client");
+        let machine = RiscvAir::machine();
+        let client = SP1LocalNodeBuilder::from_worker_client_builder(
+            cpu_worker_builder_with_machine(machine),
+        )
+        .build()
+        .await
+        .expect("failed to build client");
 
         // Check that the wrap vk is the same as the one included in the binary.
         let client_wrap_vk = client.wrap_vk().clone();
         let expected_wrap_vk =
             bincode::deserialize(WRAP_VK_BYTES).expect("failed to deserialize WRAP_VK_BYTES");
         assert_eq!(client_wrap_vk, expected_wrap_vk);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires AWS credentials for the sp1-circuit-artifacts-dev bucket; run with `--ignored` when validating dev artifact uploads"]
+    #[cfg(not(feature = "mprotect"))]
+    async fn test_dev_artifacts_uploaded_to_s3() {
+        use crate::build::DEV_CIRCUIT_ARTIFACTS_S3_BUCKET;
+
+        let groth16_artifact_name =
+            format!("{}-groth16-dev", hex_prefix(sha256_hash(WRAP_VK_BYTES)));
+
+        let plonk_artifact_name = format!("{}-plonk-dev", hex_prefix(sha256_hash(WRAP_VK_BYTES)));
+
+        async fn s3_file_exists(bucket: &str, key: &str) -> bool {
+            Command::new("aws")
+                .args(["s3api", "head-object", "--bucket", bucket, "--key", key])
+                .output()
+                .await
+                .unwrap()
+                .status
+                .success()
+        }
+
+        // Then in your main logic:
+        let groth16_s3_uri = format!("{groth16_artifact_name}.tar.gz");
+        let plonk_s3_uri = format!("{plonk_artifact_name}.tar.gz");
+
+        assert!(s3_file_exists(DEV_CIRCUIT_ARTIFACTS_S3_BUCKET, &groth16_s3_uri).await, "Groth 16 artifact not found; generate them locally, then run `upload_groth16_dev_artifacts_to_s3`");
+        assert!(s3_file_exists(DEV_CIRCUIT_ARTIFACTS_S3_BUCKET, &plonk_s3_uri).await, "Plonk artifact not found; generate them locally, then run `upload_plonk_dev_artifacts_to_s3`");
     }
 }

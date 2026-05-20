@@ -9,11 +9,11 @@ inputs:
   setup_gcc:
     description: "Whether to setup GCC or not"
     required: false
-    default: 'true'
+    default: "true"
   setup_aws_cli:
     description: "Whether to install AWS CLI or not"
     required: false
-    default: 'true'
+    default: "true"
   rustup_override:
     description: "Optional toolchain to override"
     required: false
@@ -21,7 +21,7 @@ inputs:
   setup_gpu:
     description: "Whether to setup GPU environment (CUDA, CMake, etc.)"
     required: false
-    default: 'false'
+    default: "false"
 runs:
   using: "composite"
   steps:
@@ -60,7 +60,7 @@ runs:
 
     - uses: actions/setup-python@v5
       with:
-        python-version: '3.10' 
+        python-version: "3.10"
 
     - name: Install AWS CLI v2
       if: inputs.setup_aws_cli == 'true'
@@ -134,12 +134,11 @@ runs:
       run: |
         rustup toolchain install nightly --component clippy,rustfmt
 
-
     - name: Ensure stable clippy and rustfmt is installed
       shell: bash
       run: |
         rustup toolchain install stable --component clippy,rustfmt
-        
+
     # install pkg-config and openssl
     - name: Install pkg-config and openssl
       shell: bash
@@ -190,7 +189,8 @@ runs:
       uses: arduino/setup-protoc@v3
       with:
         version: "29.4"
-  
+        repo-token: ${{ github.token }} # avoid gh api rate limiting
+
     - name: Echo docker buildx version
       shell: bash
       run: docker buildx version

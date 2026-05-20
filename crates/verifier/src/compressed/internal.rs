@@ -7,7 +7,7 @@ use slop_algebra::{AbstractField, PrimeField32};
 use slop_symmetric::CryptographicHasher;
 use sp1_hypercube::{
     verify_merkle_proof, HashableKey, InnerSC, MachineVerifier, MachineVerifierError,
-    SP1RecursionProof, ShardVerifier, DIGEST_SIZE,
+    SP1RecursionProof, ShardVerifier, DIGEST_SIZE, PROOF_MAX_NUM_PVS,
 };
 use sp1_primitives::{fri_params::recursion_fri_config, poseidon2_hasher, SP1Field};
 use sp1_recursion_executor::{RecursionPublicValues, NUM_PV_ELMS_TO_HASH};
@@ -95,6 +95,11 @@ impl SP1CompressedVerifier {
             .verify_shard(compress_vk, proof, &mut challenger)
             .map_err(MachineVerifierError::InvalidShardProof)?;
 
+        // Check the public values length.
+        if proof.public_values.len() != PROOF_MAX_NUM_PVS {
+            return Err(MachineVerifierError::InvalidPublicValues("invalid public values length"))?;
+        }
+
         // Validate the public values.
         let public_values: &RecursionPublicValues<_> = proof.public_values.as_slice().borrow();
 
@@ -105,9 +110,15 @@ impl SP1CompressedVerifier {
             )
             .into());
         }
-        // TODO: add compress vkey verification when circuits are released.
+
+        // Verify the merkle proof of inclusion in the tree.
         verify_merkle_proof(vk_merkle_proof, compress_vk.hash_koalabear(), self.vk_merkle_root)
             .map_err(CompressedError::InvalidVkey)?;
+
+        // Verify that the vk merkle tree root in the public values matches the expected root.
+        if public_values.vk_root != self.vk_merkle_root {
+            return Err(MachineVerifierError::InvalidPublicValues("vk merkle root mismatch"))?;
+        }
 
         // `is_complete` should be 1. This ensures that the proof is fully reduced.
         if public_values.is_complete != SP1Field::one() {

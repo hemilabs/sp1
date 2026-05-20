@@ -10,7 +10,7 @@ use itertools::Itertools;
 use slop_algebra::AbstractField;
 use slop_alloc::HasBackend;
 use slop_challenger::{CanObserve, FieldChallenger, IopCtx, VariableLengthChallenger};
-use slop_multilinear::{MultilinearPcsChallenger, Point};
+use slop_multilinear::{MleEval, MultilinearPcsChallenger, Point};
 use sp1_gpu_basefold::{DeviceGrindingChallenger, GrindingPowCudaProver};
 use sp1_gpu_cudart::{DevicePoint, TaskScope};
 use tracing::instrument;
@@ -20,7 +20,7 @@ use sp1_hypercube::{
     LogupGkrRoundProof, GKR_GRINDING_BITS,
 };
 
-use crate::{execution::DeviceLogUpGkrOutput, tracegen::generate_gkr_circuit};
+use crate::execution::DeviceLogUpGkrOutput;
 use sp1_gpu_utils::traces::JaggedTraceMle;
 use sp1_gpu_utils::{Ext, Felt};
 use sp1_gpu_zerocheck::primitives::round_batch_evaluations;
@@ -32,7 +32,7 @@ mod tracegen;
 mod utils;
 
 pub use interactions::Interactions;
-pub use tracegen::CudaLogUpGkrOptions;
+pub use tracegen::{generate_gkr_circuit, CudaLogUpGkrOptions};
 pub use utils::*;
 
 pub use sumcheck::{
@@ -256,14 +256,14 @@ where
     // We accomplish this by doing jagged fix last variable on the evaluation point.
     let eval_point = eval_point.last_k(num_row_variables as usize);
     let host_evaluations = round_batch_evaluations(&eval_point, jagged_trace_data);
-    let [preprocessed, main] = host_evaluations.rounds.try_into().unwrap();
+    let [preprocessed, main]: [Vec<MleEval<Ext>>; 2] = host_evaluations.rounds.try_into().unwrap();
 
     let mut chip_evaluations = BTreeMap::new();
 
     let mut preprocessed_so_far = 0;
 
     challenger.observe(Felt::from_canonical_usize(chips.len()));
-    for (chip, main_evals) in chips.iter().zip_eq(main.into_iter()) {
+    for (chip, main_evals) in chips.iter().zip_eq(main) {
         let openings = ChipEvaluation {
             main_trace_evaluations: main_evals,
             preprocessed_trace_evaluations: if chip.preprocessed_width() != 0 {

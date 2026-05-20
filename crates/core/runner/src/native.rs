@@ -7,7 +7,7 @@ use sp1_core_executor_runner_binary::{Input, Output};
 use sp1_jit::{
     memory::SharedMemory,
     shm::{ShmTraceRing, TraceResult},
-    trace_capacity, MemValue, TraceChunkRaw,
+    trace_capacity, MemValue, MinimalTrace, TraceChunkRaw,
 };
 use sp1_primitives::consts::MAX_JIT_LOG_ADDR;
 use std::{
@@ -34,6 +34,9 @@ pub struct MinimalExecutorRunner {
 
     process: Option<(Child, JoinHandle<()>)>,
     output: Option<Result<Output, ExecutionError>>,
+
+    global_clk: u64,
+    clk: u64,
 }
 
 impl MinimalExecutorRunner {
@@ -68,7 +71,7 @@ impl MinimalExecutorRunner {
         };
         let (memory, consumer) = create(&input);
 
-        Self { input, consumer, memory, process: None, output: None }
+        Self { input, consumer, memory, process: None, output: None, global_clk: 0, clk: 0 }
     }
 
     /// Create a new minimal executor with no tracing or debugging.
@@ -130,7 +133,7 @@ impl MinimalExecutorRunner {
                 Command::new(crate::binary::get_binary_path()),
                 self.input.memory_limit,
             )
-            .expect("start child proces");
+            .map_err(|e| ExecutionError::Other(format!("failed to spawn child process: {e}")))?;
 
             {
                 let stdin = child.stdin.take().expect("open stdin");
@@ -157,7 +160,11 @@ impl MinimalExecutorRunner {
             loop {
                 match consumer.access(Duration::from_millis(CONSUMER_TIMEOUT_MILLIS)) {
                     TraceResult::Data(guard) => {
-                        return Ok(Some(unsafe { TraceChunkRaw::from_shm(guard) }));
+                        let chunk = unsafe { TraceChunkRaw::from_shm(guard) };
+                        self.global_clk = chunk.global_clk_end();
+                        self.clk = chunk.clk_end();
+
+                        return Ok(Some(chunk));
                     }
                     TraceResult::Finished => {
                         self.wait_for_success();
@@ -240,6 +247,8 @@ impl MinimalExecutorRunner {
         // Normal termination, this should just return success.
         assert!(status.success());
 
+        self.global_clk = output.global_clk;
+        self.clk = output.clk;
         self.output = Some(Ok(output));
     }
 
@@ -293,7 +302,7 @@ impl MinimalExecutorRunner {
     /// This clock is incremented by 8 or 256 depending on the instruction.
     #[must_use]
     pub fn clk(&self) -> u64 {
-        todo!()
+        self.clk
     }
 
     /// Get the global clock of the JIT function.
@@ -301,7 +310,7 @@ impl MinimalExecutorRunner {
     /// This clock is incremented by 1 per instruction.
     #[must_use]
     pub fn global_clk(&self) -> u64 {
-        self.output().global_clk
+        self.global_clk
     }
 
     /// Get the exit code of the JIT function.
@@ -322,6 +331,12 @@ impl MinimalExecutorRunner {
         self.take_output().public_values_stream
     }
 
+    /// Get the public value digest words committed by the guest via `COMMIT` syscalls.
+    #[must_use]
+    pub fn public_value_digest(&self) -> [u32; sp1_jit::PUBLIC_VALUE_DIGEST_WORDS] {
+        self.output().public_value_digest
+    }
+
     /// Get the hints of the JIT function.
     #[must_use]
     pub fn hints(&self) -> &[(u64, Vec<u8>)] {
@@ -332,6 +347,13 @@ impl MinimalExecutorRunner {
     #[must_use]
     pub fn hint_lens(&self) -> Vec<usize> {
         self.output().hints.iter().map(|(_, hint)| hint.len()).collect()
+    }
+
+    /// Get the page protection record for a specific page index.
+    /// The native executor does not track page protection, so this always returns None.
+    #[must_use]
+    pub fn get_page_prot_record(&self, _page_idx: u64) -> Option<sp1_jit::PageProtValue> {
+        None
     }
 
     /// Get an unsafe memory view of the JIT function.
@@ -353,6 +375,9 @@ impl MinimalExecutorRunner {
         let (memory, consumer) = create(&self.input);
         self.memory = memory;
         self.consumer = consumer;
+
+        self.global_clk = 0;
+        self.clk = 0;
     }
 }
 
@@ -379,35 +404,22 @@ fn create(input: &Input) -> (SharedMemory, Option<ShmTraceRing>) {
 }
 
 /// Spawns a process with piped I/O and an RSS memory monitor thread.
-/// **Written by Gemini 3**
 fn spawn_restricted(mut cmd: Command, limit_bytes: u64) -> std::io::Result<Child> {
-    // Force pipes for all three standard streams
     cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
 
-    // Disable core dump for the child process for fast exiting, in debugging sessions
-    // you can comment this section out.
-    unsafe {
-        use std::os::unix::process::CommandExt;
-        cmd.pre_exec(|| {
-            // Create a limit structure with soft and hard limits set to 0
-            let limit = libc::rlimit {
-                rlim_cur: 0, // Soft limit
-                rlim_max: 0, // Hard limit
-            };
+    // Disable core dumps for the child by temporarily zeroing RLIMIT_CORE in the
+    // parent (inherited via posix_spawn). Avoids pre_exec which forces fork().
+    let child = unsafe {
+        let mut old_limit: libc::rlimit = std::mem::zeroed();
+        libc::getrlimit(libc::RLIMIT_CORE, &mut old_limit);
 
-            // Call setrlimit to disable core dumps
-            let ret = libc::setrlimit(libc::RLIMIT_CORE, &limit);
+        let zero = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+        libc::setrlimit(libc::RLIMIT_CORE, &zero);
+        let result = cmd.spawn();
+        libc::setrlimit(libc::RLIMIT_CORE, &old_limit);
 
-            if ret != 0 {
-                // Convert libc error to Rust io::Error
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
-        });
-    }
-
-    // Spawn the child normally using Rust std
-    let child = cmd.spawn()?;
+        result
+    }?;
     let child_pid = child.id();
 
     // Start the Background Memory Monitor (The Enforcer)

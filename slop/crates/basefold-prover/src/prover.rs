@@ -6,7 +6,7 @@ use derive_where::derive_where;
 use itertools::Itertools;
 use slop_algebra::TwoAdicField;
 use slop_alloc::CpuBackend;
-use slop_basefold::{BasefoldProof, BasefoldVerifier, RsCodeWord};
+use slop_basefold::{BasefoldProof, BasefoldVerifier, RsCodeWord, BATCH_GRINDING_BITS};
 use slop_challenger::{
     CanObserve, CanSampleBits, FieldChallenger, GrindingChallenger, IopCtx,
     VariableLengthChallenger,
@@ -118,6 +118,9 @@ impl<GC: IopCtx<F: TwoAdicField, EF: TwoAdicField>, P: ComputeTcsOpenings<GC, Cp
             .collect::<Message<RsCodeWord<_, _>>>();
 
         let evaluation_claims = evaluation_claims.into_iter().flatten().collect::<Vec<_>>();
+
+        // Grind for batch randomness.
+        let batch_grinding_witness = challenger.grind(BATCH_GRINDING_BITS);
 
         // Sample batching coefficients via partial Lagrange basis.
         let total_len = mles.iter().map(|mle| mle.num_polynomials()).sum::<usize>();
@@ -233,6 +236,7 @@ impl<GC: IopCtx<F: TwoAdicField, EF: TwoAdicField>, P: ComputeTcsOpenings<GC, Cp
             query_phase_openings_and_proofs,
             final_poly,
             pow_witness,
+            batch_grinding_witness,
         })
     }
 

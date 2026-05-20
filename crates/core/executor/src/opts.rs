@@ -13,13 +13,16 @@ pub const ELEMENT_THRESHOLD: u64 = (1 << 28) + (1 << 27);
 /// The height threshold for a shard.
 pub const HEIGHT_THRESHOLD: u64 = 1 << 22;
 /// The maximum size of a minimal trace chunk in terms of memory entries.
-pub const MINIMAL_TRACE_CHUNK_THRESHOLD: u64 =
-    2147483648 / std::mem::size_of::<sp1_jit::MemValue>() as u64;
+///
+/// 16,777,216 entries × 16 B/entry = 256 MiB per chunk. With
+/// [`DEFAULT_TRACE_CHUNK_SLOTS`] slots in the SHM ring buffer, this caps the
+/// trace-ring shared memory at ~5 × 256 MiB × 10/9 ≈ 1.43 GiB.
+pub const MINIMAL_TRACE_CHUNK_THRESHOLD: u64 = 16_777_216;
 /// The default number trace chunk slots
 pub const DEFAULT_TRACE_CHUNK_SLOTS: usize = 5;
 /// Default memory limit for SP1 programs, note this value has different semantics
 /// on different implementation. For native executor, it is the limit on total
-/// process memory(resident set size, or RSS) of thie entire child process. For
+/// process memory(resident set size, or RSS) of this entire child process. For
 /// portable executor, it is merely the limit on created memory entries. This
 /// means the actual memory usage for portable executor will exceed this limit.
 pub const DEFAULT_MEMORY_LIMIT: u64 = 24 * 1024 * 1024 * 1024;
@@ -123,8 +126,6 @@ impl SplitOpts {
     /// Create a new [`SplitOpts`] with the given [`SP1CoreOpts`] and the program size.
     #[must_use]
     pub fn new(opts: &SP1CoreOpts, program_size: usize, page_protect_allowed: bool) -> Self {
-        assert!(!page_protect_allowed, "page protection is turned off");
-
         let costs = rv64im_costs();
 
         let mut available_trace_area = opts.sharding_threshold.element_threshold;
@@ -143,7 +144,7 @@ impl SplitOpts {
         let max_height = opts.sharding_threshold.height_threshold;
 
         let syscall_threshold = EnumMap::from_fn(|syscall_code: SyscallCode| {
-            if syscall_code.should_send() == 0 {
+            if syscall_code.should_send() == 0 || syscall_code.as_air_id().is_none() {
                 return 0;
             }
 
@@ -159,20 +160,34 @@ impl SplitOpts {
         let memory = trunc_32(
             (available_trace_area as usize / cost_per_memory).min(max_height as usize) / 2,
         );
+        let cost_per_page_prot =
+            costs[&RiscvAirId::PageProtGlobalInit] + costs[&RiscvAirId::Global];
+        let page_prot = trunc_32(
+            (available_trace_area as usize / cost_per_page_prot).min(max_height as usize) / 2,
+        );
 
         // Allocate `2/3` of the trace area to the usual trace area.
         let pack_trace_threshold = 2 * opts.sharding_threshold.element_threshold / 3;
-        // Allocate `3/10` of the trace area to `MemoryGlobal`.
-        let combine_memory_threshold =
-            trunc_32(3 * opts.sharding_threshold.element_threshold as usize / cost_per_memory / 20);
+        // Allocate `3/10` of the trace area to `MemoryGlobal` and `PageProtGlobal`.
+        let mut combine_memory_threshold =
+            trunc_32(3 * opts.sharding_threshold.element_threshold as usize / cost_per_memory / 40);
+        let mut combine_page_prot_threshold = trunc_32(
+            3 * opts.sharding_threshold.element_threshold as usize / cost_per_page_prot / 40,
+        );
+
+        // If page protection is off, use the `3/10` of the trace area for `MemoryGlobal` only.
+        if !page_protect_allowed {
+            combine_memory_threshold *= 2;
+            combine_page_prot_threshold = 0;
+        }
 
         Self {
             pack_trace_threshold,
             combine_memory_threshold,
-            combine_page_prot_threshold: 0,
+            combine_page_prot_threshold,
             syscall_threshold,
             memory,
-            page_prot: 0,
+            page_prot,
         }
     }
 }

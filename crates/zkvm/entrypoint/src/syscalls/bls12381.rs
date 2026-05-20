@@ -7,8 +7,8 @@ use core::arch::asm;
 ///
 /// ### Safety
 ///
-/// The caller must ensure that `p` and `q` are valid pointers to data that is aligned along a four
-/// byte boundary.
+/// The caller must ensure that `p` and `q` are valid pointers to data that is aligned along an
+/// eight byte boundary.
 #[allow(unused_variables)]
 #[no_mangle]
 pub extern "C" fn syscall_bls12381_add(p: *mut [u64; 12], q: *const [u64; 12]) {
@@ -32,7 +32,7 @@ pub extern "C" fn syscall_bls12381_add(p: *mut [u64; 12], q: *const [u64; 12]) {
 ///
 /// ### Safety
 ///
-/// The caller must ensure that `p` is valid pointer to data that is aligned along a four byte
+/// The caller must ensure that `p` is valid pointer to data that is aligned along an eight byte
 /// boundary.
 #[allow(unused_variables)]
 #[no_mangle]
@@ -60,7 +60,7 @@ pub extern "C" fn syscall_bls12381_double(p: *mut [u64; 12]) {
 ///
 /// ### Safety
 ///
-/// The caller must ensure that `point` is valid pointer to data that is aligned along a four byte
+/// The caller must ensure that `point` is valid pointer to data that is aligned along an eight byte
 /// boundary.
 #[allow(unused_variables)]
 #[no_mangle]

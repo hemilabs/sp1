@@ -231,6 +231,7 @@ pub fn prove_from_batched_inputs<GC: ZkIopCtx, MK: ZkMerkleizer<GC>>(
         query_phase_openings_and_proofs,
         final_poly,
         pow_witness,
+        batch_grinding_witness: Default::default(),
     })
 }
 

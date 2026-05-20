@@ -35,188 +35,315 @@ use subenum::subenum;
     DeepSizeOf,
 )]
 pub enum RiscvAirId {
-    /// The cpu chip, which is a dummy for now, needed for shape loading.
-    #[subenum(CoreAirId)]
-    Cpu = 0,
     /// The program chip.
-    Program = 1,
+    Program = 0,
     /// The SHA-256 extend chip.
-    ShaExtend = 2,
+    ShaExtend = 1,
     /// The sha extend control chip.
-    ShaExtendControl = 3,
+    ShaExtendControl = 2,
+    /// The sha extend control chip for user mode.
+    ShaExtendControlUser = 3,
     /// The SHA-256 compress chip.
     ShaCompress = 4,
     /// The sha compress control chip.
     ShaCompressControl = 5,
+    /// The sha compress control chip for user mode.
+    ShaCompressControlUser = 6,
     /// The Edwards add assign chip.
-    EdAddAssign = 6,
+    EdAddAssign = 7,
+    /// The Edwards add assign chip for user mode.
+    EdAddAssignUser = 8,
     /// The Edwards decompress chip.
-    EdDecompress = 7,
-    /// The secp256k1 decompress chip.
-    Secp256k1Decompress = 8,
+    EdDecompress = 9,
+    /// The Edwards decompress chip for user mode.
+    EdDecompressUser = 10,
     /// The secp256k1 add assign chip.
-    Secp256k1AddAssign = 9,
+    Secp256k1AddAssign = 11,
+    /// The secp256k1 add assign chip for user mode.
+    Secp256k1AddAssignUser = 12,
     /// The secp256k1 double assign chip.
-    Secp256k1DoubleAssign = 10,
-    /// The secp256r1 decompress chip.
-    Secp256r1Decompress = 11,
+    Secp256k1DoubleAssign = 13,
+    /// The secp256k1 double assign chip for user mode.
+    Secp256k1DoubleAssignUser = 14,
     /// The secp256r1 add assign chip.
-    Secp256r1AddAssign = 12,
+    Secp256r1AddAssign = 15,
+    /// The secp256r1 add assign chip for user mode.
+    Secp256r1AddAssignUser = 16,
     /// The secp256r1 double assign chip.
-    Secp256r1DoubleAssign = 13,
+    Secp256r1DoubleAssign = 17,
+    /// The secp256r1 double assign chip for user mode.
+    Secp256r1DoubleAssignUser = 18,
     /// The Keccak permute chip.
-    KeccakPermute = 14,
+    KeccakPermute = 19,
     /// The keccak permute control chip.
-    KeccakPermuteControl = 15,
+    KeccakPermuteControl = 20,
+    /// The keccak permute control chip for user mode.
+    KeccakPermuteControlUser = 21,
     /// The bn254 add assign chip.
-    Bn254AddAssign = 16,
+    Bn254AddAssign = 22,
+    /// The bn254 add assign chip for user mode.
+    Bn254AddAssignUser = 23,
     /// The bn254 double assign chip.
-    Bn254DoubleAssign = 17,
+    Bn254DoubleAssign = 24,
+    /// The bn254 double assign chip for user mode.
+    Bn254DoubleAssignUser = 25,
     /// The bls12-381 add assign chip.
-    Bls12381AddAssign = 18,
+    Bls12381AddAssign = 26,
+    /// The bls12-381 add assign chip for user mode.
+    Bls12381AddAssignUser = 27,
     /// The bls12-381 double assign chip.
-    Bls12381DoubleAssign = 19,
+    Bls12381DoubleAssign = 28,
+    /// The bls12-381 double assign chip for user mode.
+    Bls12381DoubleAssignUser = 29,
     /// The uint256 mul mod chip.
-    Uint256MulMod = 20,
+    Uint256MulMod = 30,
+    /// The uint256 mul mod chip for user mode.
+    Uint256MulModUser = 31,
     /// The uint256 ops chip.
-    Uint256Ops = 21,
-    /// The u256 xu2048 mul chip.
-    U256XU2048Mul = 22,
+    Uint256Ops = 32,
+    /// The uint256 ops chip for user mode.
+    Uint256OpsUser = 33,
     /// The bls12-381 fp op assign chip.
-    Bls12381FpOpAssign = 23,
-    /// The bls12-831 fp2 add sub assign chip.
-    Bls12381Fp2AddSubAssign = 24,
-    /// The bls12-831 fp2 mul assign chip.
-    Bls12381Fp2MulAssign = 25,
-    /// The bn254 fp2 add sub assign chip.
-    Bn254FpOpAssign = 26,
+    Bls12381FpOpAssign = 34,
+    /// The bls12-381 fp op assign chip for user mode.
+    Bls12381FpOpAssignUser = 35,
+    /// The bls12-381 fp2 add sub assign chip.
+    Bls12381Fp2AddSubAssign = 36,
+    /// The bls12-381 fp2 add sub assign chip for user mode.
+    Bls12381Fp2AddSubAssignUser = 37,
+    /// The bls12-381 fp2 mul assign chip.
+    Bls12381Fp2MulAssign = 38,
+    /// The bls12-381 fp2 mul assign chip for user mode.
+    Bls12381Fp2MulAssignUser = 39,
     /// The bn254 fp op assign chip.
-    Bn254Fp2AddSubAssign = 27,
+    Bn254FpOpAssign = 40,
+    /// The bn254 fp op assign chip for user mode.
+    Bn254FpOpAssignUser = 41,
+    /// The bn254 fp2 add sub assign chip.
+    Bn254Fp2AddSubAssign = 42,
+    /// The bn254 fp2 add sub assign chip for user mode.
+    Bn254Fp2AddSubAssignUser = 43,
     /// The bn254 fp2 mul assign chip.
-    Bn254Fp2MulAssign = 28,
-    /// The bls12-381 decompress chip.
-    Bls12381Decompress = 29,
+    Bn254Fp2MulAssign = 44,
+    /// The bn254 fp2 mul assign chip for user mode.
+    Bn254Fp2MulAssignUser = 45,
+    /// The poseidon2 chip.
+    Poseidon2 = 46,
+    /// The poseidon2 chip for user mode.
+    Poseidon2User = 47,
     /// The syscall core chip.
     #[subenum(CoreAirId)]
-    SyscallCore = 30,
+    SyscallCore = 48,
+    /// The syscall core chip for user mode.
+    #[subenum(CoreAirId)]
+    SyscallCoreUser = 49,
     /// The syscall precompile chip.
-    SyscallPrecompile = 31,
+    SyscallPrecompile = 50,
+    /// The syscall precompile chip for user mode.
+    SyscallPrecompileUser = 51,
     /// The div rem chip.
     #[subenum(CoreAirId)]
-    DivRem = 32,
+    DivRem = 52,
+    /// The div rem chip for user mode.
+    #[subenum(CoreAirId)]
+    DivRemUser = 53,
     /// The add chip.
     #[subenum(CoreAirId)]
-    Add = 33,
+    Add = 54,
+    /// The add chip for user mode.
+    #[subenum(CoreAirId)]
+    AddUser = 55,
     /// The addi chip.
     #[subenum(CoreAirId)]
-    Addi = 34,
+    Addi = 56,
+    /// The addi chip for user mode.
+    #[subenum(CoreAirId)]
+    AddiUser = 57,
     /// The addw chip.
     #[subenum(CoreAirId)]
-    Addw = 35,
+    Addw = 58,
+    /// The addw chip for user mode.
+    #[subenum(CoreAirId)]
+    AddwUser = 59,
     /// The sub chip.
     #[subenum(CoreAirId)]
-    Sub = 36,
+    Sub = 60,
+    /// The sub chip for user mode.
+    #[subenum(CoreAirId)]
+    SubUser = 61,
     /// The subw chip.
     #[subenum(CoreAirId)]
-    Subw = 37,
+    Subw = 62,
+    /// The subw chip for user mode.
+    #[subenum(CoreAirId)]
+    SubwUser = 63,
     /// The bitwise chip.
     #[subenum(CoreAirId)]
-    Bitwise = 38,
+    Bitwise = 64,
+    /// The bitwise chip for user mode.
+    #[subenum(CoreAirId)]
+    BitwiseUser = 65,
     /// The mul chip.
     #[subenum(CoreAirId)]
-    Mul = 39,
+    Mul = 66,
+    /// The mul chip for user mode.
+    #[subenum(CoreAirId)]
+    MulUser = 67,
     /// The shift right chip.
     #[subenum(CoreAirId)]
-    ShiftRight = 40,
+    ShiftRight = 68,
+    /// The shift right chip for user mode.
+    #[subenum(CoreAirId)]
+    ShiftRightUser = 69,
     /// The shift left chip.
     #[subenum(CoreAirId)]
-    ShiftLeft = 41,
+    ShiftLeft = 70,
+    /// The shift left chip for user mode.
+    #[subenum(CoreAirId)]
+    ShiftLeftUser = 71,
     /// The lt chip.
     #[subenum(CoreAirId)]
-    Lt = 42,
+    Lt = 72,
+    /// The lt chip for user mode.
+    #[subenum(CoreAirId)]
+    LtUser = 73,
     /// The load byte chip.
     #[subenum(CoreAirId)]
-    LoadByte = 43,
+    LoadByte = 74,
+    /// The load byte chip for user mode.
+    #[subenum(CoreAirId)]
+    LoadByteUser = 75,
     /// The load half chip.
     #[subenum(CoreAirId)]
-    LoadHalf = 44,
+    LoadHalf = 76,
+    /// The load half chip for user mode.
+    #[subenum(CoreAirId)]
+    LoadHalfUser = 77,
     /// The load word chip.
     #[subenum(CoreAirId)]
-    LoadWord = 45,
+    LoadWord = 78,
+    /// The load word chip for user mode.
+    #[subenum(CoreAirId)]
+    LoadWordUser = 79,
     /// The load x0 chip.
     #[subenum(CoreAirId)]
-    LoadX0 = 46,
+    LoadX0 = 80,
+    /// The load x0 chip for user mode.
+    #[subenum(CoreAirId)]
+    LoadX0User = 81,
     /// The load double chip.
     #[subenum(CoreAirId)]
-    LoadDouble = 47,
+    LoadDouble = 82,
+    /// The load double chip for user mode.
+    #[subenum(CoreAirId)]
+    LoadDoubleUser = 83,
     /// The store byte chip.
     #[subenum(CoreAirId)]
-    StoreByte = 48,
+    StoreByte = 84,
+    /// The store byte chip for user mode.
+    #[subenum(CoreAirId)]
+    StoreByteUser = 85,
     /// The store half chip.
     #[subenum(CoreAirId)]
-    StoreHalf = 49,
+    StoreHalf = 86,
+    /// The store half chip for user mode.
+    #[subenum(CoreAirId)]
+    StoreHalfUser = 87,
     /// The store word chip.
     #[subenum(CoreAirId)]
-    StoreWord = 50,
+    StoreWord = 88,
+    /// The store word chip for user mode.
+    #[subenum(CoreAirId)]
+    StoreWordUser = 89,
     /// The store double chip.
     #[subenum(CoreAirId)]
-    StoreDouble = 51,
+    StoreDouble = 90,
+    /// The store double chip for user mode.
+    #[subenum(CoreAirId)]
+    StoreDoubleUser = 91,
     /// The utype chip.
     #[subenum(CoreAirId)]
-    UType = 52,
+    UType = 92,
+    /// The utype chip for user mode.
+    #[subenum(CoreAirId)]
+    UTypeUser = 93,
     /// The branch chip.
     #[subenum(CoreAirId)]
-    Branch = 53,
+    Branch = 94,
+    /// The branch chip for user mode.
+    #[subenum(CoreAirId)]
+    BranchUser = 95,
     /// The jal chip.
     #[subenum(CoreAirId)]
-    Jal = 54,
+    Jal = 96,
+    /// The jal chip for user mode.
+    #[subenum(CoreAirId)]
+    JalUser = 97,
     /// The jalr chip.
     #[subenum(CoreAirId)]
-    Jalr = 55,
+    Jalr = 98,
+    /// The jalr chip for user mode.
+    #[subenum(CoreAirId)]
+    JalrUser = 99,
     /// The syscall instructions chip.
     #[subenum(CoreAirId)]
-    SyscallInstrs = 56,
+    SyscallInstrs = 100,
+    /// The syscall instructions chip for user mode.
+    #[subenum(CoreAirId)]
+    SyscallInstrsUser = 101,
     /// The memory bump chip.
     #[subenum(CoreAirId)]
-    MemoryBump = 57,
+    MemoryBump = 102,
     /// The state bump chip.
     #[subenum(CoreAirId)]
-    StateBump = 58,
+    StateBump = 103,
     /// The memory global init chip.
-    MemoryGlobalInit = 59,
+    MemoryGlobalInit = 104,
     /// The memory global finalize chip.
-    MemoryGlobalFinalize = 60,
+    MemoryGlobalFinalize = 105,
     /// The memory local chip.
     #[subenum(CoreAirId)]
-    MemoryLocal = 61,
+    MemoryLocal = 106,
     /// The global chip.
     #[subenum(CoreAirId)]
-    Global = 62,
+    Global = 107,
     /// The byte chip.
-    Byte = 63,
+    Byte = 108,
     /// The range chip.
-    Range = 64,
+    Range = 109,
+    /// The ALU x0 chip (all ALU ops with rd = x0).
+    #[subenum(CoreAirId)]
+    AluX0 = 110,
+    /// The ALU x0 chip (all ALU ops with rd = x0) for user mode.
+    #[subenum(CoreAirId)]
+    AluX0User = 111,
     /// The mprotect chip.
     #[subenum(CoreAirId)]
-    Mprotect = 65,
+    Mprotect = 112,
+    /// The sigreturn chip.
+    SigReturn = 113,
     /// The instruction decode chip.
     #[subenum(CoreAirId)]
-    InstructionDecode = 66,
+    InstructionDecode = 114,
     /// The instruction fetch chip.
     #[subenum(CoreAirId)]
-    InstructionFetch = 67,
+    InstructionFetch = 115,
     /// The page prot chip.
     #[subenum(CoreAirId)]
-    PageProt = 68,
+    PageProt = 116,
     /// The page prot local chip.
     #[subenum(CoreAirId)]
-    PageProtLocal = 69,
+    PageProtLocal = 117,
     /// The page prot global init chip.
-    PageProtGlobalInit = 70,
+    PageProtGlobalInit = 118,
     /// The page prot global finalize chip.
-    PageProtGlobalFinalize = 71,
-    /// The poseidon2 chip.
-    Poseidon2 = 72,
+    PageProtGlobalFinalize = 119,
+    /// The trap exec chip.
+    #[subenum(CoreAirId)]
+    TrapExec = 120,
+    /// The trap memory chip.
+    #[subenum(CoreAirId)]
+    TrapMem = 121,
 }
 
 impl RiscvAirId {
@@ -225,44 +352,72 @@ impl RiscvAirId {
     pub fn core() -> Vec<RiscvAirId> {
         vec![
             RiscvAirId::Add,
+            RiscvAirId::AddUser,
             RiscvAirId::Addi,
+            RiscvAirId::AddiUser,
             RiscvAirId::Addw,
+            RiscvAirId::AddwUser,
             RiscvAirId::Sub,
+            RiscvAirId::SubUser,
             RiscvAirId::Subw,
+            RiscvAirId::SubwUser,
             RiscvAirId::Mul,
+            RiscvAirId::MulUser,
             RiscvAirId::Bitwise,
+            RiscvAirId::BitwiseUser,
             RiscvAirId::ShiftLeft,
+            RiscvAirId::ShiftLeftUser,
             RiscvAirId::ShiftRight,
+            RiscvAirId::ShiftRightUser,
             RiscvAirId::DivRem,
+            RiscvAirId::DivRemUser,
             RiscvAirId::Lt,
+            RiscvAirId::LtUser,
             RiscvAirId::UType,
+            RiscvAirId::UTypeUser,
             RiscvAirId::MemoryLocal,
             RiscvAirId::MemoryBump,
             RiscvAirId::StateBump,
             RiscvAirId::LoadByte,
+            RiscvAirId::LoadByteUser,
             RiscvAirId::LoadHalf,
+            RiscvAirId::LoadHalfUser,
             RiscvAirId::LoadWord,
+            RiscvAirId::LoadWordUser,
             RiscvAirId::LoadDouble,
+            RiscvAirId::LoadDoubleUser,
             RiscvAirId::LoadX0,
+            RiscvAirId::LoadX0User,
             RiscvAirId::StoreByte,
+            RiscvAirId::StoreByteUser,
             RiscvAirId::StoreHalf,
+            RiscvAirId::StoreHalfUser,
             RiscvAirId::StoreWord,
+            RiscvAirId::StoreWordUser,
             RiscvAirId::StoreDouble,
+            RiscvAirId::StoreDoubleUser,
             RiscvAirId::Branch,
+            RiscvAirId::BranchUser,
             RiscvAirId::Jal,
+            RiscvAirId::JalUser,
             RiscvAirId::Jalr,
-            RiscvAirId::PageProt,
-            RiscvAirId::PageProtLocal,
+            RiscvAirId::JalrUser,
             RiscvAirId::SyscallCore,
             RiscvAirId::SyscallInstrs,
+            RiscvAirId::SyscallInstrsUser,
             RiscvAirId::Global,
+            RiscvAirId::AluX0,
+            RiscvAirId::AluX0User,
             RiscvAirId::Mprotect,
             RiscvAirId::InstructionDecode,
             RiscvAirId::InstructionFetch,
+            RiscvAirId::PageProt,
+            RiscvAirId::PageProtLocal,
+            RiscvAirId::TrapExec,
+            RiscvAirId::TrapMem,
         ]
     }
 
-    /// TODO replace these three with subenums or something
     /// Whether the ID represents a core AIR.
     #[must_use]
     pub fn is_core(self) -> bool {
@@ -276,9 +431,9 @@ impl RiscvAirId {
             self,
             RiscvAirId::MemoryGlobalInit
                 | RiscvAirId::MemoryGlobalFinalize
-                | RiscvAirId::Global
                 | RiscvAirId::PageProtGlobalInit
                 | RiscvAirId::PageProtGlobalFinalize
+                | RiscvAirId::Global
         )
     }
 
@@ -291,10 +446,8 @@ impl RiscvAirId {
                 | RiscvAirId::ShaCompress
                 | RiscvAirId::EdAddAssign
                 | RiscvAirId::EdDecompress
-                | RiscvAirId::Secp256k1Decompress
                 | RiscvAirId::Secp256k1AddAssign
                 | RiscvAirId::Secp256k1DoubleAssign
-                | RiscvAirId::Secp256r1Decompress
                 | RiscvAirId::Secp256r1AddAssign
                 | RiscvAirId::Secp256r1DoubleAssign
                 | RiscvAirId::KeccakPermute
@@ -304,15 +457,14 @@ impl RiscvAirId {
                 | RiscvAirId::Bls12381DoubleAssign
                 | RiscvAirId::Uint256MulMod
                 | RiscvAirId::Uint256Ops
-                | RiscvAirId::U256XU2048Mul
                 | RiscvAirId::Bls12381FpOpAssign
                 | RiscvAirId::Bls12381Fp2AddSubAssign
                 | RiscvAirId::Bls12381Fp2MulAssign
                 | RiscvAirId::Bn254FpOpAssign
                 | RiscvAirId::Bn254Fp2AddSubAssign
                 | RiscvAirId::Bn254Fp2MulAssign
-                | RiscvAirId::Bls12381Decompress
                 | RiscvAirId::Poseidon2
+                | RiscvAirId::SigReturn
         )
     }
 
@@ -329,7 +481,15 @@ impl RiscvAirId {
 
     /// Get the ID of the AIR used in the syscall control implementation.
     #[must_use]
-    pub fn control_air_id(self) -> Option<RiscvAirId> {
+    pub fn control_air_id(self, page_protect_enabled: bool) -> Option<RiscvAirId> {
+        if page_protect_enabled {
+            return match self {
+                RiscvAirId::ShaCompress => Some(RiscvAirId::ShaCompressControlUser),
+                RiscvAirId::ShaExtend => Some(RiscvAirId::ShaExtendControlUser),
+                RiscvAirId::KeccakPermute => Some(RiscvAirId::KeccakPermuteControlUser),
+                _ => None,
+            };
+        }
         match self {
             RiscvAirId::ShaCompress => Some(RiscvAirId::ShaCompressControl),
             RiscvAirId::ShaExtend => Some(RiscvAirId::ShaExtendControl),

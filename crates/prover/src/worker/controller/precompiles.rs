@@ -10,8 +10,9 @@ use tokio::{sync::mpsc, task::JoinSet};
 use tracing::Instrument;
 
 use crate::worker::{
-    controller::create_core_proving_task, MessageSender, ProofData, SpawnProveOutput, TaskContext,
-    TaskError, TaskId, TraceData, WorkerClient,
+    controller::{create_core_proving_task, ProveShardGate},
+    MessageSender, ProofData, SpawnProveOutput, TaskContext, TaskError, TaskId, TraceData,
+    WorkerClient,
 };
 
 /// String used as key for add_ref to ensure precompile artifacts are not cleaned up before they
@@ -62,7 +63,7 @@ impl DeferredEvents {
         // Build futures with pre-created artifacts and run uploads in parallel
         let futures = chunk_data
             .into_iter()
-            .zip(artifacts.into_iter())
+            .zip(artifacts)
             .map(|((code, chunk), artifact)| {
                 let client = client.clone();
                 async move {
@@ -143,12 +144,21 @@ impl DeferredEvents {
                 // any.
                 let mut artifacts =
                     self.0.get_mut(&code).unwrap().drain(..index).collect::<Vec<_>>();
+                // Truncate the partial-last slice BEFORE adding refs so the key we register
+                // matches the (start, end) the consumer sees in its TraceData and uses to
+                // remove_ref.
+                if count > threshold {
+                    let mut new_range = artifacts.last().cloned().unwrap();
+                    new_range.start_idx = new_range.end_idx - (count - threshold);
+                    artifacts.last_mut().unwrap().end_idx = new_range.start_idx;
+                    self.0.get_mut(&code).unwrap().insert(0, new_range);
+                }
                 // For each artifact, add refs for the range needed in prove_shard, and then remove
                 // the controller ref if it's been fully split.
                 for (i, slice) in artifacts.iter().enumerate() {
                     let PrecompileArtifactSlice { artifact, start_idx, end_idx } = slice;
                     if let Err(e) =
-                        client.add_ref(artifact, &format!("{:?}_{:?}", start_idx, end_idx)).await
+                        client.add_ref(artifact, &format!("{}_{}", start_idx, end_idx)).await
                     {
                         tracing::error!("Failed to add ref to artifact {}: {:?}", artifact, e);
                     }
@@ -167,14 +177,6 @@ impl DeferredEvents {
                         tracing::error!("Failed to remove ref to artifact {}: {:?}", artifact, e);
                     }
                 }
-                // If there's extra in the last artifact, truncate it and leave it in the front of
-                // self.0[code].
-                if count > threshold {
-                    let mut new_range = artifacts.last().cloned().unwrap();
-                    new_range.start_idx = new_range.end_idx - (count - threshold);
-                    artifacts[index - 1].end_idx = new_range.start_idx;
-                    self.0.get_mut(&code).unwrap().insert(0, new_range);
-                }
                 shards.push(TraceData::Precompile(artifacts, code));
             }
         }
@@ -191,7 +193,8 @@ pub fn precompile_channel(
     program: &Program,
     opts: &SP1CoreOpts,
 ) -> (mpsc::UnboundedSender<DeferredMessage>, PrecompileHandler) {
-    let split_opts = SplitOpts::new(opts, program.instructions.len(), false);
+    let split_opts =
+        SplitOpts::new(opts, program.instructions.len(), program.enable_untrusted_programs);
     let (deferred_marker_tx, deferred_marker_rx) = mpsc::unbounded_channel();
     (deferred_marker_tx, PrecompileHandler { split_opts, deferred_marker_rx })
 }
@@ -210,6 +213,7 @@ impl PrecompileHandler {
         prove_shard_tx: MessageSender<W, ProofData>,
         artifact_client: A,
         worker_client: W,
+        gate: ProveShardGate<A, W>,
         context: TaskContext,
     ) -> Result<(), TaskError> {
         let precompile_range = ShardRange::precompile();
@@ -277,6 +281,17 @@ impl PrecompileHandler {
                         let deferred_events =
                             deferred_events.unwrap_or_else(|_| DeferredEvents::empty());
 
+                        // Free the per-shard wrapper now that we've consumed it. The
+                        // precompile chunks it pointed to are kept alive by the
+                        // `_controller` refs that `append` is about to add. Without this
+                        // the wrapper sits until the 4 h TTL — one zombie per shard.
+                        let _ = artifact_client
+                            .try_delete(
+                                &deferred_events_artifact,
+                                ArtifactType::UnspecifiedArtifactType,
+                            )
+                            .await;
+
                         deferred_accumulator.append(deferred_events, &artifact_client).await;
                         let new_shards =
                             deferred_accumulator.split(false, split_opts, &artifact_client).await;
@@ -291,6 +306,7 @@ impl PrecompileHandler {
                                     shard,
                                     worker_client.clone(),
                                     artifact_client.clone(),
+                                    &gate,
                                 )
                                 .await
                                 .map_err(|e| TaskError::Fatal(e.into()))?;
@@ -328,6 +344,7 @@ impl PrecompileHandler {
                             shard,
                             worker_client.clone(),
                             artifact_client.clone(),
+                            &gate,
                         )
                         .await
                         .map_err(|e| TaskError::Fatal(e.into()))?;

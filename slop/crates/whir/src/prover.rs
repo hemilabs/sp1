@@ -404,7 +404,7 @@ where
                 .collect();
             let merkle_proof = merkle_proof
                 .into_iter()
-                .zip(merkle_openings.into_iter())
+                .zip(merkle_openings)
                 .map(|(proof, opening)| MerkleTreeOpeningAndProof { values: opening, proof })
                 .collect::<Vec<_>>();
             let merkle_read_values: Vec<Mle<GC::EF>> = if round_index != 0 {
@@ -481,8 +481,11 @@ where
             KOrEfMle::EF(mle) => mle,
         };
 
-        let final_polynomial =
+        let mut final_polynomial =
             f_vec.inner().as_ref().unwrap().guts().clone().into_buffer().to_vec();
+
+        final_polynomial.resize(1 << config.final_poly_log_degree, GC::EF::zero());
+
         challenger.observe_constant_length_extension_slice(&final_polynomial);
 
         let final_pow = challenger.grind(config.final_pow_bits);
@@ -1095,7 +1098,7 @@ mod tests {
         let polynomial_concat: Mle<F> =
             Mle::new(interleave(polynomial_1.guts().clone(), polynomial_2.guts().clone()));
 
-        let num_non_zero_entries = polynomial_concat.guts().total_len() as usize;
+        let num_non_zero_entries = polynomial_concat.guts().total_len();
         let inner_evals = polynomial_concat
             .guts()
             .clone()

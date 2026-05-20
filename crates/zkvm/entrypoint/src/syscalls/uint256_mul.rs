@@ -7,8 +7,8 @@ use core::arch::asm;
 ///
 /// ### Safety
 ///
-/// The caller must ensure that `x` and `y` are valid pointers to data that is aligned along a four
-/// byte boundary.
+/// The caller must ensure that `x` and `y` are valid pointers to data that is aligned along an
+/// eight byte boundary.
 #[allow(unused_variables)]
 #[no_mangle]
 pub extern "C" fn syscall_uint256_mulmod(x: *mut [u64; 4], y: *const [u64; 4]) {

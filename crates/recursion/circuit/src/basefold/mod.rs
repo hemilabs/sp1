@@ -6,7 +6,7 @@ use crate::{
 };
 use itertools::Itertools;
 use slop_algebra::{AbstractField, TwoAdicField};
-use slop_basefold::FriConfig;
+use slop_basefold::{FriConfig, BATCH_GRINDING_BITS};
 use slop_multilinear::{partial_lagrange_blocking, MleEval, Point};
 use sp1_recursion_compiler::{
     circuit::CircuitV2Builder,
@@ -43,6 +43,8 @@ pub struct RecursiveBasefoldProof<C: CircuitConfig, SC: SP1FieldConfigVariable<C
     pub final_poly: Ext<SP1Field, SP1ExtensionField>,
     /// Proof-of-work witness.
     pub pow_witness: Felt<SP1Field>,
+    /// Batch grinding witness.
+    pub batch_grinding_witness: Felt<SP1Field>,
 }
 
 #[derive(Clone)]
@@ -133,6 +135,9 @@ impl<C: CircuitConfig, SC: SP1FieldConfigVariable<C>> RecursiveBasefoldVerifier<
         proof: &RecursiveBasefoldProof<C, SC>,
         challenger: &mut SC::FriChallengerVariable,
     ) {
+        // Check batch grinding witness.
+        challenger.check_witness(builder, BATCH_GRINDING_BITS, proof.batch_grinding_witness);
+
         // Sample batching coefficients via partial Lagrange basis.
         let total_len = evaluation_claims
             .iter()

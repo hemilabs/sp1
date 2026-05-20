@@ -6,7 +6,7 @@ use crate::{
 /// The number of limbs in [Secp256r1Point].
 pub const N: usize = 8;
 
-/// An affine point on the Secp256k1 curve.
+/// An affine point on the Secp256r1 curve.
 #[derive(Copy, Clone, Debug)]
 #[repr(align(8))]
 pub struct Secp256r1Point(pub WeierstrassPoint<N>);

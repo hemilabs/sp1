@@ -1,0 +1,29 @@
+name: "Download dev circuit artifacts"
+description: "Downloads pre-built dev circuit artifacts from S3 into ~/.sp1/circuits/"
+
+runs:
+  using: "composite"
+  steps:
+    - name: Download dev circuit artifacts
+      shell: bash
+      run: |
+        PREFIX=$(cat crates/prover/wrap_vk.bin | sha256sum | cut -c1-16)
+        echo "Artifact prefix: $PREFIX"
+        mkdir -p ~/.sp1/circuits /tmp/sp1-dev-artifacts
+        aws s3 sync s3://sp1-circuit-artifacts-dev/ /tmp/sp1-dev-artifacts/ --exclude "*" --include "${PREFIX}*" || true
+        for tarball in /tmp/sp1-dev-artifacts/*.tar.gz; do
+          [ -f "$tarball" ] || continue
+          name=$(basename "$tarball" .tar.gz)
+          dest=~/.sp1/circuits/$name
+          mkdir -p "$dest"
+          if ! tar -xzf "$tarball" -C "$dest"; then
+            echo "WARNING: failed to extract $tarball, removing $dest"
+            rm -rf "$dest"
+          elif [ ! "$(ls -A "$dest")" ]; then
+            echo "WARNING: extraction produced no files in $dest, removing"
+            rm -rf "$dest"
+          else
+            echo "Extracted $name ($(ls "$dest" | wc -l) files)"
+          fi
+        done
+        rm -rf /tmp/sp1-dev-artifacts

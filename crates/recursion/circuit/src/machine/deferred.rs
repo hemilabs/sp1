@@ -160,7 +160,13 @@ where
             challenger.observe_slice(builder, vk.pc_start);
             challenger.observe_slice(builder, vk.initial_global_cumulative_sum.0.x.0);
             challenger.observe_slice(builder, vk.initial_global_cumulative_sum.0.y.0);
-            challenger.observe(builder, vk.enable_untrusted_programs);
+            challenger.observe(builder, vk.untrusted_config.enable_untrusted_programs);
+            #[cfg(feature = "mprotect")]
+            {
+                challenger.observe(builder, vk.untrusted_config.enable_trap_handler);
+                challenger.observe_slice(builder, vk.untrusted_config.trap_context);
+                challenger.observe_slice(builder, vk.untrusted_config.untrusted_memory);
+            }
             // Observe the padding.
             let zero: Felt<_> = builder.eval(SP1Field::zero());
             for _ in 0..6 {
@@ -181,10 +187,12 @@ where
 
             // Assert that the proof is complete.
             builder.assert_felt_eq(current_public_values.is_complete, SP1Field::one());
+            // Assert that the proof has `exit_code == 0`.
+            builder.assert_felt_eq(current_public_values.exit_code, SP1Field::zero());
 
             // Update deferred proof digest
             // poseidon2( current_digest[..8] || pv.sp1_vk_digest[..8] ||
-            // pv.committed_value_digest[..16] )
+            // pv.committed_value_digest[..32] )
             let mut inputs: [Felt<SP1Field>; 48] = array::from_fn(|_| builder.uninit());
             inputs[0..DIGEST_SIZE].copy_from_slice(&reconstruct_deferred_digest);
 

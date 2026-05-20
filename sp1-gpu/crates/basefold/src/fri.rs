@@ -3,14 +3,12 @@ use std::{marker::PhantomData, sync::Arc};
 
 use slop_algebra::{AbstractExtensionField, AbstractField, ExtensionField, TwoAdicField};
 use slop_alloc::{Buffer, HasBackend};
-use slop_basefold::{BasefoldProof, FriConfig};
+use slop_basefold::{BasefoldProof, FriConfig, BATCH_GRINDING_BITS};
 use slop_basefold_prover::{host_fold_even_odd, BasefoldProverError};
 use slop_challenger::{CanObserve, CanSampleBits, FieldChallenger, IopCtx};
 use slop_commit::{Message, Rounds};
 use slop_merkle_tree::MerkleTreeOpeningAndProof;
-use slop_multilinear::{
-    partial_lagrange_blocking, Evaluations, Mle, MleEval, MultilinearPcsChallenger, Point,
-};
+use slop_multilinear::{partial_lagrange_blocking, Mle, MultilinearPcsChallenger, Point};
 use slop_tensor::Tensor;
 use sp1_primitives::{SP1ExtensionField, SP1Field};
 
@@ -117,7 +115,7 @@ where
         batching_coefficients: &Tensor<GC::EF>,
         mles: &TraceDenseData<GC::F, TaskScope>,
         codewords: Message<Tensor<Felt, TaskScope>>,
-        evaluation_claims: Vec<MleEval<GC::EF, TaskScope>>,
+        evaluation_claims: Vec<GC::EF>,
     ) -> (Mle<GC::EF, TaskScope>, Tensor<GC::F, TaskScope>, GC::EF) {
         let log_stacking_height = self.log_height;
         // Compute all the batch challenge powers.
@@ -187,11 +185,6 @@ where
         // Compute the batched evaluation claim.
         let batch_eval_claim = evaluation_claims
             .into_iter()
-            .flat_map(|batch_claims| {
-                let claims =
-                    DeviceTensor::from_raw(batch_claims.into_evaluations()).to_host().unwrap();
-                claims.into_buffer().into_vec()
-            })
             .zip(batching_coefficients.as_slice())
             .map(|(eval, coeff)| eval * *coeff)
             .sum::<GC::EF>();
@@ -322,7 +315,7 @@ where
     pub fn prove_trusted_evaluations_basefold(
         &self,
         mut eval_point: Point<GC::EF>,
-        evaluation_claims: Rounds<Evaluations<GC::EF, TaskScope>>,
+        evaluation_claims: Vec<GC::EF>,
         mles: &JaggedTraceMle<GC::F, TaskScope>,
         prover_data: Rounds<&CudaStackedPcsProverData<GC>>,
         challenger: &mut GC::Challenger,
@@ -366,7 +359,10 @@ where
 
         let encoded_messages: Message<_> = codewords.iter().cloned().collect();
 
-        let evaluation_claims = evaluation_claims.into_iter().flatten().collect::<Vec<_>>();
+        // Grind for batch randomness.
+        let batch_grinding_witness =
+            GrindingPowCudaProver::grind(challenger, BATCH_GRINDING_BITS, &scope);
+
         let batching_point = challenger.sample_point::<GC::EF>(num_batching_variables);
         let batching_coefficients = partial_lagrange_blocking(&batching_point);
 
@@ -471,6 +467,7 @@ where
             query_phase_openings_and_proofs,
             final_poly,
             pow_witness,
+            batch_grinding_witness,
         })
     }
 }
@@ -509,9 +506,9 @@ mod tests {
     use slop_commit::Message;
     use slop_futures::queue::WorkerQueue;
     use slop_merkle_tree::Poseidon2KoalaBear16Prover;
-    use slop_multilinear::Mle;
+    use slop_multilinear::{Evaluations, Mle, MleEval};
     use slop_stacked::interleave_multilinears_with_fixed_rate;
-    use sp1_gpu_cudart::{run_sync_in_place, DeviceTensor, PinnedBuffer};
+    use sp1_gpu_cudart::{run_sync_in_place, PinnedBuffer};
     use sp1_gpu_merkle_tree::{CudaTcsProver, Poseidon2SP1Field16CudaProver};
     use sp1_gpu_tracegen::CudaTraceGenerator;
     use sp1_hypercube::prover::{ProverSemaphore, TraceGenerator};
@@ -717,24 +714,12 @@ mod tests {
 
             let mut challenger = SP1GlobalContext::default_challenger();
 
-            let mut evaluation_claims_1_device = Vec::new();
-
-            for evaluation in &evaluation_claims_1.round_evaluations {
-                let eval_device =
-                    DeviceTensor::from_host(evaluation.evaluations(), &scope).unwrap().into_inner();
-                evaluation_claims_1_device.push(MleEval::new(eval_device));
-            }
-
-            let evaluation_claims_1_device =
-                Evaluations { round_evaluations: evaluation_claims_1_device };
-
-            let mut evaluation_claims_2_device = Vec::new();
-            for evaluation in &evaluation_claims_2.round_evaluations {
-                let eval_device =
-                    DeviceTensor::from_host(evaluation.evaluations(), &scope).unwrap().into_inner();
-                evaluation_claims_2_device.push(MleEval::new(eval_device));
-            }
-            let evaluation_claims_2 = Evaluations { round_evaluations: evaluation_claims_2_device };
+            let flat_evaluation_claims: Vec<Ext> = evaluation_claims_1
+                .round_evaluations
+                .iter()
+                .chain(evaluation_claims_2.round_evaluations.iter())
+                .flat_map(|mle_eval| mle_eval.iter().copied())
+                .collect();
 
             scope.synchronize_blocking().unwrap();
 
@@ -743,7 +728,7 @@ mod tests {
             let new_basefold_proof = new_cuda_prover
                 .prove_trusted_evaluations_basefold(
                     eval_point_host.clone(),
-                    [evaluation_claims_1_device, evaluation_claims_2].into_iter().collect(),
+                    flat_evaluation_claims,
                     &new_traces,
                     [&new_preprocessed_prover_data, &new_main_prover_data].into_iter().collect(),
                     &mut challenger,
@@ -753,32 +738,20 @@ mod tests {
             scope.synchronize_blocking().unwrap();
             tracing::info!("New proof time: {:?}", now.elapsed());
 
-            for (i, (a, b)) in basefold_proof
-                .univariate_messages
-                .iter()
-                .zip_eq(new_basefold_proof.univariate_messages.iter())
-                .enumerate()
-            {
-                assert_eq!(a, b, "Failure on message from round {}", i);
-            }
+            // Because the batch grinding is non-deterministic between CPU and GPU, the
+            // grinding witnesses may differ, causing all subsequent proof values (batching
+            // point, univariate messages, etc.) to diverge. Instead of comparing proof
+            // components directly, we verify both proofs independently.
 
-            for (i, (a, b)) in basefold_proof
-                .fri_commitments
-                .iter()
-                .zip_eq(new_basefold_proof.fri_commitments.iter())
-                .enumerate()
-            {
-                assert_eq!(a, b, "Failure on FRI commitment from round {}", i);
-            }
-
-            assert_eq!(
-                basefold_proof.final_poly, new_basefold_proof.final_poly,
-                "Failure on final poly"
-            );
-
-            // Because the grinding is technically non-deterministic, the proof-of-work witnesses
-            // do not need to be the same. Therefore, all the query indices are not necessarily the
-            // same between the new and old proofs. However, the new proof should still verify.
+            verifier
+                .verify_mle_evaluations(
+                    &[old_preprocessed_commitment, old_main_commitment],
+                    eval_point_host.clone(),
+                    &flattened_evaluation_claims,
+                    &basefold_proof,
+                    &mut SP1GlobalContext::default_challenger(),
+                )
+                .unwrap();
 
             verifier
                 .verify_mle_evaluations(

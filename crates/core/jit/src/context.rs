@@ -1,24 +1,72 @@
-use crate::{debug, MemValue, RiscRegister, TraceChunkHeader};
+use crate::{debug, ElfInfo, Interrupt, MemValue, PageProtValue, RiscRegister, TraceChunkHeader};
 use memmap2::{MmapMut, MmapOptions};
+use sp1_primitives::consts::{PROT_READ, PROT_WRITE};
 use std::{collections::VecDeque, io, os::fd::RawFd, ptr::NonNull, sync::mpsc};
+
+/// Number of u32 words in the public value digest emitted by `COMMIT` syscalls.
+///
+/// Mirrors `sp1_hypercube::air::PV_DIGEST_NUM_WORDS`. Kept here as a local constant to avoid
+/// pulling `sp1-hypercube` into the JIT crate's dependency graph.
+pub const PUBLIC_VALUE_DIGEST_WORDS: usize = 8;
 
 pub trait SyscallContext {
     /// Read a value from a register.
     fn rr(&self, reg: RiscRegister) -> u64;
-    /// Read a value from memory.
-    fn mr(&mut self, addr: u64) -> u64;
-    /// Write a value to memory.
-    fn mw(&mut self, addr: u64, val: u64);
-    /// Read a slice of values from memory.
-    fn mr_slice(&mut self, addr: u64, len: usize) -> impl IntoIterator<Item = &u64>;
-    /// Read a slice of values from memory, without updating the memory clock
+    /// Write a value to a register.
+    fn rw(&mut self, reg: RiscRegister, value: u64);
+    /// Write next pc.
+    fn set_next_pc(&mut self, pc: u64);
+    /// Read a value from memory, without checking page permissions.
+    fn mr_without_prot(&mut self, addr: u64) -> u64;
+    /// Write a value to memory, without checking page permissions.
+    fn mw_without_prot(&mut self, addr: u64, val: u64);
+    /// Read a slice of values from memory, checking page permissions.
+    fn mr_slice(
+        &mut self,
+        addr: u64,
+        len: usize,
+    ) -> Result<impl IntoIterator<Item = &u64>, Interrupt> {
+        self.prot_slice_check(addr, len, PROT_READ)?;
+        Ok(self.mr_slice_without_prot(addr, len))
+    }
+    /// Read a slice of values from memory, without checking page permissions.
+    fn mr_slice_without_prot(&mut self, addr: u64, len: usize) -> impl IntoIterator<Item = &u64>;
+    /// Read a slice of values from memory, without updating the memory clock.
     /// Note that it still traces the access when tracing is enabled.
     fn mr_slice_unsafe(&mut self, addr: u64, len: usize) -> impl IntoIterator<Item = &u64>;
     /// Read a slice of values from memory, without updating the memory clock or tracing the access.
     fn mr_slice_no_trace(&mut self, addr: u64, len: usize) -> impl IntoIterator<Item = &u64>;
-    /// Write a slice of values to memory.
-    fn mw_slice(&mut self, addr: u64, vals: &[u64]);
-    /// Get the input buffer
+    /// Write a slice of values to memory, checking page permissions.
+    fn mw_slice(&mut self, addr: u64, vals: &[u64]) -> Result<(), Interrupt> {
+        self.prot_slice_check(addr, vals.len(), PROT_WRITE)?;
+        self.mw_slice_without_prot(addr, vals);
+        Ok(())
+    }
+    /// Write a slice of values to memory, without checking page permissions.
+    fn mw_slice_without_prot(&mut self, addr: u64, vals: &[u64]);
+    /// Check read permission for a slice of memory.
+    #[inline]
+    fn read_slice_check(&mut self, addr: u64, len: usize) -> Result<(), Interrupt> {
+        self.prot_slice_check(addr, len, PROT_READ)
+    }
+    /// Check write permission for a slice of memory.
+    #[inline]
+    fn write_slice_check(&mut self, addr: u64, len: usize) -> Result<(), Interrupt> {
+        self.prot_slice_check(addr, len, PROT_WRITE)
+    }
+    /// Check read+write permission for a slice of memory.
+    #[inline]
+    fn read_write_slice_check(&mut self, addr: u64, len: usize) -> Result<(), Interrupt> {
+        self.prot_slice_check(addr, len, PROT_READ | PROT_WRITE)
+    }
+    /// Check page permissions for a slice of memory.
+    fn prot_slice_check(&mut self, addr: u64, len: usize, prot_bitmap: u8)
+        -> Result<(), Interrupt>;
+    /// Write a page protection value.
+    fn page_prot_write(&mut self, addr: u64, val: u8);
+    /// Flush all buffered page protection writes.
+    fn page_prot_flush(&mut self) {}
+    /// Get the input buffer.
     fn input_buffer(&mut self) -> &mut VecDeque<Vec<u8>>;
     /// Get the public values stream.
     fn public_values_stream(&mut self) -> &mut Vec<u8>;
@@ -30,15 +78,23 @@ pub trait SyscallContext {
     fn trace_hint(&mut self, addr: u64, value: Vec<u8>);
     /// Trace a dummy value.
     fn trace_value(&mut self, value: u64);
-    /// Write a hint to memory, which is like setting uninitialized memory to a nonzero value
+    /// Write a hint to memory, which is like setting uninitialized memory to a nonzero value.
     /// The clk will be set to 0, just like for uninitialized memory.
     fn mw_hint(&mut self, addr: u64, val: u64);
     /// Used for precompiles that access memory, that need to bump the clk.
     /// This increment is local to the precompile, and does not affect the number of cycles
     /// the precompile itself takes up.
     fn bump_memory_clk(&mut self);
+    /// Get the current clock value.
+    fn get_current_clk(&self) -> u64;
+    /// Set the clock value.
+    fn set_clk(&mut self, clk: u64);
     /// Set the exit code of the program.
     fn set_exit_code(&mut self, exit_code: u32);
+    /// Record one word of the public value digest emitted by a `COMMIT` syscall.
+    ///
+    /// `word_idx` must be `< PUBLIC_VALUE_DIGEST_WORDS`.
+    fn set_public_value_digest_word(&mut self, word_idx: u64, digest_word: u32);
     /// Returns if were in unconstrained mode.
     fn is_unconstrained(&self) -> bool;
     /// Get the global clock (total cycles executed).
@@ -60,6 +116,19 @@ pub trait SyscallContext {
     /// Returns (cycles_elapsed, depth) or None if no matching start.
     #[cfg(feature = "profiling")]
     fn cycle_tracker_report_end(&mut self, name: &str) -> Option<(u64, u32)>;
+
+    /// Fetch loaded ELF information.
+    fn elf_info(&self) -> ElfInfo;
+    /// Iterate through all initialized addresses.
+    fn init_addr_iter(&self) -> impl IntoIterator<Item = u64>;
+    /// Iterate through all non-default page permissions.
+    fn page_prot_iter(&self) -> impl IntoIterator<Item = (&u64, &PageProtValue)>;
+    /// Dump all profiler data for dump-elf / bootloader use.
+    fn maybe_dump_profiler_data(&self) -> (Vec<(String, u64, u64)>, Vec<u64>);
+    /// Insert function symbols in profiler mode.
+    fn maybe_insert_profiler_symbols<I: Iterator<Item = (String, u64, u64)>>(&mut self, iter: I);
+    /// Delete function symbols in profiler mode.
+    fn maybe_delete_profiler_symbols<I: Iterator<Item = u64>>(&mut self, iter: I);
 }
 
 impl SyscallContext for JitContext {
@@ -68,19 +137,37 @@ impl SyscallContext for JitContext {
         self.clk += 1;
     }
 
+    #[inline]
+    fn get_current_clk(&self) -> u64 {
+        self.clk
+    }
+
+    #[inline]
+    fn set_clk(&mut self, clk: u64) {
+        self.clk = clk;
+    }
+
     fn rr(&self, reg: RiscRegister) -> u64 {
         self.registers[reg as usize]
     }
 
-    fn mr(&mut self, addr: u64) -> u64 {
+    fn rw(&mut self, _reg: RiscRegister, _value: u64) {
+        unimplemented!()
+    }
+
+    fn set_next_pc(&mut self, _pc: u64) {
+        unimplemented!()
+    }
+
+    fn mr_without_prot(&mut self, addr: u64) -> u64 {
         unsafe { ContextMemory::new(self).mr(addr) }
     }
 
-    fn mw(&mut self, addr: u64, val: u64) {
+    fn mw_without_prot(&mut self, addr: u64, val: u64) {
         unsafe { ContextMemory::new(self).mw(addr, val) };
     }
 
-    fn mr_slice(&mut self, addr: u64, len: usize) -> impl IntoIterator<Item = &u64> {
+    fn mr_slice_without_prot(&mut self, addr: u64, len: usize) -> impl IntoIterator<Item = &u64> {
         debug_assert!(addr.is_multiple_of(8), "Address {addr} is not aligned to 8");
 
         // Convert the byte address to the word address.
@@ -146,8 +233,23 @@ impl SyscallContext for JitContext {
         slice.iter().map(|val| &val.value)
     }
 
-    fn mw_slice(&mut self, addr: u64, vals: &[u64]) {
+    fn mw_slice_without_prot(&mut self, addr: u64, vals: &[u64]) {
         unsafe { ContextMemory::new(self).mw_slice(addr, vals) };
+    }
+
+    fn prot_slice_check(
+        &mut self,
+        _addr: u64,
+        _len: usize,
+        _prot_bitmap: u8,
+    ) -> Result<(), Interrupt> {
+        // JIT executor does not implement software page protection checking.
+        // Permission enforcement is done at the OS level via libc::mprotect.
+        Ok(())
+    }
+
+    fn page_prot_write(&mut self, _addr: u64, _val: u8) {
+        unimplemented!("page_prot_write not implemented for JitContext")
     }
 
     fn input_buffer(&mut self) -> &mut VecDeque<Vec<u8>> {
@@ -190,6 +292,15 @@ impl SyscallContext for JitContext {
         self.exit_code = exit_code;
     }
 
+    fn set_public_value_digest_word(&mut self, word_idx: u64, digest_word: u32) {
+        let idx = word_idx as usize;
+        debug_assert!(
+            idx < PUBLIC_VALUE_DIGEST_WORDS,
+            "public value digest word index out of bounds: {idx}"
+        );
+        self.public_value_digest[idx] = digest_word;
+    }
+
     fn is_unconstrained(&self) -> bool {
         self.is_unconstrained == 1
     }
@@ -218,6 +329,30 @@ impl SyscallContext for JitContext {
         // This is a no-op implementation for trait completeness.
         None
     }
+
+    fn elf_info(&self) -> ElfInfo {
+        unimplemented!()
+    }
+
+    fn init_addr_iter(&self) -> impl IntoIterator<Item = u64> {
+        Vec::new()
+    }
+
+    fn page_prot_iter(&self) -> impl IntoIterator<Item = (&u64, &PageProtValue)> {
+        Vec::new()
+    }
+
+    fn maybe_dump_profiler_data(&self) -> (Vec<(String, u64, u64)>, Vec<u64>) {
+        unimplemented!()
+    }
+
+    fn maybe_insert_profiler_symbols<I: Iterator<Item = (String, u64, u64)>>(&mut self, _iter: I) {
+        unimplemented!()
+    }
+
+    fn maybe_delete_profiler_symbols<I: Iterator<Item = u64>>(&mut self, _iter: I) {
+        unimplemented!()
+    }
 }
 
 #[repr(C)]
@@ -245,7 +380,7 @@ pub struct JitContext {
     pub(crate) input_buffer: NonNull<VecDeque<Vec<u8>>>,
     /// A stream of public values from the program (global to entire program).
     pub(crate) public_values_stream: NonNull<Vec<u8>>,
-    /// The hints read by the program, with thier corresponding start address.
+    /// The hints read by the program, with their corresponding start address.
     pub(crate) hints: NonNull<Vec<(u64, Vec<u8>)>>,
     /// The memory file descriptor, this is used to create the COW memory at runtime.
     pub(crate) memory_fd: RawFd,
@@ -257,6 +392,8 @@ pub struct JitContext {
     pub(crate) debug_sender: Option<mpsc::SyncSender<Option<debug::State>>>,
     /// The exit code of the program.
     pub(crate) exit_code: u32,
+    /// The public value digest words emitted by `COMMIT` syscalls.
+    pub public_value_digest: [u32; PUBLIC_VALUE_DIGEST_WORDS],
 }
 
 impl JitContext {
@@ -327,7 +464,7 @@ impl JitContext {
     /// Exit the unconstrained context, this will restore the original memory map.
     pub fn exit_unconstrained(&mut self) {
         let unconstrained = std::mem::take(&mut self.maybe_unconstrained)
-            .expect("Exit unconstrained called but not context is present, this is a bug.");
+            .expect("Exit unconstrained called but no context is present, this is a bug.");
 
         self.memory = unconstrained.actual_memory_ptr;
         self.pc = unconstrained.pc;

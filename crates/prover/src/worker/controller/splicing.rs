@@ -3,8 +3,8 @@ use std::sync::Arc;
 use futures::{stream::FuturesUnordered, StreamExt};
 use slop_futures::pipeline::{AsyncEngine, AsyncWorker, Pipeline};
 use sp1_core_executor::{
-    CompressedMemory, CycleResult, ExecutionError, Program, SP1CoreOpts, SplicedMinimalTrace,
-    SplicingVM,
+    CompressedMemory, CompressedPages, CycleResult, ExecutionError, Program, SP1CoreOpts,
+    SplicedMinimalTrace, SplicingVMEnum,
 };
 use sp1_hypercube::air::{ShardBoundary, ShardRange};
 use sp1_jit::{MinimalTrace, TraceChunkRaw};
@@ -13,9 +13,9 @@ use tokio::{sync::mpsc, task::JoinSet};
 use tracing::Instrument;
 
 use crate::worker::{
-    controller::create_core_proving_task, CommonProverInput, DeferredMessage, FinalVmState,
-    FinalVmStateLock, MessageSender, ProofData, SpawnProveOutput, TaskContext, TouchedAddresses,
-    TraceData, WorkerClient,
+    controller::{create_core_proving_task, ProveShardGate},
+    CommonProverInput, DeferredMessage, FinalVmState, FinalVmStateLock, MessageSender, ProofData,
+    SpawnProveOutput, TaskContext, TouchedAddresses, TouchedPages, TraceData, WorkerClient,
 };
 
 pub type SplicingEngine<A, W> =
@@ -29,6 +29,7 @@ pub struct SplicingTask<W: WorkerClient> {
     pub num_deferred_proofs: usize,
     pub common_input_artifact: Artifact,
     pub all_touched_addresses: TouchedAddresses,
+    pub all_touched_pages: TouchedPages,
     pub final_vm_state: FinalVmStateLock,
     pub prove_shard_tx: MessageSender<W, ProofData>,
     pub context: TaskContext,
@@ -36,10 +37,11 @@ pub struct SplicingTask<W: WorkerClient> {
     pub deferred_marker_tx: mpsc::UnboundedSender<DeferredMessage>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
-pub struct SplicingWorker<A, W> {
+#[derive(Debug, Clone)]
+pub struct SplicingWorker<A: ArtifactClient, W: WorkerClient> {
     artifact_client: A,
     worker_client: W,
+    gate: ProveShardGate<A, W>,
     number_of_send_splice_workers: usize,
     send_splice_input_buffer_size: usize,
 }
@@ -52,12 +54,14 @@ where
     pub fn new(
         artifact_client: A,
         worker_client: W,
+        gate: ProveShardGate<A, W>,
         number_of_send_splice_workers: usize,
         send_splice_input_buffer_size: usize,
     ) -> Self {
         Self {
             artifact_client,
             worker_client,
+            gate,
             number_of_send_splice_workers,
             send_splice_input_buffer_size,
         }
@@ -75,6 +79,7 @@ where
             .map(|_| SendSpliceWorker {
                 artifact_client: self.artifact_client.clone(),
                 worker_client: self.worker_client.clone(),
+                gate: self.gate.clone(),
                 elf_artifact: elf_artifact.clone(),
                 common_input_artifact: common_input_artifact.clone(),
                 context: context.clone(),
@@ -97,6 +102,7 @@ where
             program,
             chunk,
             all_touched_addresses,
+            all_touched_pages,
             final_vm_state,
             elf_artifact,
             common_input_artifact,
@@ -179,10 +185,11 @@ where
             move || {
             let _guard = span.enter();
             let mut touched_addresses = CompressedMemory::new();
-            let mut vm = SplicingVM::new(&chunk, program.clone(), &mut touched_addresses, common_prover_input.nonce, opts);
+            let mut touched_pages = CompressedPages::new();
+            let mut vm = SplicingVMEnum::new(&chunk, program.clone(), &mut touched_addresses, &mut touched_pages, common_prover_input.nonce, opts);
 
             let start_num_mem_reads = chunk.num_mem_reads();
-            let start_clk = vm.core.clk();
+            let start_clk = vm.clk();
             let mut end_clk : u64;
             let mut last_splice = SplicedMinimalTrace::new_full_trace(chunk.clone());
                 let mut boundary = ShardBoundary {
@@ -194,14 +201,14 @@ where
                     deferred_proof: num_deferred_proofs as u64,
                 };
             loop {
-                tracing::debug!("starting new shard at clk: {} at pc: {}", vm.core.clk(), vm.core.pc());
+                tracing::debug!("starting new shard at clk: {} at pc: {}", vm.clk(), vm.pc());
                 match vm.execute()? {
                     CycleResult::ShardBoundary => {
                         // Note: Chunk implentations should always be cheap to clone.
                         if let Some(spliced) = vm.splice(chunk.clone()) {
-                            tracing::debug!(global_clk = vm.core.global_clk(), pc = vm.core.pc(), num_mem_reads_left = vm.core.mem_reads.len(), clk = vm.core.clk(), "shard boundary");
+                            tracing::debug!(global_clk = vm.global_clk(), pc = vm.pc(), num_mem_reads_left = vm.mem_reads_len(), clk = vm.clk(), "shard boundary");
                             // Get the end boundary of the shard.
-                            end_clk = vm.core.clk();
+                            end_clk = vm.clk();
                             let end = ShardBoundary {
                                 timestamp: end_clk,
                                 initialized_address: 0,
@@ -216,19 +223,19 @@ where
                             boundary = end;
 
                             // Set the last splice clk.
-                            last_splice.set_last_clk(vm.core.clk());
+                            last_splice.set_last_clk(vm.clk());
                             last_splice.set_last_mem_reads_idx(
-                                start_num_mem_reads as usize - vm.core.mem_reads.len(),
+                                start_num_mem_reads as usize - vm.mem_reads_len(),
                             );
                             let splice_to_send = std::mem::replace(&mut last_splice, spliced);
-                            tracing::debug!(global_clk = vm.core.global_clk(), "sending spliced trace to splicing tx");
+                            tracing::debug!(global_clk = vm.global_clk(), "sending spliced trace to splicing tx");
                             splicing_tx.blocking_send(SendSpliceTask { chunk: splice_to_send, range })
                                 .map_err(|e| ExecutionError::Other(format!("error sending to splicing tx: {}", e)))?;
-                            tracing::debug!(global_clk = vm.core.global_clk(), "spliced trace sent to splicing tx");
+                            tracing::debug!(global_clk = vm.global_clk(), "spliced trace sent to splicing tx");
                         } else {
-                            tracing::debug!(global_clk = vm.core.global_clk(), pc = vm.core.pc(), num_mem_reads_left = vm.core.mem_reads.len(), "trace ended");
+                            tracing::debug!(global_clk = vm.global_clk(), pc = vm.pc(), num_mem_reads_left = vm.mem_reads_len(), "trace ended");
                             // Get the end boundary of the shard.
-                            end_clk = vm.core.clk();
+                            end_clk = vm.clk();
                             let end = ShardBoundary {
                                 timestamp: end_clk,
                                 initialized_address: 0,
@@ -240,24 +247,24 @@ where
                             // Get the range of the shard.
                             let range = (boundary..end).into();
 
-                            last_splice.set_last_clk(vm.core.clk());
+                            last_splice.set_last_clk(vm.clk());
                             last_splice.set_last_mem_reads_idx(
-                                start_num_mem_reads as usize - vm.core.mem_reads.len(),
+                                start_num_mem_reads as usize - vm.mem_reads_len(),
                             );
-                            tracing::debug!(global_clk = vm.core.global_clk(), "sending last splice to splicing tx");
+                            tracing::debug!(global_clk = vm.global_clk(), "sending last splice to splicing tx");
                             splicing_tx.blocking_send(SendSpliceTask { chunk: last_splice, range })
                                 .map_err(|e| ExecutionError::Other(format!("error sending to splicing tx: {}", e)))?;
-                            tracing::debug!(global_clk = vm.core.global_clk(), "last splice sent to splicing tx");
+                            tracing::debug!(global_clk = vm.global_clk(), "last splice sent to splicing tx");
                             break;
                         }
                     }
                     CycleResult::Done(true) => {
-                        tracing::debug!(global_clk = vm.core.global_clk(), "done cycle result");
-                        last_splice.set_last_clk(vm.core.clk());
+                        tracing::debug!(global_clk = vm.global_clk(), "done cycle result");
+                        last_splice.set_last_clk(vm.clk());
                         last_splice.set_last_mem_reads_idx(chunk.num_mem_reads() as usize);
 
                         // Get the end boundary of the shard.
-                        end_clk = vm.core.clk();
+                        end_clk = vm.clk();
                         let end = ShardBoundary {
                             timestamp: end_clk,
                             initialized_address: 0,
@@ -271,14 +278,21 @@ where
 
                         // Get the last state of the vm execution and set the global final vm state to
                         // this value.
-                        let final_state = FinalVmState::new(&vm.core);
+                        let final_state = FinalVmState {
+                            registers: vm.registers(),
+                            timestamp: vm.clk(),
+                            pc: vm.pc(),
+                            exit_code: vm.exit_code(),
+                            public_value_digest: vm.public_value_digest(),
+                            proof_nonce: vm.proof_nonce(),
+                        };
                         final_vm_state.set(final_state).map_err(|e| ExecutionError::Other(e.to_string()))?;
 
-                        tracing::debug!(global_clk = vm.core.global_clk(), "sending last splice to splicing tx");
+                        tracing::debug!(global_clk = vm.global_clk(), "sending last splice to splicing tx");
                         // Send the last splice.
                         splicing_tx.blocking_send(SendSpliceTask { chunk: last_splice, range })
                             .map_err(|e| ExecutionError::Other(format!("error sending to splicing tx: {}", e)))?;
-                        tracing::debug!(global_clk = vm.core.global_clk(), "last splice sent to splicing tx");
+                        tracing::debug!(global_clk = vm.global_clk(), "last splice sent to splicing tx");
                         break;
                     }
                     CycleResult::Done(false) | CycleResult::TraceEnd => {
@@ -287,10 +301,15 @@ where
                     }
                 }
             }
-            // Append the touched addresses from this chunk to the globally tracked touched addresses.
+            // Release the &mut borrows on touched_addresses/touched_pages so we can move them.
+            drop(vm);
+            // Send per-chunk bitmaps to the global memory handler; it will OR them together
+            // and resolve final memory values from the live SHM at drain time.
             tracing::debug_span!("collecting touched addresses and sending to global memory").in_scope(|| {
-            all_touched_addresses.blocking_extend(start_clk, end_clk, touched_addresses.is_set())
+            all_touched_addresses.blocking_extend(touched_addresses)
                 .map_err(|e| ExecutionError::Other(e.to_string()))})?;
+            all_touched_pages.blocking_extend(touched_pages)
+                .map_err(|e| ExecutionError::Other(e.to_string()))?;
             Ok(())
            });
 
@@ -309,9 +328,10 @@ pub struct SendSpliceTask {
     pub range: ShardRange,
 }
 
-struct SendSpliceWorker<A, W: WorkerClient> {
+struct SendSpliceWorker<A: ArtifactClient, W: WorkerClient> {
     artifact_client: A,
     worker_client: W,
+    gate: ProveShardGate<A, W>,
     context: TaskContext,
     elf_artifact: Artifact,
     common_input_artifact: Artifact,
@@ -340,6 +360,7 @@ where
             data,
             self.worker_client.clone(),
             self.artifact_client.clone(),
+            &self.gate,
         )
         .await
         .map_err(|e| ExecutionError::Other(format!("error in create_core_proving_task: {}", e)))?;

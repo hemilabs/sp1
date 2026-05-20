@@ -142,6 +142,10 @@ impl<F: PrimeField32> MachineAir<F> for ProgramChip {
         // Collect the number of times each instruction is called from the cpu events.
         // Store it as a map of PC -> count.
         let mut instruction_counts = HashMap::new();
+        input.alu_x0_events.iter().for_each(|event| {
+            let pc = event.0.pc;
+            instruction_counts.entry(pc).and_modify(|count| *count += 1).or_insert(1);
+        });
         input.add_events.iter().for_each(|event| {
             let pc = event.0.pc;
             instruction_counts.entry(pc).and_modify(|count| *count += 1).or_insert(1);
@@ -239,6 +243,10 @@ impl<F: PrimeField32> MachineAir<F> for ProgramChip {
             instruction_counts.entry(pc).and_modify(|count| *count += 1).or_insert(1);
         });
         input.syscall_events.iter().for_each(|event| {
+            let pc = event.0.pc;
+            instruction_counts.entry(pc).and_modify(|count| *count += 1).or_insert(1);
+        });
+        input.trap_load_store_events.iter().for_each(|event| {
             let pc = event.0.pc;
             instruction_counts.entry(pc).and_modify(|count| *count += 1).or_insert(1);
         });

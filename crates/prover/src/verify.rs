@@ -7,10 +7,10 @@ use anyhow::{anyhow, Result};
 use num_bigint::BigUint;
 use slop_algebra::{AbstractField, PrimeField};
 use sp1_core_executor::SP1RecursionProof;
-use sp1_core_machine::riscv::MAX_LOG_NUMBER_OF_SHARDS;
+use sp1_core_machine::riscv::{RiscvAir, MAX_LOG_NUMBER_OF_SHARDS};
 use sp1_hypercube::{
     air::{PublicValues, POSEIDON_NUM_WORDS, PV_DIGEST_NUM_WORDS},
-    koalabears_to_bn254, HashableKey, MachineVerifier, MachineVerifierConfigError,
+    koalabears_to_bn254, HashableKey, Machine, MachineVerifier, MachineVerifierConfigError,
     MachineVerifierError, MachineVerifyingKey, SP1InnerPcs, SP1OuterPcs, SP1PcsProofInner,
     SP1PcsProofOuter, SP1VerifyingKey, SP1WrapProof, PROOF_MAX_NUM_PVS,
 };
@@ -58,7 +58,10 @@ bn254 proof"
 }
 
 /// The verifying key for the program wrapping an SP1 proof into a SNARK friendly format.
+#[cfg(not(feature = "mprotect"))]
 pub const WRAP_VK_BYTES: &[u8] = include_bytes!("../wrap_vk.bin");
+#[cfg(feature = "mprotect")]
+pub const WRAP_VK_BYTES: &[u8] = include_bytes!("../wrap_vk_mprotect.bin");
 
 #[derive(Clone)]
 pub struct SP1Verifier {
@@ -73,8 +76,15 @@ pub struct SP1Verifier {
 
 impl SP1Verifier {
     pub fn new(recursion_vks: VerifierRecursionVks) -> Self {
+        Self::new_with_machine(recursion_vks, RiscvAir::machine())
+    }
+
+    pub fn new_with_machine(
+        recursion_vks: VerifierRecursionVks,
+        machine: Machine<SP1Field, RiscvAir<SP1Field>>,
+    ) -> Self {
         // Get the verifiers from the components.
-        let core = CpuSP1ProverComponents::core_verifier();
+        let core = CpuSP1ProverComponents::core_verifier(machine);
         let compress = CpuSP1ProverComponents::compress_verifier();
         let shrink = CpuSP1ProverComponents::shrink_verifier();
         let wrap = CpuSP1ProverComponents::wrap_verifier();
@@ -344,9 +354,11 @@ impl SP1Verifier {
                 return Err(MachineVerifierError::InvalidPublicValues(
                     "previous_finalize_page_idx != last_finalize_page_idx_prev",
                 ));
-            } else if public_values.is_untrusted_programs_enabled != vk.enable_untrusted_programs {
+            } else if public_values.is_untrusted_programs_enabled
+                != vk.untrusted_config.enable_untrusted_programs
+            {
                 return Err(MachineVerifierError::InvalidPublicValues(
-                    "public_values.is_untrusted_programs_enabled != vk.enable_untrusted_programs",
+                    "public_values.is_untrusted_programs_enabled != vk.untrusted_config.enable_untrusted_programs",
                 ));
             }
 
@@ -364,6 +376,35 @@ impl SP1Verifier {
             return Err(MachineVerifierError::InvalidPublicValues(
                 "the zero address was never finalized",
             ));
+        }
+
+        // Public values and program configuration for untrusted programs.
+        // Constraints:
+        // - `enable_trap_handler` is equal between the `vk` and the public values.
+        // - `trap_context` is equal between the `vk` and the public values.
+        // - `untrusted_memory` is equal between the `vk` and the public values.
+        #[cfg(feature = "mprotect")]
+        for shard_proof in proof.0.iter() {
+            let public_values: &PublicValues<[_; 4], [_; 3], [_; 4], _> =
+                shard_proof.public_values.as_slice().borrow();
+
+            if public_values.trap_context != vk.untrusted_config.trap_context {
+                return Err(MachineVerifierError::InvalidPublicValues(
+                    "trap_context values mismatch",
+                ));
+            }
+
+            if public_values.untrusted_memory != vk.untrusted_config.untrusted_memory {
+                return Err(MachineVerifierError::InvalidPublicValues(
+                    "untrusted_memory values mismatch",
+                ));
+            }
+
+            if public_values.enable_trap_handler != vk.untrusted_config.enable_trap_handler {
+                return Err(MachineVerifierError::InvalidPublicValues(
+                    "enable_trap_handler values mismatch",
+                ));
+            }
         }
 
         // Digest constraints.
@@ -652,11 +693,11 @@ impl SP1Verifier {
     pub fn verify_plonk_bn254(&self, proof: &PlonkBn254Proof, vk: &SP1VerifyingKey) -> Result<()> {
         let prover = PlonkBn254Prover::new();
 
-        let vkey_hash = BigUint::from_str(&proof.public_inputs[0])?;
-        let committed_values_digest = BigUint::from_str(&proof.public_inputs[1])?;
-        let exit_code = BigUint::from_str(&proof.public_inputs[2])?;
-        let vk_root = BigUint::from_str(&proof.public_inputs[3])?;
-        let proof_nonce = BigUint::from_str(&proof.public_inputs[4])?;
+        let vkey_hash = parse_bn254_public_input(&proof.public_inputs[0])?;
+        let committed_values_digest = parse_bn254_public_input(&proof.public_inputs[1])?;
+        let exit_code = parse_bn254_public_input(&proof.public_inputs[2])?;
+        let vk_root = parse_bn254_public_input(&proof.public_inputs[3])?;
+        let proof_nonce = parse_bn254_public_input(&proof.public_inputs[4])?;
         let expected_vk_root = koalabears_to_bn254(&self.recursion_vks.root());
 
         if vk_root != expected_vk_root.as_canonical_biguint() {
@@ -665,6 +706,33 @@ impl SP1Verifier {
 
         if vk.hash_bn254().as_canonical_biguint() != vkey_hash {
             return Err(PlonkVerificationError::InvalidVerificationKey.into());
+        }
+
+        // The encoded_proof contains: exit_code(32) + vk_root(32) + proof_nonce(32) + proof
+        // We need to extract just the proof bytes (starting at offset 96)
+        let encoded_bytes = hex::decode(&proof.encoded_proof)?;
+        if encoded_bytes.len() < 96 {
+            return Err(anyhow!(
+                "Invalid encoded_proof length: {} (expected at least 96)",
+                encoded_bytes.len()
+            ));
+        }
+
+        // Convert BigUint to padded 32-byte big-endian array
+        let to_bytes32 = |v: &BigUint| -> [u8; 32] {
+            let mut padded = [0u8; 32];
+            let bytes = v.to_bytes_be();
+            let start = 32usize.saturating_sub(bytes.len());
+            padded[start..].copy_from_slice(&bytes[..bytes.len().min(32)]);
+            padded
+        };
+
+        // Cross-validate that the metadata embedded in encoded_proof matches public_inputs.
+        if encoded_bytes[0..32] != to_bytes32(&exit_code)
+            || encoded_bytes[32..64] != to_bytes32(&vk_root)
+            || encoded_bytes[64..96] != to_bytes32(&proof_nonce)
+        {
+            return Err(anyhow!("encoded_proof metadata does not match public inputs"));
         }
 
         // Verify the proof with the corresponding public inputs.
@@ -683,26 +751,7 @@ impl SP1Verifier {
                 &build_dir,
             )?;
         } else {
-            // The encoded_proof contains: exit_code(32) + vk_root(32) + proof_nonce(32) + proof
-            // We need to extract just the proof bytes (starting at offset 96)
-            let encoded_bytes = hex::decode(&proof.encoded_proof)?;
-            if encoded_bytes.len() < 96 {
-                return Err(anyhow!(
-                    "Invalid encoded_proof length: {} (expected at least 96)",
-                    encoded_bytes.len()
-                ));
-            }
             let proof_bytes = &encoded_bytes[96..];
-
-            // Convert BigUint to padded 32-byte big-endian array
-            let to_bytes32 = |v: &BigUint| -> [u8; 32] {
-                let mut padded = [0u8; 32];
-                let bytes = v.to_bytes_be();
-                let start = 32usize.saturating_sub(bytes.len());
-                padded[start..].copy_from_slice(&bytes[..bytes.len().min(32)]);
-                padded
-            };
-
             let public_inputs = [
                 to_bytes32(&vkey_hash),
                 to_bytes32(&committed_values_digest),
@@ -724,11 +773,11 @@ impl SP1Verifier {
     ) -> Result<()> {
         let prover = Groth16Bn254Prover::new();
 
-        let vkey_hash = BigUint::from_str(&proof.public_inputs[0])?;
-        let committed_values_digest = BigUint::from_str(&proof.public_inputs[1])?;
-        let exit_code = BigUint::from_str(&proof.public_inputs[2])?;
-        let vk_root = BigUint::from_str(&proof.public_inputs[3])?;
-        let proof_nonce = BigUint::from_str(&proof.public_inputs[4])?;
+        let vkey_hash = parse_bn254_public_input(&proof.public_inputs[0])?;
+        let committed_values_digest = parse_bn254_public_input(&proof.public_inputs[1])?;
+        let exit_code = parse_bn254_public_input(&proof.public_inputs[2])?;
+        let vk_root = parse_bn254_public_input(&proof.public_inputs[3])?;
+        let proof_nonce = parse_bn254_public_input(&proof.public_inputs[4])?;
         let expected_vk_root = koalabears_to_bn254(&self.recursion_vks.root());
 
         if vk_root != expected_vk_root.as_canonical_biguint() {
@@ -737,6 +786,34 @@ impl SP1Verifier {
 
         if vk.hash_bn254().as_canonical_biguint() != vkey_hash {
             return Err(Groth16VerificationError::InvalidVerificationKey.into());
+        }
+
+        // The encoded_proof contains: exit_code(32) + vk_root(32) + proof_nonce(32) + proof(256)
+        // We need to extract just the proof bytes (starting at offset 96)
+        let encoded_bytes = hex::decode(&proof.encoded_proof)?;
+        if encoded_bytes.len() < 96 + 256 {
+            return Err(anyhow!(
+                "Invalid encoded_proof length: {} (expected at least {})",
+                encoded_bytes.len(),
+                96 + 256
+            ));
+        }
+
+        // Convert BigUint to padded 32-byte big-endian array
+        let to_bytes32 = |v: &BigUint| -> [u8; 32] {
+            let mut padded = [0u8; 32];
+            let bytes = v.to_bytes_be();
+            let start = 32usize.saturating_sub(bytes.len());
+            padded[start..].copy_from_slice(&bytes[..bytes.len().min(32)]);
+            padded
+        };
+
+        // Cross-validate that the metadata embedded in encoded_proof matches public_inputs.
+        if encoded_bytes[0..32] != to_bytes32(&exit_code)
+            || encoded_bytes[32..64] != to_bytes32(&vk_root)
+            || encoded_bytes[64..96] != to_bytes32(&proof_nonce)
+        {
+            return Err(anyhow!("encoded_proof metadata does not match public inputs"));
         }
 
         // Verify the proof with the corresponding public inputs.
@@ -758,27 +835,7 @@ impl SP1Verifier {
                 &build_dir,
             )?;
         } else {
-            // The encoded_proof contains: exit_code(32) + vk_root(32) + proof_nonce(32) + proof(256)
-            // We need to extract just the proof bytes (starting at offset 96)
-            let encoded_bytes = hex::decode(&proof.encoded_proof)?;
-            if encoded_bytes.len() < 96 + 256 {
-                return Err(anyhow!(
-                    "Invalid encoded_proof length: {} (expected at least {})",
-                    encoded_bytes.len(),
-                    96 + 256
-                ));
-            }
             let proof_bytes = &encoded_bytes[96..];
-
-            // Convert BigUint to padded 32-byte big-endian array
-            let to_bytes32 = |v: &BigUint| -> [u8; 32] {
-                let mut padded = [0u8; 32];
-                let bytes = v.to_bytes_be();
-                let start = 32usize.saturating_sub(bytes.len());
-                padded[start..].copy_from_slice(&bytes[..bytes.len().min(32)]);
-                padded
-            };
-
             let public_inputs = [
                 to_bytes32(&vkey_hash),
                 to_bytes32(&committed_values_digest),
@@ -817,4 +874,24 @@ pub fn verify_public_values(
     }
 
     Ok(())
+}
+
+/// Parse a BN254 public input string as a BigUint and verify it fits within 32 bytes.
+fn parse_bn254_public_input(s: &str) -> Result<BigUint> {
+    let value = BigUint::from_str(s)?;
+    if value.to_bytes_be().len() > 32 {
+        return Err(anyhow!("public input exceeds 32 bytes: {}", s));
+    }
+    Ok(value)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wrap_vk_bytes_deserialize() {
+        let _vk: MachineVerifyingKey<SP1OuterGlobalContext> =
+            bincode::deserialize(WRAP_VK_BYTES).expect("WRAP_VK_BYTES failed to deserialize");
+    }
 }

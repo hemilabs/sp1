@@ -5,8 +5,8 @@ use core::arch::asm;
 ///
 /// ### Safety
 ///
-/// The caller must ensure that `w` and `state` are valid pointers to data that is aligned along a
-/// four byte boundary.
+/// The caller must ensure that `w` and `state` are valid pointers to data that is aligned along an
+/// eight byte boundary.
 #[allow(unused_variables)]
 #[no_mangle]
 pub extern "C" fn syscall_sha256_compress(w: *mut [u64; 64], state: *mut [u64; 8]) {

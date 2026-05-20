@@ -5,7 +5,7 @@ use core::arch::asm;
 ///
 /// ### Safety
 ///
-/// The caller must ensure that `state` is valid pointer to data that is aligned along a four
+/// The caller must ensure that `state` is valid pointer to data that is aligned along an eight
 /// byte boundary.
 #[allow(unused_variables)]
 #[no_mangle]

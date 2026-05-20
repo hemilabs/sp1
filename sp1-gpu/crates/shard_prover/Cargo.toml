@@ -44,6 +44,10 @@ thiserror = "1.0"
 tracing = { workspace = true }
 tokio = { workspace = true }
 
+[features]
+default = []
+mprotect = ["sp1-hypercube/mprotect"]
+
 [dev-dependencies]
 serial_test = "3.1"
 zstd = "0.13.3"
@@ -57,6 +61,16 @@ slop-stacked = { workspace = true }
 # sp1
 sp1-core-machine = { workspace = true }
 sp1-primitives = { workspace = true }
+
+# misc
+rand = { workspace = true }
+
+# Benchmarks
+criterion = "0.5"
+
+[[bench]]
+name = "prove_trusted_evaluations"
+harness = false
 
 [lints]
 workspace = true

@@ -79,6 +79,7 @@ pub fn dummy_pcs_proof(
         fri_commitments: vec![dummy_hash(); max_pcs_log_height],
         final_poly: InnerChallenge::zero(),
         pow_witness: InnerVal::zero(),
+        batch_grinding_witness: InnerVal::zero(),
         component_polynomials_query_openings_and_proofs: dummy_component_polys.collect(),
         query_phase_openings_and_proofs: dummy_query_proof(
             max_pcs_log_height,

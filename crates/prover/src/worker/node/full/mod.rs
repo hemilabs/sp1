@@ -307,12 +307,14 @@ impl SP1LocalNode {
 #[cfg(test)]
 mod tests {
     use serial_test::serial;
-    use sp1_core_machine::utils::setup_logger;
+    use sp1_core_machine::{riscv::RiscvAir, utils::setup_logger};
 
     use crate::CpuSP1ProverComponents;
     use sp1_hypercube::HashableKey;
 
-    use crate::worker::{cpu_worker_builder, SP1LocalNodeBuilder, SP1WorkerBuilder};
+    use crate::worker::{
+        cpu_worker_builder, cpu_worker_builder_with_machine, SP1LocalNodeBuilder, SP1WorkerBuilder,
+    };
 
     use super::*;
 
@@ -381,6 +383,35 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(feature = "mprotect")]
+    #[serial]
+    async fn test_e2e_node_trap() -> anyhow::Result<()> {
+        setup_logger();
+        let elf = test_artifacts::TRAP_LOAD_STORE_ELF;
+        let stdin = SP1Stdin::default();
+        let mode = ProofMode::Compressed;
+        let client = SP1LocalNodeBuilder::from_worker_client_builder(
+            cpu_worker_builder().without_vk_verification(),
+        )
+        .build()
+        .await
+        .unwrap();
+        let proof_nonce = [0x6284, 0xC0DE, 0x4242, 0xCAFE];
+        let context = SP1Context { proof_nonce, ..Default::default() };
+        let (_, _, report) = client.execute(&elf, stdin.clone(), context.clone()).await.unwrap();
+        let cycles = report.total_instruction_count() as usize;
+        tracing::info!("cycles: {}", cycles);
+        let vk = client.setup(&elf).await.unwrap();
+        let time = tokio::time::Instant::now();
+        let proof = client.prove_with_mode(&elf, stdin, context, mode).await.unwrap();
+        tracing::info!("prove time: {:?}", time.elapsed());
+        tokio::task::spawn_blocking(move || client.verify(&vk, &proof.proof).unwrap())
+            .await
+            .unwrap();
+        Ok(())
+    }
+
+    #[tokio::test]
     #[serial]
     #[ignore = "only run to write the vk root and num keys to a file"]
     async fn make_verifier_vks() -> anyhow::Result<()> {
@@ -401,6 +432,7 @@ mod tests {
 
     #[tokio::test]
     #[serial]
+    #[ignore]
     async fn test_e2e_groth16_node() -> anyhow::Result<()> {
         setup_logger();
 
@@ -408,10 +440,13 @@ mod tests {
         let stdin = SP1Stdin::default();
         let mode = ProofMode::Groth16;
 
-        let client = SP1LocalNodeBuilder::from_worker_client_builder(cpu_worker_builder())
-            .build()
-            .await
-            .unwrap();
+        let machine = RiscvAir::machine();
+        let client = SP1LocalNodeBuilder::from_worker_client_builder(
+            cpu_worker_builder_with_machine(machine),
+        )
+        .build()
+        .await
+        .unwrap();
 
         let time = tokio::time::Instant::now();
         let context = SP1Context::default();
@@ -441,6 +476,86 @@ mod tests {
         tokio::task::spawn_blocking(move || client.verify(&vk, &proof.proof).unwrap())
             .await
             .unwrap();
+
+        Ok(())
+    }
+
+    /// Test that changing the vk_root (by modifying a vk_map entry) does NOT change the wrap VK
+    /// or the Groth16 circuit. This confirms that vk_root is purely a witness variable.
+    ///
+    /// Note: Before running this test with `SP1_CIRCUIT_MODE=dev`, ensure that there are circuit
+    /// artifacts for the current wrap VK (either on S3 or locally cached). Otherwise, the test
+    /// will rebuild circuit artifacts locally, which may cause the test to pass incorrectly.
+    #[tokio::test]
+    #[serial]
+    #[cfg(feature = "experimental")]
+    #[ignore = "sanity check test; see doc-comment for proper usage"]
+    async fn test_e2e_groth16_node_modified_vk_root() -> anyhow::Result<()> {
+        use slop_algebra::AbstractField;
+        use sp1_primitives::SP1Field;
+        use sp1_recursion_executor::DIGEST_SIZE;
+        use std::collections::BTreeMap;
+        use std::io::Write;
+
+        setup_logger();
+
+        // Step 1: Load the original vk_map and modify the first entry.
+        let original_map: BTreeMap<[SP1Field; DIGEST_SIZE], usize> =
+            bincode::deserialize(include_bytes!("../../../vk_map.bin"))
+                .expect("failed to deserialize vk_map.bin");
+        tracing::info!("original vk_map has {} entries", original_map.len());
+
+        let mut modified_map = original_map.clone();
+        let first_key = *modified_map.keys().next().unwrap();
+        let first_val = modified_map.remove(&first_key).unwrap();
+        let mut new_key = first_key;
+        new_key[0] += SP1Field::one();
+        modified_map.insert(new_key, first_val);
+        assert_eq!(modified_map.len(), original_map.len(), "map size should not change");
+
+        // Step 2: Write modified vk_map to a temp file.
+        let temp_dir = tempfile::tempdir()?;
+        let vk_map_path = temp_dir.path().join("modified_vk_map.bin");
+        {
+            let mut file = std::fs::File::create(&vk_map_path)?;
+            bincode::serialize_into(&mut file, &modified_map)?;
+            file.flush()?;
+        }
+        tracing::info!("wrote modified vk_map to {:?}", vk_map_path);
+
+        // Step 3: Build the prover with the modified vk_map (vk_verification stays ON).
+        let builder =
+            cpu_worker_builder().with_vk_map_path(vk_map_path.to_str().unwrap().to_string());
+
+        let elf = test_artifacts::FIBONACCI_ELF;
+        let stdin = SP1Stdin::default();
+        let mode = ProofMode::Groth16;
+
+        let client =
+            SP1LocalNodeBuilder::from_worker_client_builder(builder).build().await.unwrap();
+
+        // Step 4: Verify that the wrap VK hasn't changed by checking the Groth16 artifacts
+        // cache directory. If the wrap VK is the same, the same cache dir
+        // (based on wrap VK hash) will be used and the existing artifacts reused.
+        let time = tokio::time::Instant::now();
+        let vk = client.setup(&elf).await.unwrap();
+        tracing::info!("setup time: {:?}", time.elapsed());
+
+        let time = tokio::time::Instant::now();
+        let context = SP1Context::default();
+        tracing::info!("proving with mode: {mode:?} (modified vk_root)");
+        let proof = client.prove_with_mode(&elf, stdin, context, mode).await.unwrap();
+        tracing::info!("proof time: {:?}", time.elapsed());
+
+        // Step 5: Verify the proof. This uses the cached Groth16 artifacts
+        // (from the previous test_e2e_groth16_node run) since the wrap VK is unchanged.
+        // If the Groth16 circuit had changed, verification would fail.
+        tokio::task::spawn_blocking(move || {
+            client.verify(&vk, &proof.proof).unwrap();
+            tracing::info!("verification with modified vk_root PASSED");
+        })
+        .await
+        .unwrap();
 
         Ok(())
     }

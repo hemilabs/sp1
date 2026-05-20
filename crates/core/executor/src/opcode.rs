@@ -82,73 +82,72 @@ pub enum Opcode {
     REM = 17,
     /// rd ← rs1 % rs2 (unsigned), pc ← pc + 4
     REMU = 18,
-    /// rd ← sx(m8(rs1 + imm)), pc ← pc + 4
-    LB = 19,
-    /// rd ← sx(m16(rs1 + imm)), pc ← pc + 4
-    LH = 20,
-    /// rd ← sx(m32(rs1 + imm)), pc ← pc + 4
-    LW = 21,
-    /// rd ← zx(m8(rs1 + imm)), pc ← pc + 4
-    LBU = 22,
-    /// rd ← zx(m16(rs1 + imm)), pc ← pc + 4
-    LHU = 23,
-    /// m8(rs1 + imm) ← rs2[7:0], pc ← pc + 4
-    SB = 24,
-    /// m16(rs1 + imm) ← rs2[15:0], pc ← pc + 4
-    SH = 25,
-    /// m32(rs1 + imm) ← rs2[31:0], pc ← pc + 4
-    SW = 26,
-    /// pc ← pc + ((rs1 == rs2) ? imm : 4)
-    BEQ = 27,
-    /// pc ← pc + ((rs1 != rs2) ? imm : 4)
-    BNE = 28,
-    /// pc ← pc + ((rs1 < rs2) ? imm : 4) (signed)
-    BLT = 29,
-    /// pc ← pc + ((rs1 >= rs2) ? imm : 4) (signed)
-    BGE = 30,
-    /// pc ← pc + ((rs1 < rs2) ? imm : 4) (unsigned)
-    BLTU = 31,
-    /// pc ← pc + ((rs1 >= rs2) ? imm : 4) (unsigned)
-    BGEU = 32,
-    /// rd ← pc + 4, pc ← pc + imm
-    JAL = 33,
-    /// rd ← pc + 4, pc ← (rs1 + imm) & ∼1
-    JALR = 34,
-    /// rd ← pc + imm, pc ← pc + 4
-    AUIPC = 35,
-    /// rd ← imm, pc ← pc + 4
-    LUI = 36,
-    /// Transfer control to the ecall handler.
-    ECALL = 37,
-    /// Transfer control to the debugger.
-    EBREAK = 38,
-    // RISCV-64
     /// rd ← rs1 + rs2, pc ← pc + 4
-    ADDW = 39,
+    ADDW = 19,
     /// rd ← rs1 - rs2, pc ← pc + 4
-    SUBW = 40,
+    SUBW = 20,
     /// rd ← rs1 << rs2, pc ← pc + 4
-    SLLW = 41,
+    SLLW = 21,
     /// rd ← rs1 >> rs2 (logical), pc ← pc + 4
-    SRLW = 42,
+    SRLW = 22,
     /// rd ← rs1 >> rs2 (arithmetic), pc ← pc + 4
-    SRAW = 43,
-    /// rd ← sx(m32(rs1 + imm)), pc ← pc + 4
-    LWU = 44,
-    /// rd ← sx(m8(rs1 + imm)), pc ← pc + 4
-    LD = 45,
-    /// m8(rs1 + imm) ← rs2[7:0], pc ← pc + 4
-    SD = 46,
+    SRAW = 23,
     /// rd ← rs1 + imm, pc ← pc + 4
-    MULW = 47,
+    MULW = 24,
     /// rd ← rs1 / rs2 (signed), pc ← pc + 4
-    DIVW = 48,
+    DIVW = 25,
     /// rd ← rs1 / rs2 (unsigned), pc ← pc + 4
-    DIVUW = 49,
+    DIVUW = 26,
     /// rd ← rs1 % rs2 (signed), pc ← pc + 4
-    REMW = 50,
+    REMW = 27,
     /// rd ← rs1 % rs2 (unsigned), pc ← pc + 4
-    REMUW = 51,
+    REMUW = 28,
+    /// rd ← sx(m8(rs1 + imm)), pc ← pc + 4
+    LB = 29,
+    /// rd ← sx(m16(rs1 + imm)), pc ← pc + 4
+    LH = 30,
+    /// rd ← sx(m32(rs1 + imm)), pc ← pc + 4
+    LW = 31,
+    /// rd ← zx(m8(rs1 + imm)), pc ← pc + 4
+    LBU = 32,
+    /// rd ← zx(m16(rs1 + imm)), pc ← pc + 4
+    LHU = 33,
+    /// rd ← sx(m32(rs1 + imm)), pc ← pc + 4
+    LWU = 34,
+    /// rd ← sx(m8(rs1 + imm)), pc ← pc + 4
+    LD = 35,
+    /// m8(rs1 + imm) ← rs2[7:0], pc ← pc + 4
+    SB = 36,
+    /// m16(rs1 + imm) ← rs2[15:0], pc ← pc + 4
+    SH = 37,
+    /// m32(rs1 + imm) ← rs2[31:0], pc ← pc + 4
+    SW = 38,
+    /// m8(rs1 + imm) ← rs2[7:0], pc ← pc + 4
+    SD = 39,
+    /// pc ← pc + ((rs1 == rs2) ? imm : 4)
+    BEQ = 40,
+    /// pc ← pc + ((rs1 != rs2) ? imm : 4)
+    BNE = 41,
+    /// pc ← pc + ((rs1 < rs2) ? imm : 4) (signed)
+    BLT = 42,
+    /// pc ← pc + ((rs1 >= rs2) ? imm : 4) (signed)
+    BGE = 43,
+    /// pc ← pc + ((rs1 < rs2) ? imm : 4) (unsigned)
+    BLTU = 44,
+    /// pc ← pc + ((rs1 >= rs2) ? imm : 4) (unsigned)
+    BGEU = 45,
+    /// rd ← pc + 4, pc ← pc + imm
+    JAL = 46,
+    /// rd ← pc + 4, pc ← (rs1 + imm) & ∼1
+    JALR = 47,
+    /// rd ← pc + imm, pc ← pc + 4
+    AUIPC = 48,
+    /// rd ← imm, pc ← pc + 4
+    LUI = 49,
+    /// Transfer control to the ecall handler.
+    ECALL = 50,
+    /// Transfer control to the debugger.
+    EBREAK = 51,
     /// Unimplemented instruction.
     UNIMP = 52,
 }

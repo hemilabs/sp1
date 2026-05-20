@@ -12,4 +12,25 @@ pub fn main() {
     }
 
     println!("{:?}", state);
+
+    for i in 0..2 {
+        let mut buf = [1u64; 64];
+        let w = buf.as_mut_ptr();
+        syscall_sha256_compress(w as *mut [u64; 64], w as *mut [u64; 8]);
+
+        let mut buf = [1u64; 64];
+        let w = buf.as_mut_ptr();
+        let h = unsafe { w.add(4) };
+        syscall_sha256_compress(w as *mut [u64; 64], h as *mut [u64; 8]);
+
+        let mut buf = [1u64; 64];
+        let w = buf.as_mut_ptr();
+        let h = unsafe { w.add(56) };
+        syscall_sha256_compress(w as *mut [u64; 64], h as *mut [u64; 8]);
+
+        let mut buf = [1u64; 68];
+        let h = buf.as_mut_ptr();
+        let w = unsafe { h.add(4) };
+        syscall_sha256_compress(w as *mut [u64; 64], h as *mut [u64; 8]);
+    }
 }

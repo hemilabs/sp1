@@ -24,15 +24,13 @@ slop-alloc = { workspace = true }
 slop-matrix = { workspace = true }
 slop-bn254 = { workspace = true }
 slop-koala-bear = { workspace = true }
+slop-utils = { workspace = true }
+
 
 thiserror = { workspace = true }
 serde = { workspace = true }
 itertools = { workspace = true }
 derive-where = { workspace = true }
-
-# For Bn254 setup
-zkhash = { workspace = true }
-ff = { workspace = true, features = ["derive", "derive_bits"] }
 
 
 [dev-dependencies]

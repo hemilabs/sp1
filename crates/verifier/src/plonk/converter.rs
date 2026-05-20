@@ -70,17 +70,13 @@ pub(crate) fn load_plonk_verifying_key_from_bytes(
     let g2_0 = unchecked_compressed_x_to_g2_point(&buffer[offset + 32..offset + 96])?;
     let g2_1 = unchecked_compressed_x_to_g2_point(&buffer[offset + 96..offset + 160])?;
 
-    offset += 160 + 33788;
+    offset += 160 + 33792;
 
-    let num_commitment_constraint_indexes = u64::from_be_bytes([
+    let num_commitment_constraint_indexes = u32::from_be_bytes([
         buffer[offset],
         buffer[offset + 1],
         buffer[offset + 2],
         buffer[offset + 3],
-        buffer[offset + 4],
-        buffer[offset + 5],
-        buffer[offset + 6],
-        buffer[offset + 7],
     ]) as usize;
 
     // Verifying key for SP1 proofs have this size.
@@ -89,7 +85,7 @@ pub(crate) fn load_plonk_verifying_key_from_bytes(
     }
 
     let mut commitment_constraint_indexes = Vec::new();
-    offset += 8;
+    offset += 4;
     for _ in 0..num_commitment_constraint_indexes {
         let index = u64::from_be_bytes([
             buffer[offset],

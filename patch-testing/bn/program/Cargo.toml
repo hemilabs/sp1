@@ -24,10 +24,26 @@ path = "bin/test_g1_add.rs"
 name = "bn_test_g1_double"
 path = "bin/test_g1_double.rs"
 
+[[bin]]
+name = "bn_test_g1_add_neg"
+path = "bin/test_g1_add_neg.rs"
+
+[[bin]]
+name = "bn_test_g1_mul_zero"
+path = "bin/test_g1_mul_zero.rs"
+
+[[bin]]
+name = "bn_test_g1_msm_edge"
+path = "bin/test_g1_msm_edge.rs"
+
+[[bin]]
+name = "bn_test_fq_partial_ord"
+path = "bin/test_fq_partial_ord.rs"
+
 [dependencies]
-sp1-zkvm = {  path = "../../../crates/zkvm/entrypoint" }
+sp1-zkvm = { path = "../../../crates/zkvm/entrypoint" }
 sp1-lib = { path = "../../../crates/zkvm/lib" }
-substrate-bn = { git = "https://github.com/sp1-patches/bn", tag = "patch-0.6.0-sp1-6.0.0", package = "substrate-bn-succinct-rs" }
+substrate-bn = { git = "https://github.com/sp1-patches/bn", tag = "patch-0.6.0-sp1-6.2.0", package = "substrate-bn-succinct-rs" }
 
 [patch.crates-io]
 sp1-lib = { path = "../../../crates/zkvm/lib" }

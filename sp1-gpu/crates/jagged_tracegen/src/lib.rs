@@ -140,6 +140,7 @@ fn sum_to_trace(dst: *mut Felt, src: *const u32, backend: &TaskScope) {
 /// Sets up the jagged traces. TODO: can use fewer arguments by packing the mutable stuff into TraceDenseData.
 ///
 /// Returns the final offset, the final number of columns, the amount of padding, and the table index.
+/// dense_data, col_index, etc. are preallocated and filled in during this function
 #[allow(clippy::too_many_arguments)]
 #[instrument(skip_all, level = "debug")]
 async fn generate_jagged_traces(
@@ -399,8 +400,13 @@ async fn host_preprocessed_tracegen<A: CudaTracegenAir<Felt>>(
                         air.generate_preprocessed_trace_into(&program, slice);
                         let start_pointer = unsafe { base_ptr.add(offset) as usize };
                         // Since it's unbounded, it will only error if the receiver is disconnected.
-                        tx.unbounded_send((air.name().to_string(), start_pointer, height, width))
-                            .unwrap();
+                        // If the receiver dropped (task cancelled), exit gracefully instead of panicking.
+                        let _ = tx.unbounded_send((
+                            air.name().to_string(),
+                            start_pointer,
+                            height,
+                            width,
+                        ));
                     }
                 },
             );
@@ -733,8 +739,8 @@ where
                             };
                             air.generate_trace_into(&record, &mut A::Record::default(), slice);
                             let start_pointer = unsafe { base_ptr.add(offset) as usize };
-                            // Since it's unbounded, it will only error if the receiver is disconnected.
-                            tx.unbounded_send((air.name().to_string(), start_pointer, height, width)).unwrap();
+                            // If the receiver dropped (task cancelled), exit gracefully instead of panicking.
+                            let _ = tx.unbounded_send((air.name().to_string(), start_pointer, height, width));
                         },
                     );
                 });

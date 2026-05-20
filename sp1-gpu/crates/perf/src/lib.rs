@@ -16,6 +16,8 @@ pub const LOOP_ELF: &[u8] =
 pub const POSEIDON2_ELF: &[u8] =
     include_bytes!("../../prover_components/programs/poseidon2/riscv64im-succinct-zkvm-elf");
 pub const RSP_ELF: &[u8] = include_bytes!("../programs/rsp/elf/rsp-client");
+pub const TRAP_ELF: &[u8] =
+    include_bytes!("../../prover_components/programs/trap/riscv64im-succinct-zkvm-elf");
 
 pub fn get_program_and_input(program: String, param: String) -> (Vec<u8>, SP1Stdin) {
     // If the program elf is local, load it.
@@ -43,6 +45,9 @@ pub fn get_program_and_input(program: String, param: String) -> (Vec<u8>, SP1Std
             let n = param.parse::<usize>().unwrap_or(1000);
             stdin.write(&n);
             return (POSEIDON2_ELF.to_vec(), stdin);
+        } else if program_path == "trap" {
+            let stdin = SP1Stdin::new();
+            return (TRAP_ELF.to_vec(), stdin);
         } else if program_path == "rsp" {
             let mut stdin = SP1Stdin::new();
             let client_input_path = format!("sp1-gpu/crates/perf/programs/rsp/input/{param}.bin");
@@ -95,4 +100,21 @@ pub fn get_program_and_input(program: String, param: String) -> (Vec<u8>, SP1Std
     std::fs::remove_file(stdin_path).unwrap();
 
     (program, stdin)
+}
+
+#[cfg(test)]
+mod tests {
+    use sp1_hypercube::SP1PcsProofInner;
+    use sp1_recursion_circuit::machine::SP1CompressWithVKeyWitnessValues;
+
+    #[test]
+    fn test_recursion_inputs_valid() {
+        let shrink_bytes = include_bytes!("../recursion_records/shrink_input.bin");
+        let compose_bytes = include_bytes!("../recursion_records/max_arity_input.bin");
+
+        let _: SP1CompressWithVKeyWitnessValues<SP1PcsProofInner> =
+            bincode::deserialize(shrink_bytes).expect("failed to deserialize shrink_input; regenerate by running a shrink proof with `SP1_RECORD_SHRINK_INPUT=1`");
+        let _: SP1CompressWithVKeyWitnessValues<SP1PcsProofInner> =
+            bincode::deserialize(compose_bytes).expect("failed to deserialize compose_input; regenerate by running an arity-4 compose proof with `SP1_RECORD_MAX_ARITY_INPUT=1`");
+    }
 }

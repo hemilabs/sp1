@@ -10,7 +10,7 @@ use core::arch::asm;
 /// ### Safety
 ///
 /// The caller must ensure that `a`, `b`, `c`, `d`, and `e` are valid pointers to data that is
-/// aligned along a four byte boundary.
+/// aligned along an eight byte boundary.
 #[allow(unused_variables)]
 #[no_mangle]
 pub extern "C" fn syscall_uint256_add_with_carry(
@@ -46,7 +46,7 @@ pub extern "C" fn syscall_uint256_add_with_carry(
 /// ### Safety
 ///
 /// The caller must ensure that `a`, `b`, `c`, `d`, and `e` are valid pointers to data that is
-/// aligned along a four byte boundary.
+/// aligned along an eight byte boundary.
 #[allow(unused_variables)]
 #[no_mangle]
 pub extern "C" fn syscall_uint256_mul_with_carry(

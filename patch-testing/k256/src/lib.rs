@@ -214,3 +214,15 @@ pub fn test_schnorr_verify(stdin: &mut sp1_sdk::SP1Stdin) -> impl FnOnce(sp1_sdk
         }
     }
 }
+
+#[sp1_test::sp1_test("k256_point_ops", gpu, prove)]
+pub fn test_point_ops_edge_cases(
+    stdin: &mut sp1_sdk::SP1Stdin,
+) -> impl FnOnce(sp1_sdk::SP1PublicValues) {
+    move |mut public| {
+        for expected in 1u8..=10 {
+            let got = public.read::<u8>();
+            assert_eq!(got, expected);
+        }
+    }
+}

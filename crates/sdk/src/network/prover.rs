@@ -33,10 +33,11 @@ use anyhow::{Context, Result};
 use sp1_build::Elf;
 use sp1_core_executor::{SP1Context, StatusCode};
 use sp1_core_machine::io::SP1Stdin;
-use sp1_prover::{
-    worker::{SP1LightNode, SP1NodeCore},
-    SP1_CIRCUIT_VERSION,
-};
+use sp1_core_machine::riscv::RiscvAir;
+use sp1_hypercube::Machine;
+use sp1_primitives::SP1Field;
+use sp1_prover::worker::{SP1LightNode, SP1NodeCore};
+use sp1_prover::SP1_CIRCUIT_VERSION;
 
 use tokio::time::sleep;
 
@@ -86,6 +87,7 @@ impl Prover for NetworkProver {
             treasury: None,
             max_price_per_pgu: None,
             auction_timeout: None,
+            private_stdin: false,
         }
     }
 
@@ -136,11 +138,22 @@ impl NetworkProver {
         rpc_url: &str,
         network_mode: NetworkMode,
     ) -> Self {
+        Self::new_with_machine(signer, rpc_url, network_mode, RiscvAir::machine()).await
+    }
+
+    #[must_use]
+    /// Same as `new` but with a custom machine
+    pub async fn new_with_machine(
+        signer: impl Into<NetworkSigner>,
+        rpc_url: &str,
+        network_mode: NetworkMode,
+        machine: Machine<SP1Field, RiscvAir<SP1Field>>,
+    ) -> Self {
         // Install default CryptoProvider if not already installed.
         let _ = rustls::crypto::ring::default_provider().install_default();
 
         let signer = signer.into();
-        let node = SP1LightNode::new().await;
+        let node = SP1LightNode::new_with_machine(machine).await;
         let client = NetworkClient::new(signer, rpc_url, network_mode);
         Self { client, node, tee_signers: vec![], network_mode }
     }
@@ -315,28 +328,26 @@ impl NetworkProver {
 
         let maybe_proof = maybe_proof.map(Into::into);
 
-        // Check if current time exceeds deadline. If so, the proof has timed out.
+        let execution_status = ExecutionStatus::try_from(status.execution_status()).unwrap();
+        let fulfillment_status = FulfillmentStatus::try_from(status.fulfillment_status()).unwrap();
+
+        // Check fulfillment before the deadline — a fulfilled proof should be
+        // returned even if polled after the deadline has passed.
+        if fulfillment_status == FulfillmentStatus::Fulfilled {
+            return Ok((maybe_proof, fulfillment_status));
+        }
+        if execution_status == ExecutionStatus::Unexecutable {
+            return Err(Error::RequestUnexecutable { request_id: request_id.to_vec() }.into());
+        }
+        if fulfillment_status == FulfillmentStatus::Unfulfillable {
+            return Err(Error::RequestUnfulfillable { request_id: request_id.to_vec() }.into());
+        }
+
+        // Only check the deadline for requests that are still in progress.
         let current_time =
             std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
         if current_time > status.deadline() {
             return Err(Error::RequestTimedOut { request_id: request_id.to_vec() }.into());
-        }
-
-        // Get the execution and fulfillment statuses.
-        let execution_status = ExecutionStatus::try_from(status.execution_status()).unwrap();
-        let fulfillment_status = FulfillmentStatus::try_from(status.fulfillment_status()).unwrap();
-
-        // Check the execution status.
-        if execution_status == ExecutionStatus::Unexecutable {
-            return Err(Error::RequestUnexecutable { request_id: request_id.to_vec() }.into());
-        }
-
-        // Check the fulfillment status.
-        if fulfillment_status == FulfillmentStatus::Fulfilled {
-            return Ok((maybe_proof, fulfillment_status));
-        }
-        if fulfillment_status == FulfillmentStatus::Unfulfillable {
-            return Err(Error::RequestUnfulfillable { request_id: request_id.to_vec() }.into());
         }
 
         Ok((None, fulfillment_status))
@@ -382,6 +393,7 @@ impl NetworkProver {
         base_fee: u64,
         max_price_per_pgu: u64,
         domain: Vec<u8>,
+        private_stdin: bool,
     ) -> Result<B256> {
         if self.client.rpc_url == TEE_NETWORK_RPC_URL && strategy != FulfillmentStrategy::Reserved {
             return Err(anyhow::anyhow!(
@@ -449,6 +461,7 @@ impl NetworkProver {
                 base_fee,
                 max_price_per_pgu,
                 domain,
+                private_stdin,
             )
             .await?;
 
@@ -566,6 +579,7 @@ impl NetworkProver {
         verifier: Option<Address>,
         treasury: Option<Address>,
         max_price_per_pgu: Option<u64>,
+        private_stdin: bool,
     ) -> Result<B256> {
         let vk_hash = self.register_program(&pk.vk, &pk.elf).await?;
         let (cycle_limit, gas_limit, public_values_hash) = self
@@ -600,6 +614,7 @@ impl NetworkProver {
             base_fee,
             max_price_per_pgu,
             domain,
+            private_stdin,
         )
         .await
     }
@@ -624,6 +639,7 @@ impl NetworkProver {
         treasury: Option<Address>,
         max_price_per_pgu: Option<u64>,
         auction_timeout: Option<Duration>,
+        private_stdin: bool,
     ) -> Result<SP1ProofWithPublicValues> {
         #[allow(unused_mut)]
         let mut whitelist = whitelist.clone();
@@ -648,6 +664,7 @@ impl NetworkProver {
                     verifier,
                     treasury,
                     max_price_per_pgu,
+                    private_stdin,
                 )
                 .await?;
 

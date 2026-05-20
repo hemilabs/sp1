@@ -35,10 +35,12 @@ use sp1_recursion_compiler::{
     ir::{Builder, DslIrProgram},
 };
 use sp1_recursion_executor::{RecursionProgram, DIGEST_SIZE};
+#[cfg(feature = "mprotect")]
+use sp1_verifier::VerifierRecursionVks;
 
 use crate::{
     shapes::{create_all_input_shapes, SP1RecursionProofShape},
-    worker::{TaskError, DEFAULT_MAX_COMPOSE_ARITY},
+    worker::TaskError,
     CompressAir, RecursionSC,
 };
 
@@ -48,12 +50,6 @@ pub struct RecursionVks {
     map: BTreeMap<<SP1GlobalContext as IopCtx>::Digest, usize>,
     tree: MerkleTree<SP1GlobalContext>,
     vk_verification: bool,
-}
-
-impl Default for RecursionVks {
-    fn default() -> Self {
-        Self::new(None, DEFAULT_MAX_COMPOSE_ARITY, true)
-    }
 }
 
 impl RecursionVks {
@@ -67,7 +63,8 @@ impl RecursionVks {
     ) -> Self {
         // Pad the map to the expected number of shapes. This allows us to build partial vk maps
         // for development purposes.
-        let num_shapes = create_all_input_shapes(RiscvAir::machine().shape(), max_compose_arity)
+        let machine = RiscvAir::machine();
+        let num_shapes = create_all_input_shapes(machine.shape(), max_compose_arity)
             .into_iter()
             .collect::<BTreeSet<_>>()
             .len();
@@ -130,6 +127,17 @@ impl RecursionVks {
         self.vk_verification
     }
 
+    /// Build a [`VerifierRecursionVks`] whose `root`, `num_keys`, and
+    /// `vk_verification` match this prover-side instance.
+    #[cfg(feature = "mprotect")]
+    pub fn to_verifier_vks(&self) -> VerifierRecursionVks {
+        VerifierRecursionVks {
+            root: self.root,
+            vk_verification: self.vk_verification,
+            num_keys: self.map.len(),
+        }
+    }
+
     pub fn open(
         &self,
         vk: &MachineVerifyingKey<SP1GlobalContext>,
@@ -152,6 +160,7 @@ impl RecursionVks {
         // Verify the proof.
         verify_merkle_proof(&proof, value, self.root)
             .map_err(|e| TaskError::Fatal(anyhow::anyhow!("invalid merkle proof: {:?}", e)))?;
+
         Ok((value, proof))
     }
 
@@ -160,9 +169,15 @@ impl RecursionVks {
         proof: &MerkleProof<SP1GlobalContext>,
         vk: &MachineVerifyingKey<SP1GlobalContext>,
     ) -> Result<(), TaskError> {
-        let digest = vk.hash_koalabear();
-        verify_merkle_proof(proof, digest, self.root)
-            .map_err(|e| TaskError::Fatal(anyhow::anyhow!("invalid merkle proof: {:?}", e)))
+        let mut digest = vk.hash_koalabear();
+        if !self.vk_verification {
+            let num_vks = self.num_keys();
+            let vk_index = digest[0].as_canonical_u32() % num_vks as u32;
+            digest = [SP1Field::from_canonical_u32(vk_index); DIGEST_SIZE];
+        }
+        let result = verify_merkle_proof(proof, digest, self.root)
+            .map_err(|e| TaskError::Fatal(anyhow::anyhow!("invalid merkle proof: {:?}", e)));
+        result
     }
 
     pub fn height(&self) -> usize {
@@ -230,7 +245,7 @@ pub(crate) fn deferred_program_from_input(
 }
 
 /// The "compose" program, which verifies some number of normalized shard proofs.
-pub(crate) fn compose_program_from_input(
+pub fn compose_program_from_input(
     recursive_verifier: &RecursiveShardVerifier<
         SP1GlobalContext,
         CompressAir<InnerVal>,
@@ -267,7 +282,7 @@ pub(crate) fn compose_program_from_input(
 }
 
 /// The "shrink" program, which only verifies the single root shard.
-pub(crate) fn shrink_program_from_input(
+pub fn shrink_program_from_input(
     recursive_verifier: &RecursiveShardVerifier<
         SP1GlobalContext,
         CompressAir<InnerVal>,
@@ -397,7 +412,7 @@ pub(crate) fn dummy_deferred_input(
     }
 }
 
-pub(crate) fn recursive_verifier<GC, A, C>(
+pub fn recursive_verifier<GC, A, C>(
     shard_verifier: &ShardVerifier<GC, SP1SC<GC, A>>,
 ) -> RecursiveShardVerifier<GC, A, C>
 where

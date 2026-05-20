@@ -146,6 +146,7 @@ where
         let query_phase_openings = self.query_phase_openings_and_proofs.read(builder);
         let final_poly = self.final_poly.read(builder);
         let pow_witness = self.pow_witness.read(builder);
+        let batch_grinding_witness = self.batch_grinding_witness.read(builder);
         RecursiveBasefoldProof::<C, GC> {
             univariate_messages,
             fri_commitments,
@@ -153,6 +154,7 @@ where
             query_phase_openings_and_proofs: query_phase_openings,
             final_poly,
             pow_witness,
+            batch_grinding_witness,
         }
     }
     fn write(&self, witness: &mut impl WitnessWriter<C>) {
@@ -162,6 +164,7 @@ where
         self.query_phase_openings_and_proofs.write(witness);
         self.final_poly.write(witness);
         self.pow_witness.write(witness);
+        self.batch_grinding_witness.write(witness);
     }
 }
 

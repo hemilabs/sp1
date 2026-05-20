@@ -6,6 +6,8 @@ pub trait AffinePoint<const N: usize>: Clone + Sized {
     const GENERATOR_T: Self;
 
     /// Creates a new [`AffinePoint`] from the given limbs.
+    /// This function does not check that the inputs form a valid point. Only use this function
+    /// when the input is either trusted or previously validated.
     fn new(limbs: [u64; N]) -> Self;
 
     /// Creates a new [`AffinePoint`] that corresponds to the identity point.
@@ -40,6 +42,8 @@ pub trait AffinePoint<const N: usize>: Clone + Sized {
     }
 
     /// Creates a new [`AffinePoint`] from the given bytes in little endian.
+    /// This function does not check that the inputs form a valid point. Only use this function
+    /// when the input is either trusted or previously validated.
     fn from_le_bytes(bytes: &[u8]) -> Self {
         let limbs = bytes_to_words_le(bytes);
         debug_assert!(limbs.len() == N);

@@ -19,8 +19,8 @@ namespace cg = cooperative_groups;
 #define DEBUG(...) // Do nothing
 #endif
 
-__device__ inline felt_t get_input_point(size_t idx) {
-    return felt_t::from_canonical_u32(2 * idx);
+__device__ inline unsigned char get_input_point(size_t idx) {
+    return (unsigned char)(2 * idx);
 }
 
 __device__ inline ext_t geq_eval(size_t idx, uint32_t threshold, ext_t eq_coefficient) {
@@ -66,15 +66,15 @@ __global__ void jaggedConstraintPolyEval(
 
     // This kernel assumes that a single block deals with a single `xValueIdx`.
     size_t xValueIdx = blockDim.z * blockIdx.z + threadIdx.z;
-    felt_t eval_point = get_input_point(xValueIdx);
+    unsigned char eval_point = get_input_point(xValueIdx);
 
     for (size_t idx = blockDim.x * blockIdx.x + threadIdx.x; idx < totalLen; idx += blockDim.x * gridDim.x) {
-        uint32_t packed_info = inputJaggedInfo.denseData.data[idx << 1];
+        uint64_t packed_info = inputJaggedInfo.denseData.data[idx << 1];
         assert(packed_info == inputJaggedInfo.denseData.data[idx << 1 | 1]);
 
-        uint32_t chip_idx = (packed_info >> 1) & 0x7F;
-        uint32_t preprocessed_idx = (packed_info >> 8) & 0x3FF;
-        uint32_t main_idx = (packed_info >> 18) & 0x3FFF;
+        uint32_t chip_idx = (packed_info >> 1) & 0x7FFF;
+        uint32_t preprocessed_idx = (packed_info >> 16) & 0xFFFF;
+        uint32_t main_idx = (packed_info >> 32) & 0xFFFFFFFF;
         uint32_t num_preprocessed_columns = preprocessed_column[chip_idx];
         uint32_t num_main_columns = main_column[chip_idx];
 
@@ -89,7 +89,7 @@ __global__ void jaggedConstraintPolyEval(
         size_t program_end_idx = evalProgramIndices[airBlockIdx + 1];
         size_t f_constant_offset = evalConstantsFIndices[airBlockIdx];
         size_t ef_constant_offset = evalConstantsEFIndices[airBlockIdx];
-        
+
         for (size_t i = 0; i < MEMORY_SIZE; i++) {
             expr_f[i] = K::zero();
         }

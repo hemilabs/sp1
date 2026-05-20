@@ -1,6 +1,7 @@
 mod compress;
 mod core;
 mod deferred;
+mod gate;
 mod global;
 mod precompiles;
 mod splicing;
@@ -9,6 +10,7 @@ mod vk_tree;
 pub use compress::*;
 pub use core::*;
 pub use deferred::*;
+pub use gate::*;
 pub use global::*;
 pub use precompiles::*;
 pub use splicing::*;
@@ -18,6 +20,7 @@ use lru::LruCache;
 
 use slop_algebra::PrimeField32;
 
+use serde::{Deserialize, Serialize};
 use sp1_core_executor::SP1CoreOpts;
 use sp1_core_executor_runner::MinimalExecutorRunner;
 use sp1_core_machine::{executor::ExecutionOutput, io::SP1Stdin};
@@ -116,12 +119,16 @@ where
         self.config.global_memory_buffer_size
     }
 
-    pub fn initialize_splicing_engine(&self) -> Arc<SplicingEngine<A, W>> {
+    pub fn initialize_splicing_engine(
+        &self,
+        gate: ProveShardGate<A, W>,
+    ) -> Arc<SplicingEngine<A, W>> {
         let splicing_workers = (0..self.config.num_splicing_workers)
             .map(|_| {
                 SplicingWorker::new(
                     self.artifact_client.clone(),
                     self.worker_client.clone(),
+                    gate.clone(),
                     self.config.number_of_send_splice_workers_per_splice,
                     self.config.send_splice_input_buffer_size_per_splice,
                 )
@@ -138,12 +145,26 @@ where
         task_id: TaskId,
         request: CoreExecuteTaskRequest,
     ) -> Result<ExecutionOutput, TaskError> {
-        let stdin = self.artifact_client.download_stdin::<SP1Stdin>(&request.stdin).await?;
+        let stdin_artifact_type =
+            if request.stdin_private { ArtifactType::PrivateStdin } else { ArtifactType::Stdin };
+        let stdin = self
+            .artifact_client
+            .download_with_type::<SP1Stdin>(&request.stdin, stdin_artifact_type)
+            .await?;
 
         let deferred_proofs = stdin.proofs.iter().map(|(proof, _)| proof.clone());
         let deferred_inputs = DeferredInputs::new(deferred_proofs);
 
-        let splicing_engine = self.initialize_splicing_engine();
+        // Per-proof backpressure gate; permit pool lives in the artifact store.
+        let gate = ProveShardGate::new(
+            self.artifact_client.clone(),
+            self.worker_client.clone(),
+            request.context.proof_id.clone(),
+        )
+        .await
+        .map_err(TaskError::Fatal)?;
+
+        let splicing_engine = self.initialize_splicing_engine(gate.clone());
         let proof_data_sender =
             MessageSender::<W, ProofData>::new(self.worker_client.clone(), task_id);
         let executor = SP1CoreExecutor::new(
@@ -158,8 +179,10 @@ where
             proof_data_sender.clone(),
             self.artifact_client.clone(),
             self.worker_client.clone(),
+            gate,
             self.minimal_executor_cache.clone(),
             request.cycle_limit,
+            request.machine,
         );
 
         let mut join_set = JoinSet::<Result<(), TaskError>>::new();
@@ -208,25 +231,16 @@ where
 
     pub async fn run(&self, request: RawTaskRequest) -> Result<ExecutionOutput, TaskError> {
         let RawTaskRequest { inputs, outputs, context } = request;
-        let elf = inputs[0].clone();
-        let stdin_artifact = inputs[1].clone();
-        let mode_artifact = inputs[2].clone();
-        let cycle_limit = inputs.get(3).and_then(|a| a.clone().to_id().parse::<u64>().ok());
-        let proof_nonce = inputs.get(4);
         let [output] = outputs.try_into().unwrap();
-        let mode = {
-            let parsed =
-                mode_artifact.to_id().parse::<i32>().map_err(|e| TaskError::Fatal(e.into()))?;
-            ProofMode::try_from(parsed).map_err(|e| TaskError::Fatal(e.into()))?
-        };
+        let ControllerInputs { elf, stdin_artifact, mode, cycle_limit, proof_nonce, metadata } =
+            ControllerInputs::try_from(inputs.as_slice())?;
 
-        let stdin_download_handle =
-            self.artifact_client.download_stdin::<SP1Stdin>(&stdin_artifact);
+        let stdin_download_handle = self
+            .artifact_client
+            .download_with_type::<SP1Stdin>(&stdin_artifact, metadata.stdin_artifact_type());
 
         let proof_nonce = match proof_nonce {
-            Some(artifact) => {
-                self.artifact_client.download::<[u32; PROOF_NONCE_NUM_WORDS]>(artifact).await?
-            }
+            Some(artifact) => self.artifact_client.download(&artifact).await?,
             None => [0u32; PROOF_NONCE_NUM_WORDS],
         };
 
@@ -269,6 +283,10 @@ where
                     let vk =
                         artifact_client_clone.download::<SP1VerifyingKey>(&vk_artifact).await?;
                     setup_cache.lock().await.put(elf_clone, vk.clone());
+                    // The vk is now memory-cached for the lifetime of this worker;
+                    let _ = artifact_client_clone
+                        .try_delete(&vk_artifact, ArtifactType::UnspecifiedArtifactType)
+                        .await;
                     vk
                 };
                 Ok(vk)
@@ -306,6 +324,9 @@ where
             num_deferred_proofs,
             cycle_limit,
             context: context.clone(),
+            // TODO: is this expensive?
+            machine: self.verifier.core.machine().clone(),
+            stdin_private: metadata.stdin_private,
         };
         let executor_task_id = self
             .worker_client
@@ -542,4 +563,76 @@ async fn collect_core_proofs(
     artifact_client.upload(&result_artifact, shard_proofs).await?;
 
     Ok(())
+}
+
+#[derive(Clone)]
+pub struct ControllerInputs {
+    pub elf: Artifact,
+    pub stdin_artifact: Artifact,
+    pub mode: ProofMode,
+    pub cycle_limit: Option<u64>,
+    pub proof_nonce: Option<Artifact>,
+    pub metadata: ControllerInputMetadata,
+}
+
+impl TryFrom<&[String]> for ControllerInputs {
+    type Error = TaskError;
+
+    fn try_from(inputs: &[String]) -> Result<Self, Self::Error> {
+        let inputs = inputs.iter().map(|x| Artifact(x.clone())).collect::<Vec<_>>();
+        Self::try_from(inputs.as_slice())
+    }
+}
+
+impl TryFrom<&[Artifact]> for ControllerInputs {
+    type Error = TaskError;
+
+    fn try_from(inputs: &[Artifact]) -> Result<Self, Self::Error> {
+        #[allow(clippy::get_first)]
+        let elf = inputs.get(0).cloned().ok_or_else(|| {
+            TaskError::Fatal(anyhow::anyhow!("ControllerInputs inputs[0] (elf) is required"))
+        })?;
+        let stdin_artifact = inputs.get(1).cloned().ok_or_else(|| {
+            TaskError::Fatal(anyhow::anyhow!("ControllerInputs inputs[1] (stdin) is required"))
+        })?;
+        let mode = {
+            let input = inputs.get(2).cloned().ok_or_else(|| {
+                TaskError::Fatal(anyhow::anyhow!("ControllerInputs inputs[2] (mode) is required"))
+            })?;
+            let parsed = input.to_id().parse::<i32>().map_err(|e| TaskError::Fatal(e.into()))?;
+            ProofMode::try_from(parsed).map_err(|e| TaskError::Fatal(e.into()))?
+        };
+        let cycle_limit = inputs.get(3).and_then(|a| a.clone().to_id().parse::<u64>().ok());
+        let proof_nonce = match inputs.get(4) {
+            Some(Artifact(s)) if !s.is_empty() => Some(Artifact(s.clone())),
+            _ => None,
+        };
+        let metadata = match inputs.get(5) {
+            Some(Artifact(s)) if !s.is_empty() => serde_json::from_str(s),
+            _ => Ok(Default::default()),
+        }
+        .map_err(|e| {
+            TaskError::Fatal(anyhow::anyhow!(
+                "failed to deserialize ControllerTaskMetadata from inputs[5]: {e}"
+            ))
+        })?;
+        Ok(Self { elf, stdin_artifact, mode, cycle_limit, proof_nonce, metadata })
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ControllerInputMetadata {
+    #[serde(default)]
+    pub stdin_private: bool,
+    // TODO: Consider moving cycle_limit and other fields in here in the future
+}
+
+impl ControllerInputMetadata {
+    pub fn stdin_artifact_type(&self) -> ArtifactType {
+        if self.stdin_private {
+            ArtifactType::PrivateStdin
+        } else {
+            ArtifactType::Stdin
+        }
+    }
 }

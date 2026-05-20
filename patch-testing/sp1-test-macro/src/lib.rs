@@ -160,6 +160,8 @@ pub fn sp1_test(attr: TokenStream, item: TokenStream) -> TokenStream {
                 assert!(__macro_internal_execution_report.syscall_counts[syscall] > 0, "Syscall {syscall} has not been emitted");
             }
 
+            assert_eq!(__macro_internal_execution_report.exit_code, 0, "incorrect exit code");
+
             __macro_internal_cb(__macro_internal_public);
 
             println!("Cycle Count: {}", __macro_internal_execution_report.total_instruction_count());

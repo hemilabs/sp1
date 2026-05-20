@@ -4,7 +4,22 @@
       "Bash(git fetch:*)",
       "Bash(git merge:*)",
       "Bash(git checkout:*)",
-      "Bash(git pull:*)"
+      "Bash(git pull:*)",
+      "Bash(RUSTFLAGS=\"--cfg sp1_debug_constraints\" cargo build -p slop-veil)",
+      "Bash(RUSTFLAGS=\"--cfg sp1_debug_constraints\" cargo test --release -p slop-veil --lib)",
+      "Bash(RUSTFLAGS=\"--cfg sp1_debug_constraints\" cargo build -p slop-veil --tests)",
+      "Bash(cargo run:*)",
+      "Bash(xargs sed:*)",
+      "Bash(for i:*)",
+      "Bash(do cargo:*)",
+      "Bash(git worktree *)",
+      "Bash(awk -F/ '{print $NF}')",
+      "Bash(cargo check *)",
+      "Bash(cargo fmt *)",
+      "Bash(cargo clippy *)",
+      "Bash(cargo build *)",
+      "Bash(cargo test *)",
+      "Bash(cargo bench *)"
     ]
   }
 }

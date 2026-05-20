@@ -7,17 +7,20 @@ use futures::{prelude::*, stream::FuturesUnordered};
 use serde::{Deserialize, Serialize};
 use slop_futures::pipeline::Pipeline;
 use sp1_core_executor::{
-    events::{MemoryInitializeFinalizeEvent, MemoryRecord},
+    events::{MemoryInitializeFinalizeEvent, MemoryRecord, PageProtInitializeFinalizeEvent},
     CoreVM, ExecutionError, Program, SP1CoreOpts, SyscallCode, UnsafeMemory,
 };
 use sp1_core_executor_runner::MinimalExecutorRunner;
-use sp1_core_machine::{executor::ExecutionOutput, io::SP1Stdin};
+use sp1_core_machine::{executor::ExecutionOutput, io::SP1Stdin, riscv::RiscvAir};
 use sp1_hypercube::{
     air::{ShardRange, PROOF_NONCE_NUM_WORDS, PV_DIGEST_NUM_WORDS},
-    SP1VerifyingKey, DIGEST_SIZE,
+    Machine, SP1VerifyingKey, DIGEST_SIZE,
 };
 use sp1_jit::MinimalTrace;
-use sp1_prover_types::{network_base_types::ProofMode, Artifact, ArtifactClient, TaskType};
+use sp1_primitives::SP1Field;
+use sp1_prover_types::{
+    network_base_types::ProofMode, Artifact, ArtifactClient, SerializableRiscvMachine, TaskType,
+};
 use tokio::{
     sync::{mpsc, oneshot},
     task::JoinSet,
@@ -59,6 +62,9 @@ impl<W: WorkerClient, T: Serialize> MessageSender<W, T> {
 struct CoreExecuteMetadata {
     num_deferred_proofs: usize,
     cycle_limit: Option<u64>,
+    machine: SerializableRiscvMachine,
+    #[serde(default)]
+    stdin_private: bool,
 }
 
 pub struct CoreExecuteTaskRequest {
@@ -69,6 +75,8 @@ pub struct CoreExecuteTaskRequest {
     pub num_deferred_proofs: usize,
     pub cycle_limit: Option<u64>,
     pub context: TaskContext,
+    pub machine: Machine<SP1Field, RiscvAir<SP1Field>>,
+    pub stdin_private: bool,
 }
 
 impl CoreExecuteTaskRequest {
@@ -80,7 +88,7 @@ impl CoreExecuteTaskRequest {
         let [execution_output] = outputs
             .try_into()
             .map_err(|e| TaskError::Fatal(anyhow::anyhow!("invalid task outputs: {e:?}")))?;
-        let metadata: CoreExecuteMetadata =
+        let CoreExecuteMetadata { num_deferred_proofs, cycle_limit, machine, stdin_private } =
             serde_json::from_str(&metadata.to_id()).map_err(|e| {
                 TaskError::Fatal(anyhow::anyhow!("failed to deserialize CoreExecuteMetadata: {e}"))
             })?;
@@ -89,9 +97,11 @@ impl CoreExecuteTaskRequest {
             stdin,
             common_input,
             execution_output,
-            num_deferred_proofs: metadata.num_deferred_proofs,
-            cycle_limit: metadata.cycle_limit,
+            num_deferred_proofs,
+            cycle_limit,
             context,
+            machine: machine.into(),
+            stdin_private,
         })
     }
 
@@ -99,6 +109,8 @@ impl CoreExecuteTaskRequest {
         let metadata = CoreExecuteMetadata {
             num_deferred_proofs: self.num_deferred_proofs,
             cycle_limit: self.cycle_limit,
+            machine: self.machine.into(),
+            stdin_private: self.stdin_private,
         };
         let metadata_str = serde_json::to_string(&metadata).map_err(|e| {
             TaskError::Fatal(anyhow::anyhow!("failed to serialize CoreExecuteMetadata: {e}"))
@@ -126,6 +138,8 @@ pub struct GlobalMemoryShard {
     pub final_state: FinalVmState,
     pub initialize_events: Vec<MemoryInitializeFinalizeEvent>,
     pub finalize_events: Vec<MemoryInitializeFinalizeEvent>,
+    pub page_prot_initialize_events: Vec<PageProtInitializeFinalizeEvent>,
+    pub page_prot_finalize_events: Vec<PageProtInitializeFinalizeEvent>,
     pub previous_init_addr: u64,
     pub previous_finalize_addr: u64,
     pub previous_init_page_idx: u64,
@@ -152,7 +166,7 @@ pub struct CommonProverInput {
     pub nonce: [u32; PROOF_NONCE_NUM_WORDS],
 }
 
-pub struct SP1CoreExecutor<A, W: WorkerClient> {
+pub struct SP1CoreExecutor<A: ArtifactClient, W: WorkerClient> {
     splicing_engine: Arc<SplicingEngine<A, W>>,
     global_memory_buffer_size: usize,
     elf: Artifact,
@@ -164,11 +178,13 @@ pub struct SP1CoreExecutor<A, W: WorkerClient> {
     sender: MessageSender<W, ProofData>,
     artifact_client: A,
     worker_client: W,
+    gate: super::ProveShardGate<A, W>,
     minimal_executor_cache: Option<MinimalExecutorCache>,
     cycle_limit: Option<u64>,
+    _machine: Machine<SP1Field, RiscvAir<SP1Field>>,
 }
 
-impl<A, W: WorkerClient> SP1CoreExecutor<A, W> {
+impl<A: ArtifactClient, W: WorkerClient> SP1CoreExecutor<A, W> {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         splicing_engine: Arc<SplicingEngine<A, W>>,
@@ -182,8 +198,10 @@ impl<A, W: WorkerClient> SP1CoreExecutor<A, W> {
         sender: MessageSender<W, ProofData>,
         artifact_client: A,
         worker_client: W,
+        gate: super::ProveShardGate<A, W>,
         minimal_executor_cache: Option<MinimalExecutorCache>,
         cycle_limit: Option<u64>,
+        _machine: Machine<SP1Field, RiscvAir<SP1Field>>,
     ) -> Self {
         Self {
             splicing_engine,
@@ -197,8 +215,10 @@ impl<A, W: WorkerClient> SP1CoreExecutor<A, W> {
             sender,
             artifact_client,
             worker_client,
+            gate,
             minimal_executor_cache,
             cycle_limit,
+            _machine,
         }
     }
 }
@@ -222,7 +242,7 @@ where
         })?);
 
         // Initialize the touched addresses map.
-        let (all_touched_addresses, global_memory_handler) =
+        let (all_touched_addresses, all_touched_pages, global_memory_handler) =
             global_memory(self.global_memory_buffer_size);
         let (deferred_marker_tx, precompile_handler) = precompile_channel(&program, &opts);
         // Initialize the final vm state.
@@ -304,7 +324,7 @@ where
 
                     // Check the `end_clk` for cycle limit
                     if let Some(cycle_limit) = self.cycle_limit {
-                        let last_clk = chunk.clk_end();
+                        let last_clk = chunk.global_clk_end();
                         if last_clk > cycle_limit {
                             tracing::error!("Cycle limit exceeded: last_clk = {last_clk}, cycle_limit = {cycle_limit}");
                             return Err(TaskError::Execution(ExecutionError::ExceededCycleLimit(
@@ -321,6 +341,7 @@ where
                         common_input_artifact: common_input_artifact.clone(),
                         num_deferred_proofs: self.num_deferred_proofs,
                         all_touched_addresses: all_touched_addresses.clone(),
+                        all_touched_pages: all_touched_pages.clone(),
                         final_vm_state: final_vm_state.clone(),
                         prove_shard_tx: sender.clone(),
                         context: context.clone(),
@@ -346,6 +367,15 @@ where
                     elapsed,
                     minimal_executor.global_clk() as f64 / (elapsed * 1e6)
                 );
+
+                if chunk_count == 0 {
+                    return Err(TaskError::Fatal(anyhow::anyhow!(
+                        "executor produced zero trace chunks in {elapsed:.3}s \
+                         (global_clk={}, is_done={})",
+                        minimal_executor.global_clk(),
+                        minimal_executor.is_done(),
+                    )));
+                }
                 // Get the output and send it to the output channel.
                 let cycles = minimal_executor.global_clk();
                 let public_value_stream = minimal_executor.public_values_stream().clone();
@@ -396,6 +426,7 @@ where
             {
                 let artifact_client = self.artifact_client.clone();
                 let worker_client = self.worker_client.clone();
+                let gate = self.gate.clone();
                 let num_deferred_proofs = self.num_deferred_proofs;
                 let sender = self.sender.clone();
                 let elf = self.elf.clone();
@@ -418,6 +449,7 @@ where
                             num_deferred_proofs,
                             artifact_client,
                             worker_client,
+                            gate,
                             minimal_executor_cache,
                         )
                         .await?;
@@ -431,6 +463,7 @@ where
         join_set.spawn({
             let artifact_client = self.artifact_client.clone();
             let worker_client = self.worker_client.clone();
+            let gate = self.gate.clone();
             let sender = self.sender.clone();
             let elf = self.elf.clone();
             let common_input = self.common_input.clone();
@@ -443,6 +476,7 @@ where
                         sender,
                         artifact_client,
                         worker_client,
+                        gate,
                         context,
                     )
                     .await?;
@@ -473,7 +507,7 @@ pub struct FinalVmState {
 }
 
 impl FinalVmState {
-    pub fn new<'a, 'b>(vm: &'a CoreVM<'b>) -> Self {
+    pub fn new<'a, 'b, M: sp1_core_executor::ExecutionMode>(vm: &'a CoreVM<'b, M>) -> Self {
         let registers = *vm.registers();
         let timestamp = vm.clk();
         let pc = vm.pc();
@@ -482,6 +516,18 @@ impl FinalVmState {
         let proof_nonce = vm.proof_nonce;
 
         Self { registers, timestamp, pc, exit_code, public_value_digest, proof_nonce }
+    }
+
+    /// Create from a `GasEstimatingVMEnum`.
+    pub fn from_gas_estimating_vm_enum(vm: &sp1_core_executor::GasEstimatingVMEnum<'_>) -> Self {
+        Self {
+            registers: vm.registers(),
+            timestamp: vm.clk(),
+            pc: vm.pc(),
+            exit_code: vm.exit_code(),
+            public_value_digest: vm.public_value_digest(),
+            proof_nonce: vm.proof_nonce(),
+        }
     }
 }
 
@@ -517,6 +563,7 @@ pub struct SpawnProveOutput {
     pub proof_data: ProofData,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn create_core_proving_task<A: ArtifactClient, W: WorkerClient>(
     elf_artifact: Artifact,
     common_input_artifact: Artifact,
@@ -525,9 +572,13 @@ pub(super) async fn create_core_proving_task<A: ArtifactClient, W: WorkerClient>
     trace_data: TraceData,
     worker_client: W,
     artifact_client: A,
+    gate: &super::ProveShardGate<A, W>,
 ) -> Result<SpawnProveOutput, ExecutionError> {
     let record_artifact =
         artifact_client.create_artifact().map_err(|e| ExecutionError::Other(e.to_string()))?;
+
+    // Reserve before upload; held across upload + submit + task completion.
+    let shard_permit = gate.acquire(&record_artifact).await;
 
     // Make a deferred marker task. This is used for the worker to send
     // its deferred record back to the controller.
@@ -590,6 +641,9 @@ pub(super) async fn create_core_proving_task<A: ArtifactClient, W: WorkerClient>
         .submit_task(TaskType::ProveShard, task)
         .await
         .map_err(|e| ExecutionError::Other(e.to_string()))?;
+
+    gate.schedule_release(task_id.clone(), shard_permit);
+
     let proof_data = ProofData { task_id, range, proof: proof_artifact };
     Ok(SpawnProveOutput { deferred_message, proof_data })
 }

@@ -1,11 +1,11 @@
-FROM golang:1.22 AS go-builder
+FROM golang:1.26 AS go-builder
 
-FROM rustlang/rust:nightly-bullseye-slim AS rust-builder
+FROM rust:1.91-slim-bookworm AS rust-builder
 
 # Dependencies
 RUN apt update && apt install -y clang
 
-# Install Go 1.22
+# Install Go 1.26
 COPY --from=go-builder /usr/local/go /usr/local/go
 ENV PATH="/usr/local/go/bin:$PATH"
 
@@ -27,7 +27,8 @@ RUN \
   --mount=type=cache,target=/sp1/target \
   cargo build --release && cp ../../../target/release/sp1-recursion-gnark-cli /gnark-cli
 
-FROM rustlang/rust:nightly-bullseye-slim
+FROM debian:bookworm-slim
+RUN apt-get update && apt-get install -y ca-certificates && rm -rf /var/lib/apt/lists/*
 COPY --from=rust-builder /gnark-cli /gnark-cli
 
 LABEL org.opencontainers.image.source=https://github.com/succinctlabs/sp1

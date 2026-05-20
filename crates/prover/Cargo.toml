@@ -71,7 +71,7 @@ mti = { workspace = true }
 opentelemetry = { workspace = true }
 pin-project = { workspace = true }
 tonic = { workspace = true }
-reqwest = { workspace = true, features = ["stream"] }
+reqwest = { workspace = true, features = ["stream", "rustls-tls"] }
 indicatif = { workspace = true }
 tempfile = { workspace = true }
 sha2 = { workspace = true }
@@ -98,12 +98,25 @@ path = "scripts/build_groth16_bn254.rs"
 name = "build_plonk_bn254"
 path = "scripts/build_plonk_bn254.rs"
 
+[[bin]]
+name = "gen_soundcalc_toml"
+path = "scripts/gen_soundcalc_toml.rs"
+
 [features]
 native-gnark = ["sp1-recursion-gnark-ffi/native"]
 debug = ["sp1-core-machine/debug"]
 bigint-rug = ["sp1-core-machine/bigint-rug"]
 experimental = []
 profiling = ["sp1-core-executor/profiling", "sp1-jit/profiling"]
+mprotect = [
+  "experimental",
+  "sp1-core-executor/mprotect",
+  "sp1-core-executor-runner/mprotect",
+  "sp1-core-machine/mprotect",
+  "sp1-hypercube/mprotect",
+  "sp1-recursion-circuit/mprotect",
+  "sp1-recursion-executor/mprotect",
+]
 
 [lints]
 workspace = true

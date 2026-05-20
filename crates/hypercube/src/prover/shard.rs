@@ -32,7 +32,7 @@ use crate::{
     septic_digest::SepticDigest,
     AirOpenedValues, Chip, ChipEvaluation, ChipOpenedValues, ChipStatistics,
     ConstraintSumcheckFolder, GkrProverImpl, LogUpEvaluations, Machine, MachineVerifyingKey,
-    ShardContext, ShardOpenedValues, ShardProof,
+    ShardContext, ShardOpenedValues, ShardProof, UntrustedConfig,
 };
 
 use super::{TraceGenerator, Traces};
@@ -279,7 +279,7 @@ impl<GC: IopCtx, SC: ShardContext<GC>, C: DefaultJaggedProver<GC, SC::Config>> A
     ) -> (MachineVerifyingKey<GC>, ShardProof<GC, PcsProof<GC, SC>>, ProverPermit) {
         // Get the initial global cumulative sum and pc start.
         let pc_start = program.pc_start();
-        let enable_untrusted_programs = program.enable_untrusted_programs();
+        let untrusted_config = program.untrusted_config();
         let initial_global_cumulative_sum = if let Some(vk) = vk {
             vk.initial_global_cumulative_sum
         } else {
@@ -306,7 +306,7 @@ impl<GC: IopCtx, SC: ShardContext<GC>, C: DefaultJaggedProver<GC, SC::Config>> A
                 pc_start,
                 initial_global_cumulative_sum,
                 preprocessed_traces,
-                enable_untrusted_programs,
+                untrusted_config,
             )
         };
 
@@ -408,7 +408,7 @@ impl<GC: IopCtx, SC: ShardContext<GC>, C: DefaultJaggedProver<GC, SC::Config>>
         pc_start: [GC::F; 3],
         initial_global_cumulative_sum: SepticDigest<GC::F>,
         preprocessed_traces: Traces<GC::F, CpuBackend>,
-        enable_untrusted_programs: GC::F,
+        untrusted_config: UntrustedConfig<GC::F>,
     ) -> (ShardProverData<GC, SC, C>, MachineVerifyingKey<GC>) {
         // Commit to the preprocessed traces, if there are any.
         assert!(!preprocessed_traces.is_empty(), "preprocessed trace cannot be empty");
@@ -420,7 +420,7 @@ impl<GC: IopCtx, SC: ShardContext<GC>, C: DefaultJaggedProver<GC, SC::Config>>
             pc_start,
             initial_global_cumulative_sum,
             preprocessed_commit,
-            enable_untrusted_programs,
+            untrusted_config,
         };
 
         let pk = ShardProverData { preprocessed_traces, preprocessed_data };
@@ -436,7 +436,7 @@ impl<GC: IopCtx, SC: ShardContext<GC>, C: DefaultJaggedProver<GC, SC::Config>>
         setup_permits: ProverSemaphore,
     ) -> (PreprocessedData<ProvingKey<GC, SC, Self>>, MachineVerifyingKey<GC>) {
         let pc_start = program.pc_start();
-        let enable_untrusted_programs = program.enable_untrusted_programs();
+        let untrusted_config = program.untrusted_config();
         let preprocessed_data = self
             .inner
             .trace_generator
@@ -449,7 +449,7 @@ impl<GC: IopCtx, SC: ShardContext<GC>, C: DefaultJaggedProver<GC, SC::Config>>
             pc_start,
             initial_global_cumulative_sum,
             preprocessed_traces,
-            enable_untrusted_programs,
+            untrusted_config,
         );
 
         let pk = ProvingKey { vk: vk.clone(), preprocessed_data: pk };
@@ -740,7 +740,7 @@ impl<GC: IopCtx, SC: ShardContext<GC>, C: DefaultJaggedProver<GC, SC::Config>>
 
         let alloc = self.inner.trace_generator.allocator();
 
-        for (_, open_values) in shard_open_values.chips.iter() {
+        for open_values in shard_open_values.chips.values() {
             let prep_local = &open_values.preprocessed.local;
             let main_local = &open_values.main.local;
             if !prep_local.is_empty() {
@@ -799,11 +799,11 @@ pub struct CoreProofShape<F: Field, A: MachineAir<F>> {
     /// The chips included in the record.
     pub shard_chips: BTreeSet<Chip<F, A>>,
 
-    /// The multiple of `log_stacking_height` that the preprocessed area adds up to.
-    pub preprocessed_multiple: usize,
+    /// The number of trace cells in the preprocessed traces.
+    pub preprocessed_area: usize,
 
-    /// The multiple of `log_stacking_height` that the main area adds up to.
-    pub main_multiple: usize,
+    /// The area of the main traces.
+    pub main_area: usize,
 
     /// The number of columns added to the preprocessed commit to round to the nearest multiple of
     /// `stacking_height`.
@@ -825,8 +825,8 @@ where
                 "shard_chips",
                 &self.shard_chips.iter().map(MachineAir::name).collect::<BTreeSet<_>>(),
             )
-            .field("preprocessed_multiple", &self.preprocessed_multiple)
-            .field("main_multiple", &self.main_multiple)
+            .field("preprocessed_area", &self.preprocessed_area)
+            .field("main_area", &self.main_area)
             .field("preprocessed_padding_cols", &self.preprocessed_padding_cols)
             .field("main_padding_cols", &self.main_padding_cols)
             .finish()

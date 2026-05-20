@@ -189,7 +189,7 @@ impl<C: ECDSACurve> Add<ProjectivePoint<C>> for ProjectivePoint<C> {
     type Output = ProjectivePoint<C>;
 
     fn add(mut self, rhs: ProjectivePoint<C>) -> Self::Output {
-        self.as_mut_zkvm_point().add_assign(rhs.as_zkvm_point());
+        self.as_mut_zkvm_point().complete_add_assign(rhs.as_zkvm_point());
 
         self
     }
@@ -199,7 +199,7 @@ impl<C: ECDSACurve> Add<&ProjectivePoint<C>> for ProjectivePoint<C> {
     type Output = ProjectivePoint<C>;
 
     fn add(mut self, rhs: &ProjectivePoint<C>) -> Self::Output {
-        self.as_mut_zkvm_point().add_assign(rhs.as_zkvm_point());
+        self.as_mut_zkvm_point().complete_add_assign(rhs.as_zkvm_point());
 
         self
     }
@@ -237,25 +237,25 @@ impl<'a, C: ECDSACurve> Sum<&'a ProjectivePoint<C>> for ProjectivePoint<C> {
 
 impl<C: ECDSACurve> AddAssign<ProjectivePoint<C>> for ProjectivePoint<C> {
     fn add_assign(&mut self, rhs: ProjectivePoint<C>) {
-        self.as_mut_zkvm_point().add_assign(rhs.as_zkvm_point());
+        self.as_mut_zkvm_point().complete_add_assign(rhs.as_zkvm_point());
     }
 }
 
 impl<C: ECDSACurve> AddAssign<&ProjectivePoint<C>> for ProjectivePoint<C> {
     fn add_assign(&mut self, rhs: &ProjectivePoint<C>) {
-        self.as_mut_zkvm_point().add_assign(rhs.as_zkvm_point());
+        self.as_mut_zkvm_point().complete_add_assign(rhs.as_zkvm_point());
     }
 }
 
 impl<C: ECDSACurve> SubAssign<ProjectivePoint<C>> for ProjectivePoint<C> {
     fn sub_assign(&mut self, rhs: ProjectivePoint<C>) {
-        self.as_mut_zkvm_point().add_assign(rhs.neg().as_zkvm_point());
+        self.as_mut_zkvm_point().complete_add_assign(rhs.neg().as_zkvm_point());
     }
 }
 
 impl<C: ECDSACurve> SubAssign<&ProjectivePoint<C>> for ProjectivePoint<C> {
     fn sub_assign(&mut self, rhs: &ProjectivePoint<C>) {
-        self.as_mut_zkvm_point().add_assign(rhs.neg().as_zkvm_point());
+        self.as_mut_zkvm_point().complete_add_assign(rhs.neg().as_zkvm_point());
     }
 }
 
@@ -285,13 +285,13 @@ impl<C: ECDSACurve> Add<&AffinePoint<C>> for ProjectivePoint<C> {
 
 impl<C: ECDSACurve> AddAssign<AffinePoint<C>> for ProjectivePoint<C> {
     fn add_assign(&mut self, rhs: AffinePoint<C>) {
-        self.as_mut_zkvm_point().add_assign(&rhs.inner);
+        self.as_mut_zkvm_point().complete_add_assign(&rhs.inner);
     }
 }
 
 impl<C: ECDSACurve> AddAssign<&AffinePoint<C>> for ProjectivePoint<C> {
     fn add_assign(&mut self, rhs: &AffinePoint<C>) {
-        self.as_mut_zkvm_point().add_assign(&rhs.inner);
+        self.as_mut_zkvm_point().complete_add_assign(&rhs.inner);
     }
 }
 
@@ -315,7 +315,7 @@ impl<C: ECDSACurve> SubAssign<AffinePoint<C>> for ProjectivePoint<C> {
     fn sub_assign(&mut self, rhs: AffinePoint<C>) {
         let projective = ProjectivePoint { inner: rhs }.neg();
 
-        self.as_mut_zkvm_point().add_assign(projective.as_zkvm_point());
+        self.as_mut_zkvm_point().complete_add_assign(projective.as_zkvm_point());
     }
 }
 
@@ -323,7 +323,7 @@ impl<C: ECDSACurve> SubAssign<&AffinePoint<C>> for ProjectivePoint<C> {
     fn sub_assign(&mut self, rhs: &AffinePoint<C>) {
         let projective = ProjectivePoint { inner: *rhs }.neg();
 
-        self.as_mut_zkvm_point().add_assign(projective.as_zkvm_point());
+        self.as_mut_zkvm_point().complete_add_assign(projective.as_zkvm_point());
     }
 }
 

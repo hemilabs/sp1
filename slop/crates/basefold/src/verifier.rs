@@ -12,6 +12,9 @@ use thiserror::Error;
 
 pub use slop_primitives::FriConfig;
 
+/// The number of bits to grind in sampling the batching randomness.
+pub const BATCH_GRINDING_BITS: usize = 5;
+
 #[derive(Clone)]
 pub struct BasefoldVerifier<GC: IopCtx> {
     pub fri_config: crate::FriConfig<GC::F>,
@@ -45,6 +48,8 @@ pub enum BaseFoldVerifierError<TcsError> {
     Sumcheck,
     #[error("Invalid proof of work witness")]
     Pow,
+    #[error("Invalid batch grinding witness")]
+    BatchPow,
     #[error("Query value mismatch")]
     QueryValueMismatch,
     #[error("query final polynomial mismatch")]
@@ -66,6 +71,9 @@ impl<TcsError: std::fmt::Display> std::fmt::Debug for BaseFoldVerifierError<TcsE
             BaseFoldVerifierError::TcsError(e) => write!(f, "tensor opening error: {e}"),
             BaseFoldVerifierError::Sumcheck => write!(f, "sumcheck error"),
             BaseFoldVerifierError::Pow => write!(f, "invalid proof of work witness"),
+            BaseFoldVerifierError::BatchPow => {
+                write!(f, "invalid batch grinding witness")
+            }
             BaseFoldVerifierError::QueryValueMismatch => write!(f, "query value mismatch"),
             BaseFoldVerifierError::QueryFinalPolyMismatch => {
                 write!(f, "query final polynomial mismatch")
@@ -103,6 +111,8 @@ pub struct BasefoldProof<GC: IopCtx> {
     pub final_poly: GC::EF,
     /// Proof-of-work witness.
     pub pow_witness: <GC::Challenger as GrindingChallenger>::Witness,
+    /// Batch grinding witness.
+    pub batch_grinding_witness: <GC::Challenger as GrindingChallenger>::Witness,
 }
 
 impl<GC: IopCtx> BasefoldVerifier<GC>
@@ -117,6 +127,11 @@ where
         proof: &BasefoldProof<GC>,
         challenger: &mut GC::Challenger,
     ) -> Result<(), BaseFoldVerifierError<MerkleTreeTcsError>> {
+        // Check batch grinding witness.
+        if !challenger.check_witness(BATCH_GRINDING_BITS, proof.batch_grinding_witness) {
+            return Err(BaseFoldVerifierError::BatchPow);
+        }
+
         // Sample the challenge used to batch all the different polynomials.
         let total_len = evaluation_claims
             .iter()
@@ -254,14 +269,15 @@ where
         for (commit, opening_and_proof) in
             commitments.iter().zip_eq(proof.component_polynomials_query_openings_and_proofs.iter())
         {
-            if opening_and_proof.proof.log_tensor_height != log_len + self.fri_config.log_blowup() {
-                return Err(BaseFoldVerifierError::IncorrectShape);
-            }
+            // Sizes is checked to have at least two dimensions above.
+            let width = opening_and_proof.values.sizes()[1];
             self.tcs
                 .verify_tensor_openings(
                     commit,
                     &query_indices,
                     &opening_and_proof.values,
+                    width,
+                    log_len + self.fri_config.log_blowup(),
                     &opening_and_proof.proof,
                 )
                 .map_err(BaseFoldVerifierError::TcsError)?;
@@ -371,19 +387,15 @@ where
                 *x = x.square();
             }
 
-            // The magic constant 2 here is the folding factor we use for FRI.
-            if round_idx != query_opening.proof.log_tensor_height
-                || query_opening.proof.width != GC::EF::D * 2
-            {
-                return Err(BaseFoldVerifierError::IncorrectShape);
-            }
-
             // Check that the opening is consistent with the commitment.
+            // The magic constant 2 here is the folding factor we use for FRI.
             self.tcs
                 .verify_tensor_openings(
                     commitment,
                     &indices,
                     &query_opening.values,
+                    GC::EF::D * 2,
+                    round_idx,
                     &query_opening.proof,
                 )
                 .map_err(BaseFoldVerifierError::TcsError)?;

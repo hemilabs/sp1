@@ -7,9 +7,9 @@ use core::arch::asm;
 ///
 /// ### Safety
 ///
-/// The caller must ensure that `p` and `q` are valid pointers to data that is aligned along a four
-/// byte boundary. Additionally, the caller must ensure that `p` and `q` are valid points on the
-/// secp256k1 curve, and that `p` and `q` are not equal to each other.
+/// The caller must ensure that `p` and `q` are valid pointers to data that is aligned along an
+/// eight byte boundary. Additionally, the caller must ensure that `p` and `q` are valid points on
+/// the secp256k1 curve, and that `p` and `q` are not equal to each other.
 #[allow(unused_variables)]
 #[no_mangle]
 pub extern "C" fn syscall_secp256k1_add(p: *mut [u64; 8], q: *mut [u64; 8]) {
@@ -33,7 +33,7 @@ pub extern "C" fn syscall_secp256k1_add(p: *mut [u64; 8], q: *mut [u64; 8]) {
 ///
 /// ### Safety
 ///
-/// The caller must ensure that `p` is valid pointer to data that is aligned along a four byte
+/// The caller must ensure that `p` is valid pointer to data that is aligned along an eight byte
 /// boundary.
 #[allow(unused_variables)]
 #[no_mangle]
@@ -65,7 +65,7 @@ pub extern "C" fn syscall_secp256k1_double(p: *mut [u64; 8]) {
 ///
 /// ### Safety
 ///
-/// The caller must ensure that `point` is valid pointer to data that is aligned along a four byte
+/// The caller must ensure that `point` is valid pointer to data that is aligned along an eight byte
 /// boundary.
 #[allow(unused_variables)]
 #[no_mangle]
