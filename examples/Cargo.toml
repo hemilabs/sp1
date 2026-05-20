@@ -18,6 +18,8 @@ members = [
   "fptower/script",
   "fibonacci/program",
   "fibonacci/script",
+  "mixed-ops/program",
+  "mixed-ops/script",
   "fibonacci-cuda/script",
   "fibonacci-cuda/program",
   "groth16/program",

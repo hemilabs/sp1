@@ -27,12 +27,17 @@ pub fn local_gpu_opts() -> (SP1CoreOpts, bool) {
     // Get the amount of memory on the GPU.
     let gpu_memory_gb: usize = (((cuda_memory_info().unwrap().1 as f64) / gb).ceil() as usize) + 4;
 
-    if gpu_memory_gb < 24 {
-        panic!("Unsupported GPU memory: {gpu_memory_gb}, must be at least 24GB");
+    if gpu_memory_gb < 16 {
+        panic!("Unsupported GPU memory: {gpu_memory_gb}, must be at least 16GB");
     }
 
-    let shard_threshold = if gpu_memory_gb <= 30 {
-        ELEMENT_THRESHOLD - (1 << 26) - (1 << 25)
+    // Shard threshold tiers based on GPU memory.
+    // Note: gpu_memory_gb = ceil(actual_vram_gb) + 4, so 24GB GPUs report as 28, 16GB as 20.
+    // 24GB GPUs (e.g. 7900 XTX) can use the full threshold — the VRAM cost is only +0.57GB
+    // over the reduced threshold, well within budget. Fewer shards = less fixed overhead.
+    let shard_threshold = if gpu_memory_gb <= 20 {
+        // 16GB GPUs (e.g. RX 9070 XT): ~134M elements per shard to fit in VRAM.
+        ELEMENT_THRESHOLD - (1 << 28)
     } else {
         ELEMENT_THRESHOLD
     };
@@ -56,10 +61,21 @@ pub async fn cuda_worker_builder(scope: TaskScope) -> SP1WorkerBuilder<SP1CudaPr
     let num_elts =
         opts.sharding_threshold.element_threshold as usize + (1 << CORE_LOG_STACKING_HEIGHT);
 
+    // Reduce worker count on memory-constrained GPUs. The ProverSemaphore(1) means
+    // only 1 shard proves at a time anyway; extra workers just allow pipeline overlap
+    // between tracegen(N+1) and proving(N). With 2 workers we still get double-buffering.
+    let num_workers = if recompute_first_layer { 2 } else { 4 };
+
     let core_verifier = SP1CudaProverComponents::core_verifier();
     let core_prover = Arc::new(
-        new_cuda_prover(core_verifier.clone(), num_elts, 4, recompute_first_layer, scope.clone())
-            .await,
+        new_cuda_prover(
+            core_verifier.clone(),
+            num_elts,
+            num_workers,
+            recompute_first_layer,
+            scope.clone(),
+        )
+        .await,
     );
 
     // TODO: tune this more precisely and make it a constant.
@@ -68,7 +84,7 @@ pub async fn cuda_worker_builder(scope: TaskScope) -> SP1WorkerBuilder<SP1CudaPr
         new_cuda_prover(
             recursion_verifier.clone(),
             RECURSION_TRACE_ALLOCATION,
-            4,
+            num_workers,
             false,
             scope.clone(),
         )
@@ -77,14 +93,26 @@ pub async fn cuda_worker_builder(scope: TaskScope) -> SP1WorkerBuilder<SP1CudaPr
 
     let shrink_verifier = SP1CudaProverComponents::shrink_verifier();
     let shrink_prover = Arc::new(
-        new_cuda_prover(shrink_verifier.clone(), SHRINK_TRACE_ALLOCATION, 4, false, scope.clone())
-            .await,
+        new_cuda_prover(
+            shrink_verifier.clone(),
+            SHRINK_TRACE_ALLOCATION,
+            num_workers,
+            false,
+            scope.clone(),
+        )
+        .await,
     );
 
     let wrap_verifier = SP1CudaProverComponents::wrap_verifier();
     let wrap_prover = Arc::new(
-        new_cuda_prover(wrap_verifier.clone(), WRAP_TRACE_ALLOCATION, 4, false, scope.clone())
-            .await,
+        new_cuda_prover(
+            wrap_verifier.clone(),
+            WRAP_TRACE_ALLOCATION,
+            num_workers,
+            false,
+            scope.clone(),
+        )
+        .await,
     );
 
     SP1WorkerBuilder::new()

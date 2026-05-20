@@ -1,6 +1,13 @@
 use std::path::PathBuf;
 use std::{env, fs};
 
+/// Which GPU backend to use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GpuBackend {
+    Cuda,
+    Hip,
+}
+
 fn cbindgen_builder() -> cbindgen::Builder {
     /// The warning placed in the cbindgen header.
     const AUTOGEN_WARNING: &str =
@@ -129,6 +136,164 @@ fn detect_cuda() -> bool {
     false
 }
 
+/// Check if HIP/ROCm is available on this system.
+fn detect_hip() -> bool {
+    // Track rerun-if-env-changed for the explicit override
+    println!("cargo:rerun-if-env-changed=SP1_HIP_ENABLED");
+
+    // 1. Check explicit SP1_HIP_ENABLED env var
+    if let Ok(val) = env::var("SP1_HIP_ENABLED") {
+        match val.to_lowercase().as_str() {
+            "0" | "false" => return false,
+            "1" | "true" => return true,
+            _ => {} // Fall through to auto-detection
+        }
+    }
+
+    // 2. Try running hipcc --version
+    if std::process::Command::new("hipcc")
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+    {
+        return true;
+    }
+
+    // 3. Check ROCM_PATH env var
+    if env::var("ROCM_PATH").is_ok() {
+        return true;
+    }
+
+    // 4. Check HIP_PATH env var
+    if env::var("HIP_PATH").is_ok() {
+        return true;
+    }
+
+    // 5. Check common ROCm installation paths
+    for path in &["/opt/rocm/bin/hipcc", "/opt/rocm-7.2.0/bin/hipcc"] {
+        if std::path::Path::new(path).exists() {
+            return true;
+        }
+    }
+
+    false
+}
+
+/// Determine which GPU backend to use.
+///
+/// Priority:
+/// 1. SP1_GPU_BACKEND=hip|cuda — explicit override
+/// 2. SP1_HIP_ENABLED=1 — forces HIP
+/// 3. SP1_CUDA_ENABLED=1 — forces CUDA
+/// 4. Auto-detect: prefer CUDA if available, fall back to HIP
+fn select_gpu_backend() -> Option<GpuBackend> {
+    println!("cargo:rerun-if-env-changed=SP1_GPU_BACKEND");
+
+    // Explicit backend selection
+    if let Ok(val) = env::var("SP1_GPU_BACKEND") {
+        match val.to_lowercase().as_str() {
+            "hip" | "rocm" | "amd" => return Some(GpuBackend::Hip),
+            "cuda" | "nvidia" => return Some(GpuBackend::Cuda),
+            "none" | "off" => return None,
+            _ => {} // Fall through
+        }
+    }
+
+    // Check explicit enable flags
+    if let Ok(val) = env::var("SP1_HIP_ENABLED") {
+        if val == "1" || val.to_lowercase() == "true" {
+            return Some(GpuBackend::Hip);
+        }
+    }
+
+    // Auto-detect: prefer CUDA, fall back to HIP
+    if detect_cuda() {
+        return Some(GpuBackend::Cuda);
+    }
+    if detect_hip() {
+        return Some(GpuBackend::Hip);
+    }
+
+    None
+}
+
+/// Resolve the CUDA toolkit root directory, trying sources in order:
+/// 1. `CUDA_PATH` env var
+/// 2. `CUDACXX` env var (path to nvcc → its grandparent)
+/// 3. `nvcc` on PATH (via `which`)
+/// 4. `/usr/local/cuda/bin/nvcc`'s resolved symlink target grandparent
+/// 5. `/usr/local/cuda` as a last-resort default
+///
+/// Used for BOTH setting `CMAKE_CUDA_COMPILER` (so CMake compiles against the
+/// matching headers) and setting the Rust `link-search` path (so we link the
+/// matching `libcudart`). Keeping these in sync avoids the `cudaDeviceProp`
+/// struct ABI mismatch that silently corrupts `multiProcessorCount` when
+/// CMake uses CUDA 13 nvcc but Rust links 12's libcudart (or vice versa).
+fn resolve_cuda_toolkit_path() -> String {
+    if let Ok(v) = env::var("CUDA_PATH") {
+        if !v.is_empty() {
+            return v;
+        }
+    }
+    if let Ok(cudacxx) = env::var("CUDACXX") {
+        if let Some(root) = std::path::Path::new(&cudacxx).parent().and_then(|p| p.parent()) {
+            return root.to_string_lossy().into_owned();
+        }
+    }
+    if let Ok(output) = std::process::Command::new("which").arg("nvcc").output() {
+        if output.status.success() {
+            if let Ok(path) = String::from_utf8(output.stdout) {
+                let path = path.trim();
+                if !path.is_empty() {
+                    if let Some(root) = std::path::Path::new(path).parent().and_then(|p| p.parent())
+                    {
+                        return root.to_string_lossy().into_owned();
+                    }
+                }
+            }
+        }
+    }
+    // No env hints — search /usr/local/cuda-*. Prefer higher major versions
+    // because CUDA 12.x ptxas rejects the G2 MSM `accumulate` kernel's
+    // register count, while CUDA 13.x compiles the same code fine. When a
+    // distribution ships multiple toolkits side-by-side, we want the newer
+    // one even if `/usr/local/cuda` symlinks to the older one.
+    if let Ok(entries) = std::fs::read_dir("/usr/local") {
+        let mut candidates: Vec<(u32, u32, String)> = entries
+            .filter_map(|e| e.ok())
+            .filter_map(|entry| {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                let rest = name.strip_prefix("cuda-")?;
+                let mut parts = rest.split('.');
+                let major: u32 = parts.next()?.parse().ok()?;
+                let minor: u32 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+                let root = format!("/usr/local/{}", name);
+                if std::path::Path::new(&format!("{root}/bin/nvcc")).exists() {
+                    Some((major, minor, root))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        // Newest first (by major, then minor)
+        candidates.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.cmp(&a.1)));
+        if let Some((_, _, root)) = candidates.into_iter().next() {
+            return root;
+        }
+    }
+    // Last resort — follow whatever /usr/local/cuda points at.
+    let default_nvcc = std::path::Path::new("/usr/local/cuda/bin/nvcc");
+    if default_nvcc.exists() {
+        if let Ok(resolved) = default_nvcc.canonicalize() {
+            if let Some(root) = resolved.parent().and_then(|p| p.parent()) {
+                return root.to_string_lossy().into_owned();
+            }
+        }
+    }
+    "/usr/local/cuda".to_string()
+}
+
 fn main() {
     // Directives for tracking changes in folders
     println!("cargo:rerun-if-changed=include/");
@@ -140,6 +305,8 @@ fn main() {
     println!("cargo:rerun-if-env-changed=OPT_LEVEL");
     println!("cargo:rerun-if-env-changed=DEBUG");
     println!("cargo:rerun-if-env-changed=CUDA_ARCHS");
+    println!("cargo:rerun-if-env-changed=CUDA_PATH");
+    println!("cargo:rerun-if-env-changed=CUDACXX");
     println!("cargo:rerun-if-env-changed=PROFILE_DEBUG_DATA");
 
     // The crate directory.
@@ -180,11 +347,21 @@ fn main() {
         Err(e) => panic!("{e:?}"),
     }
 
-    // Check if CUDA is available before attempting to build
-    if !detect_cuda() {
-        println!("cargo:warning=CUDA not detected, skipping GPU build");
-        return;
-    }
+    // Determine which GPU backend to use
+    let backend = match select_gpu_backend() {
+        Some(b) => b,
+        None => {
+            println!(
+                "cargo:warning=No GPU backend detected (neither CUDA nor HIP), skipping GPU build"
+            );
+            return;
+        }
+    };
+
+    println!("cargo:rerun-if-env-changed=HIP_ARCHS");
+    println!("cargo:rerun-if-env-changed=ROCM_PATH");
+    println!("cargo:rerun-if-env-changed=HIP_PATH");
+    println!("cargo:rerun-if-env-changed=SP1_GPU_BACKEND");
 
     // Build using CMake
     let mut cmake_config = cmake::Config::new(".");
@@ -192,10 +369,67 @@ fn main() {
     // Export compile commands for clangd IDE support
     cmake_config.define("CMAKE_EXPORT_COMPILE_COMMANDS", "ON");
 
-    // Pass CUDA architectures to CMake only if explicitly set
-    // Otherwise, CMake will use its own version-based defaults
-    if let Ok(cuda_archs) = env::var("CUDA_ARCHS") {
-        cmake_config.define("CUDA_ARCHS", &cuda_archs);
+    // Register the hip_backend cfg so Rust's check-cfg doesn't warn on usage.
+    println!("cargo:rustc-check-cfg=cfg(hip_backend)");
+
+    match backend {
+        GpuBackend::Hip => {
+            println!("cargo:warning=Building with HIP/ROCm backend for AMD GPUs");
+            println!("cargo:rustc-cfg=hip_backend");
+
+            // Tell CMakeLists.txt to use the HIP path
+            cmake_config.define("USE_HIP", "ON");
+
+            // Determine ROCm path
+            let rocm_path =
+                env::var("ROCM_PATH").or_else(|_| env::var("HIP_PATH")).unwrap_or_else(|_| {
+                    // Auto-detect: check versioned paths first, then generic
+                    for candidate in &["/opt/rocm-7.2.0", "/opt/rocm"] {
+                        if std::path::Path::new(candidate).join("bin/hipcc").exists() {
+                            return candidate.to_string();
+                        }
+                    }
+                    "/opt/rocm".to_string()
+                });
+
+            // Point CMake at the ROCm installation
+            cmake_config.define("CMAKE_PREFIX_PATH", &rocm_path);
+
+            // Use the AMD clang compiler directly (CMake 4.x rejects hipcc wrapper).
+            // The ROCm clang at lib/llvm/bin/clang++ handles HIP natively.
+            let clang_path = format!("{}/lib/llvm/bin/clang++", rocm_path);
+            if std::path::Path::new(&clang_path).exists() {
+                cmake_config.define("CMAKE_HIP_COMPILER", &clang_path);
+            }
+            // If clang++ not found, let CMake auto-detect
+
+            // Pass HIP architectures if explicitly set
+            if let Ok(hip_archs) = env::var("HIP_ARCHS") {
+                cmake_config.define("HIP_ARCHS", &hip_archs);
+            }
+        }
+        GpuBackend::Cuda => {
+            // Pass CUDA architectures to CMake only if explicitly set
+            // Otherwise, CMake will use its own version-based defaults
+            if let Ok(cuda_archs) = env::var("CUDA_ARCHS") {
+                cmake_config.define("CUDA_ARCHS", &cuda_archs);
+            }
+
+            // CRITICAL: pin CMake's CUDA compiler to the same toolkit that
+            // we'll link libcudart from. The `cudaDeviceProp` struct layout
+            // changed between CUDA 12 and CUDA 13; if CMake compiles against
+            // 13 headers but we link 12's libcudart (or vice versa),
+            // `cudaGetDeviceProperties` returns garbage for
+            // `multiProcessorCount` and sppark's MSM launches die with
+            // `cudaErrorInvalidConfiguration` (grid_size = sm_count/3 = 0).
+            // We deliberately resolve the toolkit the same way the link
+            // search path logic below resolves it, so both sides agree.
+            let resolved = resolve_cuda_toolkit_path();
+            let nvcc_path = format!("{resolved}/bin/nvcc");
+            if std::path::Path::new(&nvcc_path).exists() {
+                cmake_config.define("CMAKE_CUDA_COMPILER", &nvcc_path);
+            }
+        }
     }
 
     // Pass cbindgen include directory
@@ -226,26 +460,66 @@ fn main() {
         rel_symlink_file(&compile_commands_src, project_root.join("compile_commands.json"));
     }
 
-    // Link the library
+    // Link the static library (named sys-cuda for both backends, for FFI compatibility)
     println!("cargo:rustc-link-search=native={}/lib", dst.display());
     println!("cargo:rustc-link-lib=static=sys-cuda");
 
-    // Add CUDA library search paths
-    if let Ok(cuda_path) = env::var("CUDA_PATH") {
-        println!("cargo:rustc-link-search=native={cuda_path}/lib64");
-        println!("cargo:rustc-link-search=native={cuda_path}/lib");
-    } else {
-        println!("cargo:rustc-link-search=native=/usr/local/cuda/lib64");
-    }
+    match backend {
+        GpuBackend::Hip => {
+            // ROCm / HIP library search paths
+            let rocm_path =
+                env::var("ROCM_PATH").or_else(|_| env::var("HIP_PATH")).unwrap_or_else(|_| {
+                    for candidate in &["/opt/rocm-7.2.0", "/opt/rocm"] {
+                        if std::path::Path::new(candidate).exists() {
+                            return candidate.to_string();
+                        }
+                    }
+                    "/opt/rocm".to_string()
+                });
 
-    // Link CUDA runtime libraries
-    println!("cargo:rustc-link-lib=cudart");
-    println!("cargo:rustc-link-lib=cudadevrt");
+            println!("cargo:rustc-link-search=native={}/lib", rocm_path);
+            println!("cargo:rustc-link-search=native={}/lib64", rocm_path);
+
+            // HIP runtime libraries
+            println!("cargo:rustc-link-lib=amdhip64");
+
+            // HIP device runtime for relocatable device code (GPU linking)
+            println!("cargo:rustc-link-lib=hiprtc");
+        }
+        GpuBackend::Cuda => {
+            // Add CUDA library search paths.
+            // IMPORTANT: must match the CUDA version used by nvcc to avoid
+            // cudaDeviceProp ABI mismatch (struct layout changed between
+            // CUDA 12 and 13). `resolve_cuda_toolkit_path` is also used when
+            // configuring CMake above, so the two sides stay in sync.
+            let cuda_path = resolve_cuda_toolkit_path();
+            println!("cargo:rustc-link-search=native={cuda_path}/lib64");
+            println!("cargo:rustc-link-search=native={cuda_path}/lib");
+            // CUDA 13+ places libraries under targets/<triple>/lib
+            println!("cargo:rustc-link-search=native={cuda_path}/targets/x86_64-linux/lib");
+
+            // Link CUDA runtime libraries
+            println!("cargo:rustc-link-lib=cudart");
+            println!("cargo:rustc-link-lib=cudadevrt");
+        }
+    }
 
     // Link system libraries
     println!("cargo:rustc-link-lib=stdc++");
-    println!("cargo:rustc-link-lib=gomp");
     println!("cargo:rustc-link-lib=dl");
+    match backend {
+        GpuBackend::Hip => {
+            // HIP uses LLVM's OpenMP runtime (libomp), not GNU's (libgomp)
+            let rocm_link = env::var("ROCM_PATH")
+                .or_else(|_| env::var("HIP_PATH"))
+                .unwrap_or_else(|_| "/opt/rocm-7.2.0".to_string());
+            println!("cargo:rustc-link-search=native={}/lib/llvm/lib", rocm_link);
+            println!("cargo:rustc-link-lib=omp");
+        }
+        GpuBackend::Cuda => {
+            println!("cargo:rustc-link-lib=gomp");
+        }
+    }
 
     // Add include directories for compilation if needed
     println!("cargo:include={}", out_include_dir.display());

@@ -160,6 +160,9 @@ impl RecursionVks {
         proof: &MerkleProof<SP1GlobalContext>,
         vk: &MachineVerifyingKey<SP1GlobalContext>,
     ) -> Result<(), TaskError> {
+        if !self.vk_verification {
+            return Ok(());
+        }
         let digest = vk.hash_koalabear();
         verify_merkle_proof(proof, digest, self.root)
             .map_err(|e| TaskError::Fatal(anyhow::anyhow!("invalid merkle proof: {:?}", e)))

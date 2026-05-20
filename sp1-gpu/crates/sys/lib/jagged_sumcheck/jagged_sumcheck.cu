@@ -1,14 +1,11 @@
 #include "jagged_sumcheck/jagged_sumcheck.cuh"
 #include "sum_and_reduce/reduce.cuh"
 #include "tracegen/jagged_tracegen/jagged.cuh"
+#include "runtime/gpu_compat.cuh"
 
 
-#include <cooperative_groups.h>
-#include <cooperative_groups/reduce.h>
-
-
-__global__ void
-jaggedSumAsPoly(ext_t* evaluations, const JaggedMle<JaggedSumcheckData> inputJaggedMle) {
+SP1_KERNEL void
+jaggedSumAsPoly(ext_t* __restrict__ evaluations, const JaggedMle<JaggedSumcheckData> inputJaggedMle) {
 
     ext_t evalZero = ext_t::zero();
     ext_t evalHalf = ext_t::zero();
@@ -56,11 +53,11 @@ jaggedSumAsPoly(ext_t* evaluations, const JaggedMle<JaggedSumcheckData> inputJag
 }
 
 
-__global__ void jaggedFixAndSum(
-    ext_t* evaluations,
+SP1_KERNEL void jaggedFixAndSum(
+    ext_t* __restrict__ evaluations,
     const JaggedMle<JaggedSumcheckData> inputJaggedMle,
-    ext_t* output_p,
-    ext_t* output_q,
+    ext_t* __restrict__ output_p,
+    ext_t* __restrict__ output_q,
     ext_t alpha) {
 
     Hadamard hadamard;
@@ -118,13 +115,13 @@ __global__ void jaggedFixAndSum(
     }
 }
 
-__global__ void paddedHadamardFixAndSum(
-    const ext_t* base_input,
-    const ext_t* ext_input,
-    ext_t* __restrict base_output,
-    ext_t* __restrict ext_output,
+SP1_KERNEL void paddedHadamardFixAndSum(
+    const ext_t* __restrict__ base_input,
+    const ext_t* __restrict__ ext_input,
+    ext_t* __restrict__ base_output,
+    ext_t* __restrict__ ext_output,
     ext_t alpha,
-    ext_t* univariate_result,
+    ext_t* __restrict__ univariate_result,
     size_t inputHeight) {
 
     size_t outputHeight = (inputHeight + 1) >> 1;

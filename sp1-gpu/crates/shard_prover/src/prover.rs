@@ -16,9 +16,14 @@ use sp1_gpu_challenger::FromHostChallengerSync;
 use sp1_gpu_cudart::PinnedBuffer;
 use sp1_gpu_cudart::{DeviceMle, DevicePoint, TaskScope};
 use sp1_gpu_jagged_assist::prove_jagged_evaluation_sync;
-use sp1_gpu_jagged_sumcheck::{generate_jagged_sumcheck_poly, jagged_sumcheck};
+use sp1_gpu_jagged_sumcheck::{
+    generate_jagged_sumcheck_poly, jagged_sumcheck_gpu_challenger, AsMutRawChallenger,
+    ObserveAndSampleKernel,
+};
 use sp1_gpu_jagged_tracegen::{full_tracegen_permit, main_tracegen_permit, CudaShardProverData};
-use sp1_gpu_logup_gkr::{prove_logup_gkr, CudaLogUpGkrOptions, Interactions};
+use sp1_gpu_logup_gkr::{
+    prove_logup_gkr, CudaLogUpGkrOptions, Interactions, ObserveAndSampleCubicKernel,
+};
 use sp1_gpu_merkle_tree::{CudaTcsProver, SingleLayerMerkleTreeProverError};
 use sp1_gpu_tracegen::CudaTracegenAir;
 use sp1_gpu_utils::{Ext, Felt, JaggedTraceMle};
@@ -48,6 +53,10 @@ pub trait CudaShardProverComponents<GC: IopCtx>: Send + Sync + 'static {
     type DeviceChallenger: sp1_gpu_jagged_assist::AsMutRawChallenger
         + FromChallenger<GC::Challenger, TaskScope>
         + FromHostChallengerSync<GC::Challenger>
+        + AsMutRawChallenger
+        + ObserveAndSampleKernel
+        + ObserveAndSampleCubicKernel
+        + sp1_gpu_zerocheck::ObserveAndSampleQuarticKernel
         + Clone
         + Send
         + Sync;
@@ -516,7 +525,9 @@ impl<GC: IopCtx<F = Felt, EF = Ext>, PC: CudaShardProverComponents<GC>>
         let sumcheck_poly = generate_jagged_sumcheck_poly(all_mles, eq_z_col, eq_z_row);
 
         let (sumcheck_proof, component_poly_evals) = tracing::debug_span!("jagged sumcheck")
-            .in_scope(|| jagged_sumcheck(sumcheck_poly, challenger, sumcheck_claim));
+            .in_scope(|| {
+                sp1_gpu_jagged_sumcheck::jagged_sumcheck(sumcheck_poly, challenger, sumcheck_claim)
+            });
 
         let final_eval_point = sumcheck_proof.point_and_eval.0.clone();
 
@@ -554,6 +565,7 @@ impl<GC: IopCtx<F = Felt, EF = Ext>, PC: CudaShardProverComponents<GC>>
 
         challenger.observe_ext_element(component_poly_evals[0]);
 
+        // Copy batch evaluations to host once, use for both proof struct and challenger.
         let mut host_batch_evaluations = Rounds::new();
         for round_evals in batch_evaluations.iter() {
             let mut host_round_evals = vec![];
@@ -562,18 +574,12 @@ impl<GC: IopCtx<F = Felt, EF = Ext>, PC: CudaShardProverComponents<GC>>
                     sp1_gpu_cudart::DeviceTensor::copy_to_host(eval.evaluations()).unwrap();
                 host_round_evals.extend(host_eval.into_buffer().into_vec());
             }
+            // Observe into challenger from the same host copy.
+            for evaluation in host_round_evals.iter() {
+                challenger.observe_ext_element(*evaluation);
+            }
             let host_round_evals = Evaluations::new(vec![host_round_evals.into()]);
             host_batch_evaluations.push(host_round_evals);
-        }
-
-        for round in batch_evaluations.iter() {
-            for claim in round.iter() {
-                let host_claim =
-                    sp1_gpu_cudart::DeviceTensor::copy_to_host(claim.evaluations()).unwrap();
-                for evaluation in host_claim.into_buffer().into_vec() {
-                    challenger.observe_ext_element(evaluation);
-                }
-            }
         }
 
         let pcs_proof = tracing::debug_span!("prove trusted evaluations basefold")
@@ -671,7 +677,7 @@ impl<GC: IopCtx<F = Felt, EF = Ext>, PC: CudaShardProverComponents<GC>>
         }
 
         let logup_gkr_proof = tracing::debug_span!("logup gkr proof").in_scope(|| {
-            prove_logup_gkr::<GC, _>(
+            prove_logup_gkr::<GC, _, PC::DeviceChallenger>(
                 shard_chips,
                 self.all_interactions.clone(),
                 traces,
@@ -688,6 +694,10 @@ impl<GC: IopCtx<F = Felt, EF = Ext>, PC: CudaShardProverComponents<GC>>
         let gkr_opening_batch_challenge = challenger.sample_ext_element::<GC::EF>();
 
         // Generate the zerocheck proof.
+        // Create a device challenger for GPU-side Fiat-Shamir in zerocheck.
+        let zc_backend = traces.dense_data.backend();
+        let mut device_challenger =
+            PC::DeviceChallenger::from_host_challenger_sync(&challenger, &zc_backend);
         let (shard_open_values, zerocheck_partial_sumcheck_proof) =
             tracing::debug_span!("zerocheck").in_scope(|| {
                 zerocheck(
@@ -699,6 +709,7 @@ impl<GC: IopCtx<F = Felt, EF = Ext>, PC: CudaShardProverComponents<GC>>
                     &logup_gkr_proof.logup_evaluations,
                     public_values.clone(),
                     &mut challenger,
+                    &mut device_challenger,
                     self.max_log_row_count,
                 )
             });

@@ -2,9 +2,7 @@
 #include "config.cuh"
 #include <stdint.h>
 #include "sum_and_reduce/reduce.cuh"
-
-#include <cooperative_groups.h>
-#include <cooperative_groups/reduce.h>
+#include "runtime/gpu_compat.cuh"
 
 // Upper_bound for monotone start_idx (returns first j with start_idx[j] > x)
 __device__ __forceinline__ uint32_t
@@ -49,6 +47,56 @@ struct JaggedMle {
         size_t restrictedIndex = (output.startIndices[colIdx] << 1) + rowIdx;
 
         this->denseData.fixLastVariable(output.denseData, restrictedIndex, zeroIdx, oneIdx, alpha);
+
+        return restrictedIndex;
+    }
+
+    // Like fixLastVariableUnchecked but also returns the computed values in registers.
+    // The return type depends on DenseData::fixLastVariableWithValues (auto deduction).
+    template <typename Result>
+    __forceinline__ __device__ size_t
+    fixLastVariableUncheckedWithValues(JaggedMle<OutputDenseData>& output, size_t i, ext_t alpha, Result& outValues) const {
+        size_t colIdx = this->colIndex[i];
+        size_t startIdx = this->startIndices[colIdx];
+
+        size_t rowIdx = i - startIdx;
+
+        size_t zeroIdx = i << 1;
+        size_t oneIdx = (i << 1) + 1;
+        size_t restrictedIndex = (output.startIndices[colIdx] << 1) + rowIdx;
+
+        outValues = this->denseData.fixLastVariableWithValues(output.denseData, restrictedIndex, zeroIdx, oneIdx, alpha);
+
+        return restrictedIndex;
+    }
+
+    // Like fixLastVariableTwoPadding but also returns the computed values in registers.
+    template <typename Result>
+    __forceinline__ __device__ size_t
+    fixLastVariableTwoPaddingWithValues(JaggedMle<OutputDenseData>& output, size_t i, ext_t alpha, Result& outValues) const {
+        size_t colIdx = this->colIndex[i];
+        size_t startIdx = this->startIndices[colIdx];
+        size_t interactionHeight = this->startIndices[colIdx + 1] - startIdx;
+
+        size_t rowIdx = i - startIdx;
+
+        size_t zeroIdx = i << 1;
+        size_t oneIdx = (i << 1) + 1;
+        size_t restrictedIndex = (output.startIndices[colIdx] << 1) + rowIdx;
+
+        outValues = this->denseData.fixLastVariableWithValues(output.denseData, restrictedIndex, zeroIdx, oneIdx, alpha);
+
+        size_t remainderModFour = interactionHeight & 3;
+        bool isLast = (interactionHeight - 1) == rowIdx;
+        if (remainderModFour && isLast) {
+            this->denseData.pad(output.denseData, restrictedIndex + 1);
+            this->denseData.pad(output.denseData, restrictedIndex + 2);
+            output.colIndex[(restrictedIndex >> 1) + 1] = colIdx;
+        }
+
+        if (rowIdx & 1) {
+            output.colIndex[restrictedIndex >> 1] = colIdx;
+        }
 
         return restrictedIndex;
     }

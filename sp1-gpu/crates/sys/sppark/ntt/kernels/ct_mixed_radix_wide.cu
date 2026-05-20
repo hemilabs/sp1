@@ -3,7 +3,11 @@
 // SPDX-License-Identifier: Apache-2.0
 
 template <int intermediate_mul, class fr_t>
+#ifdef __HIPCC__
+__launch_bounds__(512, 2) __global__  // RDNA3: 2 blocks/CU for better occupancy
+#else
 __launch_bounds__(768, 1) __global__
+#endif
 void _CT_NTT(const unsigned int radix, const unsigned int lg_domain_size,
              const unsigned int stage, const unsigned int iterations,
              fr_t* d_inout, const fr_t (*d_partial_twiddles)[WINDOW_SIZE],
@@ -139,13 +143,17 @@ class CT_launcher {
     bool is_intt;
     int stage;
     const NTTParameters& ntt_parameters;
-    const stream_t& stream;
+    const cudaStream_t stream;
+    unsigned int batch_count;
+    unsigned int col_stride;
 
 public:
     CT_launcher(fr_t* d_ptr, int lg_dsz, bool intt,
-                const NTTParameters& params, const stream_t& s)
+                const NTTParameters& params, const cudaStream_t& s,
+                unsigned int batch = 1, unsigned int stride = 0)
       : d_inout(d_ptr), lg_domain_size(lg_dsz), is_intt(intt), stage(0),
-        ntt_parameters(params), stream(s)
+        ntt_parameters(params), stream(s),
+        batch_count(batch), col_stride(stride)
     {}
 
     void step(int iterations)
