@@ -33,7 +33,12 @@ unsafe impl Allocator for PinnedAllocator {
     }
 
     unsafe fn deallocate(&self, ptr: std::ptr::NonNull<u8>, _layout: std::alloc::Layout) {
-        CudaError::result_from_ffi(cuda_free_host(ptr.as_ptr() as *mut c_void)).unwrap()
+        // Do not panic from this destructor path. `cuda_free_host` can
+        // legitimately fail with "invalid argument" when a PinnedBuffer is
+        // dropped after the CUDA context has been torn down (process exit /
+        // cudaDeviceReset). The OS reclaims the host allocation on exit, so a
+        // failed free here is benign — panicking instead aborts the process.
+        let _ = CudaError::result_from_ffi(cuda_free_host(ptr.as_ptr() as *mut c_void));
     }
 }
 
