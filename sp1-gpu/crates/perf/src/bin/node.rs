@@ -154,6 +154,18 @@ async fn main() {
             println!("{measurement}");
             measurements.push(measurement);
         }
+
+        // Exit explicitly once all proofs are produced and verified, while still
+        // inside the GPU task scope. The Groth16/PLONK wrap path calls
+        // `cudaDeviceReset` in the parent to free VRAM for the helper subprocess,
+        // which invalidates the parent's remaining CUDA-backed objects (caching
+        // allocator, device buffers, task scope). Letting the scope unwind then
+        // runs their `Drop` impls, which call `cudaFree` on dead pointers and
+        // segfault. All work is done here, so skip destructors and exit cleanly.
+        println!("All {} measurements done", measurements.len());
+        std::io::Write::flush(&mut std::io::stdout()).ok();
+        std::process::exit(0);
+        #[allow(unreachable_code)]
         measurements
     })
     .await

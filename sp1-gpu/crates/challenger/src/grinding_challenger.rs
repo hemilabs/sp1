@@ -9,7 +9,6 @@ use slop_symmetric::CryptographicPermutation;
 use sp1_gpu_cudart::sys::challenger::{grind_koala_bear, grind_multi_field32};
 use sp1_gpu_cudart::sys::runtime::KernelPtr;
 use sp1_gpu_cudart::{args, DeviceBuffer, TaskScope};
-use sp1_primitives::fri_params::SP1_PROOF_OF_WORK_BITS;
 use sp1_primitives::SP1DiffusionMatrix;
 
 /// Poseidon2 permutation type for KoalaBear grinding.
@@ -44,8 +43,14 @@ where
     let mut found_flag = DeviceBuffer::<bool>::from_host_slice(&[false], scope).unwrap();
     let mut gpu_challenger = cpu_challenger.to_device_sync(scope).unwrap();
 
-    let block_dim: usize = 512;
-    let grid_dim: usize = (1 << (bits.saturating_sub(SP1_PROOF_OF_WORK_BITS))).max(512);
+    // Kernel is compiled with __launch_bounds__(256, 1) in
+    // sp1-gpu/crates/sys/lib/challenger/challenger.cu; using 512 here
+    // triggers "invalid argument" at cudaLaunchKernel/hipLaunchKernel.
+    let block_dim: usize = 256;
+    // Scale grid to ~4x expected nonces needed (2^bits), capped at 1M threads.
+    // Over-provisioning wastes GPU cycles on unnecessary Poseidon2 permutations.
+    let target_threads = (4usize << bits).min(1 << 20);
+    let grid_dim: usize = target_threads.div_ceil(block_dim).max(1);
     let n = F::ORDER_U64;
 
     unsafe {
