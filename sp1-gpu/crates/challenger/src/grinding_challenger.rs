@@ -106,16 +106,21 @@ where
     let cpu_challenger: MultiField32Challenger<F, PF, _> = challenger.clone().into();
 
     let mut result = DeviceBuffer::with_capacity_in(1, scope.clone());
-    let mut found_flag = DeviceBuffer::<bool>::with_capacity_in(1, scope.clone());
+    // found_flag MUST be host-initialized to false. The kernel no longer
+    // resets it (that reset raced with late waves clobbering a found witness).
+    let mut found_flag = DeviceBuffer::<bool>::from_host_slice(&[false], scope).unwrap();
     let mut gpu_challenger = cpu_challenger.to_device_sync(scope).unwrap();
 
-    let block_dim: usize = 512;
-    let grid_dim: usize = 1;
+    // Kernel is compiled __launch_bounds__(256, 1); block_dim must be <= 256.
+    // Use a real grid (mirrors grind_duplex_challenger_on_device) so the witness
+    // search is parallel — grid=1/block=512 left only ~512 threads scanning 2^31.
+    let block_dim: usize = 256;
+    let target_threads = (4usize << bits).min(1 << 20);
+    let grid_dim: usize = target_threads.div_ceil(block_dim).max(1);
     let n = F::ORDER_U64;
 
     unsafe {
         result.assume_init();
-        found_flag.assume_init();
         let args = args!(
             gpu_challenger.as_mut_raw(),
             result.as_mut_ptr(),

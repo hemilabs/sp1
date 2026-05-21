@@ -18,9 +18,12 @@ grindKernel(DuplexChallenger challenger, kb31_t* result, size_t bits, size_t n, 
 
 extern "C" void* grind_koala_bear() { return (void*)grindKernel; }
 
-__global__ void
+__global__ __launch_bounds__(256, 1) void
 grindMultiFieldKernel(MultiField32Challenger challenger, kb31_t* result, size_t bits, size_t n, bool* found_flag) {
-    found_flag[0] = false;
+    // found_flag is initialized to false by the host before launch.
+    // Do NOT set it here — late-starting blocks/waves would overwrite a
+    // true back to false, clobbering an early success so the search misses
+    // it and scans the full 2^31 space (a minutes-long effective hang).
     challenger.grind(bits, result, found_flag, n);
 }
 
