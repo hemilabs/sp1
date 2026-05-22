@@ -103,7 +103,9 @@ where
 
     const BLOCK_SIZE: usize = 256;
     const CHUNK_SIZE: usize = 1 << 16;
-    let grid_size_x = (length as usize).div_ceil(CHUNK_SIZE).max(256);
+    // Floor at ~2 blocks/SM (grid-stride kernel); old 256 floor assumed a 128-SM GPU.
+    let grid_size_x =
+        (length as usize).div_ceil(CHUNK_SIZE).max(2 * sp1_gpu_cudart::cuda_sm_count_cached());
     let grid_size = (grid_size_x, 1, 1);
     let block_dim = BLOCK_SIZE;
 
@@ -266,7 +268,9 @@ pub fn evaluate_jagged_info_fix_last_variable(
 
     const BLOCK_SIZE: usize = 256;
     const CHUNK_SIZE: usize = 1 << 16;
-    let grid_size_x = (length as usize).div_ceil(CHUNK_SIZE).max(256);
+    // Floor at ~2 blocks/SM (grid-stride kernel); old 256 floor assumed a 128-SM GPU.
+    let grid_size_x =
+        (length as usize).div_ceil(CHUNK_SIZE).max(2 * sp1_gpu_cudart::cuda_sm_count_cached());
     let grid_size = (grid_size_x, 1, 1);
     let block_dim = BLOCK_SIZE;
 

@@ -11,6 +11,8 @@
 #define cudaMemcpyHostToDevice hipMemcpyHostToDevice
 #define cudaMemcpyDeviceToHost hipMemcpyDeviceToHost
 #define cudaMemcpyDeviceToDevice hipMemcpyDeviceToDevice
+#define cudaDeviceGetAttribute hipDeviceGetAttribute
+#define cudaDevAttrMultiProcessorCount hipDeviceAttributeMultiprocessorCount
 #endif
 
 #include "runtime/exception.cuh"
@@ -48,6 +50,11 @@ extern "C" rustCudaError_t cuda_host_unregister(void* hostPtr) {
 
 extern "C" rustCudaError_t cuda_mem_get_info(size_t* free, size_t* total) {
     CUDA_OK(cudaMemGetInfo(free, total));
+    return CUDA_SUCCESS_CSL;
+}
+
+extern "C" rustCudaError_t cuda_sm_count(int* count) {
+    CUDA_OK(cudaDeviceGetAttribute(count, cudaDevAttrMultiProcessorCount, 0));
     return CUDA_SUCCESS_CSL;
 }
 

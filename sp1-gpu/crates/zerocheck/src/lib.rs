@@ -417,7 +417,10 @@ where
     const NUM_EVAL_POINT: usize = 3;
 
     let n_chunks = input.total_len.div_ceil(1 << 12);
-    let grid_size_x = n_chunks.max(256);
+    // Floor the grid at ~2 blocks per SM so it fills the device. The kernel is a
+    // grid-stride loop, so a larger grid is always safe; the old hardcoded 256
+    // floor was sized for a 128-SM GPU and left newer/larger GPUs underfilled.
+    let grid_size_x = n_chunks.max(2 * sp1_gpu_cudart::cuda_sm_count_cached());
     let grid_size = (grid_size_x, 1, NUM_EVAL_POINT);
 
     let num_tiles = BLOCK_SIZE.div_ceil(32);
@@ -531,7 +534,10 @@ where
     const NUM_EVAL_POINT: usize = 3;
 
     let n_chunks = input.total_len.div_ceil(1 << 12);
-    let grid_size_x = n_chunks.max(256);
+    // Floor the grid at ~2 blocks per SM so it fills the device. The kernel is a
+    // grid-stride loop, so a larger grid is always safe; the old hardcoded 256
+    // floor was sized for a 128-SM GPU and left newer/larger GPUs underfilled.
+    let grid_size_x = n_chunks.max(2 * sp1_gpu_cudart::cuda_sm_count_cached());
     let grid_size = (grid_size_x, 1, NUM_EVAL_POINT);
 
     let num_tiles = BLOCK_SIZE.div_ceil(32);
