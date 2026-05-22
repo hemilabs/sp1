@@ -11,6 +11,11 @@
 #define cudaMemcpyHostToDevice hipMemcpyHostToDevice
 #define cudaMemcpyDeviceToHost hipMemcpyDeviceToHost
 #define cudaMemcpyDeviceToDevice hipMemcpyDeviceToDevice
+#define cudaDeviceGetAttribute hipDeviceGetAttribute
+#define cudaDevAttrMultiProcessorCount hipDeviceAttributeMultiprocessorCount
+#define cudaGetDevice hipGetDevice
+#define cudaGetDeviceProperties hipGetDeviceProperties
+#define cudaDeviceProp hipDeviceProp_t
 #endif
 
 #include "runtime/exception.cuh"
@@ -58,6 +63,13 @@ extern "C" rustCudaError_t cuda_get_device_name(char* name, size_t len) {
     cudaDeviceProp prop;
     CUDA_OK(cudaGetDeviceProperties(&prop, device));
     std::snprintf(name, len, "%s", prop.name);
+    return CUDA_SUCCESS_CSL;
+}
+
+extern "C" rustCudaError_t cuda_sm_count(int* count) {
+    int device = 0;
+    CUDA_OK(cudaGetDevice(&device));
+    CUDA_OK(cudaDeviceGetAttribute(count, cudaDevAttrMultiProcessorCount, device));
     return CUDA_SUCCESS_CSL;
 }
 
