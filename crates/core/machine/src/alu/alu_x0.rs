@@ -107,7 +107,7 @@ impl<F: PrimeField32, M: TrustMode> MachineAir<F> for AluX0Chip<M> {
             return;
         }
 
-        let chunk_size = std::cmp::max(input.alu_x0_events.len() / num_cpus::get(), 1);
+        let chunk_size = 256;
         let padded_nb_rows = <AluX0Chip<M> as MachineAir<F>>::num_rows(self, input).unwrap();
         let num_event_rows = input.alu_x0_events.len();
         let width = <AluX0Chip<M> as BaseAir<F>>::width(self);
@@ -123,7 +123,7 @@ impl<F: PrimeField32, M: TrustMode> MachineAir<F> for AluX0Chip<M> {
         let buffer_ptr = buffer.as_mut_ptr() as *mut F;
         let values = unsafe { core::slice::from_raw_parts_mut(buffer_ptr, num_event_rows * width) };
 
-        values.chunks_mut(chunk_size * width).enumerate().par_bridge().for_each(|(i, rows)| {
+        values.par_chunks_mut(chunk_size * width).enumerate().for_each(|(i, rows)| {
             rows.chunks_mut(width).enumerate().for_each(|(j, row)| {
                 let idx = i * chunk_size + j;
                 let cols: &mut AluX0Cols<F, M> = row.borrow_mut();

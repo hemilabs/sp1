@@ -797,7 +797,7 @@ async fn device_main_tracegen<A: CudaTracegenAir<Felt>>(
         async move { (inner_name, Mle::new(guts)) }
     }
     .instrument(
-        tracing::trace_span!(parent: &outer_span, "copy host trace to device", chip = %name)
+        tracing::debug_span!(parent: &outer_span, "copy host trace to device", chip = %name)
     )));
 
     // Stream that, when polled, copies events to the device and generates traces.

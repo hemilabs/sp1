@@ -6,10 +6,14 @@ use std::marker::PhantomData;
 
 use hashbrown::HashMap;
 use itertools::Itertools;
+use rayon::{
+    iter::{IndexedParallelIterator, IntoParallelRefIterator},
+    slice::ParallelSliceMut,
+};
 use slop_air::{Air, BaseAir};
 use slop_algebra::{AbstractField, PrimeField, PrimeField32};
 use slop_matrix::Matrix;
-use slop_maybe_rayon::prelude::{ParallelBridge, ParallelIterator};
+use slop_maybe_rayon::prelude::{ParallelIterator, ParallelSlice};
 use sp1_core_executor::{
     events::{AluEvent, ByteLookupEvent, ByteRecord},
     ExecutionRecord, Opcode, Program, CLK_INC, PC_INC,
@@ -98,7 +102,6 @@ impl<F: PrimeField32, M: TrustMode> MachineAir<F> for SubwChip<M> {
         }
 
         // Generate the rows for the trace.
-        let chunk_size = std::cmp::max(input.subw_events.len() / num_cpus::get(), 1);
         let padded_nb_rows = <SubwChip<M> as MachineAir<F>>::num_rows(self, input).unwrap();
         let num_event_rows = input.subw_events.len();
         let width = <SubwChip<M> as BaseAir<F>>::width(self);
@@ -114,24 +117,20 @@ impl<F: PrimeField32, M: TrustMode> MachineAir<F> for SubwChip<M> {
         let buffer_ptr = buffer.as_mut_ptr() as *mut F;
         let values = unsafe { core::slice::from_raw_parts_mut(buffer_ptr, num_event_rows * width) };
 
-        values.chunks_mut(chunk_size * width).enumerate().par_bridge().for_each(|(i, rows)| {
-            rows.chunks_mut(width).enumerate().for_each(|(j, row)| {
-                let idx = i * chunk_size + j;
+        values.par_chunks_exact_mut(width).zip(input.subw_events.par_iter()).for_each(
+            |(row, event)| {
                 let cols: &mut SubwCols<F, M> = row.borrow_mut();
 
-                if idx < input.subw_events.len() {
-                    let mut byte_lookup_events = Vec::new();
-                    let event = input.subw_events[idx];
-                    self.event_to_row(&event.0, cols, &mut byte_lookup_events);
-                    cols.state.populate(&mut byte_lookup_events, event.0.clk, event.0.pc);
-                    cols.adapter.populate(&mut byte_lookup_events, event.1);
-                    if !M::IS_TRUSTED {
-                        let cols: &mut SubwCols<F, UserMode> = row.borrow_mut();
-                        cols.adapter_cols.is_trusted = F::from_bool(!event.1.is_untrusted);
-                    }
+                let mut byte_lookup_events = Vec::new();
+                self.event_to_row(&event.0, cols, &mut byte_lookup_events);
+                cols.state.populate(&mut byte_lookup_events, event.0.clk, event.0.pc);
+                cols.adapter.populate(&mut byte_lookup_events, event.1);
+                if !M::IS_TRUSTED {
+                    let cols: &mut SubwCols<F, UserMode> = row.borrow_mut();
+                    cols.adapter_cols.is_trusted = F::from_bool(!event.1.is_untrusted);
                 }
-            });
-        });
+            },
+        );
     }
 
     fn generate_dependencies(&self, input: &Self::Record, output: &mut Self::Record) {
@@ -140,11 +139,11 @@ impl<F: PrimeField32, M: TrustMode> MachineAir<F> for SubwChip<M> {
         }
 
         let chunk_size = std::cmp::max(input.subw_events.len() / num_cpus::get(), 1);
-        let event_iter = input.subw_events.chunks(chunk_size);
         let width = <SubwChip<M> as BaseAir<F>>::width(self);
 
-        let blu_batches = event_iter
-            .par_bridge()
+        let blu_batches = input
+            .subw_events
+            .par_chunks(chunk_size)
             .map(|events| {
                 let mut blu: HashMap<ByteLookupEvent, usize> = HashMap::new();
                 events.iter().for_each(|event| {

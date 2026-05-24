@@ -9,7 +9,9 @@ use itertools::Itertools;
 use slop_air::{Air, AirBuilder, BaseAir};
 use slop_algebra::{AbstractField, Field, PrimeField, PrimeField32};
 use slop_matrix::Matrix;
-use slop_maybe_rayon::prelude::{ParallelBridge, ParallelIterator, ParallelSlice};
+use slop_maybe_rayon::prelude::{
+    IndexedParallelIterator, ParallelIterator, ParallelSlice, ParallelSliceMut,
+};
 use sp1_core_executor::{
     events::{AluEvent, ByteLookupEvent, ByteRecord},
     ALUTypeRecord, ByteOpcode, ExecutionRecord, Opcode, Program, CLK_INC, PC_INC,
@@ -137,7 +139,7 @@ impl<F: PrimeField32, M: TrustMode> MachineAir<F> for ShiftLeftChip<M> {
         // Generate the trace rows for each event.
         let padded_nb_rows = <ShiftLeftChip<M> as MachineAir<F>>::num_rows(self, input).unwrap();
         let nb_rows = input.shift_left_events.len();
-        let chunk_size = std::cmp::max((padded_nb_rows + 1) / num_cpus::get(), 1);
+        let chunk_size = 256;
         let width = <ShiftLeftChip<M> as BaseAir<F>>::width(self);
 
         unsafe {
@@ -160,7 +162,7 @@ impl<F: PrimeField32, M: TrustMode> MachineAir<F> for ShiftLeftChip<M> {
             row
         };
 
-        values.chunks_mut(chunk_size * width).enumerate().par_bridge().for_each(|(i, rows)| {
+        values.par_chunks_mut(chunk_size * width).enumerate().for_each(|(i, rows)| {
             rows.chunks_mut(width).enumerate().for_each(|(j, row)| {
                 let idx = i * chunk_size + j;
                 let cols: &mut ShiftLeftCols<F, M> = row.borrow_mut();
