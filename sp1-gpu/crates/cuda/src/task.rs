@@ -44,9 +44,18 @@ static POOL_ID: AtomicUsize = AtomicUsize::new(0);
 
 pub struct TaskPoolBuilder {
     device: CudaDevice,
-    mem_release_threshold: u64,
+    /// `None` means: auto-derive at `build()` time from the device VRAM and
+    /// the `SP1_GPU_MEM_RELEASE_THRESHOLD` env var.
+    mem_release_threshold: Option<u64>,
     capacity: Option<usize>,
 }
+
+/// 24 GiB cutoff — devices at or below this (RTX 4090) keep the conservative
+/// "release on every sync" behaviour to avoid OOM; devices above (RTX 5090
+/// 32 GiB, H100, etc.) get a non-zero pool retention to amortise
+/// `cudaMalloc` syscall latency over per-shard / per-round allocations.
+const MEM_RELEASE_24GIB_CUTOFF: u64 = 24 * 1024 * 1024 * 1024;
+const MEM_RELEASE_HIGH_VRAM_DEFAULT: u64 = 8 * 1024 * 1024 * 1024;
 
 pub(crate) fn global_task_pool() -> &'static Arc<TaskPool> {
     GLOBAL_TASK_POOL.get_or_init(|| Arc::new(TaskPoolBuilder::new().build().unwrap()))
@@ -149,10 +158,36 @@ pub enum GlobalTaskPoolBuildError {
 
 impl TaskPoolBuilder {
     pub fn new() -> Self {
-        // Release threshold 0 means the CUDA/HIP memory pool returns freed memory
-        // at synchronization points. With u64::MAX (the old default), freed memory
-        // was permanently held in the pool, causing OOM on large programs.
-        Self { capacity: None, device: CudaDevice(0), mem_release_threshold: 0 }
+        // `mem_release_threshold: None` selects the auto path in `build()`:
+        // 0 on ≤24 GiB devices (RTX 4090 OOM-safe behaviour); 8 GiB on larger
+        // devices (RTX 5090 32 GiB, H100, etc.) to amortise per-shard /
+        // per-round `cudaMallocAsync` syscall latency. Override with the
+        // `SP1_GPU_MEM_RELEASE_THRESHOLD` env var (bytes) or the
+        // `.mem_release_threshold()` setter.
+        Self { capacity: None, device: CudaDevice(0), mem_release_threshold: None }
+    }
+
+    /// Resolve `mem_release_threshold` honouring (in order):
+    /// 1. The `SP1_GPU_MEM_RELEASE_THRESHOLD` env var (parsed as bytes), if set.
+    /// 2. The explicit `.mem_release_threshold(t)` builder setter, if used.
+    /// 3. Device-VRAM-based default: 0 on ≤24 GiB, 8 GiB above.
+    ///
+    /// Falls back to 0 on any query failure (matches the previous default).
+    fn resolve_mem_release_threshold(&self) -> u64 {
+        if let Ok(v) = std::env::var("SP1_GPU_MEM_RELEASE_THRESHOLD") {
+            if let Ok(parsed) = v.trim().parse::<u64>() {
+                return parsed;
+            }
+        }
+        if let Some(explicit) = self.mem_release_threshold {
+            return explicit;
+        }
+        match crate::device::cuda_memory_info() {
+            Ok((_free, total)) if (total as u64) > MEM_RELEASE_24GIB_CUTOFF => {
+                MEM_RELEASE_HIGH_VRAM_DEFAULT
+            }
+            _ => 0,
+        }
     }
 
     pub fn num_tasks(mut self, num_tasks: usize) -> Self {
@@ -172,7 +207,7 @@ impl TaskPoolBuilder {
     /// This setting will affect the memory release threshold for the entire device, not just the
     /// current task pool being built.
     pub fn mem_release_threshold(mut self, threshold: u64) -> Self {
-        self.mem_release_threshold = threshold;
+        self.mem_release_threshold = Some(threshold);
         self
     }
 
@@ -187,6 +222,12 @@ impl TaskPoolBuilder {
     pub fn build(self) -> Result<TaskPool, TaskPoolBuildError> {
         let id = self.allocate_new_id();
         let num_tasks = self.capacity.unwrap_or(DEFAULT_NUM_TASKS);
+        let mem_release_threshold = self.resolve_mem_release_threshold();
+        tracing::debug!(
+            target: "sp1_gpu_cudart",
+            mem_release_threshold,
+            "task pool: mem_release_threshold resolved"
+        );
 
         // Set the memory release threshold
         unsafe {
@@ -198,7 +239,7 @@ impl TaskPoolBuilder {
             .unwrap();
             CudaError::result_from_ffi(cuda_mem_pool_set_release_threshold(
                 mem_pool,
-                self.mem_release_threshold,
+                mem_release_threshold,
             ))
             .unwrap();
         };
