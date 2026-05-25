@@ -117,6 +117,44 @@ Combined projection: **~50-90 s e2e** off a 552 s 1M sha2-loop on the 5090
   in `zerocheck`/`prove_trusted_evaluations` reads back from
   `dense_data` after commit; if anything does, shard N+1's tracegen would
   clobber it). Gate behind `SP1_PROVE_OVERLAP_TRACEGEN=1` until validated
+
+  **2026-05-25 attempt — structural blocker identified:**
+
+  `MainTraceData<F, A, P>` (the carrier moved across the tracegen→prove
+  boundary, fields `traces`, `public_values`, `permit`, `shard_chips`)
+  lives in `sp1-hypercube::prover::*` — it is the *trait-level* prover
+  type used by both the CPU and the GPU backends. The pool design needs
+  a "buffer handle" travelling from `main_tracegen_permit` to
+  `prove_shard_with_data` for the same shard, so that prove uses the
+  exact buffer tracegen wrote. The two natural shapes are:
+
+  1. **Add a per-shard handle field to `MainTraceData`** — requires a
+     trait-level edit in `sp1-hypercube` that ripples to the CPU prover
+     too (the CPU backend has no analogous pool concept; the handle
+     would have to be an associated-type to avoid making CPU pay for a
+     concept it doesn't use). Multi-file refactor across the trait
+     boundary.
+  2. **Side-channel the handle inside the `Mutex<CudaShardProverData>`
+     itself** — e.g. a `pending_buffers: HashMap<ShardId, JaggedTraceMle>`
+     where tracegen inserts and prove removes by id. But `ShardId` is
+     not threaded by the trait either; needs the same trait edit to
+     plumb an id through.
+
+  Both paths cross the GPU↔hypercube trait boundary. A safe single-
+  session implementation of #1.3 is therefore not available; the
+  refactor must touch sp1-hypercube's prover trait first.
+
+  Smaller scoped variants that DO fit a single session but deliver no
+  measurable win on their own (no behavior change):
+  - Add a `TraceBufferPool` infrastructure type with N=1 default
+    (~150 LOC). Future commits flip N>1 + ProverSemaphore split.
+  - Pre-create N JaggedTraceMle clones at setup, leave them unused
+    behind an env flag. Allocates VRAM but doesn't change the data
+    flow.
+
+  Recommended next session: do the sp1-hypercube `MainTraceData`
+  associated-type extension first as its own commit, then layer the
+  GPU-side pool on top.
   on the 18-cell perf matrix.
 - Default ON for 5090 only (gated by `>24 GiB VRAM` check) once validated.
 
