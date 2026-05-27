@@ -161,16 +161,27 @@ Combined projection: **~50-90 s e2e** off a 552 s 1M sha2-loop on the 5090
   (semaphore). Audit: confirm nothing reads back the pk's trace buffer after
   `commit_traces` (the buffer now lives in the guard, not the pk).
 
-  **Open risk to validate first (cheap, before the full refactor):** even
-  with separate buffers + streams, `device_main_tracegen` and `prove`
-  contend for the same 5090 SMs — the 69 s "100% exposed" device-tracegen
-  may not fully overlap prove if prove saturates the SMs. The memcpy (H2D)
-  portion overlaps via the copy engine, but the per-chip tracegen *kernels*
-  need idle SM capacity. Recommend a contention probe (a dummy
-  tracegen-shaped kernel concurrent with a real `prove_shard_with_data`,
-  measuring prove regression — the Phase -1 §2.2 test) to bound the real
-  win before committing the multi-day refactor. The 30-50 s estimate
-  assumes good overlap; SM contention could cut it substantially.
+  **Overlap-headroom probe (2026-05-27) — RESOLVED, GO.** Rather than the
+  SM-contention worry, the right question is "does the GPU have idle capacity
+  to absorb device tracegen at all?" Answered non-invasively from the
+  campaign nsys profiles (union of all CUPTI kernel+memcpy+memset intervals
+  vs wall):
+
+  | profile | wall | GPU all-busy | **GPU idle** |
+  |---|---|---|---|
+  | 5090 100k | 73.8 s | 29.1 s (39%) | **44.7 s (60.6%)** |
+  | 4090 100k | 77.9 s | 41.9 s (54%) | **36.1 s (46%)** |
+
+  The 5090 GPU is **idle ~61% of the proof wall** — it sits waiting on the
+  CPU-bound phases (executor, host tracegen). `device_main_tracegen` is only
+  ~7 s (100k) / ~69 s (1M) of GPU work, dwarfed by the idle window (44.7 s /
+  ~335 s). So the SM-contention fear was misframed: tracegen does **not** need
+  to fight prove kernels for SMs — it can run in the abundant pure-idle gaps
+  during other shards' CPU phases. Capacity is not the barrier. The refactor's
+  job is purely to let the scheduler place shard N+1's device tracegen into
+  those idle windows (per-shard buffers + relaxed permit). The 30-50 s
+  estimate is plausible; the residual risk is scheduling/pipeline tuning, not
+  GPU capacity. **Proceed with the refactor.**
 
   Implementation is byte-identical at N=1 (same single buffer, threaded by
   handle instead of re-locked); flipping to N>1 + the semaphore split then
