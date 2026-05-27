@@ -34,6 +34,12 @@ sha2 = { workspace = true }
 [dev-dependencies]
 sp1-core-machine = { workspace = true }
 test-artifacts = { path = "../../test-artifacts" }
+criterion = { workspace = true }
+sp1-hypercube = { workspace = true }
+
+[[bench]]
+name = "trace_chunk"
+harness = false
 
 [lints]
 workspace = true
