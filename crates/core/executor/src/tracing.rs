@@ -5,7 +5,6 @@ use std::{
 };
 
 use hashbrown::HashMap;
-use rustc_hash::FxBuildHasher;
 use sp1_hypercube::air::{PublicValues, PROOF_NONCE_NUM_WORDS};
 use sp1_jit::MinimalTrace;
 use sp1_primitives::consts::PAGE_SIZE;
@@ -1480,14 +1479,9 @@ impl<'a, M: ExecutionMode> SyscallRuntime<'a, M> for TracingVM<'a, M> {
     }
 }
 
-/// Hot path: ~30 M `insert_record` calls per shard, mostly hitting the 32
-/// register addresses. The default hashbrown hasher (`ahash`) is ~5-10 ns/op on
-/// `u64`; `FxHash` is ~1-2 ns/op and distributes well enough for word-aligned
-/// addresses (identity-hash would collide because the low 3 bits of aligned
-/// addresses are always 0).
 #[derive(Debug, Default)]
 pub struct LocalMemoryAccess {
-    pub inner: HashMap<u64, MemoryLocalEvent, FxBuildHasher>,
+    pub inner: HashMap<u64, MemoryLocalEvent>,
 }
 
 impl LocalMemoryAccess {
@@ -1519,7 +1513,7 @@ impl LocalMemoryAccess {
 }
 
 impl Deref for LocalMemoryAccess {
-    type Target = HashMap<u64, MemoryLocalEvent, FxBuildHasher>;
+    type Target = HashMap<u64, MemoryLocalEvent>;
     fn deref(&self) -> &Self::Target {
         &self.inner
     }
