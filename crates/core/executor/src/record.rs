@@ -195,6 +195,9 @@ impl ExecutionRecord {
         let untrusted_memory = program.untrusted_memory;
         let mut result = Self { program, ..Default::default() };
 
+        // Vec::reserve mostly costs virtual address space (the kernel demand-faults
+        // pages on first touch), so the per-opcode generous reserve is cheap in
+        // practice — keep as-is to avoid reallocation cost in event-heavy shards.
         result.alu_x0_events.reserve(reservation_size);
         result.add_events.reserve(reservation_size);
         result.addi_events.reserve(reservation_size);
@@ -223,7 +226,14 @@ impl ExecutionRecord {
         result.global_memory_initialize_events.reserve(reservation_size);
         result.global_memory_finalize_events.reserve(reservation_size);
         result.global_interaction_events.reserve(reservation_size);
-        result.byte_lookups.reserve(reservation_size);
+        // `byte_lookups` is a HashMap (not a Vec) — `reserve(N)` rounds the
+        // hashbrown bucket array up to the next power of two and *zero-fills* it
+        // immediately. With N = `shard_size >> 3` ≈ 2 M, the bucket array is
+        // ~60-80 MiB and is paid up-front every shard. The byte-lookup domain
+        // (ByteOpcode × b × c) is small — a few tens of thousands of distinct
+        // entries even on big shards — so cap the up-front reservation. A larger
+        // working set just grows the map past the cap; no correctness change.
+        result.byte_lookups.reserve(std::cmp::min(reservation_size, 16 * 1024));
 
         result.public_values.proof_nonce = proof_nonce;
         result.public_values.is_untrusted_programs_enabled = enable_untrusted_programs as u32;
