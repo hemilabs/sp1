@@ -42,6 +42,10 @@ sp1-hypercube = { workspace = true }
 name = "trace_chunk"
 harness = false
 
+[[bench]]
+name = "chip_tracegen"
+harness = false
+
 [lints]
 workspace = true
 

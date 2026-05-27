@@ -203,7 +203,7 @@ Combined projection: **~50-90 s e2e** off a 552 s 1M sha2-loop on the 5090
 | # | Finding | File:line | Estimated e2e | Effort |
 |---|---|---|---|---|
 | 2.1 | Pin per-round small D2H buffers (zerocheck eval triplets, basefold β, sumcheck univariate evals) through a reused `PinnedBuffer<Ext>` + event sync | `zerocheck/src/lib.rs:893-894, 855`; `basefold/src/fri.rs:395-401`; `jagged_sumcheck/src/hadamard.rs:276`; `logup_gkr/src/sumcheck.rs:1175` | **2-4 s** | 1-2 d |
-| 2.2 | Convert sequential `InstructionFetch` + `InstructionDecode` + `ByteChip` + `RangeChip` `generate_trace_into` to rayon (currently zero parallelism — single rayon worker tied up for the entire chip wall) | `crates/core/machine/src/program/{instruction_fetch.rs:195, instruction_decode.rs:100}`; `crates/core/machine/src/bytes/trace.rs:81`; `crates/core/machine/src/range/trace.rs:111` | **3-8 s** | 1 d |
+| 2.2 | ~~Convert sequential `InstructionFetch`/`InstructionDecode`/`ByteChip`/`RangeChip` `generate_trace_into` to rayon~~ — **mostly REJECTED, see note below** | `crates/core/machine/src/program/{instruction_fetch.rs:195, instruction_decode.rs:100}`; `crates/core/machine/src/bytes/trace.rs:81`; `crates/core/machine/src/range/trace.rs:111` | **~0 (trusted)** | skip |
 | 2.3 | Hoist `next_start_indices_and_column_heights` H2D out of the GKR layer/round hot path (per-layer + per-round ~400 B u32 buffer × 100+ calls) | `sp1-gpu/crates/utils/src/jagged.rs:139`; `sp1-gpu/crates/logup_gkr/src/{execution.rs:31,82, sumcheck.rs:546,758,294}` | **1-3 s** | 1 d |
 | 2.4 | Memory load/store COUPLED chips: `chunks_mut().par_bridge()` → `par_chunks_mut(chunk_size)` keeping `chunk_size = len/num_cpus` (preserves bounded HashMap-merge count) | 9 files in `crates/core/machine/src/memory/instructions/{load,store}/*.rs` + jalr/trap/memory/syscall/instructions | **~1 s** | 0.5 d |
 | 2.5 | PLONK Phase C: wire the canonical-form device-resident path through `prove()`. `gpu_ifft_then_coset_fft_to_device_keep_canonical` already shipped but `#[allow(dead_code)]`; would eliminate per-prove H2D of L/R/O/Z + h0/h1/h2 (~4 GiB at N=2²⁵) in R5 lincomb | `sp1-gpu/crates/plonk/src/prover.rs:1402-1439, 3157-3159`; `domain.rs:603, 793` | **0.6-0.8 s wrap** | 2-3 d |
@@ -212,6 +212,21 @@ Combined projection: **~50-90 s e2e** off a 552 s 1M sha2-loop on the 5090
 | 2.8 | R1CS solver: drop unused 3 GB `cudaHostAlloc(h_pinned_wires)`; route D2H through pinned buffers (currently pageable → ~170 ms; pinned → ~40 ms) | `sp1-gpu/crates/sys/lib/r1cs/r1cs_solver.cu:651-658, 751-759`; `sp1-gpu/crates/groth16/src/r1cs_solver.rs:112-162` | **~130 ms wrap** | 0.5 d |
 | 2.9 | PLONK: use existing `msm_with_next` for the two R5 commit MSM pairs (SDMA-overlaps next-MSM H2D with prior compute) | `sp1-gpu/crates/plonk/src/prover.rs:3214, 3220, 2460, 2461` | **80-160 ms wrap** | 0.5 d |
 | 2.10 | Merkle tree: raise `batch_threshold` from 7 → 10 (`compressBatched` handles up to 1024 nodes); eliminates ~120 sub-occupancy micro-launches per shard on 5090's 170 SMs | `sp1-gpu/crates/merkle_tree/src/single_layer.rs:138-149`; `sp1-gpu/crates/sys/lib/merkle_tree/merkle_tree.cu:37-49, 66-82` | **0.15-0.5 s** | 0.5 d |
+
+> **#2.2 measurement note (2026-05-27, via `chip_tracegen` bench).**
+> Pointed the microbench harness at the four chips. `InstructionFetch` and
+> `InstructionDecode` have **0 events** for trusted programs (fibonacci, sha2
+> — i.e. all normal workloads): their `generate_trace_into` only carries rows
+> when `enable_untrusted_programs` is set. Measured `instr_fetch` ≈ 600 ns and
+> `instr_decode` ≈ 34 ns (empty padding path) on both. So parallelizing them
+> is a no-op for the common case — the agent's "= total executed instructions"
+> premise was untrusted-mode-only. `ByteChip`/`RangeChip` iterate the
+> `byte_lookups` multiset (bounded to the small ByteOpcode×b×c domain,
+> ~tens of thousands of entries → sub-ms even sequential) and write to indexed
+> `(row, opcode)` cells that are awkward to parallelize safely. **Verdict:
+> skip #2.2** for trusted workloads. The bench is retained
+> (`crates/core/runner/benches/chip_tracegen.rs`) as a template + to measure
+> these chips under untrusted-program workloads if that ever becomes a target.
 
 ## 4. Tier 3 — small wins / speculative
 
