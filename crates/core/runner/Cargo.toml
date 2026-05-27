@@ -35,6 +35,12 @@ sha2 = { workspace = true }
 sp1-core-machine = { workspace = true }
 test-artifacts = { path = "../../test-artifacts" }
 tokio = { workspace = true, features = ["sync"] }
+criterion = { workspace = true }
+sp1-hypercube = { workspace = true }
+
+[[bench]]
+name = "trace_chunk"
+harness = false
 
 [lints]
 workspace = true
