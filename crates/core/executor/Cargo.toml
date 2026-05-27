@@ -29,7 +29,6 @@ rrs-lib = { workspace = true }
 eyre = { workspace = true }
 bincode = { workspace = true }
 hashbrown = { workspace = true, features = ["serde", "inline-more"] }
-rustc-hash = { workspace = true }
 itertools = { workspace = true }
 num = { workspace = true }
 typenum = { workspace = true }

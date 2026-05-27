@@ -6899,7 +6899,6 @@ dependencies = [
  "object",
  "rrs-succinct",
  "rustc-demangle",
- "rustc-hash 2.1.2",
  "serde",
  "serde_arrays",
  "serde_json",
