@@ -118,44 +118,64 @@ Combined projection: **~50-90 s e2e** off a 552 s 1M sha2-loop on the 5090
   `dense_data` after commit; if anything does, shard N+1's tracegen would
   clobber it). Gate behind `SP1_PROVE_OVERLAP_TRACEGEN=1` until validated
 
-  **2026-05-25 attempt — structural blocker identified:**
+  **2026-05-27 correction — NO hypercube trait edit needed (GPU-contained):**
 
-  `MainTraceData<F, A, P>` (the carrier moved across the tracegen→prove
-  boundary, fields `traces`, `public_values`, `permit`, `shard_chips`)
-  lives in `sp1-hypercube::prover::*` — it is the *trait-level* prover
-  type used by both the CPU and the GPU backends. The pool design needs
-  a "buffer handle" travelling from `main_tracegen_permit` to
-  `prove_shard_with_data` for the same shard, so that prove uses the
-  exact buffer tracegen wrote. The two natural shapes are:
+  The 2026-05-25 note was wrong. There are *two* `MainTraceData` types:
+  - `sp1-hypercube::prover::shard::MainTraceData<F, A, B>` (the generic one),
+  - **`sp1_gpu_shard_prover::MainTraceData<GC, SC, Prover>`** in
+    `sp1-gpu/crates/shard_prover/src/types.rs:23` — a *separate, GPU-owned*
+    type.
 
-  1. **Add a per-shard handle field to `MainTraceData`** — requires a
-     trait-level edit in `sp1-hypercube` that ripples to the CPU prover
-     too (the CPU backend has no analogous pool concept; the handle
-     would have to be an associated-type to avoid making CPU pay for a
-     concept it doesn't use). Multi-file refactor across the trait
-     boundary.
-  2. **Side-channel the handle inside the `Mutex<CudaShardProverData>`
-     itself** — e.g. a `pending_buffers: HashMap<ShardId, JaggedTraceMle>`
-     where tracegen inserts and prove removes by id. But `ShardId` is
-     not threaded by the trait either; needs the same trait edit to
-     plumb an id through.
+  The production GPU prove path uses the **GPU** one: `prove_shard_with_data`
+  takes `crate::ShardData` (→ `crate::MainTraceData`), constructed in
+  `setup_and_prove_shard` / `prove_shard_with_pk`. And `pk.preprocessed_data`
+  is the GPU backend's `ProvingKey::PreprocessedData` associated type
+  (`Mutex<CudaShardProverData>`, prover.rs:178) — `ProvingKey` (hypercube)
+  just stores `Prover::PreprocessedData` generically (shard.rs:108). So the
+  whole pool refactor is **GPU-contained**; the CPU backend is untouched.
 
-  Both paths cross the GPU↔hypercube trait boundary. A safe single-
-  session implementation of #1.3 is therefore not available; the
-  refactor must touch sp1-hypercube's prover trait first.
+  **Concrete design (split shared PCS data + buffer pool):**
+  1. `PreprocessedData` becomes a pool type holding (a) `Arc` of the
+     read-only preprocessed PCS data + table-height metadata, and (b) a
+     `WorkerQueue<JaggedTraceMle<Felt, TaskScope>>` of N trace buffers,
+     each pre-initialised with the preprocessed slots via N calls to
+     `allocate_and_initialize_traces` at setup (avoids needing `Clone` on
+     the device buffer).
+  2. `main_tracegen` acquires one buffer from the pool, writes the main
+     trace into it (replacing the in-place `jagged_traces.lock()` write),
+     and returns the **owned buffer handle** alongside
+     `(public_values, chip_set, permit)`.
+  3. The GPU `MainTraceData` (types.rs) gains a `trace_buffer:
+     TraceBufferGuard` field carrying that handle.
+  4. `prove_shard_with_data` reads the trace from `main_trace_data
+     .trace_buffer` (not by re-locking the pk) and the PCS data from the
+     shared `Arc`; the guard's `Drop` returns the buffer to the pool.
+  5. `ProverSemaphore::new(1)` → split into `tracegen_permit (=N)` +
+     `prove_permit (=1)` (or a single permit of N matched to the pool).
 
-  Smaller scoped variants that DO fit a single session but deliver no
-  measurable win on their own (no behavior change):
-  - Add a `TraceBufferPool` infrastructure type with N=1 default
-    (~150 LOC). Future commits flip N>1 + ProverSemaphore split.
-  - Pre-create N JaggedTraceMle clones at setup, leave them unused
-    behind an env flag. Allocates VRAM but doesn't change the data
-    flow.
+  Touch points (~6 files): `jagged_tracegen/src/lib.rs` (CudaShardProverData
+  split + main_tracegen), `shard_prover/src/types.rs` (MainTraceData field),
+  `shard_prover/src/prover.rs` (PreprocessedData type, prove buffer access,
+  table-heights accessor, MainTraceData construction), `shard_prover/src/
+  setup.rs` (pool construction), `prover_components/src/builder.rs`
+  (semaphore). Audit: confirm nothing reads back the pk's trace buffer after
+  `commit_traces` (the buffer now lives in the guard, not the pk).
 
-  Recommended next session: do the sp1-hypercube `MainTraceData`
-  associated-type extension first as its own commit, then layer the
-  GPU-side pool on top.
-  on the 18-cell perf matrix.
+  **Open risk to validate first (cheap, before the full refactor):** even
+  with separate buffers + streams, `device_main_tracegen` and `prove`
+  contend for the same 5090 SMs — the 69 s "100% exposed" device-tracegen
+  may not fully overlap prove if prove saturates the SMs. The memcpy (H2D)
+  portion overlaps via the copy engine, but the per-chip tracegen *kernels*
+  need idle SM capacity. Recommend a contention probe (a dummy
+  tracegen-shaped kernel concurrent with a real `prove_shard_with_data`,
+  measuring prove regression — the Phase -1 §2.2 test) to bound the real
+  win before committing the multi-day refactor. The 30-50 s estimate
+  assumes good overlap; SM contention could cut it substantially.
+
+  Implementation is byte-identical at N=1 (same single buffer, threaded by
+  handle instead of re-locked); flipping to N>1 + the semaphore split then
+  enables concurrency. Gate behind `SP1_PROVE_OVERLAP_TRACEGEN=1` until
+  validated on the 18-cell perf matrix.
 - Default ON for 5090 only (gated by `>24 GiB VRAM` check) once validated.
 
 ### 1.4 Move `prover_permit.acquire()` to AFTER the host-trace H2D
