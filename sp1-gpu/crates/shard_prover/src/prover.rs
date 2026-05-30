@@ -284,8 +284,23 @@ where
 
         let pk = Arc::new(pk);
 
-        let main_trace_data =
-            MainTraceData { traces: pk, public_values, shard_chips: chip_set, permit };
+        // `setup_from_preprocessed_data_and_traces` wrapped the freshly-built
+        // buffer in a pool of N=1. `full_tracegen_permit` already filled both
+        // preprocessed + main slots, so we just need to acquire that one
+        // buffer as a `Worker` for prove to hold through `prove_shard_with_data`.
+        // Explicit annotation pins `Self::PreprocessedData`, which the trait
+        // resolver otherwise can't concretize here.
+        let trace_data: &Mutex<CudaShardProverData<GC, PC::Air>> = &pk.preprocessed_data;
+        let pool = trace_data.lock().await.trace_buffer_pool.clone();
+        let trace_buffer = pool.pop().await.expect("acquire trace buffer from setup pool");
+
+        let main_trace_data = MainTraceData {
+            traces: pk,
+            public_values,
+            shard_chips: chip_set,
+            permit,
+            trace_buffer,
+        };
 
         // Create a chanllenger
         let mut challenger = GC::default_challenger();
@@ -324,7 +339,7 @@ where
 
         let buffer = self.inner.get_buffer().await;
 
-        let (public_values, chip_set, permit) = main_tracegen_permit(
+        let (public_values, chip_set, permit, trace_buffer) = main_tracegen_permit(
             &self.inner.machine,
             record,
             &pk.preprocessed_data,
@@ -344,6 +359,7 @@ where
                 public_values,
                 shard_chips: chip_set,
                 permit,
+                trace_buffer,
             },
         };
 
@@ -369,15 +385,11 @@ where
     async fn preprocessed_table_heights(
         pk: Arc<ProvingKey<GC, ShardContextImpl<GC, PC::C, PC::Air>, Self>>,
     ) -> BTreeMap<String, usize> {
-        // Access through pk.preprocessed_data which is of type CudaShardProverData
+        // After #3 the heights are cached on the shared (read-only) part of
+        // `CudaShardProverData`, so a brief lock just to clone the BTreeMap
+        // suffices — no need to reach into a trace buffer.
         let preprocessed_data = pk.preprocessed_data.lock().await;
-        preprocessed_data
-            .preprocessed_traces
-            .dense()
-            .preprocessed_table_index
-            .iter()
-            .map(|(name, offset)| (name.clone(), offset.poly_size))
-            .collect()
+        preprocessed_data.preprocessed_table_heights().clone()
     }
 }
 
@@ -631,16 +643,22 @@ impl<GC: IopCtx<F = Felt, EF = Ext>, PC: CudaShardProverComponents<GC>>
             sp1_gpu_jagged_assist::BranchingProgramKernel<GC::F, GC::EF, PC::DeviceChallenger>,
     {
         let ShardData { main_trace_data } = data;
-        let MainTraceData { traces, public_values, shard_chips, permit } = main_trace_data;
+        let MainTraceData { traces: pk, public_values, shard_chips, permit, trace_buffer } =
+            main_trace_data;
 
         let shard_chips = self.machine().smallest_cluster(&shard_chips).unwrap();
 
         // Observe the public values.
         challenger.observe_slice(&public_values);
 
-        let locked_preprocessed_data = traces.preprocessed_data.blocking_lock();
-        let traces = &locked_preprocessed_data.preprocessed_traces;
-        let preprocessed_data = &locked_preprocessed_data.preprocessed_data;
+        // #3: the per-shard trace MLE buffer travels through `MainTraceData`
+        // as an owned `Worker` (popped from the PK's pool by tracegen);
+        // `Drop` returns it to the pool when this function returns. The
+        // shared (read-only) PCS data is cloned out of the brief outer Mutex
+        // so no lock is held during prove.
+        let shared = pk.preprocessed_data.blocking_lock().shared.clone();
+        let traces = &*trace_buffer;
+        let preprocessed_data = &shared.preprocessed_data;
 
         // Commit to the traces.
         let (main_commit, main_data) =

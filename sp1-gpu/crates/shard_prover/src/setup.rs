@@ -104,7 +104,10 @@ where
             untrusted_config,
         };
 
-        let pk = CudaShardProverData::new(preprocessed_traces, preprocessed_data);
+        // #3: wrap the single freshly-allocated buffer in a pool of N=1, which
+        // preserves the original single-buffer behaviour byte-identically.
+        // Future work scales N>1 (env-gated `SP1_PROVE_OVERLAP_TRACEGEN`).
+        let pk = CudaShardProverData::new(vec![preprocessed_traces], preprocessed_data);
 
         (pk, vk)
     }

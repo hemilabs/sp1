@@ -1,7 +1,7 @@
 use core::pin::pin;
 use itertools::Itertools;
 use slop_alloc::mem::DeviceMemory;
-use slop_futures::queue::Worker;
+use slop_futures::queue::{Worker, WorkerQueue};
 use slop_tensor::{Dimensions, Tensor};
 use sp1_core_machine::global::GLOBAL_OFFSET_POS_COPY;
 use std::collections::{BTreeMap, BTreeSet};
@@ -76,29 +76,60 @@ impl Trace<TaskScope> {
     }
 }
 
-pub struct CudaShardProverData<GC: IopCtx, Air: MachineAir<GC::F>> {
-    /// The preprocessed traces.
-    pub preprocessed_traces: JaggedTraceMle<Felt, TaskScope>,
+/// Read-only data shared across all concurrent shards using this proving key:
+/// the preprocessed PCS commitment and the derived per-table heights.
+///
+/// Split out of `CudaShardProverData` so the *mutable* per-shard trace MLE
+/// buffer can live in a pool while the (large, read-only) PCS data stays a
+/// single shared `Arc` — see #3 in `sp1-gpu/docs/5090_optimization_plan.md`.
+pub struct CudaShardProverShared<GC: IopCtx, Air: MachineAir<GC::F>> {
     /// The pcs data for the preprocessed traces.
     pub preprocessed_data: JaggedProverData<GC, CudaStackedPcsProverData<GC>>,
+    /// Preprocessed table heights (derived once from any trace buffer; all
+    /// pool buffers share identical preprocessed slots).
+    pub preprocessed_table_heights: BTreeMap<String, usize>,
     phantom: PhantomData<Air>,
+}
+
+pub struct CudaShardProverData<GC: IopCtx, Air: MachineAir<GC::F>> {
+    /// Read-only PCS data + metadata, shared across all concurrent shards.
+    pub shared: Arc<CudaShardProverShared<GC, Air>>,
+    /// Pool of N trace MLE buffers — one per concurrent in-flight shard.
+    /// Each buffer is pre-initialised with the preprocessed slots; per-shard
+    /// `main_tracegen` pops a buffer, writes its main slots, and on drop the
+    /// buffer is returned to the pool. N=1 preserves the original
+    /// single-buffer behaviour byte-identically.
+    pub trace_buffer_pool: Arc<WorkerQueue<JaggedTraceMle<Felt, TaskScope>>>,
 }
 
 impl<GC: IopCtx, Air: MachineAir<GC::F>> CudaShardProverData<GC, Air> {
     pub fn new(
-        preprocessed_traces: JaggedTraceMle<Felt, TaskScope>,
+        trace_buffers: Vec<JaggedTraceMle<Felt, TaskScope>>,
         preprocessed_data: JaggedProverData<GC, CudaStackedPcsProverData<GC>>,
     ) -> Self {
-        Self { preprocessed_traces, preprocessed_data, phantom: PhantomData }
-    }
-
-    pub fn preprocessed_table_heights(&self) -> BTreeMap<String, usize> {
-        self.preprocessed_traces
+        assert!(
+            !trace_buffers.is_empty(),
+            "CudaShardProverData::new requires a non-empty trace buffer pool"
+        );
+        // Derive table heights from the first buffer; all pool buffers were
+        // initialised with the same preprocessed slots, so any will do.
+        let preprocessed_table_heights = trace_buffers[0]
             .dense()
             .preprocessed_table_index
             .iter()
             .map(|(name, offset)| (name.clone(), offset.poly_size))
-            .collect()
+            .collect();
+        let shared = Arc::new(CudaShardProverShared {
+            preprocessed_data,
+            preprocessed_table_heights,
+            phantom: PhantomData,
+        });
+        let trace_buffer_pool = Arc::new(WorkerQueue::new(trace_buffers));
+        Self { shared, trace_buffer_pool }
+    }
+
+    pub fn preprocessed_table_heights(&self) -> &BTreeMap<String, usize> {
+        &self.shared.preprocessed_table_heights
     }
 }
 
@@ -841,7 +872,9 @@ async fn device_main_tracegen<A: CudaTracegenAir<Felt>>(
 }
 
 /// Corresponds to `generate_main_traces`.
-/// Mutates jagged_traces in place, and returns public values.
+/// Pops a trace buffer from the per-PK pool, fills its main slots, and
+/// returns the owned `Worker` handle alongside the public values. The
+/// `Worker`'s `Drop` returns the buffer to the pool after prove completes.
 #[instrument(skip_all, level = "debug")]
 #[allow(clippy::too_many_arguments)]
 pub async fn main_tracegen<GC: IopCtx<F = Felt>, A: CudaTracegenAir<Felt>>(
@@ -854,15 +887,26 @@ pub async fn main_tracegen<GC: IopCtx<F = Felt>, A: CudaTracegenAir<Felt>>(
     backend: &TaskScope,
     prover_permit: ProverSemaphore,
     global_dependencies_opt: bool,
-) -> (Vec<Felt>, BTreeSet<Chip<Felt, A>>, ProverPermit) {
+) -> (Vec<Felt>, BTreeSet<Chip<Felt, A>>, ProverPermit, Worker<JaggedTraceMle<Felt, TaskScope>>) {
     // Start generating traces on host.
     let (host_phase_tracegen, host_phase_shape_info) =
         host_main_tracegen(machine, buffer.as_ptr() as usize, 0, record.clone()).await;
 
     let HostPhaseShapeInfo { traces_by_name: initial_traces, chip_set } = host_phase_shape_info;
+
+    // Acquire a trace buffer from the per-PK pool. With N=1 (default) this
+    // serialises shards identically to the old single-buffer Mutex; with N>1
+    // (env-gated, future) it lets shard N+1's tracegen begin while shard N's
+    // prove still holds its buffer.
+    let pool = jagged_traces.lock().await.trace_buffer_pool.clone();
+    let mut trace_buffer = pool
+        .pop()
+        .instrument(tracing::debug_span!("acquire trace buffer"))
+        .await
+        .expect("acquire trace buffer from pool");
+
     let permit =
         prover_permit.acquire().instrument(tracing::debug_span!("acquire permit")).await.unwrap();
-    let mut jagged_traces = jagged_traces.lock().await;
 
     // Now that the permit is acquired, we can begin the following two tasks:
     // - Copying host traces to the device.
@@ -874,14 +918,14 @@ pub async fn main_tracegen<GC: IopCtx<F = Felt>, A: CudaTracegenAir<Felt>>(
 
     copy_main_jagged_traces(
         traces,
-        &mut jagged_traces.preprocessed_traces,
+        &mut *trace_buffer,
         log_stacking_height,
         max_log_row_count,
         global_dependencies_opt,
     )
     .await;
 
-    (public_values, chip_set, permit)
+    (public_values, chip_set, permit, trace_buffer)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -895,8 +939,8 @@ pub async fn main_tracegen_permit<GC: IopCtx<F = Felt>, A: CudaTracegenAir<Felt>
     backend: &TaskScope,
     prover_permit: ProverSemaphore,
     global_dependencies_opt: bool,
-) -> (Vec<Felt>, BTreeSet<Chip<Felt, A>>, ProverPermit) {
-    let (public_values, chip_set, permit) = main_tracegen(
+) -> (Vec<Felt>, BTreeSet<Chip<Felt, A>>, ProverPermit, Worker<JaggedTraceMle<Felt, TaskScope>>) {
+    main_tracegen(
         machine,
         record,
         jagged_traces,
@@ -907,9 +951,7 @@ pub async fn main_tracegen_permit<GC: IopCtx<F = Felt>, A: CudaTracegenAir<Felt>
         prover_permit,
         global_dependencies_opt,
     )
-    .await;
-
-    (public_values, chip_set, permit)
+    .await
 }
 
 /// Does tracegen for both preprocessed and main.
