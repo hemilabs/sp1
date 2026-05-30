@@ -97,8 +97,33 @@ pub async fn cuda_worker_builder_with_machine(
     scope: TaskScope,
     machine: Machine<SP1Field, RiscvAir<SP1Field>>,
 ) -> SP1WorkerBuilder<SP1CudaProverComponents> {
-    // Create a prover permits, assuming a single proof happens at a time.
-    let prover_permits = ProverSemaphore::new(1);
+    // #3: permit count = max in-flight shards. Default 1 = single-shard
+    // (today's behaviour); env `SP1_PROVE_OVERLAP_TRACEGEN` ≥ 1 raises it
+    // in lockstep with the per-PK trace-buffer pool size (see
+    // shard_prover::setup) so shard N+1's tracegen can start while shard N
+    // still holds its buffer + permit.
+    //
+    // WARNING: empirically N=2 OOMs on a 32 GiB RTX 5090 (per-shard prove
+    // allocates ~3-6 GiB single allocations; two concurrent shards exceed
+    // VRAM). N>1 currently requires either a bigger GPU (e.g. 80 GiB H100)
+    // or prove-side VRAM reduction work first — see #3 in
+    // sp1-gpu/docs/5090_optimization_plan.md. Default 1 is always safe.
+    let pool_size = std::env::var("SP1_PROVE_OVERLAP_TRACEGEN")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(1)
+        .max(1);
+    if pool_size > 1 {
+        tracing::warn!(
+            target: "sp1_gpu_prover",
+            pool_size,
+            "SP1_PROVE_OVERLAP_TRACEGEN > 1 — N concurrent shards each hold \
+             a ~2 GiB trace buffer plus 5-10 GiB of prove-side allocations; \
+             empirically OOMs on a 32 GiB RTX 5090 at N=2. Use only on \
+             GPUs with substantial VRAM headroom."
+        );
+    }
+    let prover_permits = ProverSemaphore::new(pool_size);
 
     // Get the core options.
     let (opts, _) = local_gpu_opts();

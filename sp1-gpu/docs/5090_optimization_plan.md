@@ -187,6 +187,24 @@ Combined projection: **~50-90 s e2e** off a 552 s 1M sha2-loop on the 5090
   handle instead of re-locked); flipping to N>1 + the semaphore split then
   enables concurrency. Gate behind `SP1_PROVE_OVERLAP_TRACEGEN=1` until
   validated on the 18-cell perf matrix.
+
+  **2026-05-30 Inc 1-7 shipped — N=1 byte-identical, N>1 blocked by VRAM
+  (new finding).** The data-flow refactor + env gate are in place
+  (`max/5090-opts-tier1`, commits leading to `d933db49c`+). N=1 is the
+  default and is byte-identical to the pre-#3 code; 1M sha2-loop proof
+  completes valid. **Setting `SP1_PROVE_OVERLAP_TRACEGEN=2` OOMs on the
+  32 GiB 5090** — per-shard prove makes single allocations of 3-6 GiB
+  (saw `AllocError { size: 6442450944 }` etc.); two concurrent shards
+  exceed VRAM. So the overlap-headroom probe was right that *temporal*
+  GPU capacity exists (60.6% idle), but I didn't account for *spatial*
+  (VRAM) contention: prove's working set was sized assuming single-shard.
+
+  **To unlock N>1 on the 5090, a follow-on step needs prove-side VRAM
+  reduction** — most likely the half-domain quotient kernel + earlier
+  intermediate-buffer drops in basefold/zerocheck/jagged_sumcheck. Until
+  then N>1 is only usable on much larger GPUs (e.g. 80 GiB H100). The
+  env emits a runtime `tracing::warn!` when N>1 to flag the risk. Default
+  N=1 stays safe everywhere.
 - Default ON for 5090 only (gated by `>24 GiB VRAM` check) once validated.
 
 ### 1.4 Move `prover_permit.acquire()` to AFTER the host-trace H2D

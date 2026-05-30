@@ -104,10 +104,25 @@ where
             untrusted_config,
         };
 
-        // #3: wrap the single freshly-allocated buffer in a pool of N=1, which
-        // preserves the original single-buffer behaviour byte-identically.
-        // Future work scales N>1 (env-gated `SP1_PROVE_OVERLAP_TRACEGEN`).
-        let pk = CudaShardProverData::new(vec![preprocessed_traces], preprocessed_data);
+        // #3: build the trace-buffer pool. Default N=1 preserves the
+        // single-buffer behaviour byte-identically; `SP1_PROVE_OVERLAP_TRACEGEN`
+        // env (an integer ≥ 1) bumps N to enable shard-N+1 tracegen to run
+        // while shard-N still holds its buffer. Additional buffers are D2D
+        // clones of the first (preprocessed slots are identical across the
+        // pool, and `Buffer::clone` does a real device-to-device copy via
+        // `copy_nonoverlapping`).
+        let pool_size = std::env::var("SP1_PROVE_OVERLAP_TRACEGEN")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(1)
+            .max(1);
+        let mut trace_buffers = Vec::with_capacity(pool_size);
+        trace_buffers.push(preprocessed_traces);
+        for _ in 1..pool_size {
+            let cloned = trace_buffers[0].clone();
+            trace_buffers.push(cloned);
+        }
+        let pk = CudaShardProverData::new(trace_buffers, preprocessed_data);
 
         (pk, vk)
     }
