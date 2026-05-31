@@ -54,7 +54,25 @@ pub fn local_gpu_opts() -> (SP1CoreOpts, bool) {
 
     opts.global_dependencies_opt = true;
 
-    (opts, gpu_memory_gb <= 30)
+    // `recompute_first_layer`: drop the first GKR layer (numerator+denominator,
+    // ~2.8 GiB at 100K) after L1 transition and regenerate at the tail of
+    // prove. Default ON for all GPUs — verified essential on the 5090: with
+    // it OFF, a 100K sha2-loop shard OOMs at a 2.84 GiB alloc inside
+    // logup_gkr (cuda_memory_info reports *free*, not total, so the prior
+    // `<=30` gate was usually true on a half-used 5090 anyway — this just
+    // makes the behaviour explicit). Override with
+    // `SP1_GPU_RECOMPUTE_FIRST_LAYER={0,1}`; setting to 0 is only safe on
+    // GPUs with much more headroom than 32 GiB.
+    let recompute_first_layer = std::env::var("SP1_GPU_RECOMPUTE_FIRST_LAYER")
+        .ok()
+        .and_then(|s| match s.as_str() {
+            "0" | "false" => Some(false),
+            "1" | "true" => Some(true),
+            _ => None,
+        })
+        .unwrap_or(true);
+
+    (opts, recompute_first_layer)
 }
 
 /// Create a [SP1CudaProverWorkerBuilder] with a default machine.
