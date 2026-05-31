@@ -253,6 +253,54 @@ Combined projection: **~50-90 s e2e** off a 552 s 1M sha2-loop on the 5090
   ≤16 GiB (10 GiB cut). Killing the 6 GiB commit + halving logup_gkr's
   big 2.84 GiB allocs would get there. None of these are single-session
   items individually; the diagnostic infrastructure is the foundation.
+
+  **2026-05-31 (afternoon) per-phase peak attribution + reduction-target
+  pivot.** Added `vram_reset_peak()` + `vram_snapshot_mib()` markers
+  around the 4 top-level prove phases AND the 3 sub-phases inside
+  `prove_trusted_evaluations`. Re-ran 100K sha2-loop on the 5090.
+  Authoritative per-phase peaks (delta above ~11.2 GiB persistent
+  baseline of traces + main_data):
+
+  | phase | delta peak | absolute peak |
+  |---|---|---|
+  | **`basefold_eval:jagged_sumcheck`** | **+9.06 GiB** | **20.0 GiB** |
+  | `basefold_eval:basefold_prove` | +6.75 GiB | 18.1 GiB |
+  | `logup_gkr` | +6.71 GiB | 17.7 GiB |
+  | `commit_traces` | +6.00 GiB | 17.4 GiB |
+  | `zerocheck` | +5.14 GiB | 16.5 GiB |
+  | `basefold_eval:jagged_eval` | ~0 GiB | 11.2 GiB |
+
+  Findings vs the morning's reduction-target list:
+
+  - **#1 logup_gkr `recompute_first_layer` is already ON** by default.
+    Earlier reading of `gpu_memory_gb <= 30` was misleading:
+    `cuda_memory_info()` returns *free* memory, not total, so on a
+    half-used 5090 the gate is true and recompute is enabled. Verified
+    essential — forcing it OFF via the new `SP1_GPU_RECOMPUTE_FIRST_LAYER=0`
+    env override OOMs at the 2.84 GiB first_layer transition alloc.
+    Further logup_gkr reduction needs aggressive per-layer checkpointing
+    of `materialized_layers` (multi-day, multiplies compute by ~2-4×).
+  - **#3 `jagged_sumcheck` is the actual biggest target.** Source-level
+    analysis: the peak hits in round-2 of the sumcheck inner loop at
+    `hadamard.rs:229 fix_last_variable_and_sum_as_poly` — both p and q
+    (size 16 × H, ~3.2 GiB each at H=200M) plus the new base_output
+    and ext_output (16 × H/2, ~1.6 GiB each) are alive simultaneously
+    during the kernel launch. Total = 48 × H = 9.6 GiB. The kernel
+    `paddedHadamardFixAndSum` reads input[2i] + input[2i+H/2] and
+    writes output[2i], output[2i+1] — these index ranges DO NOT
+    overlap, so an in-place variant (output == input, writing only to
+    first H/2 of the buffer) is feasible. Savings: ~3 GiB peak (drops
+    jagged_sumcheck from +9.06 to +6.4 GiB). Effort: 1-2 d (new CUDA
+    kernel + Rust wrapper + verify byte-identical).
+  - **#2 `commit_traces` 6 GiB** is the persistent main_data LDE that
+    carries through into basefold; reducing it requires a streamed
+    commit + recompute-at-opening refactor (still multi-day).
+
+  Net: the realistic next single-session VRAM win is the
+  jagged_sumcheck in-place kernel (~3 GiB / shard). Combined with a
+  future commit-traces refactor (~3-6 GiB) and a zerocheck
+  partial_lagrange incrementalization (~2 GiB) the 26 → 16 GiB target
+  is in reach. But each of these is its own focused project.
 - Default ON for 5090 only (gated by `>24 GiB VRAM` check) once validated.
 
 ### 1.4 Move `prover_permit.acquire()` to AFTER the host-trace H2D
