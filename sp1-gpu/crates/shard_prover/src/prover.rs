@@ -780,6 +780,18 @@ impl<GC: IopCtx<F = Felt, EF = Ext>, PC: CudaShardProverComponents<GC>>
             public_values,
         };
 
+        // #3 follow-on: per-shard VRAM telemetry. `current` reflects live
+        // device bytes at this instant; `peak` is the high-water mark since
+        // process start (or last `vram_reset_peak()`). The peak tells us the
+        // single-shard prove budget — N>1 needs ~N× this to fit on the GPU.
+        let (cur_mib, peak_mib) = sp1_gpu_cudart::vram_snapshot_mib();
+        tracing::debug!(
+            target: "sp1_gpu_vram",
+            current_mib = cur_mib,
+            peak_mib = peak_mib,
+            "prove_shard_with_data done"
+        );
+
         (proof, permit)
     }
 }

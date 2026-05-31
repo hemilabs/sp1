@@ -15,7 +15,10 @@ mod tracegen;
 
 pub use error::CudaError;
 pub use event::CudaEvent;
-pub use stream::{CudaStream, StreamCallbackFuture};
+pub use stream::{
+    vram_current_bytes, vram_peak_bytes, vram_reset_peak, vram_snapshot_mib, CudaStream,
+    StreamCallbackFuture, VRAM_STATS,
+};
 
 pub use buffer::*;
 pub use device::*;

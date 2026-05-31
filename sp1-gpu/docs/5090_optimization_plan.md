@@ -205,6 +205,54 @@ Combined projection: **~50-90 s e2e** off a 552 s 1M sha2-loop on the 5090
   then N>1 is only usable on much larger GPUs (e.g. 80 GiB H100). The
   env emits a runtime `tracing::warn!` when N>1 to flag the risk. Default
   N=1 stays safe everywhere.
+
+  **2026-05-31 VRAM diagnostic instrumentation + measurement.** Added a
+  process-wide allocation tracker to `CudaStream` (`vram_peak_bytes()`,
+  `vram_snapshot_mib()`, env-gated per-alloc logging via
+  `SP1_GPU_LARGE_ALLOC_LOG_MIB=<MiB>`). Ran a 1M sha2-loop proof and
+  attributed every large alloc to its tracing span. Findings:
+
+  - **Single-shard prove peak: 26.56 GiB on the 5090** (5.4 GiB headroom
+    on a 32 GiB card). N=2 needs ~53 GiB → ~21 GiB over budget. ✓
+    quantitatively explains the OOM.
+  - **Top single allocation: 6.00 GiB**, made once per shard in
+    `prove_shard_with_data:commit traces` (matches the
+    `AllocError { size: 6442450944 }` from the N=2 OOM exactly).
+  - **Per-shard aggregate by phase:**
+
+    | span | aggregate per shard | hot single allocs |
+    |---|---|---|
+    | `logup gkr proof` (generate + prove gkr circuit) | **~13 GiB** | 3× 2.84 GiB + 3× 1.42 GiB |
+    | `prove evaluation claims:jagged sumcheck` | **~9 GiB** | 2× 3.02 GiB + 2× 1.51 GiB |
+    | `commit traces` | **~6 GiB** | 1× 6.00 GiB (the single biggest) |
+    | `zerocheck` | **~4.5 GiB** | 1× 3.02 + 1× 1.51 |
+
+  Phases run sequentially and largely drop intermediates between them,
+  so 26.56 GiB peak is significantly less than the ~32 GiB summed
+  aggregate — but the *individual* big allocs (6 GiB, 3 GiB) are what
+  trigger OOM under N>1 contention.
+
+  **Reduction targets, ordered by leverage:**
+  1. **`logup_gkr` (biggest aggregate, 6× allocs ≥ 1.42 GiB per shard)** —
+     drop per-layer GKR circuit intermediates more aggressively; the
+     2.84 GiB allocs appearing in both `generate_gkr_circuit` and
+     `prove_gkr_circuit` suggest the same data is re-allocated rather
+     than reused / handed over.
+  2. **`commit traces` single 6 GiB alloc** — the LDE of the main trace
+     (used for commit + later for openings). Hardest to reduce because
+     openings need it later; a streamed commit + recompute-at-opening
+     is a multi-day refactor.
+  3. **`jagged sumcheck` per-round 3 GiB intermediates** — Plan §3.4
+     already flagged "wire `fix_last_variable_in_place`" which would
+     skip the per-round output alloc. Probably the cheapest win.
+  4. **`zerocheck` 3 GiB partial_lagrange** — similar in-place pattern;
+     Plan §3.2 noted the partial_lagrange could be incremental
+     (one-round-update) instead of recomputed from scratch.
+
+  Realistic budget to enable N=2 on 5090: peak must drop from 26.56 to
+  ≤16 GiB (10 GiB cut). Killing the 6 GiB commit + halving logup_gkr's
+  big 2.84 GiB allocs would get there. None of these are single-session
+  items individually; the diagnostic infrastructure is the foundation.
 - Default ON for 5090 only (gated by `>24 GiB VRAM` check) once validated.
 
 ### 1.4 Move `prover_permit.acquire()` to AFTER the host-trace H2D
