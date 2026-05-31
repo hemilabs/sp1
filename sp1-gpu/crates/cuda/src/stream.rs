@@ -88,6 +88,27 @@ impl CudaStream {
         ))
     }
 
+    /// Launch a cooperative-grid kernel. Required for kernels that use
+    /// `cooperative_groups::this_grid().sync()` to synchronise all threads
+    /// across the entire grid (e.g. read-all-then-write-all patterns).
+    pub unsafe fn launch_cooperative_kernel(
+        &self,
+        kernel: KernelPtr,
+        grid_dim: impl Into<Dim3>,
+        block_dim: impl Into<Dim3>,
+        args: &[*mut c_void],
+        shared_mem: usize,
+    ) -> Result<(), CudaError> {
+        CudaError::result_from_ffi(sp1_gpu_sys::runtime::cuda_launch_cooperative_kernel(
+            kernel,
+            grid_dim.into(),
+            block_dim.into(),
+            args.as_ptr() as *mut *mut c_void,
+            shared_mem,
+            self.0,
+        ))
+    }
+
     #[inline]
     fn query(&self) -> Result<(), CudaError> {
         CudaError::result_from_ffi(unsafe { cuda_stream_query(self.0) })

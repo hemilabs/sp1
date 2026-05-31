@@ -5,6 +5,7 @@
 
 extern "C" void* jagged_sum_as_poly();
 extern "C" void* jagged_fix_and_sum();
+extern "C" void* padded_hadamard_fix_and_sum_inplace();
 
 struct Hadamard {
     ext_t* p;

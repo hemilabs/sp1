@@ -158,6 +158,15 @@ extern "C" {
         stream: CudaStreamHandle,
     ) -> CudaRustError;
 
+    pub fn cuda_launch_cooperative_kernel(
+        kernel: KernelPtr,
+        grid: Dim3,
+        block: Dim3,
+        args: *mut *mut c_void,
+        shared_mem: usize,
+        stream: CudaStreamHandle,
+    ) -> CudaRustError;
+
     pub fn cuda_device_get_default_mem_pool(
         memPool: *mut CudaMemPool,
         device: CudaDevice,

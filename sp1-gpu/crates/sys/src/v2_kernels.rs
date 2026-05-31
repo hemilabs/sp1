@@ -96,6 +96,7 @@ extern "C" {
     pub fn jagged_sum_as_poly() -> KernelPtr;
     pub fn jagged_fix_and_sum() -> KernelPtr;
     pub fn padded_hadamard_fix_and_sum() -> KernelPtr;
+    pub fn padded_hadamard_fix_and_sum_inplace_range() -> KernelPtr;
 
     // Populate restrict eq
     pub fn populate_restrict_eq_host(

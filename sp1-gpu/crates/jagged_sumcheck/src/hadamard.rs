@@ -18,6 +18,7 @@ use sp1_gpu_cudart::sys::v2_kernels::hadamard_sum_as_poly_base_ext_kernel;
 use sp1_gpu_cudart::sys::v2_kernels::hadamard_sum_as_poly_ext_ext_kernel;
 use sp1_gpu_cudart::sys::v2_kernels::mle_fix_last_variable_koala_bear_ext_ext_zero_padding;
 use sp1_gpu_cudart::sys::v2_kernels::padded_hadamard_fix_and_sum;
+use sp1_gpu_cudart::sys::v2_kernels::padded_hadamard_fix_and_sum_inplace_range;
 use sp1_gpu_cudart::TaskScope;
 use sp1_gpu_cudart::{args, DeviceBuffer, DeviceTensor};
 use sp1_gpu_utils::{Ext, Felt};
@@ -291,6 +292,170 @@ where
     );
 
     (Mle::new(base_output), Mle::new(ext_output), uni_poly)
+}
+
+/// In-place variant of [`fix_last_variable_and_sum_as_poly`] that overwrites
+/// `base` and `ext` rather than allocating fresh output tensors. Avoids the
+/// peak-memory cliff of round 2 of jagged_sumcheck where the out-of-place
+/// version simultaneously holds the input (16 × H × 2 bytes) AND newly
+/// allocated output (16 × H/2 × 2 bytes) during the kernel launch.
+///
+/// # Race-freedom by exponential launch dispatch
+///
+/// The underlying kernel reads input[4i..4i+3] and writes input[2i..2i+1]
+/// (i.e. read positions = 2 × write positions). A single grid-stride launch
+/// over the whole `i ∈ [0, halfOutputHeight)` range races: thread i's writes
+/// at [2i, 2i+1] corrupt thread ⌊i/2⌋'s reads at [4⌊i/2⌋..4⌊i/2⌋+3] ⊇ [2i, 2i+1].
+///
+/// Instead, we dispatch a sequence of launches with `iEnd ≤ 2 × iStart`:
+///   launch 0:  i = 0           (1 thread, trivially race-free)
+///   launch 1:  i ∈ [1, 2)      (writes [2,3], reads [4,7])
+///   launch 2:  i ∈ [2, 4)      (writes [4,7], reads [8,15])
+///   launch k:  i ∈ [2^(k-1), 2^k)
+///       writes ⊆ [2^k, 2^(k+1))   reads ⊆ [2^(k+1), 2^(k+2))
+/// Within each launch, writes ⊆ [2 × iStart, 2 × iEnd) and reads ⊆
+/// [4 × iStart, 4 × iEnd); the constraint iEnd ≤ 2 × iStart makes these
+/// disjoint, so no thread in the launch can corrupt another's read.
+/// Across launches, each launch only reads positions in the buffer that no
+/// previous launch wrote to (each launch reads from the next octave up).
+/// Launches are serialised on the same CUDA stream so they run in order.
+///
+/// After the dispatch the first `output_height` elements of each buffer
+/// hold the fixed-last-variable result and the rest is stale; the caller
+/// truncates each Mle's logical length to `output_height` while keeping
+/// the underlying device allocation alive at full capacity, which avoids a
+/// re-allocation for the next round's in-place launches.
+pub fn fix_last_variable_and_sum_as_poly_inplace(
+    mut base: Mle<Ext, TaskScope>,
+    mut ext: Mle<Ext, TaskScope>,
+    alpha: Ext,
+    claim: Ext,
+) -> (Mle<Ext, TaskScope>, Mle<Ext, TaskScope>, UnivariatePolynomial<Ext>) {
+    let input_height = base.guts().sizes()[1];
+    assert_eq!(input_height, ext.guts().sizes()[1]);
+    let output_height = input_height.div_ceil(2);
+    let half_output_height = output_height.div_ceil(2);
+    let backend = base.backend().clone();
+
+    const BLOCK_SIZE: usize = 256;
+    const STRIDE: usize = 1;
+
+    let num_tiles = BLOCK_SIZE.checked_div(32).unwrap_or(1);
+    let shared_mem = num_tiles * std::mem::size_of::<Ext>();
+
+    // Pre-compute the (i_start, i_end) ranges for the sequence of launches
+    // that together cover [0, half_output_height) with iEnd ≤ 2 × iStart.
+    let mut ranges: Vec<(usize, usize)> = Vec::new();
+    if half_output_height > 0 {
+        ranges.push((0, 1));
+    }
+    let mut next = 1usize;
+    while next < half_output_height {
+        let end = (next * 2).min(half_output_height);
+        ranges.push((next, end));
+        next = end;
+    }
+
+    // Allocate one shared univariate-eval buffer big enough for the per-block
+    // partials of every launch (two slots per block: eval_zero and eval_half).
+    // Each launch's `univariateOffset` partitions this buffer so the launches
+    // don't stomp on each other's partial sums.
+    let mut total_slots: usize = 0;
+    let mut offsets: Vec<usize> = Vec::with_capacity(ranges.len());
+    for (i_start, i_end) in &ranges {
+        let count = i_end - i_start;
+        let grid_size_x = count.div_ceil(BLOCK_SIZE * STRIDE).max(1);
+        offsets.push(total_slots);
+        total_slots += 2 * grid_size_x;
+    }
+    let total_slots = total_slots.max(1);
+
+    let mut univariate_evals =
+        Tensor::<Ext, TaskScope>::with_sizes_in([total_slots], backend.clone());
+
+    unsafe {
+        univariate_evals.assume_init();
+        for (range, &offset) in ranges.iter().zip(offsets.iter()) {
+            let (i_start, i_end) = *range;
+            let count = i_end - i_start;
+            let grid_size_x = count.div_ceil(BLOCK_SIZE * STRIDE).max(1);
+
+            let args = args!(
+                base.guts_mut().as_mut_ptr(),
+                ext.guts_mut().as_mut_ptr(),
+                alpha,
+                univariate_evals.as_mut_ptr(),
+                input_height,
+                i_start,
+                i_end,
+                offset
+            );
+            backend
+                .launch_kernel(
+                    padded_hadamard_fix_and_sum_inplace_range(),
+                    grid_size_x,
+                    BLOCK_SIZE,
+                    &args,
+                    shared_mem,
+                )
+                .unwrap();
+        }
+    }
+
+    // The univariate buffer is laid out per-launch as
+    //     [zero_blocks_launch0 | half_blocks_launch0 | zero_blocks_launch1 | …]
+    // (zero and half slots are written by gridDim.x * blockIdx.y + blockIdx.x and
+    //  gridDim.x * gridDim.y + gridDim.x * blockIdx.y + blockIdx.x respectively,
+    //  with the constant univariateOffset added on top). To get
+    // (eval_zero, eval_half) we sum the appropriate halves of each launch's
+    // slice on the host.
+    let host_evals = DeviceTensor::from_raw(univariate_evals).to_host().unwrap();
+    let host_evals_slice = host_evals.as_slice();
+    let mut eval_zero = Ext::zero();
+    let mut eval_half = Ext::zero();
+    for (range, &offset) in ranges.iter().zip(offsets.iter()) {
+        let (i_start, i_end) = *range;
+        let count = i_end - i_start;
+        let grid_size_x = count.div_ceil(BLOCK_SIZE * STRIDE).max(1);
+        for k in 0..grid_size_x {
+            eval_zero += host_evals_slice[offset + k];
+            eval_half += host_evals_slice[offset + grid_size_x + k];
+        }
+    }
+
+    let eval_one = claim - eval_zero;
+    let uni_poly = interpolate_univariate_polynomial(
+        &[
+            Ext::from_canonical_u16(0),
+            Ext::from_canonical_u16(1),
+            Ext::from_canonical_u16(2).inverse(),
+        ],
+        &[eval_zero, eval_one, eval_half * Felt::from_canonical_u16(4).inverse()],
+    );
+
+    // Truncate the logical length of each Mle to output_height. The underlying
+    // device allocation stays at `input_height` capacity (the cudaMallocAsync
+    // backing buffer cannot be partially freed), so subsequent in-place rounds
+    // pay no per-round allocation cost.
+    truncate_mle_logical_len(&mut base, output_height);
+    truncate_mle_logical_len(&mut ext, output_height);
+
+    (base, ext, uni_poly)
+}
+
+/// Shrink an `Mle<Ext>`'s logical length while keeping the underlying device
+/// allocation alive at its current capacity. Used by the in-place sumcheck
+/// path to chain rounds without re-allocating.
+fn truncate_mle_logical_len(mle: &mut Mle<Ext, TaskScope>, new_height: usize) {
+    let tensor = mle.guts_mut();
+    let old_total = tensor.dimensions.total_len();
+    debug_assert!(new_height <= old_total);
+    // SAFETY: the elements in [0, new_height) were initialised by the in-place
+    // kernel; the rest is stale data that the caller promises not to read.
+    unsafe {
+        tensor.storage.set_len(new_height);
+    }
+    tensor.dimensions = slop_tensor::Dimensions::try_from([1, new_height].as_slice()).unwrap();
 }
 
 /// Like `fix_last_variable_and_sum_as_poly`, but returns the reduced evals as a device tensor

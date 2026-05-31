@@ -23,7 +23,8 @@ use sp1_gpu_utils::{DenseData, Ext, Felt, JaggedTraceMle};
 
 use super::hadamard::{
     fix_last_variable, fix_last_variable_and_sum_as_poly, fix_last_variable_and_sum_as_poly_device,
-    launch_observe_and_sample, AsMutRawChallenger, ObserveAndSampleKernel,
+    fix_last_variable_and_sum_as_poly_inplace, launch_observe_and_sample, AsMutRawChallenger,
+    ObserveAndSampleKernel,
 };
 
 pub struct JaggedFirstRoundPoly<'a, A: Backend = TaskScope> {
@@ -261,17 +262,37 @@ where
 
     let mut stacked_evals =
         DeviceBuffer::with_capacity_in(1 << (num_variables as usize - log_stacking_height), task);
+    // Per-round in-place dispatch: each round overwrites p, q's existing
+    // device buffer with the fixed-last-variable result and shrinks the
+    // logical length by half. The underlying allocations stay alive at
+    // their original capacity = output of fix_and_sum_first_round
+    // (16 × half_len bytes each), so the jagged_sumcheck phase peak is
+    // ~32 × half_len bytes throughout the loop instead of the
+    // ~48 × half_len cliff in the out-of-place version's round 2.
+    // Opt-out via SP1_JAGGED_SUMCHECK_INPLACE=0 for A/B comparison.
+    let inplace = std::env::var("SP1_JAGGED_SUMCHECK_INPLACE")
+        .ok()
+        .map(|v| v != "0" && v != "false")
+        .unwrap_or(true);
     for sc_round in 2..num_variables as usize {
         // Get the round claims from the last round's univariate poly messages.
         let round_claim = univariate_poly_msgs.last().unwrap().eval_at_point(alpha);
 
-        (p, q, uni_poly) = fix_last_variable_and_sum_as_poly(
-            p,
-            q,
-            alpha,
-            round_claim,
-            padded_hadamard_fix_and_sum,
-        );
+        if inplace {
+            let (new_p, new_q, new_uni_poly) =
+                fix_last_variable_and_sum_as_poly_inplace(p, q, alpha, round_claim);
+            p = new_p;
+            q = new_q;
+            uni_poly = new_uni_poly;
+        } else {
+            (p, q, uni_poly) = fix_last_variable_and_sum_as_poly(
+                p,
+                q,
+                alpha,
+                round_claim,
+                padded_hadamard_fix_and_sum,
+            );
+        }
 
         if sc_round == log_stacking_height {
             stacked_evals.extend_from_device_slice(p.guts().as_buffer()).unwrap();

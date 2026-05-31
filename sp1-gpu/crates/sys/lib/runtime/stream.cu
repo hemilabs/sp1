@@ -303,3 +303,14 @@ extern "C" rustCudaError_t cuda_launch_kernel(
     CUDA_OK(cudaLaunchKernel(kernel, grid, block, args, shared_mem, stream));
     return CUDA_SUCCESS_CSL;
 }
+
+extern "C" rustCudaError_t cuda_launch_cooperative_kernel(
+    void* kernel,
+    dim3 grid,
+    dim3 block,
+    void** args,
+    size_t shared_mem,
+    cudaStream_t stream) {
+    CUDA_OK(cudaLaunchCooperativeKernel(kernel, grid, block, args, shared_mem, stream));
+    return CUDA_SUCCESS_CSL;
+}

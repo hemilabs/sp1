@@ -450,6 +450,19 @@ impl TaskScope {
         self.stream().launch_kernel(kernel, grid_dim, block_dim, args, shared_mem)
     }
 
+    /// Launch a cooperative-grid kernel on this task's stream. See
+    /// [`CudaStream::launch_cooperative_kernel`].
+    pub unsafe fn launch_cooperative_kernel(
+        &self,
+        kernel: KernelPtr,
+        grid_dim: impl Into<Dim3>,
+        block_dim: impl Into<Dim3>,
+        args: &[*mut c_void],
+        shared_mem: usize,
+    ) -> Result<(), CudaError> {
+        self.stream().launch_cooperative_kernel(kernel, grid_dim, block_dim, args, shared_mem)
+    }
+
     /// Sends the CUDA task to sleep for **at least** the given duration.
     ///
     /// This function will not block the calling host thread. The function does a small allocation
