@@ -391,6 +391,57 @@ where
             peak_mib = peak_mib,
             "phase peak"
         );
+
+        // OPT-IN VRAM-reduction path. After batch() has consumed each codeword,
+        // move them to host memory and free the device tensors. The codewords
+        // (~6 GiB total for a 100K shard) are not used during commit_phase
+        // and are only needed at the query phase to extract values at the
+        // FRI query indices — a few hundred bytes total. Host indexing
+        // matches the device kernel's [num_polys, codeword_len] row-major
+        // layout, so the per-shard prove peak drops by the codeword size
+        // throughout commit_phase and query.
+        //
+        // Measured on 5090 100K sha2-loop: basefold_prove peak
+        // 18128 -> 11984 MiB (-6.0 GiB) BUT wall time 45.4 -> 187.8 s
+        // (~4× slowdown). Root cause: copy_into_host_buffer allocates a fresh
+        // pageable Vec per shard and cudaMemcpyAsync degrades to synchronous
+        // on pageable destinations (~13 GB/s + page-fault overhead, vs
+        // ~32 GB/s with pinned memory). Per shard adds ~2.6 s for the D2H.
+        //
+        // Default OFF until a pinned-staging variant lands (one persistent
+        // ~6 GiB pinned buffer on the FriCudaProver, reused across shards,
+        // would let cudaMemcpyAsync stay truly async and overlap with
+        // commit_phase). Opt in via SP1_BASEFOLD_HOST_CODEWORDS=1.
+        let host_codewords_enabled = std::env::var("SP1_BASEFOLD_HOST_CODEWORDS")
+            .ok()
+            .map(|v| v == "1" || v == "true")
+            .unwrap_or(false);
+        let host_codewords: Option<Vec<Tensor<Felt, slop_alloc::CpuBackend>>> =
+            if host_codewords_enabled {
+                let host: Vec<Tensor<Felt, slop_alloc::CpuBackend>> = codewords
+                    .iter()
+                    .map(|cw| {
+                        sp1_gpu_cudart::DeviceTensor::copy_to_host(cw.as_ref()).unwrap()
+                    })
+                    .collect();
+                // `clear()` drops the Arc<Tensor> elements (each holding a
+                // ~few-GiB device allocation) but leaves the Vec itself
+                // valid, which keeps the borrow checker happy for the
+                // device-fallback path below and lets us use a simple
+                // `if let Some(host)` branch without restructuring.
+                codewords.clear();
+                let (cur_mib, peak_mib) = sp1_gpu_cudart::vram_snapshot_mib();
+                tracing::debug!(
+                    target: "sp1_gpu_vram",
+                    phase = "basefold_prove:codewords_d2h",
+                    current_mib = cur_mib,
+                    peak_mib = peak_mib,
+                    "phase peak"
+                );
+                Some(host)
+            } else {
+                None
+            };
         // From this point on, run the BaseFold protocol on the random linear combination codeword,
         // the random linear combination multilinear, and the random linear combination of the
         // evaluation claims.
@@ -466,16 +517,34 @@ where
 
         // Open the original polynomials at the query indices.
         let mut component_polynomials_query_openings_and_proofs = vec![];
-        for (data, codeword) in prover_data.iter().zip(codewords.iter()) {
-            let values = self.tcs_prover.compute_openings_at_indices(codeword, &query_indices);
-            let proof = self
-                .tcs_prover
-                .prove_openings_at_indices(&data.merkle_tree_tcs_data, &query_indices)
-                .map_err(BasefoldProverError::TcsCommitError)?;
-            let opening = MerkleTreeOpeningAndProof::<GC> { values, proof };
-            component_polynomials_query_openings_and_proofs.push(opening);
+        // Branch on host_codewords vs device codewords. The device path uses
+        // the on-GPU codeword tensor and the existing kernel-backed
+        // compute_openings_at_indices; the host path indexes a plain
+        // CpuBackend tensor in the same [num_polys, codeword_len] row-major
+        // layout the kernel expects, so the resulting `values` Tensor<F> is
+        // byte-identical to the device path.
+        if let Some(ref host_codewords) = host_codewords {
+            for (data, codeword_host) in prover_data.iter().zip(host_codewords.iter()) {
+                let values = host_compute_openings_at_indices(codeword_host, &query_indices);
+                let proof = self
+                    .tcs_prover
+                    .prove_openings_at_indices(&data.merkle_tree_tcs_data, &query_indices)
+                    .map_err(BasefoldProverError::TcsCommitError)?;
+                let opening = MerkleTreeOpeningAndProof::<GC> { values, proof };
+                component_polynomials_query_openings_and_proofs.push(opening);
+            }
+        } else {
+            for (data, codeword) in prover_data.iter().zip(codewords.iter()) {
+                let values =
+                    self.tcs_prover.compute_openings_at_indices(codeword, &query_indices);
+                let proof = self
+                    .tcs_prover
+                    .prove_openings_at_indices(&data.merkle_tree_tcs_data, &query_indices)
+                    .map_err(BasefoldProverError::TcsCommitError)?;
+                let opening = MerkleTreeOpeningAndProof::<GC> { values, proof };
+                component_polynomials_query_openings_and_proofs.push(opening);
+            }
         }
-
         // Provide openings for the FRI query phase.
         let mut query_phase_openings_and_proofs = vec![];
         let mut indices = query_indices;
@@ -512,6 +581,36 @@ where
             batch_grinding_witness,
         })
     }
+}
+
+/// Host-side replica of `CudaTcsProver::compute_openings_at_indices`. The
+/// codeword tensor has shape [num_polys, codeword_len] in row-major layout
+/// (so `tensor[poly][col] == storage[poly * codeword_len + col]`). The
+/// kernel writes, for each (k, w) in [num_indices] × [num_polys],
+/// `output[k, w] = tensor[w, indices[k]]`, producing a host Tensor of shape
+/// [num_indices, num_polys]. This function reproduces that mapping
+/// exactly on the host so the device and host paths return byte-identical
+/// `Tensor<F>` values.
+fn host_compute_openings_at_indices<F>(
+    codeword: &Tensor<F, slop_alloc::CpuBackend>,
+    indices: &[usize],
+) -> Tensor<F>
+where
+    F: Copy + slop_algebra::AbstractField,
+{
+    let num_polys = codeword.sizes()[0];
+    let codeword_len = codeword.sizes()[1];
+    let src = codeword.as_buffer().as_slice();
+    let mut out: Vec<F> = Vec::with_capacity(indices.len() * num_polys);
+    for &idx in indices {
+        debug_assert!(idx < codeword_len, "query index out of bounds");
+        for poly in 0..num_polys {
+            out.push(src[poly * codeword_len + idx]);
+        }
+    }
+    let mut tensor = Tensor::<F>::from(out);
+    tensor.reshape_in_place([indices.len(), num_polys]);
+    tensor
 }
 
 unsafe impl MleBatchKernel<SP1Field, SP1ExtensionField> for TaskScope {
