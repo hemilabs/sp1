@@ -324,6 +324,10 @@ where
         GC::Challenger: DeviceGrindingChallenger<Witness = GC::F>,
     {
         let scope = mles.dense().dense.backend().clone();
+        // Sub-phase markers: attribute basefold_prove's per-shard peak (5090
+        // 100K = +6.75 GiB delta) across {codeword_encode, batch,
+        // commit_phase, query}. See sp1_gpu_cudart::vram_snapshot_mib doc.
+        sp1_gpu_cudart::vram_reset_peak();
         let mut codewords: Vec<Arc<Tensor<Felt, TaskScope>>> = Vec::new();
         for data in prover_data.iter() {
             if let Some(ref codeword) = data.codeword_mle {
@@ -354,6 +358,15 @@ where
             }
         }
 
+        let (cur_mib, peak_mib) = sp1_gpu_cudart::vram_snapshot_mib();
+        tracing::debug!(
+            target: "sp1_gpu_vram",
+            phase = "basefold_prove:codeword_encode",
+            current_mib = cur_mib,
+            peak_mib = peak_mib,
+            "phase peak"
+        );
+
         let total_num_polynomials = codewords.iter().map(|c| c.sizes()[0]).sum::<usize>();
         let num_batching_variables = total_num_polynomials.next_power_of_two().ilog2();
 
@@ -367,8 +380,17 @@ where
         let batching_coefficients = partial_lagrange_blocking(&batching_point);
 
         // Batch the mles and codewords.
+        sp1_gpu_cudart::vram_reset_peak();
         let (mle_batch, codeword_batch, batched_eval_claim) =
             self.batch(&batching_coefficients, mles.dense(), encoded_messages, evaluation_claims);
+        let (cur_mib, peak_mib) = sp1_gpu_cudart::vram_snapshot_mib();
+        tracing::debug!(
+            target: "sp1_gpu_vram",
+            phase = "basefold_prove:batch",
+            current_mib = cur_mib,
+            peak_mib = peak_mib,
+            "phase peak"
+        );
         // From this point on, run the BaseFold protocol on the random linear combination codeword,
         // the random linear combination multilinear, and the random linear combination of the
         // evaluation claims.
@@ -389,6 +411,7 @@ where
         );
 
         challenger.observe(Felt::from_canonical_usize(eval_point.dimension()));
+        sp1_gpu_cudart::vram_reset_peak();
         for _ in 0..eval_point.dimension() {
             // Compute claims for `g(X_0, X_1, ..., X_{d-1}, 0)` and `g(X_0, X_1, ..., X_{d-1}, 1)`.
             let last_coord = eval_point.remove_last_coordinate();
@@ -419,6 +442,16 @@ where
             current_codeword = folded_codeword;
             current_batched_eval_claim = zero_val + beta * one_val;
         }
+
+        let (cur_mib, peak_mib) = sp1_gpu_cudart::vram_snapshot_mib();
+        tracing::debug!(
+            target: "sp1_gpu_vram",
+            phase = "basefold_prove:commit_phase",
+            current_mib = cur_mib,
+            peak_mib = peak_mib,
+            "phase peak"
+        );
+        sp1_gpu_cudart::vram_reset_peak();
 
         let final_poly = self.final_poly(current_codeword);
         challenger.observe_ext_element(final_poly);
@@ -459,6 +492,15 @@ where
             let opening = MerkleTreeOpeningAndProof { values, proof };
             query_phase_openings_and_proofs.push(opening);
         }
+
+        let (cur_mib, peak_mib) = sp1_gpu_cudart::vram_snapshot_mib();
+        tracing::debug!(
+            target: "sp1_gpu_vram",
+            phase = "basefold_prove:query",
+            current_mib = cur_mib,
+            peak_mib = peak_mib,
+            "phase peak"
+        );
 
         Ok(BasefoldProof {
             univariate_messages,
