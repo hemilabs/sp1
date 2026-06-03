@@ -58,7 +58,55 @@ pub struct FriCudaProver<GC, P, F> {
     pub tcs_prover: P,
     pub config: FriConfig<F>,
     pub log_height: u32,
+    /// Persistent pinned-host staging buffer for the codeword D2H optimisation
+    /// in `prove_trusted_evaluations_basefold`. Lazily allocated on first use
+    /// and grown if a later shard needs more capacity. Pinned memory keeps
+    /// `cudaMemcpyAsync` truly async (vs the pageable-Vec path which forces a
+    /// synchronous copy), so the D2H can overlap with the commit_phase
+    /// rounds (which don't read the codewords). Wrapped in `Mutex` for the
+    /// `N>1` case; for `N=1` the lock is uncontested.
+    pub pinned_codeword_staging: std::sync::Mutex<PinnedCodewordStaging>,
     _marker: PhantomData<GC>,
+}
+
+/// Lazy-grown pinned host buffer used to stage codeword D2H copies for
+/// `prove_trusted_evaluations_basefold`. The buffer is allocated on first
+/// use (so non-cuda code paths and tests pay nothing) and grows
+/// monotonically — each prove only resizes if the codewords are bigger
+/// than every previous shard's.
+pub struct PinnedCodewordStaging {
+    inner: Option<sp1_gpu_cudart::pinned::PinnedBuffer<Felt>>,
+}
+
+impl PinnedCodewordStaging {
+    pub fn new() -> Self {
+        Self { inner: None }
+    }
+
+    /// Ensure the underlying buffer has at least `needed` elements of
+    /// capacity, allocating or reallocating if necessary.
+    pub fn ensure_capacity(
+        &mut self,
+        needed: usize,
+    ) -> &mut sp1_gpu_cudart::pinned::PinnedBuffer<Felt> {
+        let need_alloc = self.inner.as_ref().map(|b| b.capacity() < needed).unwrap_or(true);
+        if need_alloc {
+            tracing::debug!(
+                target: "sp1_gpu_vram",
+                bytes = needed * std::mem::size_of::<Felt>(),
+                "allocating pinned codeword staging buffer"
+            );
+            self.inner =
+                Some(sp1_gpu_cudart::pinned::PinnedBuffer::<Felt>::with_capacity(needed));
+        }
+        self.inner.as_mut().unwrap()
+    }
+}
+
+impl Default for PinnedCodewordStaging {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl<GC: IopCtx<F = Felt, EF = Ext>, P> FriCudaProver<GC, P, GC::F>
@@ -73,7 +121,13 @@ where
         + MleFlattenKernel<GC::F, GC::EF>,
 {
     pub fn new(tcs_prover: P, config: FriConfig<GC::F>, log_height: u32) -> Self {
-        Self { tcs_prover, config, log_height, _marker: PhantomData }
+        Self {
+            tcs_prover,
+            config,
+            log_height,
+            pinned_codeword_staging: std::sync::Mutex::new(PinnedCodewordStaging::new()),
+            _marker: PhantomData,
+        }
     }
     pub fn encode_and_commit(
         &self,
@@ -392,56 +446,122 @@ where
             "phase peak"
         );
 
-        // OPT-IN VRAM-reduction path. After batch() has consumed each codeword,
-        // move them to host memory and free the device tensors. The codewords
-        // (~6 GiB total for a 100K shard) are not used during commit_phase
-        // and are only needed at the query phase to extract values at the
-        // FRI query indices — a few hundred bytes total. Host indexing
-        // matches the device kernel's [num_polys, codeword_len] row-major
-        // layout, so the per-shard prove peak drops by the codeword size
-        // throughout commit_phase and query.
+        // OPT-IN VRAM-reduction path: after batch() has consumed each
+        // codeword, move them to a persistent pinned-host staging buffer
+        // and free the device tensors. The codewords (~6 GiB total for a
+        // 100K shard) are not used during commit_phase and are only
+        // needed at the query phase to extract values at the FRI query
+        // indices — a few hundred bytes total. Host indexing matches the
+        // device kernel's [num_polys, codeword_len] row-major layout, so
+        // the per-shard prove peak drops by the codeword size throughout
+        // commit_phase and query.
         //
-        // Measured on 5090 100K sha2-loop: basefold_prove peak
-        // 18128 -> 11984 MiB (-6.0 GiB) BUT wall time 45.4 -> 187.8 s
-        // (~4× slowdown). Root cause: copy_into_host_buffer allocates a fresh
-        // pageable Vec per shard and cudaMemcpyAsync degrades to synchronous
-        // on pageable destinations (~13 GB/s + page-fault overhead, vs
-        // ~32 GB/s with pinned memory). Per shard adds ~2.6 s for the D2H.
+        // Status on 5090 100K sha2-loop:
+        // - basefold_prove peak: 18128 -> 11984 MiB (-6.0 GiB, verified)
+        // - wall time: 46.5 -> 69.9 s (+50%, single-shard)
         //
-        // Default OFF until a pinned-staging variant lands (one persistent
-        // ~6 GiB pinned buffer on the FriCudaProver, reused across shards,
-        // would let cudaMemcpyAsync stay truly async and overlap with
-        // commit_phase). Opt in via SP1_BASEFOLD_HOST_CODEWORDS=1.
+        // The remaining wall-time cost is the async D2H serializing with
+        // commit_phase kernels on the SAME CUDA stream (CUDA streams run
+        // FIFO). Removing that overlap penalty needs a separate stream
+        // for the D2H + a cross-stream event, which the current
+        // TaskScope model doesn't expose; tracked as follow-on.
+        //
+        // For N=1 the per-shard overhead is a straight loss, so default
+        // OFF. For N>1 (SP1_PROVE_OVERLAP_TRACEGEN >= 2) the peak
+        // headroom is the gating constraint and this trade-off goes the
+        // other way — opt in with SP1_BASEFOLD_HOST_CODEWORDS=1.
         let host_codewords_enabled = std::env::var("SP1_BASEFOLD_HOST_CODEWORDS")
             .ok()
             .map(|v| v == "1" || v == "true")
             .unwrap_or(false);
-        let host_codewords: Option<Vec<Tensor<Felt, slop_alloc::CpuBackend>>> =
-            if host_codewords_enabled {
-                let host: Vec<Tensor<Felt, slop_alloc::CpuBackend>> = codewords
+
+        // We hold the staging guard for the duration of basefold_prove so
+        // the host-side codeword slices we hand to the query phase stay
+        // valid until the proof is done. Under N=1 this lock is
+        // uncontested; under N>1 it serializes basefold_prove across
+        // concurrent shards. If that ever becomes the bottleneck the
+        // staging cache can grow into a small pool keyed by capacity.
+        let mut staging_guard_opt = if host_codewords_enabled {
+            Some(self.pinned_codeword_staging.lock().unwrap())
+        } else {
+            None
+        };
+
+        // (codeword_byte_offset, num_polys, codeword_len) per codeword,
+        // recorded before the D2H so the host-view structs below can index
+        // back into the pinned buffer.
+        let mut codeword_meta: Vec<(usize, usize, usize)> = Vec::new();
+        if let Some(ref mut staging_guard) = staging_guard_opt {
+            let total_needed: usize = codewords.iter().map(|c| c.total_len()).sum();
+            let staging = staging_guard.ensure_capacity(total_needed);
+
+            // Stage all codewords contiguously in the pinned buffer.
+            let mut offset: usize = 0;
+            for cw in codewords.iter() {
+                let cw_len = cw.total_len();
+                let cw_bytes = cw_len * std::mem::size_of::<Felt>();
+                // SAFETY: the pinned buffer has capacity >= total_needed, and
+                // [offset, offset + cw_len) is disjoint from prior codewords'
+                // ranges. cudaMemcpyAsync is enqueued on the current stream;
+                // subsequent commit_phase kernels submitted to the same
+                // stream observe it as a happens-before predecessor, and we
+                // synchronize the stream before the query phase reads.
+                unsafe {
+                    let dst_ptr = staging.as_mut_ptr().add(offset);
+                    scope
+                        .copy_device_to_host_async_raw(
+                            dst_ptr as *mut std::ffi::c_void,
+                            cw.as_ptr() as *const std::ffi::c_void,
+                            cw_bytes,
+                        )
+                        .unwrap();
+                }
+                codeword_meta.push((offset, cw.sizes()[0], cw.sizes()[1]));
+                offset += cw_len;
+            }
+            // Drop the device-side Arc<Tensor>s; cudaMemcpyAsync reads from
+            // each codeword's device buffer through the stream and the
+            // cudaMallocAsync allocator defers the free until the stream's
+            // pending ops complete, so this is safe to do immediately.
+            codewords.clear();
+
+            let (cur_mib, peak_mib) = sp1_gpu_cudart::vram_snapshot_mib();
+            tracing::debug!(
+                target: "sp1_gpu_vram",
+                phase = "basefold_prove:codewords_d2h",
+                current_mib = cur_mib,
+                peak_mib = peak_mib,
+                "phase peak"
+            );
+        }
+
+        // Compute host-view slices from the staged pinned buffer. These
+        // borrow the buffer for the rest of basefold_prove via the
+        // MutexGuard held in `staging_guard_opt`.
+        let host_codeword_views: Option<Vec<HostCodewordView<'_>>> =
+            staging_guard_opt.as_ref().map(|guard| {
+                let staging_ptr = guard
+                    .inner
+                    .as_ref()
+                    .expect("staging buffer should be allocated after ensure_capacity")
+                    .as_ptr();
+                codeword_meta
                     .iter()
-                    .map(|cw| {
-                        sp1_gpu_cudart::DeviceTensor::copy_to_host(cw.as_ref()).unwrap()
+                    .map(|&(offset, num_polys, codeword_len)| {
+                        // SAFETY: the pinned buffer has capacity covering
+                        // [0, total_needed) and we hold the guard for the
+                        // lifetime of these views. The async D2H is sync'd
+                        // before the query phase reads from this slice.
+                        let data = unsafe {
+                            std::slice::from_raw_parts(
+                                staging_ptr.add(offset),
+                                num_polys * codeword_len,
+                            )
+                        };
+                        HostCodewordView { data, num_polys, codeword_len }
                     })
-                    .collect();
-                // `clear()` drops the Arc<Tensor> elements (each holding a
-                // ~few-GiB device allocation) but leaves the Vec itself
-                // valid, which keeps the borrow checker happy for the
-                // device-fallback path below and lets us use a simple
-                // `if let Some(host)` branch without restructuring.
-                codewords.clear();
-                let (cur_mib, peak_mib) = sp1_gpu_cudart::vram_snapshot_mib();
-                tracing::debug!(
-                    target: "sp1_gpu_vram",
-                    phase = "basefold_prove:codewords_d2h",
-                    current_mib = cur_mib,
-                    peak_mib = peak_mib,
-                    "phase peak"
-                );
-                Some(host)
-            } else {
-                None
-            };
+                    .collect()
+            });
         // From this point on, run the BaseFold protocol on the random linear combination codeword,
         // the random linear combination multilinear, and the random linear combination of the
         // evaluation claims.
@@ -523,9 +643,20 @@ where
         // CpuBackend tensor in the same [num_polys, codeword_len] row-major
         // layout the kernel expects, so the resulting `values` Tensor<F> is
         // byte-identical to the device path.
-        if let Some(ref host_codewords) = host_codewords {
-            for (data, codeword_host) in prover_data.iter().zip(host_codewords.iter()) {
-                let values = host_compute_openings_at_indices(codeword_host, &query_indices);
+        if let Some(ref host_codeword_views) = host_codeword_views {
+            // Make sure the async D2H from before commit_phase has landed in
+            // the pinned buffer before we read from it. In practice this is
+            // a fast no-op because commit_phase itself waited on the stream,
+            // but synchronize_blocking is the only safe way to convert
+            // "async copy is enqueued" into "host can read".
+            scope.synchronize_blocking().unwrap();
+            for (data, view) in prover_data.iter().zip(host_codeword_views.iter()) {
+                let values = host_compute_openings_at_indices(
+                    view.data,
+                    view.num_polys,
+                    view.codeword_len,
+                    &query_indices,
+                );
                 let proof = self
                     .tcs_prover
                     .prove_openings_at_indices(&data.merkle_tree_tcs_data, &query_indices)
@@ -583,24 +714,34 @@ where
     }
 }
 
+/// View into a single codeword living in the pinned staging buffer.
+/// `data.len() == num_polys * codeword_len`. The slice borrows from the
+/// `PinnedCodewordStaging` for the duration of basefold_prove, which is
+/// guaranteed by the `MutexGuard` held in that function.
+pub struct HostCodewordView<'a> {
+    pub data: &'a [Felt],
+    pub num_polys: usize,
+    pub codeword_len: usize,
+}
+
 /// Host-side replica of `CudaTcsProver::compute_openings_at_indices`. The
-/// codeword tensor has shape [num_polys, codeword_len] in row-major layout
-/// (so `tensor[poly][col] == storage[poly * codeword_len + col]`). The
-/// kernel writes, for each (k, w) in [num_indices] × [num_polys],
-/// `output[k, w] = tensor[w, indices[k]]`, producing a host Tensor of shape
-/// [num_indices, num_polys]. This function reproduces that mapping
+/// codeword has shape [num_polys, codeword_len] in row-major layout
+/// (so `tensor[poly][col] == src[poly * codeword_len + col]`). The kernel
+/// writes, for each (k, w) in [num_indices] × [num_polys],
+/// `output[k, w] = tensor[w, indices[k]]`, producing a host Tensor of
+/// shape [num_indices, num_polys]. This function reproduces that mapping
 /// exactly on the host so the device and host paths return byte-identical
 /// `Tensor<F>` values.
 fn host_compute_openings_at_indices<F>(
-    codeword: &Tensor<F, slop_alloc::CpuBackend>,
+    src: &[F],
+    num_polys: usize,
+    codeword_len: usize,
     indices: &[usize],
 ) -> Tensor<F>
 where
     F: Copy + slop_algebra::AbstractField,
 {
-    let num_polys = codeword.sizes()[0];
-    let codeword_len = codeword.sizes()[1];
-    let src = codeword.as_buffer().as_slice();
+    debug_assert_eq!(src.len(), num_polys * codeword_len);
     let mut out: Vec<F> = Vec::with_capacity(indices.len() * num_polys);
     for &idx in indices {
         debug_assert!(idx < codeword_len, "query index out of bounds");

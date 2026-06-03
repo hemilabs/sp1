@@ -486,6 +486,31 @@ impl TaskScope {
         dst.copy_from_slice(src, self)
     }
 
+    /// Enqueue an async D2H copy to a raw host pointer (intended to be a
+    /// pinned-host destination, which keeps the copy truly async). The copy
+    /// is queued on this task's stream; the caller must `synchronize_blocking`
+    /// (or use a stream event) before reading `dst`.
+    ///
+    /// # Safety
+    /// `dst` must be valid for `byte_count` bytes of writes and must not be
+    /// freed while the copy is in flight. `src` must be a valid device
+    /// pointer for `byte_count` bytes. The destination should be pinned
+    /// memory for the copy to be truly async — pageable destinations
+    /// degrade to synchronous behaviour internally.
+    pub unsafe fn copy_device_to_host_async_raw(
+        &self,
+        dst: *mut std::ffi::c_void,
+        src: *const std::ffi::c_void,
+        byte_count: usize,
+    ) -> Result<(), CudaError> {
+        CudaError::result_from_ffi(sp1_gpu_sys::runtime::cuda_mem_copy_device_to_host_async(
+            dst,
+            src,
+            byte_count,
+            self.stream.0,
+        ))
+    }
+
     /// Waits for all work enqueued so far in this task to finish.
     ///
     /// This function can be useful in case there is work to be enqueued but for some reason this
