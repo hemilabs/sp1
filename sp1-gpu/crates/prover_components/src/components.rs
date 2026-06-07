@@ -108,6 +108,21 @@ where
     }
 
     let trace_buffers = Arc::new(WorkerQueue::new(trace_buffers));
+    // `drop_ldes`: previously tied to `recompute_first_layer` because both
+    // default the same on a 32 GiB card. Decoupled here so that opt-in
+    // experiments (e.g. trying to fit N=2 by reusing the commit_traces LDE
+    // in basefold instead of re-encoding) can flip this independently via
+    // `SP1_GPU_DROP_LDES={0,1}`. The default still follows
+    // `recompute_first_layer` (= `true` on 5090) which is the previously
+    // measured-optimal point for N=1.
+    let drop_ldes = std::env::var("SP1_GPU_DROP_LDES")
+        .ok()
+        .and_then(|s| match s.as_str() {
+            "0" | "false" => Some(false),
+            "1" | "true" => Some(true),
+            _ => None,
+        })
+        .unwrap_or(recompute_first_layer);
     CudaShardProver::<GC, PC>::new(
         trace_buffers,
         max_log_row_count as u32,
@@ -118,6 +133,6 @@ where
         all_interactions,
         cache,
         recompute_first_layer,
-        recompute_first_layer,
+        drop_ldes,
     )
 }
