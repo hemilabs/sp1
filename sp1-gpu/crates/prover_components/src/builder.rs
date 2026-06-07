@@ -53,7 +53,18 @@ pub fn local_gpu_opts() -> SP1CoreOpts {
     opts.sharding_threshold.element_threshold = shard_threshold;
 
     opts.global_dependencies_opt = true;
-    opts.drop_ldes = opts.full_size_shards && gpu_memory_gb <= 30;
+    // Dropping the LDEs after the trace commit and re-encoding them in basefold trades time for
+    // ~6 GiB at a 100K shard. Upstream drops them only for full-size shards on 24 GB-class cards;
+    // the 16 GB tier always drops them, as the v6.0.0 fork did. Override with
+    // `SP1_GPU_DROP_LDES={0,1}`.
+    opts.drop_ldes = std::env::var("SP1_GPU_DROP_LDES")
+        .ok()
+        .and_then(|s| match s.as_str() {
+            "0" | "false" => Some(false),
+            "1" | "true" => Some(true),
+            _ => None,
+        })
+        .unwrap_or(gpu_memory_gb <= 20 || (opts.full_size_shards && gpu_memory_gb <= 30));
 
     // Recomputing the first GKR layer instead of keeping it resident saves ~2.8 GiB at a 100K
     // shard. Upstream turned it off once look-ahead sumchecks and truncated Merkle trees (#2917,
