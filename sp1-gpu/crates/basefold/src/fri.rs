@@ -66,6 +66,20 @@ pub struct FriCudaProver<GC, P, F> {
     /// rounds (which don't read the codewords). Wrapped in `Mutex` for the
     /// `N>1` case; for `N=1` the lock is uncontested.
     pub pinned_codeword_staging: std::sync::Mutex<PinnedCodewordStaging>,
+    /// Serializes the codeword_encode + batch + D2H window of
+    /// `prove_trusted_evaluations_basefold` across concurrent shards when
+    /// `SP1_BASEFOLD_HOST_CODEWORDS=1` is active. Without this serializer,
+    /// two N>1 shards could simultaneously allocate ~6 GiB device codewords,
+    /// busting the 32 GiB 5090 budget on the second alloc. The lock is
+    /// released as soon as the codewords have been D2H'd to the pinned
+    /// staging buffer and the device tensors dropped — commit_phase and
+    /// query run unrestricted (those phases hold only ~12 GiB device VRAM
+    /// per shard with HOST_CODEWORDS=1, well within the 32 GiB cap for
+    /// N=2). The serializer is a no-op when HOST_CODEWORDS=0, because in
+    /// that mode the codewords stay device-resident for the entire
+    /// basefold_prove and serialising the lock window would force fully
+    /// sequential basefold execution, defeating any N>1 throughput gain.
+    pub codeword_encode_serializer: std::sync::Mutex<()>,
     _marker: PhantomData<GC>,
 }
 
@@ -126,6 +140,7 @@ where
             config,
             log_height,
             pinned_codeword_staging: std::sync::Mutex::new(PinnedCodewordStaging::new()),
+            codeword_encode_serializer: std::sync::Mutex::new(()),
             _marker: PhantomData,
         }
     }
@@ -378,6 +393,30 @@ where
         GC::Challenger: DeviceGrindingChallenger<Witness = GC::F>,
     {
         let scope = mles.dense().dense.backend().clone();
+
+        // Read the host-codewords flag early so we can also decide whether
+        // to take the codeword_encode serializer (the two are coupled —
+        // see the `codeword_encode_serializer` field doc).
+        let host_codewords_enabled = std::env::var("SP1_BASEFOLD_HOST_CODEWORDS")
+            .ok()
+            .map(|v| v == "1" || v == "true")
+            .unwrap_or(false);
+
+        // Acquire the codeword_encode serializer if HOST_CODEWORDS is on.
+        // For N=1 this lock is uncontested; for N>1 it forces the heavy
+        // ~6 GiB codeword_encode + batch + D2H window to run sequentially
+        // across concurrent shards, so the simultaneous-codewords peak
+        // stays at 1× (not N×) — the binding constraint that otherwise
+        // OOMs the 32 GiB 5090. We release the guard explicitly right
+        // after the device codewords have been D2H'd and dropped; from
+        // that point on the two shards' commit_phase/query work freely
+        // overlap.
+        let _serialize_guard = if host_codewords_enabled {
+            Some(self.codeword_encode_serializer.lock().unwrap())
+        } else {
+            None
+        };
+
         // Sub-phase markers: attribute basefold_prove's per-shard peak (5090
         // 100K = +6.75 GiB delta) across {codeword_encode, batch,
         // commit_phase, query}. See sp1_gpu_cudart::vram_snapshot_mib doc.
@@ -470,10 +509,8 @@ where
         // OFF. For N>1 (SP1_PROVE_OVERLAP_TRACEGEN >= 2) the peak
         // headroom is the gating constraint and this trade-off goes the
         // other way — opt in with SP1_BASEFOLD_HOST_CODEWORDS=1.
-        let host_codewords_enabled = std::env::var("SP1_BASEFOLD_HOST_CODEWORDS")
-            .ok()
-            .map(|v| v == "1" || v == "true")
-            .unwrap_or(false);
+        // (`host_codewords_enabled` was already read above so we can also
+        //  decide whether to take the codeword_encode serializer.)
 
         // We hold the staging guard for the duration of basefold_prove so
         // the host-side codeword slices we hand to the query phase stay
@@ -525,6 +562,18 @@ where
             // pending ops complete, so this is safe to do immediately.
             codewords.clear();
 
+            // Synchronise the stream so the D2H copies AND the deferred
+            // cudaFreeAsync of the device codewords have actually
+            // completed before we release the codeword_encode serializer.
+            // Without this, a concurrent shard could pick up the lock,
+            // call cudaMallocAsync on its own stream, and OOM because the
+            // ~6 GiB codeword pages aren't yet returned to the shared
+            // memory pool. Cost: forfeits the (already-broken) overlap of
+            // D2H with this shard's own commit_phase, but the inter-shard
+            // pipelining buys back the wall — shard A's commit_phase
+            // overlaps with shard B's codeword_encode after this point.
+            scope.synchronize_blocking().unwrap();
+
             let (cur_mib, peak_mib) = sp1_gpu_cudart::vram_snapshot_mib();
             tracing::debug!(
                 target: "sp1_gpu_vram",
@@ -534,6 +583,11 @@ where
                 "phase peak"
             );
         }
+
+        // Release the codeword_encode serializer — commit_phase and query
+        // hold only ~12 GiB device VRAM per shard, so two shards can run
+        // those concurrently within the 32 GiB cap.
+        drop(_serialize_guard);
 
         // Compute host-view slices from the staged pinned buffer. These
         // borrow the buffer for the rest of basefold_prove via the

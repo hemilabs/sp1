@@ -23,6 +23,29 @@ pub fn commit_multilinears<GC: IopCtx<F = Felt, EF = Ext>, P: CudaTcsProver<GC>>
     (GC::Digest, JaggedProverData<GC, CudaStackedPcsProverData<GC>>),
     SingleLayerMerkleTreeProverError,
 > {
+    // Serialize the 6 GiB LDE allocation across concurrent shards when
+    // HOST_CODEWORDS=1 + drop_main_traces=true. Without this, two N>1
+    // shards both reach the `Tensor::with_sizes_in` call below
+    // simultaneously and try to allocate ~6 GiB each, busting the 32 GiB
+    // 5090 budget on the second alloc. With drop_main_traces=true the LDE
+    // is freed at the end of encode_and_commit so the serializer can be
+    // released immediately after.
+    //
+    // We use the same mutex as basefold_prove's codeword_encode (it's the
+    // same FriCudaProver and the two allocate the same-shaped tensor), so
+    // commit_traces in shard A serializes against basefold codeword_encode
+    // in shard B and vice versa.
+    let serialize_codeword_encode = drop_main_traces
+        && std::env::var("SP1_BASEFOLD_HOST_CODEWORDS")
+            .ok()
+            .map(|v| v == "1" || v == "true")
+            .unwrap_or(false);
+    let _serialize_guard = if serialize_codeword_encode {
+        Some(basefold_prover.codeword_encode_serializer.lock().unwrap())
+    } else {
+        None
+    };
+
     let (index, padding, dst) = if use_preprocessed {
         (
             &jagged_trace_mle.dense().preprocessed_table_index,
