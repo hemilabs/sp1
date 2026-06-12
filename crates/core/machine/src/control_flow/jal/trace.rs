@@ -2,7 +2,7 @@ use std::{borrow::BorrowMut, mem::MaybeUninit};
 
 use hashbrown::HashMap;
 use itertools::Itertools;
-use rayon::iter::{ParallelBridge, ParallelIterator};
+use slop_maybe_rayon::prelude::{IndexedParallelIterator, ParallelIterator, ParallelSlice, ParallelSliceMut};
 use slop_air::BaseAir;
 use slop_algebra::PrimeField32;
 use sp1_core_executor::{
@@ -48,8 +48,7 @@ impl<F: PrimeField32, M: TrustMode> MachineAir<F> for JalChip<M> {
 
         let blu_batches = input
             .jal_events
-            .chunks(chunk_size)
-            .par_bridge()
+            .par_chunks(chunk_size)
             .map(|events| {
                 let mut blu: HashMap<ByteLookupEvent, usize> = HashMap::new();
                 events.iter().for_each(|event| {
@@ -101,7 +100,7 @@ impl<F: PrimeField32, M: TrustMode> MachineAir<F> for JalChip<M> {
         let buffer_ptr = buffer.as_mut_ptr() as *mut F;
         let values = unsafe { core::slice::from_raw_parts_mut(buffer_ptr, num_event_rows * width) };
 
-        values.chunks_mut(chunk_size * width).enumerate().par_bridge().for_each(|(i, rows)| {
+        values.par_chunks_mut(chunk_size * width).enumerate().for_each(|(i, rows)| {
             let mut blu = Vec::new();
             rows.chunks_mut(width).enumerate().for_each(|(j, row)| {
                 let idx = i * chunk_size + j;
