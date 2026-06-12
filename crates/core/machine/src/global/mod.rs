@@ -4,9 +4,9 @@ use std::{
 };
 
 use rayon::iter::{
-    IndexedParallelIterator, IntoParallelIterator, IntoParallelRefMutIterator, ParallelBridge,
-    ParallelIterator,
+    IndexedParallelIterator, IntoParallelIterator, IntoParallelRefMutIterator, ParallelIterator,
 };
+use rayon::slice::{ParallelSlice, ParallelSliceMut};
 use rayon_scan::ScanParallelIterator;
 use slop_air::{Air, BaseAir, PairBuilder};
 use slop_algebra::PrimeField32;
@@ -88,8 +88,7 @@ impl<F: PrimeField32> MachineAir<F> for GlobalChip {
         let chunk_size = std::cmp::max(events.len() / num_cpus::get(), 1);
 
         let blu_batches = events
-            .chunks(chunk_size)
-            .par_bridge()
+            .par_chunks(chunk_size)
             .map(|events| {
                 let mut blu: Vec<ByteLookupEvent> = Vec::new();
                 let mut row = [F::zero(); NUM_GLOBAL_COLS];
@@ -215,7 +214,7 @@ impl<F: PrimeField32> MachineAir<F> for GlobalChip {
         let start_digest_plus_dummy = start_digest.add_incomplete(dummy);
 
         let chunk_size = std::cmp::max(padded_nb_rows / num_cpus::get(), 0) + 1;
-        values.chunks_mut(chunk_size * NUM_GLOBAL_COLS).enumerate().par_bridge().for_each(
+        values.par_chunks_mut(chunk_size * NUM_GLOBAL_COLS).enumerate().for_each(
             |(i, rows)| {
                 rows.chunks_mut(NUM_GLOBAL_COLS).enumerate().for_each(|(j, row)| {
                     let idx = i * chunk_size + j;
