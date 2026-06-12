@@ -1,9 +1,10 @@
 use std::{
+    collections::HashMap,
     io::Write,
     path::PathBuf,
     sync::{
         atomic::{AtomicUsize, Ordering},
-        Arc,
+        Arc, Mutex,
     },
 };
 
@@ -208,6 +209,15 @@ pub struct CoreWorker<A, W, C: SP1ProverComponents> {
     pk: Option<CoreProvingKeyCache<C>>,
     verify_intermediates: bool,
     record_write_dir_and_frequency: Option<(String, usize)>,
+    /// Per-ELF `Arc<Program>` cache keyed by the elf Artifact id.
+    ///
+    /// `Program::from(&elf)` rebuilds the full memory_image
+    /// (`HashMap<u64,u64>`, hundreds of MB at scale) + `page_prot_image`
+    /// once per shard. Same ELF -> identical Program, so we cache the
+    /// `Arc<Program>` and hand it back to subsequent shards for free.
+    /// Single ELF per proof in the common case, so the cache stays tiny
+    /// and the lock is essentially uncontested.
+    program_cache: Arc<Mutex<HashMap<String, Arc<Program>>>>,
 }
 
 impl<A, W, C: SP1ProverComponents> CoreWorker<A, W, C> {
@@ -235,6 +245,7 @@ impl<A, W, C: SP1ProverComponents> CoreWorker<A, W, C> {
             pk,
             verify_intermediates,
             record_write_dir_and_frequency,
+            program_cache: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -278,16 +289,37 @@ where
         };
 
         let span = tracing::debug_span!("into_record");
+        let elf_id = input.elf.0.clone();
+        let program_cache = self.program_cache.clone();
         let (program, mut record, deferred_record, is_precompile) = tokio::task::spawn_blocking({
             let artifact_client = self.artifact_client.clone();
             let opts = self.opts.clone();
             move || {
                 let _guard = span.enter();
                 {
-                    let program = Program::from(&elf).map_err(|e| {
-                        TaskError::Fatal(anyhow::anyhow!("failed to disassemble program: {}", e))
-                    })?;
-                    let program = Arc::new(program);
+                    // Cache lookup: Program::from(&elf) at scale rebuilds a
+                    // hundreds-of-MB memory_image. Same ELF id => identical
+                    // Program, so cache + reuse Arc<Program> across shards.
+                    // The lock is uncontested in the steady state (one ELF
+                    // per proof; lookup happens once per shard).
+                    let cached =
+                        program_cache.lock().expect("program_cache poisoned").get(&elf_id).cloned();
+                    let program = if let Some(cached) = cached {
+                        cached
+                    } else {
+                        let program = Program::from(&elf).map_err(|e| {
+                            TaskError::Fatal(anyhow::anyhow!(
+                                "failed to disassemble program: {}",
+                                e
+                            ))
+                        })?;
+                        let program = Arc::new(program);
+                        program_cache
+                            .lock()
+                            .expect("program_cache poisoned")
+                            .insert(elf_id.clone(), program.clone());
+                        program
+                    };
                     let (record, deferred_record, is_precompile) = match record {
                         TraceData::Core(chunk_bytes) => {
                             let chunk: TraceChunk =
