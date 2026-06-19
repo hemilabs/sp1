@@ -468,9 +468,24 @@ async fn device_preprocessed_tracegen<A: CudaTracegenAir<Felt>>(
             let trace_len = height * width;
             let mut storage: Buffer<Felt, TaskScope> =
                 Buffer::with_capacity_in(trace_len, backend.clone());
-            let slice =
-                unsafe { std::slice::from_raw_parts_mut(start_pointer as *mut Felt, trace_len) };
-            storage.extend_from_host_slice(slice).unwrap();
+            // Run the H2D on the task's aux stream so it doesn't queue
+            // behind kernel work on the primary stream. The driver's
+            // per-stream command buffer fills up under heavy kernel
+            // launch volume and starts blocking `cudaMemcpyAsync` host
+            // returns; nsys 2026-06-18 attributed 24.7 s (56% of 5090
+            // 100K wall) to that effect. The aux helper handles the
+            // cross-stream alloc/copy ordering via cudaEvents.
+            let byte_count = trace_len * std::mem::size_of::<Felt>();
+            unsafe {
+                backend
+                    .copy_host_to_device_aux_async(
+                        storage.as_mut_ptr() as *mut std::ffi::c_void,
+                        start_pointer as *const std::ffi::c_void,
+                        byte_count,
+                    )
+                    .unwrap();
+                storage.set_len(trace_len);
+            }
             let dims: Dimensions = [height, width].try_into().unwrap();
             let tensor = Tensor { storage, dimensions: dims };
             let guts = DeviceTensor::from_raw(tensor).transpose().into_inner();
@@ -819,9 +834,20 @@ async fn device_main_tracegen<A: CudaTracegenAir<Felt>>(
         let trace_len = height * width;
         let mut storage: Buffer<Felt, TaskScope> =
             Buffer::with_capacity_in(trace_len, backend.clone());
-        let slice =
-            unsafe { std::slice::from_raw_parts_mut(start_pointer as *mut Felt, trace_len) };
-        storage.extend_from_host_slice(slice).unwrap();
+        // Aux-stream H2D — see device_preprocessed_tracegen for the
+        // motivation. This is the per-shard main trace upload (the big
+        // copies in the nsys profile).
+        let byte_count = trace_len * std::mem::size_of::<Felt>();
+        unsafe {
+            backend
+                .copy_host_to_device_aux_async(
+                    storage.as_mut_ptr() as *mut std::ffi::c_void,
+                    start_pointer as *const std::ffi::c_void,
+                    byte_count,
+                )
+                .unwrap();
+            storage.set_len(trace_len);
+        }
         let dims: Dimensions = [height, width].try_into().unwrap();
         let tensor = Tensor { storage, dimensions: dims };
         let guts = DeviceTensor::from_raw(tensor).transpose().into_inner();

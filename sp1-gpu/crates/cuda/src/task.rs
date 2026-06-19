@@ -247,8 +247,15 @@ impl TaskPoolBuilder {
         let mut tasks = Vec::with_capacity(num_tasks);
         for (i, _) in (0..num_tasks).enumerate() {
             let stream = CudaStream::create().map_err(TaskPoolBuildError::StreamCreationFailed)?;
+            // Auxiliary stream dedicated to large H2D copies, used via
+            // `TaskScope::copy_host_to_device_aux_async`. Splitting H2D off
+            // the primary stream avoids the driver's stream-queue
+            // back-pressure that nsys 2026-06-18 attributed 24.7s of
+            // wall-time to (see project_5090_optimization_plan.md #2).
+            let aux_stream =
+                CudaStream::create().map_err(TaskPoolBuildError::StreamCreationFailed)?;
             let end_event = CudaEvent::create().map_err(TaskPoolBuildError::EventCreationFailed)?;
-            tasks.push(Task { owner_id: id, id: i, stream, end_event });
+            tasks.push(Task { owner_id: id, id: i, stream, aux_stream, end_event });
         }
         let inner = Arc::new(WorkerQueue::new(tasks));
 
@@ -511,6 +518,63 @@ impl TaskScope {
         ))
     }
 
+    /// Enqueue a large H2D copy on the task's auxiliary stream, with
+    /// event-based ordering so the primary stream sees the copy completed
+    /// before any subsequent op. Use this for big transfers (trace data,
+    /// codeword inputs) where the primary stream is also handling kernel
+    /// work — running them concurrently on different streams avoids the
+    /// driver's command-queue back-pressure that turns `cudaMemcpyAsync`
+    /// from "fire and forget" into a 41 ms-per-call host stall (nsys
+    /// 2026-06-18 attributes 24.7 s of 5090 100K wall to this).
+    ///
+    /// Ordering: the aux stream is told to wait on a freshly-recorded
+    /// event from the primary stream so any pending `cudaMallocAsync`
+    /// for `dst` retires before the copy begins; the primary stream is
+    /// then told to wait on a freshly-recorded event from the aux stream
+    /// so the next kernel launched on the primary sees the H2D's bytes.
+    /// Host returns essentially immediately — both events and the memcpy
+    /// itself are enqueued, not awaited.
+    ///
+    /// # Safety
+    /// `dst` must be a valid device pointer for `byte_count` bytes of
+    /// writes (allocated on this task's primary backend, typically via
+    /// `cudaMallocAsync` on the primary stream). `src` must point to
+    /// pinned host memory for `byte_count` bytes that stays live until
+    /// the copy completes. The caller must NOT free `dst` or unpin `src`
+    /// before subsequent work on the primary stream synchronises (which
+    /// it will implicitly via the recorded event).
+    pub unsafe fn copy_host_to_device_aux_async(
+        &self,
+        dst: *mut std::ffi::c_void,
+        src: *const std::ffi::c_void,
+        byte_count: usize,
+    ) -> Result<(), CudaError> {
+        use sp1_gpu_sys::runtime::{
+            cuda_event_record, cuda_mem_copy_host_to_device_async, cuda_stream_wait_event,
+        };
+
+        // 1. Record a sync point on the primary stream so the aux stream
+        //    can wait for any pending allocations / prior work on `dst`.
+        let alloc_done = CudaEvent::create()?;
+        CudaError::result_from_ffi(cuda_event_record(alloc_done.0, self.stream.0))?;
+        CudaError::result_from_ffi(cuda_stream_wait_event(self.aux_stream.0, alloc_done.0))?;
+
+        // 2. Issue the H2D on the aux stream — the actual memcpy work.
+        CudaError::result_from_ffi(cuda_mem_copy_host_to_device_async(
+            dst,
+            src,
+            byte_count,
+            self.aux_stream.0,
+        ))?;
+
+        // 3. Record a sync point on the aux stream so any subsequent kernel
+        //    on the primary stream sees the H2D's writes happen-before.
+        let copy_done = CudaEvent::create()?;
+        CudaError::result_from_ffi(cuda_event_record(copy_done.0, self.aux_stream.0))?;
+        CudaError::result_from_ffi(cuda_stream_wait_event(self.stream.0, copy_done.0))?;
+        Ok(())
+    }
+
     /// Waits for all work enqueued so far in this task to finish.
     ///
     /// This function can be useful in case there is work to be enqueued but for some reason this
@@ -642,6 +706,12 @@ pub struct Task {
     pub(crate) owner_id: usize,
     pub(crate) id: usize,
     pub(crate) stream: CudaStream,
+    /// Auxiliary stream for large H2D copies; see
+    /// `TaskScope::copy_host_to_device_aux_async`. Routes long transfers
+    /// off the primary stream to avoid driver-level command-queue
+    /// back-pressure (the 591-call / 24.7s host stall identified by the
+    /// 2026-06-18 nsys profile).
+    pub(crate) aux_stream: CudaStream,
     end_event: CudaEvent,
 }
 
@@ -665,6 +735,7 @@ impl Drop for Task {
         unsafe {
             self.end_event.query().expect("attempting to drop a task that did not finish");
             self.stream.query().expect("attempting to drop a task that did not finish");
+            self.aux_stream.query().expect("attempting to drop a task with aux stream busy");
         }
     }
 }
