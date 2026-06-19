@@ -1097,9 +1097,9 @@ where
         alpha_buf.set_len(1);
         next_claim_buf.set_len(1);
     }
-    // Pre-allocated pinned staging buffers for D2H of alpha and claim (avoid per-round Vec alloc).
-    let mut alpha_staging = sp1_gpu_cudart::pinned::PinnedBuffer::<Ext>::with_capacity(1);
-    let mut claim_staging = sp1_gpu_cudart::pinned::PinnedBuffer::<Ext>::with_capacity(1);
+    // (Previously had unused `alpha_staging` / `claim_staging` PinnedBuffers
+    // here from never-completed pinned-D2H work; removed — they cost ~50
+    // `cudaMallocHost` per proof for zero benefit.)
 
     // Save reduced evals and poly snapshots for batch D2H at the end.
     let mut saved_reduced_evals: Vec<DeviceTensor<Ext>> =

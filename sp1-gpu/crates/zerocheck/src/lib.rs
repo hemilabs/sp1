@@ -836,8 +836,6 @@ where
         alpha_buf.set_len(1);
         next_claim_buf.set_len(1);
     }
-    let mut alpha_staging = sp1_gpu_cudart::pinned::PinnedBuffer::<Ext>::with_capacity(1);
-    let mut claim_staging = sp1_gpu_cudart::pinned::PinnedBuffer::<Ext>::with_capacity(1);
 
     let mut univariate_polys: Vec<UnivariatePolynomial<Ext>> =
         Vec::with_capacity(max_log_row_count as usize);
