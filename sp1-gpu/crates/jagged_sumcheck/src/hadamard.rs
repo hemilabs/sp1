@@ -5,14 +5,14 @@ use slop_algebra::{AbstractExtensionField, UnivariatePolynomial};
 use slop_challenger::FieldChallenger;
 use slop_multilinear::Mle;
 use slop_multilinear::MleBaseBackend;
+use sp1_gpu_cudart::sys::kernels::hadamard_fix_last_variable_and_sum_as_poly_base_ext_kernel;
+use sp1_gpu_cudart::sys::kernels::hadamard_fix_last_variable_and_sum_as_poly_ext_ext_kernel;
+use sp1_gpu_cudart::sys::kernels::hadamard_sum_as_poly_base_ext_kernel;
+use sp1_gpu_cudart::sys::kernels::hadamard_sum_as_poly_ext_ext_kernel;
+use sp1_gpu_cudart::sys::kernels::mle_fix_last_variable_koala_bear_ext_ext_zero_padding;
+use sp1_gpu_cudart::sys::kernels::padded_hadamard_fix_and_sum;
 use sp1_gpu_cudart::sys::runtime::Dim3;
 use sp1_gpu_cudart::sys::runtime::KernelPtr;
-use sp1_gpu_cudart::sys::v2_kernels::hadamard_fix_last_variable_and_sum_as_poly_base_ext_kernel;
-use sp1_gpu_cudart::sys::v2_kernels::hadamard_fix_last_variable_and_sum_as_poly_ext_ext_kernel;
-use sp1_gpu_cudart::sys::v2_kernels::hadamard_sum_as_poly_base_ext_kernel;
-use sp1_gpu_cudart::sys::v2_kernels::hadamard_sum_as_poly_ext_ext_kernel;
-use sp1_gpu_cudart::sys::v2_kernels::mle_fix_last_variable_koala_bear_ext_ext_zero_padding;
-use sp1_gpu_cudart::sys::v2_kernels::padded_hadamard_fix_and_sum;
 use sp1_gpu_cudart::TaskScope;
 use sp1_gpu_cudart::{args, DeviceTensor};
 use sp1_gpu_utils::{Ext, Felt};
@@ -171,26 +171,32 @@ where
         backend.launch_kernel(kernel(), grid_size_x, BLOCK_SIZE, &args, shared_mem).unwrap();
     }
 
-    // Sum the univariate evals and interpolate into a degree-2 univariate
+    let uni_poly = interpolate_round_poly(univariate_evals, claim);
+
+    (Mle::new(base_output), Mle::new(ext_output), uni_poly)
+}
+
+/// Sum the per-block `(eval_zero, eval_half)` partial evaluations produced by a
+/// fix-and-sum kernel and interpolate the round's degree-2 univariate polynomial.
+fn interpolate_round_poly(
+    univariate_evals: Tensor<Ext, TaskScope>,
+    claim: Ext,
+) -> UnivariatePolynomial<Ext> {
     let univariate_evals = DeviceTensor::from_raw(univariate_evals);
     let host_evals = univariate_evals.sum_dim(1).to_host().unwrap();
 
-    let [component_eval_zero, component_eval_half] = host_evals.as_slice().try_into().unwrap();
-    let eval_zero = component_eval_zero;
-    let eval_half = component_eval_half;
+    let [eval_zero, eval_half] = host_evals.as_slice().try_into().unwrap();
 
     let eval_one = claim - eval_zero;
 
-    let uni_poly = interpolate_univariate_polynomial(
+    interpolate_univariate_polynomial(
         &[
             Ext::from_canonical_u16(0),
             Ext::from_canonical_u16(1),
             Ext::from_canonical_u16(2).inverse(),
         ],
         &[eval_zero, eval_one, eval_half * Felt::from_canonical_u16(4).inverse()],
-    );
-
-    (Mle::new(base_output), Mle::new(ext_output), uni_poly)
+    )
 }
 
 /// A simpler hadamard sumcheck. Avoids using the complex slop traits, and prioritizes a simple, readable implementation.

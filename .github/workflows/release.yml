@@ -259,6 +259,11 @@ jobs:
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
           rustup install stable
 
+      - name: Install CUDA prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y software-properties-common
+
       - name: Install CUDA
         uses: Jimver/cuda-toolkit@v0.2.23
         id: cuda-toolkit
@@ -331,6 +336,16 @@ jobs:
     with:
       docker-tag: ${{ needs.prepare.outputs.tag_name }}
       dry-run: ${{ inputs.dry_run }}
+
+  zkevm-sdk-release:
+    name: zkEVM SDK build and upload
+    needs: [prepare]
+    uses: ./.github/workflows/zkevm-sdk-build.yml
+    with:
+      version: ${{ needs.prepare.outputs.tag_name }}
+      release_tag: ${{ needs.prepare.outputs.tag_name }}
+      dry_run: ${{ inputs.dry_run }}
+    secrets: inherit
 
   set-latest-release:
     name: Set latest release

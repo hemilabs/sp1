@@ -23,7 +23,7 @@ use crate::{
     SP1CudaProverComponents,
 };
 
-pub fn local_gpu_opts() -> (SP1CoreOpts, bool) {
+pub fn local_gpu_opts() -> SP1CoreOpts {
     let mut opts = SP1CoreOpts::default();
 
     let log2_shard_size = 24;
@@ -38,8 +38,8 @@ pub fn local_gpu_opts() -> (SP1CoreOpts, bool) {
         panic!("Unsupported GPU memory: {gpu_memory_gb}, must be at least 24GB");
     }
 
-    let shard_threshold = if gpu_memory_gb <= 30 {
-        ELEMENT_THRESHOLD - (1 << 26) - (1 << 25)
+    let shard_threshold = if !opts.full_size_shards && gpu_memory_gb <= 30 {
+        ELEMENT_THRESHOLD - (1 << 26) - (1 << 25) - (1 << 24)
     } else {
         ELEMENT_THRESHOLD
     };
@@ -48,8 +48,10 @@ pub fn local_gpu_opts() -> (SP1CoreOpts, bool) {
     opts.sharding_threshold.element_threshold = shard_threshold;
 
     opts.global_dependencies_opt = true;
+    opts.recompute_gkr_trace = false;
+    opts.drop_ldes = opts.full_size_shards && gpu_memory_gb <= 30;
 
-    (opts, gpu_memory_gb <= 30)
+    opts
 }
 
 /// Create a [SP1CudaProverWorkerBuilder] with a default machine.
@@ -64,12 +66,20 @@ pub async fn core_prover_and_verifier(
     CudaShardProver<SP1GlobalContext, CudaProverCoreComponents>,
     MachineVerifier<SP1GlobalContext, InnerSC<RiscvAir<SP1Field>>>,
 ) {
-    let (opts, recompute_first_layer) = local_gpu_opts();
+    let opts = local_gpu_opts();
     let num_elts =
         opts.sharding_threshold.element_threshold as usize + (1 << CORE_LOG_STACKING_HEIGHT);
     let core_verifier = SP1CudaProverComponents::core_verifier(machine);
     (
-        new_cuda_prover(&core_verifier, num_elts, 4, recompute_first_layer, scope).await,
+        new_cuda_prover(
+            &core_verifier,
+            num_elts,
+            4,
+            opts.recompute_gkr_trace,
+            opts.drop_ldes,
+            scope,
+        )
+        .await,
         core_verifier,
     )
 }
@@ -82,7 +92,8 @@ pub async fn recursion_prover_and_verifier(
 ) {
     let recursion_verifier = SP1CudaProverComponents::compress_verifier();
     (
-        new_cuda_prover(&recursion_verifier, RECURSION_TRACE_ALLOCATION, 4, false, scope).await,
+        new_cuda_prover(&recursion_verifier, RECURSION_TRACE_ALLOCATION, 4, false, false, scope)
+            .await,
         recursion_verifier,
     )
 }
@@ -96,7 +107,7 @@ pub async fn cuda_worker_builder_with_machine(
     let prover_permits = ProverSemaphore::new(1);
 
     // Get the core options.
-    let (opts, _) = local_gpu_opts();
+    let opts = local_gpu_opts();
 
     let core_prover = Arc::new(core_prover_and_verifier(scope.clone(), machine.clone()).await.0);
 
@@ -105,12 +116,14 @@ pub async fn cuda_worker_builder_with_machine(
 
     let shrink_verifier = SP1CudaProverComponents::shrink_verifier();
     let shrink_prover = Arc::new(
-        new_cuda_prover(&shrink_verifier, SHRINK_TRACE_ALLOCATION, 4, false, scope.clone()).await,
+        new_cuda_prover(&shrink_verifier, SHRINK_TRACE_ALLOCATION, 4, false, false, scope.clone())
+            .await,
     );
 
     let wrap_verifier = SP1CudaProverComponents::wrap_verifier();
     let wrap_prover = Arc::new(
-        new_cuda_prover(&wrap_verifier, WRAP_TRACE_ALLOCATION, 4, false, scope.clone()).await,
+        new_cuda_prover(&wrap_verifier, WRAP_TRACE_ALLOCATION, 4, false, false, scope.clone())
+            .await,
     );
 
     let base_builder = SP1WorkerBuilder::new_with_machine(machine)
