@@ -134,7 +134,30 @@ class DuplexChallenger {
         __syncthreads();
 
         // Local copy of challenger state for each thread in each iteration.
-        kb31_t local_state[NUM_ELEMENTS];
+        //
+        // SIZED FOR THE PERMUTATION, not for the state transferred from the host.
+        //
+        // `load()` points `output_buffer` at `local_state + WIDTH + RATE`, and `duplexing()` then does
+        // `hasher.permute(sponge_state, output_buffer)` — and `permute` is declared
+        // `permute(F_t in[WIDTH], F_t out[WIDTH])`, so it writes WIDTH = 16 elements there. At
+        // `NUM_ELEMENTS = WIDTH + 2*RATE = 32` the array ends at index 32 while `output_buffer` starts
+        // at 24, leaving only RATE = 8 slots for a 16-element write: an 8-element (32-byte) overflow of
+        // a thread-local array, every single duplexing.
+        //
+        // It is invisible on sm_89 and fatal on sm_120. Local memory is per-thread global memory and
+        // the compiler lays the frame out per architecture; on Ada the overflow lands in frame padding
+        // and nothing notices, while on Blackwell it runs past the thread's local window. That is the
+        // `misaligned address` / `unspecified launch failure` that made SP1 look unusable on a 5080.
+        // compute-sanitizer names it directly: `Invalid __local__ write of size 16 bytes at
+        // challenger.cuh:42`, inside `mdsLightPermutation4x4` (which writes 4 elements = 16 bytes at a
+        // time), under `grindKernel`.
+        //
+        // Only the array grows. `NUM_ELEMENTS` still describes what is copied from the host state, so
+        // the staging `challenger_state` and both copy loops are unchanged; the extra slots are scratch
+        // that `permute` overwrites before anything reads them, and `duplexing()` zeroes
+        // `output_buffer[RATE..WIDTH)` afterwards exactly as before.
+        static constexpr const size_t LOCAL_ELEMENTS = WIDTH + RATE + WIDTH;
+        kb31_t local_state[LOCAL_ELEMENTS];
         size_t buffer_sizes[2];
         for (size_t i = idx; i < n && !*found_flag; i += blockDim.x * gridDim.x) {
             buffer_sizes[0] = original_buffer_size;

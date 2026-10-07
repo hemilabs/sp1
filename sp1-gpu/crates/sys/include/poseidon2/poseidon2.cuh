@@ -5,6 +5,22 @@
 
 namespace poseidon2 {
 
+// ALIGNMENT: every buffer that is `reinterpret_cast` to `FDW_t` must be 16-byte aligned.
+//
+// `FDW_t` above is declared `__align__(16)`, and this file casts plain `F_t[...]` arrays to it in six
+// places to move a digest as one 128-bit vector. A plain array of 4-byte `F_t` only guarantees 4-byte
+// alignment, so those casts are undefined behaviour: the compiler emits 128-bit loads/stores and they
+// fault the moment the array does not happen to land on a 16-byte boundary.
+//
+// compute-sanitizer named it precisely on sm_120: `Invalid __local__ read of size 16 bytes ... Access
+// to 0xfff728 is misaligned` at the `finalize` cast below, inside Poseidon2's sbox under `leafHash`.
+// That is the `CudaRustError: misaligned address` that made SP1 unusable on a Blackwell card. Local
+// arrays are laid out per architecture, so on sm_89 these happened to be 16-byte aligned and the bug
+// was invisible; on sm_120 the frame layout differs and they are not.
+//
+// Declaring the arrays `__align__(16)` makes the casts legitimate rather than lucky. It costs nothing:
+// these are small fixed-size on-stack buffers, and the alignment is what the vector access already
+// assumed.
 template <typename Params>
 struct __align__(16) FDW_t {
     using F_t = typename Params::F_t;
@@ -45,7 +61,7 @@ class Hasher {
   public:
     __device__ static void
     permute(F_t in[Params::WIDTH], F_t out[Params::WIDTH], RoundConstants_t roundConstants) {
-        F_t state[Params::WIDTH];
+        __align__(16) F_t state[Params::WIDTH];
         for (int i = 0; i < Params::WIDTH; i++) {
             state[i] = in[i];
         }
@@ -84,7 +100,7 @@ class Hasher {
         F_t right[Params::DIGEST_WIDTH],
         F_t out[Params::DIGEST_WIDTH],
         RoundConstants_t roundConstants) {
-        F_t state[Params::WIDTH];
+        __align__(16) F_t state[Params::WIDTH];
         FDW_t* stateWidth = reinterpret_cast<FDW_t*>(state);
         stateWidth[0] = *reinterpret_cast<FDW_t*>(left);
         stateWidth[1] = *reinterpret_cast<FDW_t*>(right);
@@ -97,7 +113,7 @@ class Hasher {
 
     __device__ static void
     hash(F_t* in, size_t nIn, F_t out[Params::DIGEST_WIDTH], RoundConstants_t roundConstants) {
-        F_t state[Params::WIDTH];
+        __align__(16) F_t state[Params::WIDTH];
         for (int i = 0; i < Params::WIDTH; i++) {
             state[i].set_to_zero();
         }
@@ -188,7 +204,7 @@ struct HasherState {
     using F_t = typename Params::F_t;
     using FDW_t = FDW_t<Params>;
 
-    F_t data[Params::WIDTH];
+    __align__(16) F_t data[Params::WIDTH];
     size_t index;
 
     __device__ HasherState() : index(0) {
