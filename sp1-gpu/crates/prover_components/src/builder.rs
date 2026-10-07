@@ -40,13 +40,46 @@ pub fn local_gpu_opts() -> SP1CoreOpts {
 
     // Shard threshold tiers based on GPU memory. `gpu_memory_gb` = ceil(actual GiB) + 4, so a 16 GB
     // card reports 20 and a 24 GB card 28.
-    let shard_threshold = if gpu_memory_gb <= 20 {
+    let tier_threshold = if gpu_memory_gb <= 20 {
         // 16 GB cards (e.g. RTX 5080, RX 9070 XT): ~134M elements per shard to fit in VRAM.
         ELEMENT_THRESHOLD - (1 << 28)
     } else if !opts.full_size_shards && gpu_memory_gb <= 30 {
         ELEMENT_THRESHOLD - (1 << 26) - (1 << 25) - (1 << 24)
     } else {
         ELEMENT_THRESHOLD
+    };
+
+    // `SP1_GPU_ELEMENT_THRESHOLD` caps the tier's choice; it never replaces it.
+    //
+    // `SP1CoreOpts::default()` already reads `ELEMENT_THRESHOLD` from the environment, but the tier
+    // above overwrites it, so without this there is no supported way to tune the core trace budget.
+    // It is the main host-RAM dial: the threshold sizes each worker's PINNED host trace buffer, so
+    // lowering it saves non-swappable host memory at the cost of more shards.
+    //
+    // A cap, because the caller usually derives it from HOST memory, which says nothing about the
+    // card: as a replacement it raised a 16 GB card's 134,217,728 to 268,435,456 and ran the card out
+    // of VRAM mid-proof. Raising it above `ELEMENT_THRESHOLD` would also produce recursion shapes the
+    // circuit does not accept. Taking the minimum respects both the tier and the caller.
+    let shard_threshold = match std::env::var("SP1_GPU_ELEMENT_THRESHOLD")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+    {
+        Some(requested) => {
+            let capped = requested.min(tier_threshold);
+            if capped != requested {
+                tracing::info!(
+                    "SP1_GPU_ELEMENT_THRESHOLD={requested} is above what this card's VRAM tier \
+                     allows ({tier_threshold}); using the tier's value."
+                );
+            } else if capped != tier_threshold {
+                tracing::info!(
+                    "element threshold capped to {capped} by SP1_GPU_ELEMENT_THRESHOLD (tier would \
+                     have used {tier_threshold})"
+                );
+            }
+            capped
+        }
+        None => tier_threshold,
     };
 
     tracing::debug!("Shard threshold: {shard_threshold}");
@@ -119,10 +152,18 @@ pub async fn recursion_prover_and_verifier(
     CudaShardProver<SP1GlobalContext, CudaProverRecursionComponents>,
     MachineVerifier<SP1GlobalContext, InnerSC<CompressAir<SP1Field>>>,
 ) {
+    let opts = local_gpu_opts();
     let recursion_verifier = SP1CudaProverComponents::compress_verifier();
     (
-        new_cuda_prover(&recursion_verifier, RECURSION_TRACE_ALLOCATION, 4, false, false, scope)
-            .await,
+        new_cuda_prover(
+            &recursion_verifier,
+            RECURSION_TRACE_ALLOCATION,
+            4,
+            opts.recompute_gkr_trace,
+            opts.drop_ldes,
+            scope,
+        )
+        .await,
         recursion_verifier,
     )
 }
@@ -165,19 +206,46 @@ pub async fn cuda_worker_builder_with_machine(
 
     let core_prover = Arc::new(core_prover_and_verifier(scope.clone(), machine.clone()).await.0);
 
+    // The memory-saving flags apply to all four provers, not just core.
+    //
+    // Upstream passes them to core and a literal `false` to recursion, shrink and wrap, so those
+    // phases keep their LDE codewords and their materialized LogUp-GKR first layer. The tier only
+    // shrinks the core threshold; the retained codewords in recursion (~2 GiB), shrink (~1 GiB) and
+    // wrap (~2.5 GiB) are tier-blind, and the wrap's peak is what blocks a 16 GB card from finishing a
+    // Groth16 proof. On larger cards both flags default off, so nothing changes there.
+    //
+    // Correctness: `drop_ldes` only decides whether a codeword is kept or recomputed. The commitment
+    // is taken before the drop (`FriCudaProver::encode_and_commit`), the recompute re-runs the same
+    // `encode_batch`, and openings are checked against the committed tree, so a divergence would give
+    // an invalid proof, not a different valid one. Setup is unaffected: `commit_multilinears` never
+    // drops preprocessed traces.
     // TODO: tune this more precisely and make it a constant.
     let recursion_prover = Arc::new(recursion_prover_and_verifier(scope.clone()).await.0);
 
     let shrink_verifier = SP1CudaProverComponents::shrink_verifier();
     let shrink_prover = Arc::new(
-        new_cuda_prover(&shrink_verifier, SHRINK_TRACE_ALLOCATION, 4, false, false, scope.clone())
-            .await,
+        new_cuda_prover(
+            &shrink_verifier,
+            SHRINK_TRACE_ALLOCATION,
+            4,
+            opts.recompute_gkr_trace,
+            opts.drop_ldes,
+            scope.clone(),
+        )
+        .await,
     );
 
     let wrap_verifier = SP1CudaProverComponents::wrap_verifier();
     let wrap_prover = Arc::new(
-        new_cuda_prover(&wrap_verifier, WRAP_TRACE_ALLOCATION, 4, false, false, scope.clone())
-            .await,
+        new_cuda_prover(
+            &wrap_verifier,
+            WRAP_TRACE_ALLOCATION,
+            4,
+            opts.recompute_gkr_trace,
+            opts.drop_ldes,
+            scope.clone(),
+        )
+        .await,
     );
 
     let base_builder = SP1WorkerBuilder::new_with_machine(machine)
