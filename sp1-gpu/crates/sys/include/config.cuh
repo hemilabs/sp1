@@ -14,6 +14,11 @@ using ext_t = kb31_extension_t;
 #define SP1_KERNEL __global__
 #endif
 
+// CUDA's __trap() aborts the kernel; HIP spells it __builtin_trap().
+#ifdef __HIPCC__
+#define __trap() __builtin_trap()
+#endif
+
 struct Pair {
     ext_t p;
     ext_t q;
