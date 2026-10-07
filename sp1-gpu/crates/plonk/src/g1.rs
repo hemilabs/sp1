@@ -330,6 +330,10 @@ fn gpu_msm(points: &[G1Affine], scalars: &[crate::fields::Fr]) -> G1Jacobian {
 /// Any card with strictly less than 14 GiB total VRAM will see GLV auto-
 /// disabled. RX 7900 XTX (24 GiB), RTX 4090 (24 GiB), RX 9070 XT (16 GiB)
 /// all qualify.
+///
+/// Auto never enables GLV on a CUDA build: the CUDA GLV entry points in
+/// `bn254_msm_sppark.cu` are stubs that fail ("GLV MSM is HIP-only"), so an
+/// RTX 4090 or 5090 would fail every Groth16 attempt.
 #[cfg(feature = "cuda")]
 fn glv_enabled() -> bool {
     static GLV: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -360,8 +364,11 @@ fn glv_enabled() -> bool {
         // the 1.5 GB pool, 1.9 GB G2, and 1.5 GB H buffer is right at the
         // 16 GB ceiling. Keep threshold at 20 GB so 7900 XTX stays GLV-on
         // and 9070 XT falls back cleanly.
-        let enable = ok && total >= 20 * 1024 * 1024 * 1024; // ≥ 20 GiB
-        if ok {
+        let hip = sp1_gpu_sys::is_hip_backend();
+        let enable = hip && ok && total >= 20 * 1024 * 1024 * 1024; // ≥ 20 GiB
+        if !hip {
+            eprintln!("[MSM] GLV auto: disabled (GLV is HIP-only)");
+        } else if ok {
             eprintln!(
                 "[MSM] GLV auto: total VRAM = {:.1} GB, {}",
                 total as f64 / (1024.0 * 1024.0 * 1024.0),
@@ -374,7 +381,11 @@ fn glv_enabled() -> bool {
         } else {
             eprintln!("[MSM] GLV auto: could not query VRAM, defaulting to enabled");
         }
-        ok.then_some(enable).unwrap_or(true)
+        if ok || !hip {
+            enable
+        } else {
+            true
+        }
     })
 }
 
