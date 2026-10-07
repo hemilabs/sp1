@@ -23,16 +23,33 @@ use crate::{
     SP1CudaProverComponents,
 };
 
+/// The card's memory as the tiers below see it: `ceil(total GiB) + 4`, so a 16 GB card reports 20
+/// and a 24 GB card 28.
+fn gpu_memory_gb() -> usize {
+    let gb = 1024.0 * 1024.0 * 1024.0;
+    (((cuda_memory_info().unwrap().1 as f64) / gb).ceil() as usize) + 4
+}
+
+/// Pinned host trace buffers per prover. One shard proves at a time (`ProverSemaphore(1)`), so
+/// two still double-buffer tracegen of shard N+1 against proving of shard N. Cards of 30 GB or
+/// less use two, as `max/optimizations_and_amd` did before it was rebased onto upstream: four
+/// pin ~6 GB of host memory across the four provers, which leaves too little beside the Groth16
+/// prover on a 28 GB host.
+fn trace_buffer_count() -> usize {
+    if gpu_memory_gb() <= 30 {
+        2
+    } else {
+        4
+    }
+}
+
 pub fn local_gpu_opts() -> SP1CoreOpts {
     let mut opts = SP1CoreOpts::default();
 
     let log2_shard_size = 24;
     opts.shard_size = 1 << log2_shard_size;
 
-    let gb = 1024.0 * 1024.0 * 1024.0;
-
-    // Get the amount of memory on the GPU.
-    let gpu_memory_gb: usize = (((cuda_memory_info().unwrap().1 as f64) / gb).ceil() as usize) + 4;
+    let gpu_memory_gb = gpu_memory_gb();
 
     if gpu_memory_gb < 16 {
         panic!("Unsupported GPU memory: {gpu_memory_gb}, must be at least 16GB");
@@ -136,7 +153,7 @@ pub async fn core_prover_and_verifier(
         new_cuda_prover(
             &core_verifier,
             num_elts,
-            4,
+            trace_buffer_count(),
             opts.recompute_gkr_trace,
             opts.drop_ldes,
             scope,
@@ -158,7 +175,7 @@ pub async fn recursion_prover_and_verifier(
         new_cuda_prover(
             &recursion_verifier,
             RECURSION_TRACE_ALLOCATION,
-            4,
+            trace_buffer_count(),
             opts.recompute_gkr_trace,
             opts.drop_ldes,
             scope,
@@ -227,7 +244,7 @@ pub async fn cuda_worker_builder_with_machine(
         new_cuda_prover(
             &shrink_verifier,
             SHRINK_TRACE_ALLOCATION,
-            4,
+            trace_buffer_count(),
             opts.recompute_gkr_trace,
             opts.drop_ldes,
             scope.clone(),
@@ -240,7 +257,7 @@ pub async fn cuda_worker_builder_with_machine(
         new_cuda_prover(
             &wrap_verifier,
             WRAP_TRACE_ALLOCATION,
-            4,
+            trace_buffer_count(),
             opts.recompute_gkr_trace,
             opts.drop_ldes,
             scope.clone(),
