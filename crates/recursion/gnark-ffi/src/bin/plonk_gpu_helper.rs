@@ -653,9 +653,9 @@ fn build_plonk_proof(
 }
 
 /// Try to produce `PlonkWitnessData` via the in-process GPU SCS solver.
-/// Available on both CUDA (via `scs_solver.cu`) and HIP (via
-/// `scs_solver.hip.cu`) builds. The `cuda` cargo feature gates the
-/// presence of the GPU code paths in `sp1-gpu-plonk` for both backends.
+/// The `cuda` cargo feature gates the GPU code paths in `sp1-gpu-plonk` for
+/// both backends. The solver's device sources were never committed, so
+/// `PlonkScsSolver::new` currently always fails and callers use gnark.
 #[cfg(feature = "cuda")]
 fn try_gpu_scs_solver(
     prep_circuit_dir: &Path,

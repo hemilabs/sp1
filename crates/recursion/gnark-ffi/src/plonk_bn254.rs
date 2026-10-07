@@ -577,12 +577,11 @@ impl PlonkBn254Prover {
         // Phase H: when SP1_GPU_PLONK_SOLVER=gpu is set on a CUDA backend,
         // skip the gnark.spr.Solve shell-out and prepare the GPU SCS solver
         // inputs (prep-circuit cache + per-prove witness-init dir) instead.
-        // Falls back to gnark.spr.Solve if anything fails. HIP backend
-        // The GPU SCS solver is now available on BOTH backends (CUDA via
-        // `scs_solver.cu`, HIP via `scs_solver.hip.cu`). The backend probe
-        // is kept only for diagnostic logging; both branches dispatch to
-        // the in-process GPU solver. `SP1_GPU_PLONK_SOLVER_BACKEND` may
-        // still override the report.
+        // Falls back to gnark.spr.Solve if anything fails. The solver's
+        // device sources were never committed, so on this branch
+        // `sp1_gpu_sys::plonk_scs_solver` is a stub and the request always
+        // falls back. The backend probe is kept only for diagnostic logging;
+        // `SP1_GPU_PLONK_SOLVER_BACKEND` may still override the report.
         let backend_is_cuda = match std::env::var("SP1_GPU_PLONK_SOLVER_BACKEND").ok().as_deref() {
             Some("cuda") | Some("nvidia") => true,
             Some("hip") | Some("rocm") | Some("amd") => false,
@@ -591,8 +590,8 @@ impl PlonkBn254Prover {
         let want_gpu_solver = std::env::var("SP1_GPU_PLONK_SOLVER").as_deref() == Ok("gpu");
         if std::env::var("SP1_GPU_PLONK_SOLVER").as_deref() == Ok("gpu") {
             tracing::info!(
-                "[plonk] GPU PLONK SCS solver requested: backend_is_cuda={} (using in-process \
-                 GPU solver — HIP path is now supported via scs_solver.hip.cu)",
+                "[plonk] GPU PLONK SCS solver requested: backend_is_cuda={} (falls back to \
+                 gnark.spr.Solve if the in-process GPU solver is unavailable)",
                 backend_is_cuda,
             );
         }

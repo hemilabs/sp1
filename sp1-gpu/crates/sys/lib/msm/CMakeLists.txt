@@ -8,13 +8,13 @@
 
 if(NOT USE_HIP)
     # CUDA: sppark MSM (production performance) for G1 + the one-shot G2.
-    # bn254_g2_msm_cuda.cu owns the **persistent** G2 MSM context — a
-    # port of the HIP path with its own cudaStreams that bypass sppark's
-    # gpu_t singleton (which conflicts with G1 PersistentMsm contexts).
+    # The persistent G2 MSM context is HIP-only; bn254_g2_msm_cuda_stub.cu
+    # makes its CUDA entry points report failure so callers use the one-shot
+    # path (the CUDA port, bn254_g2_msm_cuda.cu, was never committed).
     add_library(msm_objs OBJECT
         bn254_msm_sppark.cu
         bn254_g2_msm_sppark.cu
-        bn254_g2_msm_cuda.cu
+        bn254_g2_msm_cuda_stub.cu
     )
     # Allow per-build override of the G2 CUDA WBITS via env G2_CUDA_WBITS
     # (compile-time constexpr; default 13 matches HIP).
