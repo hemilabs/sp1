@@ -40,7 +40,19 @@ where
     let cpu_challenger: DuplexChallenger<F, _> = challenger.clone().into();
 
     let mut result = DeviceBuffer::with_capacity_in(1, scope.clone());
-    let mut found_flag = DeviceBuffer::<bool>::from_host_slice(&[false], scope).unwrap();
+    // FOUR bytes, not one, even though the kernel takes a `bool*`.
+    //
+    // `grindKernel` signals a hit with `atomicExch((int*)found_flag, 1)` (challenger.cuh), and CUDA has
+    // no 1-byte atomic — so a `DeviceBuffer::<bool>` of one element means a 4-byte atomic writing three
+    // bytes past a 1-byte allocation, on every successful grind. compute-sanitizer names it exactly:
+    // `Invalid __global__ atomic of size 4 bytes ... nearest allocation ... of size 1 bytes`.
+    //
+    // Harmless wherever the allocator leaves slack after a 1-byte block, which is why it has gone
+    // unnoticed; fatal on Blackwell (sm_120), where it faults and takes the whole proof down as
+    // `unspecified launch failure`. Allocating the flag at the width the atomic actually uses is the
+    // fix, and it keeps the kernel side untouched: `atomicExch` stores `0x00000001`, so byte 0 is 1 and
+    // the kernel's `*found_flag` bool read still sees `true` on any little-endian target, which CUDA is.
+    let mut found_flag = DeviceBuffer::<u32>::from_host_slice(&[0u32], scope).unwrap();
     let mut gpu_challenger = cpu_challenger.to_device_sync(scope).unwrap();
 
     // Kernel is compiled with __launch_bounds__(256, 1) in
@@ -60,7 +72,8 @@ where
             result.as_mut_ptr(),
             bits,
             n,
-            found_flag.as_mut_ptr()
+            // Cast back to the `bool*` the kernel declares; only the ALLOCATION width changes.
+            found_flag.as_mut_ptr() as *mut bool
         );
         scope.launch_kernel(grind_kernel(), (grid_dim, 1, 1), block_dim, &args, 0).unwrap();
     }
@@ -108,7 +121,8 @@ where
     let mut result = DeviceBuffer::with_capacity_in(1, scope.clone());
     // found_flag MUST be host-initialized to false. The kernel no longer
     // resets it (that reset raced with late waves clobbering a found witness).
-    let mut found_flag = DeviceBuffer::<bool>::from_host_slice(&[false], scope).unwrap();
+    // Four bytes for the kernel's 4-byte `atomicExch`; see `grind_duplex_challenger_on_device`.
+    let mut found_flag = DeviceBuffer::<u32>::from_host_slice(&[0u32], scope).unwrap();
     let mut gpu_challenger = cpu_challenger.to_device_sync(scope).unwrap();
 
     // Kernel is compiled __launch_bounds__(256, 1); block_dim must be <= 256.
@@ -126,7 +140,7 @@ where
             result.as_mut_ptr(),
             bits,
             n,
-            found_flag.as_mut_ptr()
+            found_flag.as_mut_ptr() as *mut bool
         );
         scope
             .launch_kernel(multi_field32_grind_kernel(), (grid_dim, 1, 1), block_dim, &args, 0)
