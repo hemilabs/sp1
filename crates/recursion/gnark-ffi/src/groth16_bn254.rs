@@ -459,6 +459,29 @@ impl Groth16Bn254Prover {
         Sha256::digest(vk_bin_bytes).into()
     }
 
+    /// Whether this circuit's GPU-format proving key is already exported, so that
+    /// [`Self::prove_gpu_subprocess`] skips the one-time export (~9 GB written to the cache root,
+    /// `/dev/shm` unless `SP1_GROTH16_PK_CACHE` says otherwise). Read-only, unlike the resolution
+    /// the prover does. Always false when the cache is disabled.
+    #[cfg(feature = "native")]
+    pub fn gpu_pk_cache_ready(build_dir: &Path) -> bool {
+        let vkey_hash_hex = hex::encode(Self::get_vkey_hash(build_dir));
+        pk_cache_dir(&vkey_hash_hex).is_some_and(|dir| dir.join(PK_CACHE_SENTINEL).is_file())
+    }
+
+    /// Whether the `groth16_gpu_helper` binary that [`Self::prove_gpu_subprocess`] spawns can be
+    /// found, by the same rules it uses (`SP1_GROTH16_GPU_HELPER`, next to this executable, then
+    /// `$PATH`).
+    #[cfg(feature = "native")]
+    pub fn gpu_helper_available() -> bool {
+        let path = resolve_helper_path("groth16_gpu_helper");
+        if path.components().count() > 1 {
+            return path.is_file();
+        }
+        std::env::var_os("PATH")
+            .is_some_and(|paths| std::env::split_paths(&paths).any(|dir| dir.join(&path).is_file()))
+    }
+
     /// Executes the prover in testing mode with a circuit definition and witness.
     pub fn test<C: Config>(constraints: Vec<Constraint>, witness: Witness<C>) {
         let serialized = serde_json::to_string(&constraints).unwrap();

@@ -84,6 +84,10 @@ pub struct SP1RecursionProverConfig {
     vk_map_file: Option<String>,
     /// The reduce shape
     pub reduce_shape: SP1RecursionProofShape,
+    /// Whether this worker's card is large enough for the GPU Groth16 prover. Set by the GPU
+    /// worker builder for cards above the 16 GB tier; false, i.e. gnark's CPU prover, otherwise.
+    /// Host memory is checked again before each proof (see `groth16_backend`).
+    pub groth16_gpu: bool,
 }
 
 impl SP1RecursionProverConfig {
@@ -111,6 +115,7 @@ impl SP1RecursionProverConfig {
             verify_intermediates,
             vk_map_file: None,
             reduce_shape,
+            groth16_gpu: false,
         }
     }
     #[cfg(feature = "experimental")]
@@ -756,6 +761,8 @@ impl<A: ArtifactClient, C: SP1ProverComponents> SP1RecursionProver<A, C> {
             .await
             .map_err(TaskError::Fatal)?;
 
+        #[cfg(feature = "native-gnark")]
+        let card_eligible = self.wrap_prover_init.config.groth16_gpu;
         let groth16_proof = tokio::task::spawn_blocking(move || -> Result<_, anyhow::Error> {
             let SP1WrapProof { vk, proof } = wrap_proof;
             let input = SP1ShapedWitnessValues {
@@ -785,18 +792,33 @@ impl<A: ArtifactClient, C: SP1ProverComponents> SP1RecursionProver<A, C> {
                 witness
             };
             let prover = Groth16Bn254Prover::new();
-            // GPU-accelerated final-wrap path (sp1-gpu-groth16) via a
-            // SUBPROCESS helper. The shard-prover's persistent HIP/CUDA
-            // contexts from the earlier recursion phase would deadlock the
-            // in-process Groth16 GPU prover at the first MSM; spawning a
-            // clean child process isolates HIP state. Parent still does the
-            // Go R1CS solve + PK export (CPU-only) in-process — only the GPU
-            // compute step is subprocess-isolated.
+            // Either the GPU prover (sp1-gpu-groth16) or gnark's CPU prover; see
+            // `groth16_backend` for how the choice is made. The GPU prover runs in a SUBPROCESS
+            // helper: the shard prover's persistent HIP/CUDA contexts from the earlier recursion
+            // phase would deadlock an in-process Groth16 GPU prover at the first MSM. The parent
+            // still does the Go R1CS solve and PK export (CPU-only) in-process; only the GPU
+            // compute step is isolated. On an AMD 7900 XTX the GPU path drops the wrap step from
+            // ~41 s (Docker CPU gnark) to ~3 s (round-6.4 standalone measurement).
             //
-            // Falls back to gnark Go / Docker when native-gnark is not set.
-            // On AMD 7900 XTX the GPU path drops the wrap step from ~41 s
-            // (Docker CPU gnark) to ~3 s (round-6.4 standalone measurement).
-            //
+            // Without native-gnark, gnark runs in Docker and there is no choice to make.
+            #[cfg(feature = "native-gnark")]
+            let use_gpu = {
+                use super::groth16_backend::{host_mem_available, use_gpu, Groth16Inputs};
+                let override_env = std::env::var("SP1_GROTH16_GPU").ok();
+                let (gpu, reason) = use_gpu(&Groth16Inputs {
+                    override_env: override_env.as_deref(),
+                    card_eligible,
+                    helper_available: Groth16Bn254Prover::gpu_helper_available(),
+                    mem_available: host_mem_available(),
+                    pk_cache_ready: Groth16Bn254Prover::gpu_pk_cache_ready(&build_dir),
+                });
+                tracing::info!(
+                    "Groth16 prover: {} ({reason})",
+                    if gpu { "GPU" } else { "gnark CPU" }
+                );
+                gpu
+            };
+
             // Wrapped in `prove_with_retry` to harden against transient
             // hardware-induced verify failures (rare ~1/2000 flakes
             // documented in `project_groth16_flake_2026-05-08.md`). Each
@@ -814,7 +836,11 @@ impl<A: ArtifactClient, C: SP1ProverComponents> SP1RecursionProver<A, C> {
                 max_retries,
                 || -> Result<_, anyhow::Error> {
                     #[cfg(feature = "native-gnark")]
-                    let p = prover.prove_gpu_subprocess(witness.clone(), &build_dir);
+                    let p = if use_gpu {
+                        prover.prove_gpu_subprocess(witness.clone(), &build_dir)
+                    } else {
+                        prover.prove(witness.clone(), &build_dir)
+                    };
                     #[cfg(not(feature = "native-gnark"))]
                     let p = prover.prove(witness.clone(), &build_dir);
                     Ok(p)
