@@ -1,5 +1,4 @@
 use slop_algebra::{Field, TwoAdicField};
-use slop_basefold::BasefoldVerifier;
 use slop_challenger::{CanObserve, FieldChallenger, IopCtx};
 use slop_multilinear::{Mle, Point};
 use slop_stacked::{StackedBasefoldProof, StackedPcsVerifier, StackedVerifierError};
@@ -34,6 +33,8 @@ pub enum VerifyError {
     GroupOracleCountMismatch { group_idx: usize, expected: usize, actual: usize },
     #[error("MLE claim group {group_idx}, oracle {oracle_idx}: user-claimed eval does not match the proof's recovered eval")]
     EvalClaimMismatch { group_idx: usize, oracle_idx: usize },
+    #[error("proof has MLE-eval claims but the verifier was constructed without a PCS verifier")]
+    MissingPcsVerifier,
     #[error(transparent)]
     PcsError(
         StackedVerifierError<
@@ -172,11 +173,11 @@ impl<GC: IopCtx> ReadingCtx for TransparentVerifierCtx<GC> {
         Ok(())
     }
 
-    fn read_oracle(
-        &mut self,
-        num_encoding_variables: u32,
-        log_num_polynomials: u32,
-    ) -> Option<Self::MleOracle> {
+    fn read_oracle(&mut self, num_variables: u32) -> Option<Self::MleOracle> {
+        // The PCS's fixed encoding width pins the expected per-oracle shape; subtract it
+        // from the declared total to recover the expected number of stacked polynomials.
+        let num_encoding_variables = self.pcs_verifier.as_ref()?.log_stacking_height;
+        let log_num_polynomials = num_variables.checked_sub(num_encoding_variables)?;
         let idx = self.oracle_cursor;
         let (digest, proof_num_enc, proof_log_num) = *self.oracle_commits.get(idx)?;
         if proof_num_enc != num_encoding_variables || proof_log_num != log_num_polynomials {
@@ -213,10 +214,7 @@ impl<GC: IopCtx<F: TwoAdicField, EF: TwoAdicField>> TransparentVerifierCtx<GC> {
                     actual: self.pcs_proofs.len(),
                 });
             }
-            let pcs_verifier = self
-                .pcs_verifier
-                .as_ref()
-                .expect("MLE-eval claims exist but no PCS verifier was configured");
+            let pcs_verifier = self.pcs_verifier.as_ref().ok_or(VerifyError::MissingPcsVerifier)?;
 
             for (group_idx, (group, pcs_proof)) in
                 self.mle_claims.iter().zip(&self.pcs_proofs).enumerate()
@@ -278,14 +276,4 @@ impl<GC: IopCtx<F: TwoAdicField, EF: TwoAdicField>> TransparentVerifierCtx<GC> {
 
         Ok(())
     }
-}
-
-// Convenience helper so callers can build a `StackedPcsVerifier` with a default
-// basefold config.
-#[allow(dead_code)]
-fn default_pcs_verifier<GC: IopCtx>(log_stacking_height: u32) -> StackedPcsVerifier<GC> {
-    StackedPcsVerifier::new(
-        BasefoldVerifier::<GC>::new(slop_basefold::FriConfig::default_fri_config(), 1),
-        log_stacking_height,
-    )
 }

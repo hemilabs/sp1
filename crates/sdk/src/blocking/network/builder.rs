@@ -6,9 +6,10 @@ use alloy_primitives::Address;
 use sp1_core_machine::riscv::RiscvAir;
 use sp1_hypercube::Machine;
 use sp1_primitives::SP1Field;
+use tonic::transport::Identity;
 
 use super::NetworkProver;
-use crate::network::{signer::NetworkSigner, NetworkMode, TEE_NETWORK_RPC_URL};
+use crate::network::{signer::NetworkSigner, NetworkBearerToken, NetworkMode, TEE_NETWORK_RPC_URL};
 
 /// A builder for the blocking [`NetworkProver`].
 ///
@@ -19,6 +20,9 @@ pub struct NetworkProverBuilder {
     pub(crate) tee_signers: Option<Vec<Address>>,
     pub(crate) signer: Option<NetworkSigner>,
     pub(crate) network_mode: Option<NetworkMode>,
+    pub(crate) client_identity: Option<Identity>,
+    pub(crate) bearer_token: Option<NetworkBearerToken>,
+    pub(crate) hosted: bool,
     pub(crate) machine: Machine<SP1Field, RiscvAir<SP1Field>>,
 }
 
@@ -44,6 +48,9 @@ impl NetworkProverBuilder {
             tee_signers: None,
             signer: None,
             network_mode: None,
+            client_identity: None,
+            bearer_token: None,
+            hosted: false,
             machine,
         }
     }
@@ -102,6 +109,27 @@ impl NetworkProverBuilder {
         self
     }
 
+    /// Configures the prover for hosted proving.
+    ///
+    /// # Details
+    /// Hosted proving runs in [`NetworkMode::Reserved`] and makes `prove(&pk, stdin)` skip local
+    /// simulation and use the maximum cycle and gas limits by default, with no network-specific
+    /// toggles required. This matches the behavior expected by self-hosted clusters talking to the
+    /// network-gateway. The defaults remain overridable per request.
+    ///
+    /// # Example
+    /// ```rust,no_run
+    /// use sp1_sdk::blocking::ProverClient;
+    ///
+    /// let prover = ProverClient::builder().network().hosted().build();
+    /// ```
+    #[must_use]
+    pub fn hosted(mut self) -> Self {
+        self.hosted = true;
+        self.network_mode = Some(NetworkMode::Reserved);
+        self
+    }
+
     /// Sets the list of TEE signers, used for verifying TEE proofs.
     #[must_use]
     pub fn tee_signers(mut self, tee_signers: &[Address]) -> Self {
@@ -118,6 +146,24 @@ impl NetworkProverBuilder {
     #[must_use]
     pub fn signer(mut self, signer: NetworkSigner) -> Self {
         self.signer = Some(signer);
+        self
+    }
+
+    /// Sets the PEM-encoded certificate and private key used for mutual TLS authentication.
+    #[must_use]
+    pub fn client_identity(
+        mut self,
+        certificate: impl AsRef<[u8]>,
+        private_key: impl AsRef<[u8]>,
+    ) -> Self {
+        self.client_identity = Some(Identity::from_pem(certificate, private_key));
+        self
+    }
+
+    /// Sets the bearer token added to Prover Network and Artifact Store requests.
+    #[must_use]
+    pub fn bearer_token(mut self, bearer_token: NetworkBearerToken) -> Self {
+        self.bearer_token = Some(bearer_token);
         self
     }
 
@@ -141,8 +187,11 @@ impl NetworkProverBuilder {
             private_key: self.private_key,
             rpc_url: self.rpc_url,
             tee_signers: self.tee_signers,
-            signer: self.signer,
+            signer: self.signer.map(Into::into),
             network_mode: self.network_mode,
+            client_identity: self.client_identity,
+            bearer_token: self.bearer_token,
+            hosted: self.hosted,
             machine: self.machine,
         };
         let prover = crate::blocking::block_on(async_builder.build());
