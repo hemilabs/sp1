@@ -103,3 +103,14 @@ func ProveGroth16(dataDir string, witnessPath string) Proof {
 
 	return NewSP1Groth16Proof(&proof, witnessInput)
 }
+
+// releaseProverCache drops the R1CS and proving key ProveGroth16 keeps, so the next call reloads
+// them. See ReleaseCaches.
+func releaseProverCache() {
+	globalMutex.Lock()
+	defer globalMutex.Unlock()
+	globalR1cs = icicle_groth16.NewCS(ecc.BN254)
+	globalR1csInitialized = false
+	globalPk = icicle_groth16.NewProvingKey(ecc.BN254)
+	globalPkInitialized = false
+}

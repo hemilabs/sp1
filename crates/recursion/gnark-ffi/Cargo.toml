@@ -21,7 +21,6 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
 tempfile = { workspace = true }
-fd-lock = { workspace = true }
 num-bigint = { workspace = true }
 cfg-if = { workspace = true }
 bincode = { workspace = true }
@@ -39,6 +38,7 @@ sp1-gpu-plonk = { path = "../../../sp1-gpu/crates/plonk", optional = true }
 clap = { workspace = true, features = ["derive"], optional = true }
 libloading = { version = "0.8", optional = true }
 libc = { workspace = true, optional = true }
+tracing-subscriber = { workspace = true, features = ["env-filter"], optional = true }
 
 [build-dependencies]
 bindgen = { workspace = true, optional = true }
@@ -101,27 +101,28 @@ name = "groth16_gpu_helper"
 path = "src/bin/groth16_gpu_helper.rs"
 required-features = ["native", "cuda"]
 
+# Subprocess helper that runs gnark's CPU Groth16 prover for one proof and exits, so the caller
+# does not keep its ~12 GB of circuit and key for the life of the process. Binaries that call
+# `run_groth16_cpu_helper_if_requested` (sp1-gpu-server, node) serve as their own helper; this
+# binary is for those that do not. See `Groth16Bn254Prover::prove_isolated`.
+[[bin]]
+name = "groth16_cpu_helper"
+path = "src/bin/groth16_cpu_helper.rs"
+required-features = ["native"]
+
 # Subprocess helper invoked by sp1-prover's recursion task to run the GPU
 # PLONK final wrap in a clean child process. Same rationale as the Groth16
 # helper above. The `cuda` feature gates the GPU-accelerated PLONK code paths
 # in `sp1-gpu-plonk` (despite the name, both HIP and CUDA backends are gated
 # by it; runtime backend is selected by SP1_GPU_BACKEND / sp1-gpu-sys
 # build.rs).
-# Subprocess helper that runs gnark's CPU Groth16 prover for one proof and exits, so the caller
-# does not keep its ~12 GB of circuit and key for the life of the process. Invoked by
-# `Groth16Bn254Prover::prove_isolated`.
-[[bin]]
-name = "groth16_cpu_helper"
-path = "src/bin/groth16_cpu_helper.rs"
-required-features = ["native"]
-
 [[bin]]
 name = "plonk_gpu_helper"
 path = "src/bin/plonk_gpu_helper.rs"
 required-features = ["native", "cuda"]
 
 [features]
-native = ["dep:bindgen", "dep:clap", "dep:libloading", "dep:libc"]
+native = ["dep:bindgen", "dep:clap", "dep:libloading", "dep:libc", "dep:tracing-subscriber"]
 groth16-cuda = []
 cuda = ["sp1-gpu-groth16/cuda", "dep:sp1-gpu-plonk", "sp1-gpu-plonk/cuda"]
 

@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"runtime"
+	"runtime/debug"
 	"time"
 
 	"github.com/consensys/gnark-crypto/ecc"
@@ -96,4 +98,20 @@ func ExportGroth16StrippedR1cs(dataDir string, outputPath string) {
 	r1csFile.Close()
 	fmt.Printf("[groth16-strip] Reading R1CS took %s\n", time.Since(start))
 	writeStrippedR1cs(r1cs, outputPath)
+}
+
+// ReleaseCaches drops the circuit and proving key that ProveGroth16 and ExportGroth16GpuWitness
+// keep in package globals (~12 GB on the v6.1.0 circuit), and returns the freed memory to the
+// host. A long-lived prover calls it after a proof, so that a process that has proved once does
+// not stay that much larger. The next call reloads what it needs.
+func ReleaseCaches() {
+	releaseProverCache()
+	gpuWitnessMutex.Lock()
+	gpuWitnessR1cs = nil
+	gpuWitnessR1csDataDir = ""
+	gpuWitnessPk = nil
+	gpuWitnessPkDataDir = ""
+	gpuWitnessMutex.Unlock()
+	runtime.GC()
+	debug.FreeOSMemory()
 }

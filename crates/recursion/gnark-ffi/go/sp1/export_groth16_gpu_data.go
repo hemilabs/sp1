@@ -248,6 +248,12 @@ func writeStrippedR1cs(r1cs constraint.ConstraintSystem, path string) {
 		strippedFile.Close()
 		panic(fmt.Sprintf("Failed to flush stripped R1CS: %v", err))
 	}
+	// Durable before the cache that holds it is published: on disk, a crash after the publish
+	// could otherwise leave a complete-looking cache with a short file.
+	if err := strippedFile.Sync(); err != nil {
+		strippedFile.Close()
+		panic(fmt.Sprintf("Failed to sync stripped R1CS: %v", err))
+	}
 	if err := strippedFile.Close(); err != nil {
 		panic(fmt.Sprintf("Failed to close stripped R1CS: %v", err))
 	}

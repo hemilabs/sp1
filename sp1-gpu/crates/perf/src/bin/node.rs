@@ -33,10 +33,17 @@ fn proof_mode_from_string(s: &str) -> ProofMode {
     }
 }
 
+fn main() {
+    // First: when started as its own Groth16 CPU helper, prove and exit here. See
+    // `sp1_recursion_gnark_ffi::run_groth16_cpu_helper_if_requested`.
+    sp1_recursion_gnark_ffi::run_groth16_cpu_helper_if_requested();
+    run();
+}
+
 #[tokio::main]
 #[allow(clippy::field_reassign_with_default)]
 #[allow(clippy::print_stdout)]
-async fn main() {
+async fn run() {
     let args = Args::parse();
 
     // Load the environment variables.

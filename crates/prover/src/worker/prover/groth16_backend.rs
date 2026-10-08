@@ -65,13 +65,47 @@ pub(crate) fn use_gpu(inputs: &Groth16Inputs<'_>) -> (bool, String) {
     }
 }
 
-/// `MemAvailable` from `/proc/meminfo`, in bytes.
+/// Memory this process can still use, in bytes: `MemAvailable`, or less where a cgroup v2 limit
+/// leaves less headroom. In a container, or a systemd scope with `MemoryMax` (as the miner runs its
+/// workers), host RAM says nothing about what this process may use.
 pub(crate) fn host_mem_available() -> Option<u64> {
-    let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
-    meminfo.lines().find_map(|line| {
-        let kb = line.strip_prefix("MemAvailable:")?.trim().strip_suffix("kB")?.trim();
-        kb.parse::<u64>().ok().map(|kb| kb * 1024)
-    })
+    let meminfo = std::fs::read_to_string("/proc/meminfo").ok().and_then(|meminfo| {
+        meminfo.lines().find_map(|line| {
+            let kb = line.strip_prefix("MemAvailable:")?.trim().strip_suffix("kB")?.trim();
+            kb.parse::<u64>().ok().map(|kb| kb * 1024)
+        })
+    });
+    let cgroup = std::fs::read_to_string("/proc/self/cgroup").ok().and_then(|cgroup| {
+        // The cgroup v2 line is `0::<path>`.
+        let path = cgroup.lines().find_map(|line| line.strip_prefix("0::"))?.to_string();
+        cgroup_headroom(std::path::Path::new("/sys/fs/cgroup"), &path)
+    });
+    match (meminfo, cgroup) {
+        (Some(available), Some(headroom)) => Some(available.min(headroom)),
+        (available, headroom) => available.or(headroom),
+    }
+}
+
+/// The least `memory.max - memory.current` of the cgroup at `path` under `root` and of its
+/// ancestors. `None` when none of them has a limit.
+fn cgroup_headroom(root: &std::path::Path, path: &str) -> Option<u64> {
+    let read = |dir: &std::path::Path, file: &str| std::fs::read_to_string(dir.join(file)).ok();
+    let mut dir = root.join(path.trim_start_matches('/'));
+    let mut least: Option<u64> = None;
+    loop {
+        if let (Some(max), Some(current)) = (read(&dir, "memory.max"), read(&dir, "memory.current"))
+        {
+            if let (Ok(max), Ok(current)) =
+                (max.trim().parse::<u64>(), current.trim().parse::<u64>())
+            {
+                let headroom = max.saturating_sub(current);
+                least = Some(least.map_or(headroom, |least| least.min(headroom)));
+            }
+        }
+        if dir == root || !dir.pop() {
+            return least;
+        }
+    }
 }
 
 #[cfg(test)]
@@ -132,8 +166,33 @@ mod tests {
         let small = Groth16Inputs { card_eligible: false, ..big_card(0) };
         assert!(use_gpu(&Groth16Inputs { override_env: Some("1"), ..small }).0);
         assert!(!use_gpu(&Groth16Inputs { override_env: Some("0"), ..big_card(256 * GIB) }).0);
-        // Anything else is ignored rather than guessed at.
+        assert!(use_gpu(&Groth16Inputs { override_env: Some("true"), ..small }).0);
+        assert!(!use_gpu(&Groth16Inputs { override_env: Some("false"), ..big_card(256 * GIB) }).0);
+        // Anything else is ignored rather than guessed at: it neither forces nor forbids.
+        assert!(use_gpu(&Groth16Inputs { override_env: Some("yes"), ..big_card(256 * GIB) }).0);
         assert!(!use_gpu(&Groth16Inputs { override_env: Some("yes"), ..small }).0);
+    }
+
+    /// A limit anywhere up the cgroup tree caps what the proof may use, and the tightest wins.
+    #[test]
+    fn cgroup_limits_cap_available_memory() {
+        let root = tempfile::tempdir().unwrap();
+        let leaf = root.path().join("user.slice/worker.scope");
+        std::fs::create_dir_all(&leaf).unwrap();
+        let set = |dir: &std::path::Path, max: &str, current: &str| {
+            std::fs::write(dir.join("memory.max"), max).unwrap();
+            std::fs::write(dir.join("memory.current"), current).unwrap();
+        };
+        // No limits anywhere: no opinion.
+        set(&leaf, "max\n", "100\n");
+        assert_eq!(cgroup_headroom(root.path(), "/user.slice/worker.scope"), None);
+        // The leaf has 24 GiB with 20 GiB in use; its parent allows more.
+        set(&leaf, &(24 * GIB).to_string(), &(20 * GIB).to_string());
+        set(&root.path().join("user.slice"), &(64 * GIB).to_string(), &(30 * GIB).to_string());
+        assert_eq!(cgroup_headroom(root.path(), "/user.slice/worker.scope"), Some(4 * GIB));
+        // Now the parent is the tighter one.
+        set(&root.path().join("user.slice"), &(32 * GIB).to_string(), &(31 * GIB).to_string());
+        assert_eq!(cgroup_headroom(root.path(), "/user.slice/worker.scope"), Some(GIB));
     }
 
     #[test]

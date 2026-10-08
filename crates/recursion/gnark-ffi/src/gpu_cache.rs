@@ -1,24 +1,31 @@
-//! Per-circuit caches that every prover process on the host shares.
+//! Per-circuit caches that every prover process on the host shares, and per-proof scratch
+//! directories beside them.
 //!
-//! The GPU provers export large, deterministic artifacts per circuit (the Groth16 proving key in GPU
-//! form is ~9 GB and takes minutes) into a directory keyed by the circuit's vkey hash, by default
-//! under `/dev/shm`, so every proof after the first skips the export. Several provers share that
-//! directory: one per GPU, and possibly several proofs in one process.
+//! The Groth16 provers derive large, deterministic files from a circuit, keyed by its vkey hash:
+//! - the GPU-format proving key (~9 GB, minutes to export), by default under `/dev/shm`;
+//! - the GPU R1CS solver's prep-circuit artifacts, likewise;
+//! - the CPU prover's stripped circuit (~1.5 GB), on disk beside the circuit artifacts.
 //!
+//! Several provers share each one: one per GPU, and possibly several proofs in one process.
 //! [`ensure_built`] builds such a directory exactly once:
-//! - Readers need no lock. A directory whose marker file exists is complete and never changes.
+//! - Readers need no lock. A directory whose marker is present and matches the files is complete
+//!   and never changes.
 //! - Builders take an exclusive lock first, so a second process waits for the first build instead
 //!   of running its own, which would double a multi-gigabyte peak, or deleting the first one's
 //!   half-written files as "partial".
-//! - The build goes to a staging directory that is renamed into place with the marker already
-//!   inside, so a crash at any point leaves either nothing or a complete cache, never a partial one
-//!   under the real name. Staging directories left by a crashed builder are removed by the next one.
+//! - The build goes to a staging directory that is synced and then renamed into place with the
+//!   marker already inside, so a crash at any point leaves either nothing or a complete cache,
+//!   never a partial one under the real name. The marker lists every file's size, so a cache torn
+//!   by a crash (on disk, before the sync) is detected and rebuilt rather than trusted. Staging
+//!   directories left by a crashed builder are removed by the next one.
 //!
 //! Per-proof files must never go into these directories; see [`proof_tempdir`].
 
 use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Context, Result};
+
+use crate::host_lock;
 
 /// What [`ensure_built`] found.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -31,9 +38,21 @@ pub(crate) enum CacheOutcome {
     Built,
 }
 
-/// Whether `dir` is a complete cache: it carries `marker`.
+/// Whether `dir` is a complete cache: it carries `marker`, and every file the marker lists has the
+/// listed size. A marker that lists nothing (`ok`, the layout before manifests) is trusted as is.
 pub(crate) fn is_complete(dir: &Path, marker: &str) -> bool {
-    dir.join(marker).is_file()
+    let Ok(manifest) = std::fs::read_to_string(dir.join(marker)) else {
+        return false;
+    };
+    manifest.lines().filter(|line| !line.trim().is_empty() && line.trim() != "ok").all(|line| {
+        let Some((size, name)) = line.split_once(' ') else {
+            return false;
+        };
+        match (size.parse::<u64>(), std::fs::metadata(dir.join(name))) {
+            (Ok(size), Ok(meta)) => meta.is_file() && meta.len() == size,
+            _ => false,
+        }
+    })
 }
 
 /// Returns once `dir` is a complete cache, running `build` to fill it if no complete one exists.
@@ -56,31 +75,32 @@ pub(crate) fn ensure_built(
     // The lock lives beside the cache, not in it, so it is never removed along with a partial
     // directory and every process keeps locking the same inode.
     let lock_path = parent.join(format!(".{name}.lock"));
-    let lock_file = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(&lock_path)
-        .with_context(|| format!("failed to open cache lock {}", lock_path.display()))?;
-    // std::fs::File::lock requires Rust 1.89. Use fd-lock while the MSRV is 1.88, as
-    // sp1-prover's circuit-artifact install does.
-    let mut lock = fd_lock::RwLock::new(lock_file);
-    // The probe only decides whether to say why the next call may block for minutes.
-    if lock.try_write().is_err() {
-        tracing::info!(
-            "waiting for another prover to finish building the cache at {}",
-            dir.display()
-        );
-    }
-    let _guard = lock.write().with_context(|| format!("failed to lock {}", lock_path.display()))?;
+    let _lock = loop {
+        let file = host_lock::open(&lock_path)
+            .with_context(|| format!("failed to open cache lock {}", lock_path.display()))?;
+        if !host_lock::try_lock(&file)
+            .with_context(|| format!("failed to lock {}", lock_path.display()))?
+        {
+            tracing::info!(
+                "waiting for another prover to finish building the cache at {}",
+                dir.display()
+            );
+            host_lock::lock(&file)
+                .with_context(|| format!("failed to lock {}", lock_path.display()))?;
+        }
+        // Someone deleted the lock file while we waited: lock the one that is there now, or two
+        // builders would each hold "the" lock.
+        if host_lock::is_current(&file, &lock_path) {
+            break file;
+        }
+    };
 
     if is_complete(dir, marker) {
         return Ok(CacheOutcome::BuiltElsewhere);
     }
 
     // Only a lock holder builds, so with the lock held nothing else is writing under these names:
-    // a directory without its marker, or a staging directory, is debris from a crashed build.
+    // a directory that is not complete, or a staging directory, is debris from a crashed build.
     let staging_prefix = format!(".{name}.staging.");
     remove_debris(dir, parent, &staging_prefix)?;
 
@@ -89,10 +109,38 @@ pub(crate) fn ensure_built(
         .tempdir_in(parent)
         .with_context(|| format!("failed to create a staging directory in {}", parent.display()))?;
     build(staging.path())?;
+    publish(staging, dir, parent, marker)
+}
+
+/// Syncs the staged files, writes the marker listing them, and renames the directory into place.
+fn publish(
+    staging: tempfile::TempDir,
+    dir: &Path,
+    parent: &Path,
+    marker: &str,
+) -> Result<CacheOutcome> {
+    let mut manifest = String::new();
+    let mut entries = std::fs::read_dir(staging.path())
+        .with_context(|| format!("failed to list {}", staging.path().display()))?
+        .collect::<std::io::Result<Vec<_>>>()?;
+    entries.sort_by_key(|entry| entry.file_name());
+    for entry in entries {
+        let path = entry.path();
+        if !entry.file_type()?.is_file() {
+            continue;
+        }
+        let file = std::fs::File::open(&path)
+            .with_context(|| format!("failed to open {}", path.display()))?;
+        file.sync_all().with_context(|| format!("failed to sync {}", path.display()))?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        manifest.push_str(&format!("{} {name}\n", file.metadata()?.len()));
+    }
     // The marker moves into place with the directory, so no reader can observe the cache before
     // the build has finished.
-    std::fs::write(staging.path().join(marker), b"ok\n")
-        .with_context(|| format!("failed to write {marker}"))?;
+    let marker_path = staging.path().join(marker);
+    std::fs::write(&marker_path, manifest).with_context(|| format!("failed to write {marker}"))?;
+    sync_path(&marker_path)?;
+    sync_path(staging.path())?;
 
     let staged = staging.keep();
     if let Err(err) = std::fs::rename(&staged, dir) {
@@ -104,11 +152,23 @@ pub(crate) fn ensure_built(
         return Err(err)
             .with_context(|| format!("failed to move {} to {}", staged.display(), dir.display()));
     }
+    // Make the rename itself durable.
+    sync_path(parent)?;
     Ok(CacheOutcome::Built)
+}
+
+fn sync_path(path: &Path) -> Result<()> {
+    std::fs::File::open(path)
+        .and_then(|file| file.sync_all())
+        .with_context(|| format!("failed to sync {}", path.display()))
 }
 
 /// A fresh directory for one proof's files, beside the caches when there is a cache root, so it
 /// lands on the same filesystem (by default RAM-backed `/dev/shm`). Removed when dropped.
+///
+/// A prover killed mid-proof cannot remove its own, and in `/dev/shm` each one holds RAM (a GPU
+/// witness is several GB), so the name carries the owner's pid and every call first removes the
+/// directories of owners that no longer exist.
 pub(crate) fn proof_tempdir(cache_dir: Option<&Path>, prefix: &str) -> Result<tempfile::TempDir> {
     let root = match cache_dir.and_then(Path::parent) {
         Some(root) => root.to_path_buf(),
@@ -116,10 +176,50 @@ pub(crate) fn proof_tempdir(cache_dir: Option<&Path>, prefix: &str) -> Result<te
     };
     std::fs::create_dir_all(&root)
         .with_context(|| format!("failed to create {}", root.display()))?;
+    sweep_dead_owners(&root, prefix);
     tempfile::Builder::new()
-        .prefix(prefix)
+        .prefix(&format!("{prefix}{}_", std::process::id()))
         .tempdir_in(&root)
         .with_context(|| format!("failed to create a {prefix}* directory in {}", root.display()))
+}
+
+/// Removes `<root>/<prefix><pid>_*` entries whose pid is not running.
+fn sweep_dead_owners(root: &Path, prefix: &str) {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let Some(pid) = name
+            .strip_prefix(prefix)
+            .and_then(|rest| rest.split_once('_'))
+            .and_then(|(pid, _)| pid.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        if !process_alive(pid) {
+            tracing::info!("removing {} left by a prover that is gone", entry.path().display());
+            let _ = std::fs::remove_dir_all(entry.path());
+        }
+    }
+}
+
+#[cfg(unix)]
+fn process_alive(pid: u32) -> bool {
+    let Ok(pid) = libc::pid_t::try_from(pid) else {
+        return true;
+    };
+    // SAFETY: signal 0 only checks whether the process exists.
+    if unsafe { libc::kill(pid, 0) } == 0 {
+        return true;
+    }
+    // EPERM: it exists but belongs to someone else.
+    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+#[cfg(not(unix))]
+fn process_alive(_pid: u32) -> bool {
+    true
 }
 
 /// `/dev/shm` where it exists, otherwise the system temp directory.
@@ -133,8 +233,10 @@ pub(crate) fn default_root() -> PathBuf {
 }
 
 fn parent_and_name(dir: &Path) -> Result<(&Path, String)> {
-    let parent =
-        dir.parent().ok_or_else(|| anyhow!("cache dir {} has no parent", dir.display()))?;
+    let parent = dir
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .ok_or_else(|| anyhow!("cache dir {} has no parent", dir.display()))?;
     let name = dir
         .file_name()
         .ok_or_else(|| anyhow!("cache dir {} has no name", dir.display()))?
@@ -145,7 +247,7 @@ fn parent_and_name(dir: &Path) -> Result<(&Path, String)> {
 
 fn remove_debris(dir: &Path, parent: &Path, staging_prefix: &str) -> Result<()> {
     if dir.exists() {
-        tracing::warn!("removing incomplete cache at {} (no marker)", dir.display());
+        tracing::warn!("removing incomplete cache at {}", dir.display());
         std::fs::remove_dir_all(dir)
             .with_context(|| format!("failed to remove incomplete cache {}", dir.display()))?;
     }
@@ -308,10 +410,65 @@ mod tests {
         let b = proof_tempdir(Some(&cache), "witness_").unwrap();
         assert_ne!(a.path(), b.path());
         assert_eq!(a.path().parent(), Some(root.path()));
+        let name = a.path().file_name().unwrap().to_string_lossy().into_owned();
+        assert!(name.starts_with(&format!("witness_{}_", std::process::id())), "{name}");
         let (a_path, b_path) = (a.path().to_path_buf(), b.path().to_path_buf());
         drop(a);
         assert!(!a_path.exists());
         assert!(b_path.exists());
+    }
+
+    /// A prover killed mid-proof leaves its scratch directory behind; the next proof removes it,
+    /// and only it.
+    #[cfg(unix)]
+    #[test]
+    fn scratch_of_dead_provers_is_swept() {
+        let root = tempfile::tempdir().unwrap();
+        let cache = root.path().join("cache");
+        // A pid that certainly no longer runs: a child we started and reaped.
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let dead = child.id();
+        child.wait().unwrap();
+        let dead_dir = root.path().join(format!("witness_{dead}_abc"));
+        let live_dir = root.path().join(format!("witness_{}_def", std::process::id()));
+        let other_dir = root.path().join("unrelated_1_x");
+        for dir in [&dead_dir, &live_dir, &other_dir] {
+            std::fs::create_dir_all(dir).unwrap();
+            std::fs::write(dir.join("wire_values.bin"), b"x").unwrap();
+        }
+        let _mine = proof_tempdir(Some(&cache), "witness_").unwrap();
+        assert!(!dead_dir.exists(), "the dead prover's scratch was not removed");
+        assert!(live_dir.exists(), "a running prover's scratch was removed");
+        assert!(other_dir.exists(), "an unrelated directory was removed");
+    }
+
+    #[test]
+    fn the_marker_lists_every_file_and_its_size() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("cache");
+        let builds = AtomicUsize::new(0);
+        ensure_built(&dir, MARKER, slow_build(&builds)).unwrap();
+        let manifest = std::fs::read_to_string(dir.join(MARKER)).unwrap();
+        assert_eq!(manifest, "4096 a.bin\n4096 b.bin\n");
+    }
+
+    /// What a crash on disk before the data reached it can leave: the directory and marker
+    /// published, a file short. It must be rebuilt, not trusted.
+    #[test]
+    fn a_torn_cache_is_rebuilt() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("cache");
+        let builds = AtomicUsize::new(0);
+        ensure_built(&dir, MARKER, slow_build(&builds)).unwrap();
+        std::fs::write(dir.join("b.bin"), b"short").unwrap();
+        assert!(!is_complete(&dir, MARKER));
+        assert_eq!(ensure_built(&dir, MARKER, slow_build(&builds)).unwrap(), CacheOutcome::Built);
+        assert_eq!(builds.load(Ordering::SeqCst), 2);
+        assert_complete(&dir);
+
+        // A listed file that disappeared counts the same.
+        std::fs::remove_file(dir.join("a.bin")).unwrap();
+        assert!(!is_complete(&dir, MARKER));
     }
 
     /// Several processes racing on one cold cache, as provers on different GPUs do. Each child
@@ -328,12 +485,7 @@ mod tests {
         let children: Vec<_> = (0..6)
             .map(|_| {
                 std::process::Command::new(&exe)
-                    .args([
-                        "--exact",
-                        "gpu_cache::tests::concurrent_processes_build_exactly_once",
-                        "--nocapture",
-                        "--test-threads=1",
-                    ])
+                    .args(["--exact", &this_test(), "--nocapture", "--test-threads=1"])
                     .env("GPU_CACHE_TEST_CHILD", &dir)
                     .stdout(std::process::Stdio::piped())
                     .spawn()
@@ -345,6 +497,7 @@ mod tests {
             let out = child.wait_with_output().unwrap();
             assert!(out.status.success(), "child failed: {out:?}");
             let stdout = String::from_utf8_lossy(&out.stdout);
+            assert!(stdout.contains("1 passed"), "the child ran no test: {stdout}");
             let outcome = stdout
                 .lines()
                 // libtest prints `test <name> ... ` on the same line first.
@@ -358,6 +511,12 @@ mod tests {
         assert_eq!(outcomes.iter().filter(|o| *o == "Built").count(), 1, "{outcomes:?}");
         assert_complete(&dir);
         assert!(leftovers(root.path()).is_empty());
+    }
+
+    /// This test's name as libtest knows it, so a rename cannot leave children running nothing.
+    fn this_test() -> String {
+        let module = module_path!().split_once("::").map_or(module_path!(), |(_, rest)| rest);
+        format!("{module}::concurrent_processes_build_exactly_once")
     }
 
     // The child reports its outcome to the parent test on stdout.

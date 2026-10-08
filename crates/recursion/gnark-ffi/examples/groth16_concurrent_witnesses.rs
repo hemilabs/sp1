@@ -1,4 +1,5 @@
-//! Manual GPU test for concurrent GPU Groth16 proofs sharing one proving-key cache.
+//! Manual test for concurrent Groth16 proofs: the GPU path's shared proving-key cache, and the
+//! host-wide queue with the CPU helper.
 //!
 //! Provers on one host share the per-circuit GPU proving-key cache (`SP1_GROTH16_PK_CACHE`,
 //! `/dev/shm` by default). Before per-proof witness directories, every proof wrote its solved
@@ -25,7 +26,7 @@
 //! ```
 //!
 //! `prove` needs `SP1_GROTH16_GPU_HELPER` to point at `groth16_gpu_helper`, since examples live
-//! one directory below the binaries.
+//! one directory below the binaries. `prove-cpu` needs nothing: this binary is its own CPU helper.
 
 // A CLI test tool: its results are its output.
 #![allow(clippy::print_stdout)]
@@ -37,6 +38,8 @@ use num_bigint::BigUint;
 use sp1_recursion_gnark_ffi::Groth16Bn254Prover;
 
 fn main() {
+    // This binary is its own Groth16 CPU helper, so `prove-cpu` needs nothing else installed.
+    sp1_recursion_gnark_ffi::run_groth16_cpu_helper_if_requested();
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mode = args.first().map(String::as_str);
     match (mode, &args[1..]) {

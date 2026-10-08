@@ -303,6 +303,13 @@ pub fn prove_groth16_bn254_with_r1cs(
     }
 }
 
+/// Drops the circuit and proving key that [`prove_groth16_bn254`] and
+/// [`export_groth16_gpu_witness`] keep in Go globals (~12 GB on the v6.1.0 circuit), and returns
+/// the memory to the host. The next call reloads them.
+pub fn release_groth16_caches() {
+    unsafe { bind::ReleaseGroth16Caches() }
+}
+
 /// Writes the Groth16 R1CS in `data_dir` to `output_path` without its debug information, which
 /// the prover does not use and which makes up about a third of the file.
 pub fn export_groth16_stripped_r1cs(data_dir: &str, output_path: &str) {

@@ -17,9 +17,16 @@ struct Args {
     version: bool,
 }
 
+fn main() {
+    // First, before the runtime or CUDA start: when started as its own Groth16 CPU helper, prove
+    // and exit here. See `sp1_recursion_gnark_ffi::run_groth16_cpu_helper_if_requested`.
+    sp1_recursion_gnark_ffi::run_groth16_cpu_helper_if_requested();
+    serve();
+}
+
 #[tokio::main]
 #[allow(clippy::print_stdout)]
-async fn main() {
+async fn serve() {
     tracing_subscriber::fmt::init();
 
     let args = Args::parse();

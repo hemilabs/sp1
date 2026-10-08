@@ -132,18 +132,26 @@ func ProveGroth16Bn254WithR1cs(dataDir *C.char, r1csPath *C.char, witnessPath *C
 	return groth16ProofToC(proof)
 }
 
+//export ReleaseGroth16Caches
+func ReleaseGroth16Caches() {
+	sp1.ReleaseCaches()
+}
+
 //export ExportGroth16StrippedR1cs
 func ExportGroth16StrippedR1cs(dataDir *C.char, outputPath *C.char) (errStr *C.char) {
+	// The full circuit read below is ~9 GB of garbage afterwards, whether or not the export
+	// succeeds. The CPU helper proves right after this in the same process, so return it to the
+	// host before that prove's own peak. Deferred first, so it runs after the recover below.
+	defer func() {
+		runtime.GC()
+		debug.FreeOSMemory()
+	}()
 	defer func() {
 		if r := recover(); r != nil {
 			errStr = C.CString(fmt.Sprintf("[groth16-strip] panic: %v", r))
 		}
 	}()
 	sp1.ExportGroth16StrippedR1cs(C.GoString(dataDir), C.GoString(outputPath))
-	// The full circuit read above is ~9 GB of garbage now. groth16_cpu_helper proves right after
-	// this in the same process, so return it to the host before that prove's own peak.
-	runtime.GC()
-	debug.FreeOSMemory()
 	return nil
 }
 
@@ -178,6 +186,12 @@ func FreeGroth16Bn254Proof(proof *C.C_Groth16Bn254Proof) {
 
 //export ExportGroth16GpuData
 func ExportGroth16GpuData(dataDir *C.char, outputDir *C.char) (errStr *C.char) {
+	// The export reads the full circuit and proving key (~9 GB of garbage afterwards); return it
+	// to the host either way rather than leave a long-lived prover that much larger.
+	defer func() {
+		runtime.GC()
+		debug.FreeOSMemory()
+	}()
 	defer func() {
 		if r := recover(); r != nil {
 			errStr = C.CString(fmt.Sprintf("[groth16-export] panic: %v", r))

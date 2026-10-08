@@ -8260,7 +8260,6 @@ dependencies = [
  "cfg-if",
  "clap",
  "dirs",
- "fd-lock",
  "hex",
  "libc",
  "libloading",
