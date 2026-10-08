@@ -87,7 +87,7 @@ pub struct SP1RecursionProverConfig {
     pub reduce_shape: SP1RecursionProofShape,
     /// Whether this worker's card is large enough for the GPU Groth16 prover. Set by the GPU
     /// worker builder for cards above the 16 GB tier; false, i.e. gnark's CPU prover, otherwise.
-    /// Host memory is checked again before each proof (see `groth16_backend`).
+    /// Free GPU and host memory are checked again before each proof (see `groth16_backend`).
     pub groth16_gpu: bool,
 }
 
@@ -794,13 +794,15 @@ impl<A: ArtifactClient, C: SP1ProverComponents> SP1RecursionProver<A, C> {
             };
             let prover = Groth16Bn254Prover::new();
             // Either the GPU prover (sp1-gpu-groth16) or gnark's CPU prover; see
-            // `groth16_backend` for how the choice is made. Both run in helper processes. The
-            // GPU prover's helper exists because the shard prover's persistent HIP/CUDA contexts
-            // from the earlier recursion phase would deadlock an in-process Groth16 GPU prover at
-            // the first MSM; the parent still does the Go R1CS solve and PK export (CPU-only). On
-            // an AMD 7900 XTX the GPU path drops the wrap step from ~41 s (Docker CPU gnark) to
-            // ~3 s (round-6.4 standalone measurement). The CPU prover's helper exists so that
-            // this process does not keep gnark's ~12 GB of circuit and key afterwards.
+            // `groth16_backend` for how the choice is made. Both normally run in helper
+            // processes; the CPU prover proves in this process when no helper is found, with
+            // SP1_GROTH16_IN_PROCESS, or in groth16-cuda builds. The GPU prover's helper exists
+            // because the shard prover's persistent HIP/CUDA contexts from the earlier recursion
+            // phase would deadlock an in-process Groth16 GPU prover at the first MSM; the parent
+            // still does the Go R1CS solve and PK export (CPU-only). On an AMD 7900 XTX the GPU
+            // path drops the wrap step from ~41 s (Docker CPU gnark) to ~3 s (round-6.4
+            // standalone measurement). The CPU prover's helper exists so that this process does
+            // not keep gnark's ~12 GB of circuit and key afterwards.
             //
             // The host-wide final-wrap slot (`groth16_queue`) is taken first, so free memory is
             // measured while this proof holds the slot, not while another proof is at its peak.
@@ -808,16 +810,18 @@ impl<A: ArtifactClient, C: SP1ProverComponents> SP1RecursionProver<A, C> {
             //
             // Without native-gnark, gnark runs in Docker: no choice, no helper, no queue.
             #[cfg(feature = "native-gnark")]
-            let _slot = Groth16Bn254Prover::queue_slot("Groth16");
+            let _slot = sp1_recursion_gnark_ffi::final_wrap_slot("Groth16");
             #[cfg(feature = "native-gnark")]
             let use_gpu = {
-                use super::groth16_backend::{host_mem_available, use_gpu, Groth16Inputs};
+                use super::groth16_backend::{use_gpu, Groth16Inputs};
                 let override_env = std::env::var("SP1_GROTH16_GPU").ok();
                 let (gpu, reason) = use_gpu(&Groth16Inputs {
                     override_env: override_env.as_deref(),
                     card_eligible,
                     helper_available: Groth16Bn254Prover::gpu_helper_available(),
-                    mem_available: host_mem_available(),
+                    vram_free: sp1_recursion_gnark_ffi::gpu_free_memory(),
+                    gpu_reset: sp1_recursion_gnark_ffi::gpu_reset_requested(),
+                    mem_available: sp1_recursion_gnark_ffi::host_memory::available(),
                     pk_cache_ready: Groth16Bn254Prover::gpu_pk_cache_ready(&build_dir),
                 });
                 tracing::info!(
@@ -862,45 +866,38 @@ impl<A: ArtifactClient, C: SP1ProverComponents> SP1RecursionProver<A, C> {
                     .map_err(|e| anyhow::anyhow!("Failed to verify groth16 wrap proof: {}", e))
             };
 
-            // The GPU prover first, when chosen. Its helper reports failure by panicking; if it
-            // fails, or its proofs keep failing verification, the CPU prover takes over rather
-            // than losing the proof.
-            #[cfg(feature = "native-gnark")]
-            if use_gpu {
-                let gpu = prove_with_retry(
+            let cpu = || {
+                prove_with_retry(
                     "groth16_wrap",
                     max_retries,
                     || -> Result<_, anyhow::Error> {
-                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                            prover.prove_gpu_subprocess(witness.clone(), &build_dir)
-                        }))
-                        .map_err(|panic| {
-                            let message = panic
-                                .downcast_ref::<String>()
-                                .map(String::as_str)
-                                .or_else(|| panic.downcast_ref::<&str>().copied())
-                                .unwrap_or("unknown panic");
-                            anyhow::anyhow!("the GPU Groth16 prover failed: {message}")
-                        })
+                        #[cfg(feature = "native-gnark")]
+                        return prover.prove_isolated(witness.clone(), &build_dir);
+                        #[cfg(not(feature = "native-gnark"))]
+                        Ok(prover.prove(witness.clone(), &build_dir))
                     },
                     &verify,
-                );
-                match gpu {
-                    Ok(proof) => return Ok(proof),
-                    Err(e) => tracing::warn!("{e:#}; proving with gnark's CPU prover instead"),
-                }
-            }
-            let proof = prove_with_retry(
-                "groth16_wrap",
-                max_retries,
-                || -> Result<_, anyhow::Error> {
-                    #[cfg(feature = "native-gnark")]
-                    return prover.prove_isolated(witness.clone(), &build_dir);
-                    #[cfg(not(feature = "native-gnark"))]
-                    Ok(prover.prove(witness.clone(), &build_dir))
+                )
+            };
+            // The GPU prover first, when chosen. If it fails, or its proofs keep failing
+            // verification, the CPU prover takes over rather than losing the proof.
+            #[cfg(feature = "native-gnark")]
+            let proof = super::groth16_backend::prove_preferring_gpu(
+                use_gpu,
+                || {
+                    prove_with_retry(
+                        "groth16_wrap",
+                        max_retries,
+                        || -> Result<_, anyhow::Error> {
+                            Ok(prover.prove_gpu_subprocess(witness.clone(), &build_dir))
+                        },
+                        &verify,
+                    )
                 },
-                &verify,
+                cpu,
             )?;
+            #[cfg(not(feature = "native-gnark"))]
+            let proof = cpu()?;
             Ok(proof)
         })
         .instrument(tracing::info_span!("prove groth16"))
@@ -930,7 +927,7 @@ impl<A: ArtifactClient, C: SP1ProverComponents> SP1RecursionProver<A, C> {
         let plonk_proof = tokio::task::spawn_blocking(move || -> Result<_, anyhow::Error> {
             // PLONK's final wrap is as memory-hungry as Groth16's and shares its host-wide slot.
             #[cfg(feature = "native-gnark")]
-            let _slot = Groth16Bn254Prover::queue_slot("PLONK");
+            let _slot = sp1_recursion_gnark_ffi::final_wrap_slot("PLONK");
             let SP1WrapProof { vk: wrap_vk, proof: wrap_proof } = wrap_proof;
             let input = SP1ShapedWitnessValues {
                 vks_and_proofs: vec![(wrap_vk.clone(), wrap_proof.clone())],

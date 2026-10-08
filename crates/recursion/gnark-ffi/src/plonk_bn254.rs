@@ -45,57 +45,6 @@ fn shm_named_tempfile() -> tempfile::NamedTempFile {
     tempfile::NamedTempFile::new().expect("failed to create temp file")
 }
 
-/// Release the parent process's GPU memory before spawning the helper
-/// subprocess. Mirror of `groth16_bn254::try_release_parent_gpu_memory`.
-/// The PLONK GPU prover at N=2^25 needs ~24 GB of VRAM; on 24 GB cards the
-/// parent's pooled buffers must be released before the helper's allocations
-/// will fit.
-#[cfg(feature = "native")]
-fn try_release_parent_gpu_memory() -> bool {
-    use libloading::{Library, Symbol};
-
-    let backend = std::env::var("SP1_GPU_BACKEND").ok();
-    let cuda_first = matches!(backend.as_deref(), Some("cuda") | Some("nvidia"));
-
-    let cuda_candidates: &[(&str, &str)] = &[
-        ("libcudart.so", "cudaDeviceReset"),
-        ("libcudart.so.13", "cudaDeviceReset"),
-        ("libcudart.so.12", "cudaDeviceReset"),
-    ];
-    let hip_candidates: &[(&str, &str)] = &[
-        ("libamdhip64.so", "hipDeviceReset"),
-        ("libamdhip64.so.6", "hipDeviceReset"),
-        ("libamdhip64.so.5", "hipDeviceReset"),
-    ];
-    let groups: [&[(&str, &str)]; 2] = if cuda_first {
-        [cuda_candidates, hip_candidates]
-    } else {
-        [hip_candidates, cuda_candidates]
-    };
-
-    for group in groups {
-        for (libname, fname) in group {
-            let lib = unsafe { Library::new(libname) };
-            let Ok(lib) = lib else { continue };
-            let sym: Result<Symbol<unsafe extern "C" fn() -> i32>, _> =
-                unsafe { lib.get(fname.as_bytes()) };
-            let Ok(reset_fn) = sym else { continue };
-            let rc = unsafe { reset_fn() };
-            tracing::info!(
-                "[plonk] Released parent GPU memory via {}::{} (rc={})",
-                libname,
-                fname,
-                rc
-            );
-            return true;
-        }
-    }
-    tracing::warn!(
-        "[plonk] Could not release parent GPU memory — neither HIP nor CUDA runtime library found."
-    );
-    false
-}
-
 /// Detect whether the parent process was built against the CUDA backend by
 /// probing `/proc/self/maps` for the loaded runtime library. Returns true
 /// iff `libcudart.so.*` is loaded. Falls back to `false` when the maps file
@@ -363,30 +312,26 @@ fn try_prepare_gpu_plonk_inputs(
             prep_resolved.path.display()
         );
         let t0 = std::time::Instant::now();
-        let status = std::process::Command::new(&scs_bin)
-            .arg("prep-circuit-prod")
-            .arg(build_dir)
-            .arg(&prep_resolved.path)
-            .status();
-        match status {
-            Ok(s) if s.success() => {
+        let mut cmd = std::process::Command::new(&scs_bin);
+        cmd.arg("prep-circuit-prod").arg(build_dir).arg(&prep_resolved.path);
+        match crate::subprocess::run(cmd, "scs_solve_plan prep-circuit-prod") {
+            Ok(finished) if finished.status.success() => {
                 tracing::info!("PLONK prep-circuit-prod completed in {:?}", t0.elapsed());
                 mark_plonk_prep_complete(&prep_resolved);
             }
-            Ok(s) => {
+            Ok(finished) => {
                 tracing::warn!(
-                    "PLONK prep-circuit-prod failed (exit {s:?}) using {}; \
-                     falling back to gnark.spr.Solve",
-                    scs_bin.display()
+                    "PLONK prep-circuit-prod failed using {}: {}; falling back to \
+                     gnark.spr.Solve",
+                    scs_bin.display(),
+                    finished.describe()
                 );
                 return None;
             }
             Err(e) => {
                 tracing::warn!(
-                    "failed to spawn scs_solve_plan {}: {e}; falling back to \
-                     gnark.spr.Solve. Set SP1_SCS_SOLVE_PLAN to the binary \
-                     path or place it next to the current executable.",
-                    scs_bin.display()
+                    "{e:#}; falling back to gnark.spr.Solve. Set SP1_SCS_SOLVE_PLAN to the \
+                     scs_solve_plan binary or place it next to the current executable.",
                 );
                 return None;
             }
@@ -426,27 +371,25 @@ fn try_prepare_gpu_plonk_inputs(
 
     if !used_worker {
         tracing::info!("Running scs_solve_plan make-witness-init (one-shot)...");
-        let status = std::process::Command::new(&scs_bin)
-            .arg("make-witness-init")
+        let mut cmd = std::process::Command::new(&scs_bin);
+        cmd.arg("make-witness-init")
             .arg(build_dir)
             .arg(&prep_resolved.path)
             .arg(witness_path)
-            .arg(witness_init_td.path())
-            .status();
-        match status {
-            Ok(s) if s.success() => {
+            .arg(witness_init_td.path());
+        match crate::subprocess::run(cmd, "scs_solve_plan make-witness-init") {
+            Ok(finished) if finished.status.success() => {
                 tracing::info!("PLONK make-witness-init completed in {:?}", t0.elapsed());
             }
-            Ok(s) => {
+            Ok(finished) => {
                 tracing::warn!(
-                    "make-witness-init failed (exit {s:?}); falling back to gnark.spr.Solve"
+                    "make-witness-init failed: {}; falling back to gnark.spr.Solve",
+                    finished.describe()
                 );
                 return None;
             }
             Err(e) => {
-                tracing::warn!(
-                    "failed to spawn scs_solve_plan: {e}; falling back to gnark.spr.Solve"
-                );
+                tracing::warn!("{e:#}; falling back to gnark.spr.Solve");
                 return None;
             }
         }
@@ -618,13 +561,12 @@ impl PlonkBn254Prover {
         let helper_path = resolve_plonk_helper_path("plonk_gpu_helper");
         let out_file = shm_named_tempfile();
 
-        // Release the parent's pooled GPU memory so the helper's
-        // ~24 GB of VRAM allocations fit on 24 GB cards.
-        try_release_parent_gpu_memory();
+        // The helper needs ~24 GB of VRAM at N=2^25, which a prover keeping its shard-prover
+        // state on the card does not have free. Only a process that exits after this proof may
+        // reset its GPU to make room (`SP1_GPU_RESET_BEFORE_WRAP=1`; see `gpu_device`).
+        crate::gpu_device::reset_if_requested("PLONK (GPU)");
 
-        // Belt-and-suspenders: the helper needs ~24 GB of VRAM at N=2^25.
-        // `cudaDeviceReset` in the parent process is necessary but in
-        // practice not always sufficient (the parent's CUDA driver context
+        // Even a reset is not always sufficient (the parent's CUDA driver context
         // may retain pooled memory until the host process exits). Operators
         // can route the helper to a different GPU via SP1_PLONK_GPU_HELPER_DEVICES
         // (semicolon-separated CUDA_VISIBLE_DEVICES / HIP_VISIBLE_DEVICES
@@ -742,16 +684,17 @@ impl PlonkBn254Prover {
                 "[plonk] Routing GPU PLONK helper to devices: {devs} (via SP1_PLONK_GPU_HELPER_DEVICES)"
             );
         }
-        let status = cmd.status().unwrap_or_else(|e| {
+        // Bound to this prover and its final-wrap slot, and timed out if it hangs; see
+        // `subprocess`.
+        let finished = crate::subprocess::run(cmd, "plonk_gpu_helper").unwrap_or_else(|e| {
             panic!(
-                "failed to spawn GPU PLONK helper {helper_path:?}: {e}. \
-                     Either build the `plonk_gpu_helper` binary (cargo build \
-                     --release -p sp1-recursion-gnark-ffi --features native,cuda) \
-                     or set SP1_PLONK_GPU_HELPER to its path."
+                "GPU PLONK helper {helper_path:?}: {e:#}. Either build the `plonk_gpu_helper` \
+                 binary (cargo build --release -p sp1-recursion-gnark-ffi --features native,cuda) \
+                 or set SP1_PLONK_GPU_HELPER to its path."
             )
         });
-        if !status.success() {
-            panic!("GPU PLONK helper exited non-zero: {status:?}");
+        if !finished.status.success() {
+            panic!("GPU PLONK helper failed: {}", finished.describe());
         }
 
         // Step 4: read the helper's proof JSON and return.

@@ -126,9 +126,16 @@ func ProveGroth16Bn254(dataDir *C.char, witnessPath *C.char) *C.C_Groth16Bn254Pr
 	return groth16ProofToC(sp1Groth16Bn254Proof)
 }
 
+// ProveGroth16Bn254WithR1cs returns nil and sets *r1csErr when the R1CS cannot be read; see
+// sp1.ProveGroth16WithR1cs.
+//
 //export ProveGroth16Bn254WithR1cs
-func ProveGroth16Bn254WithR1cs(dataDir *C.char, r1csPath *C.char, witnessPath *C.char) *C.C_Groth16Bn254Proof {
-	proof := sp1.ProveGroth16WithR1cs(C.GoString(dataDir), C.GoString(r1csPath), C.GoString(witnessPath))
+func ProveGroth16Bn254WithR1cs(dataDir *C.char, r1csPath *C.char, witnessPath *C.char, r1csErr **C.char) *C.C_Groth16Bn254Proof {
+	proof, err := sp1.ProveGroth16WithR1cs(C.GoString(dataDir), C.GoString(r1csPath), C.GoString(witnessPath))
+	if err != nil {
+		*r1csErr = C.CString(err.Error())
+		return nil
+	}
 	return groth16ProofToC(proof)
 }
 

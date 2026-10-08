@@ -1,15 +1,22 @@
 //! Which prover makes the final Groth16 proof: the GPU prover (`groth16_gpu_helper`) or gnark's
 //! CPU prover.
 //!
-//! The GPU prover is much faster but needs far more host memory. It solves the circuit in this
-//! process, which grows it by ~12 GB, and holds that while a helper process loads its own copy of
-//! the proving key in GPU form (13.7 GB). Beside a resident prover that is more than a 28 GB host
-//! has. gnark's CPU prover, which the v6.0.0 fork always used, fits.
+//! The GPU prover is faster (60 s against ~95 s for a whole proof on an RTX 4090), but its helper
+//! needs GPU memory of its own, and the prover that starts it keeps its shard-prover state on the
+//! card between proofs (~22 GB of a 24 GB card). So the GPU prover is used only where the card has
+//! the room free, or where this process resets its GPU first (`SP1_GPU_RESET_BEFORE_WRAP`, for a
+//! process that exits after its proof). It also needs more host memory: it solves the circuit in
+//! this process, ~13 GB, then a helper loads the proving key in GPU form, ~13 GB. gnark's CPU
+//! prover, which the v6.0.0 fork always used, needs neither.
 
 /// Host memory the GPU prover needs beyond what is in use when it starts, once the GPU-format
-/// proving key has been exported. Measured on the v6.1.0 circuit: ~12 GB for the in-process solve
-/// plus the 13.7 GB helper, both alive at once, rounded up for headroom.
-pub(crate) const GPU_MIN_AVAILABLE_BYTES: u64 = 28 << 30;
+/// proving key has been exported. Measured on the v6.1.0 circuit: 13.1 GB for the in-process solve,
+/// then 12.9 GB for the helper (the solve's memory is released first), rounded up for headroom.
+pub(crate) const GPU_MIN_AVAILABLE_BYTES: u64 = 16 << 30;
+
+/// Free GPU memory the GPU prover's helper needs. Measured on the v6.1.0 circuit: 14.5 GiB at peak
+/// on an RTX 4090, rounded up.
+pub(crate) const GPU_HELPER_VRAM_BYTES: u64 = 16 << 30;
 
 /// Extra host memory for the one-time proving-key export on a cold cache: ~9 GB of files, written
 /// to RAM-backed `/dev/shm` unless `SP1_GROTH16_PK_CACHE` points elsewhere.
@@ -25,7 +32,12 @@ pub(crate) struct Groth16Inputs<'a> {
     pub card_eligible: bool,
     /// Whether `groth16_gpu_helper` can be found.
     pub helper_available: bool,
-    /// `MemAvailable`, if it could be read.
+    /// Free memory on this process's GPU, if known.
+    pub vram_free: Option<u64>,
+    /// Whether this process resets its GPU before the helper runs, which frees the card for it.
+    pub gpu_reset: bool,
+    /// Memory this process can still use (`host_memory::available`: `MemAvailable`, capped by
+    /// cgroup v2 limits), if known.
     pub mem_available: Option<u64>,
     /// Whether the GPU-format proving key is already exported.
     pub pk_cache_ready: bool,
@@ -49,6 +61,22 @@ pub(crate) fn use_gpu(inputs: &Groth16Inputs<'_>) -> (bool, String) {
                 .into(),
         );
     }
+    if !inputs.gpu_reset {
+        match inputs.vram_free {
+            Some(free) if free >= GPU_HELPER_VRAM_BYTES => {}
+            Some(free) => {
+                return (
+                    false,
+                    format!(
+                        "{} GiB of GPU memory is free and the GPU prover's helper needs {} GiB",
+                        free >> 30,
+                        GPU_HELPER_VRAM_BYTES >> 30
+                    ),
+                )
+            }
+            None => return (false, "free GPU memory is unknown".into()),
+        }
+    }
     let needed =
         GPU_MIN_AVAILABLE_BYTES + if inputs.pk_cache_ready { 0 } else { GPU_PK_EXPORT_BYTES };
     match inputs.mem_available {
@@ -65,47 +93,30 @@ pub(crate) fn use_gpu(inputs: &Groth16Inputs<'_>) -> (bool, String) {
     }
 }
 
-/// Memory this process can still use, in bytes: `MemAvailable`, or less where a cgroup v2 limit
-/// leaves less headroom. In a container, or a systemd scope with `MemoryMax` (as the miner runs its
-/// workers), host RAM says nothing about what this process may use.
-pub(crate) fn host_mem_available() -> Option<u64> {
-    let meminfo = std::fs::read_to_string("/proc/meminfo").ok().and_then(|meminfo| {
-        meminfo.lines().find_map(|line| {
-            let kb = line.strip_prefix("MemAvailable:")?.trim().strip_suffix("kB")?.trim();
-            kb.parse::<u64>().ok().map(|kb| kb * 1024)
-        })
-    });
-    let cgroup = std::fs::read_to_string("/proc/self/cgroup").ok().and_then(|cgroup| {
-        // The cgroup v2 line is `0::<path>`.
-        let path = cgroup.lines().find_map(|line| line.strip_prefix("0::"))?.to_string();
-        cgroup_headroom(std::path::Path::new("/sys/fs/cgroup"), &path)
-    });
-    match (meminfo, cgroup) {
-        (Some(available), Some(headroom)) => Some(available.min(headroom)),
-        (available, headroom) => available.or(headroom),
+/// Proves with the GPU prover when `use_gpu`, and with the CPU prover otherwise or if the GPU prover
+/// fails, so that a GPU failure costs time rather than the proof. `gpu` may fail by returning an
+/// error or by panicking, which is how its helper reports failure.
+pub(crate) fn prove_preferring_gpu<P>(
+    use_gpu: bool,
+    gpu: impl FnOnce() -> anyhow::Result<P>,
+    cpu: impl FnOnce() -> anyhow::Result<P>,
+) -> anyhow::Result<P> {
+    if use_gpu {
+        let failure = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(gpu)) {
+            Ok(Ok(proof)) => return Ok(proof),
+            Ok(Err(e)) => format!("{e:#}"),
+            Err(panic) => panic
+                .downcast_ref::<String>()
+                .map(String::as_str)
+                .or_else(|| panic.downcast_ref::<&str>().copied())
+                .unwrap_or("unknown panic")
+                .to_string(),
+        };
+        tracing::warn!(
+            "the GPU Groth16 prover failed: {failure}; proving with gnark's CPU prover instead"
+        );
     }
-}
-
-/// The least `memory.max - memory.current` of the cgroup at `path` under `root` and of its
-/// ancestors. `None` when none of them has a limit.
-fn cgroup_headroom(root: &std::path::Path, path: &str) -> Option<u64> {
-    let read = |dir: &std::path::Path, file: &str| std::fs::read_to_string(dir.join(file)).ok();
-    let mut dir = root.join(path.trim_start_matches('/'));
-    let mut least: Option<u64> = None;
-    loop {
-        if let (Some(max), Some(current)) = (read(&dir, "memory.max"), read(&dir, "memory.current"))
-        {
-            if let (Ok(max), Ok(current)) =
-                (max.trim().parse::<u64>(), current.trim().parse::<u64>())
-            {
-                let headroom = max.saturating_sub(current);
-                least = Some(least.map_or(headroom, |least| least.min(headroom)));
-            }
-        }
-        if dir == root || !dir.pop() {
-            return least;
-        }
-    }
+    cpu()
 }
 
 #[cfg(test)]
@@ -119,6 +130,8 @@ mod tests {
             override_env: None,
             card_eligible: true,
             helper_available: true,
+            vram_free: Some(40 * GIB),
+            gpu_reset: false,
             mem_available: Some(mem_available),
             pk_cache_ready: true,
         }
@@ -131,9 +144,27 @@ mod tests {
     }
 
     #[test]
-    fn a_big_card_on_a_28_gb_host_uses_the_cpu_prover() {
-        // What this box has free with the prover resident.
-        assert!(!use_gpu(&big_card(19 * GIB)).0);
+    fn a_24_gb_card_holding_a_resident_prover_uses_the_cpu_prover() {
+        // Measured on an RTX 4090: the prover keeps 21.7 GB of its 24 GB between proofs.
+        let inputs = Groth16Inputs { vram_free: Some(2 * GIB), ..big_card(64 * GIB) };
+        assert!(!use_gpu(&inputs).0);
+        assert!(!use_gpu(&Groth16Inputs { vram_free: None, ..inputs }).0, "unknown is not room");
+        // Unless this process resets the card first.
+        assert!(use_gpu(&Groth16Inputs { gpu_reset: true, ..inputs }).0);
+        assert!(use_gpu(&Groth16Inputs { gpu_reset: true, vram_free: None, ..inputs }).0);
+    }
+
+    #[test]
+    fn the_helper_needs_its_measured_gpu_memory_free() {
+        let with_free = |vram| Groth16Inputs { vram_free: Some(vram), ..big_card(64 * GIB) };
+        assert!(use_gpu(&with_free(GPU_HELPER_VRAM_BYTES)).0);
+        assert!(!use_gpu(&with_free(GPU_HELPER_VRAM_BYTES - 1)).0);
+    }
+
+    #[test]
+    fn a_big_card_on_a_28_gb_host_with_a_resident_prover_uses_the_cpu_prover() {
+        // What this box has available with the prover resident, in a 24 GB scope.
+        assert!(!use_gpu(&big_card(15 * GIB)).0);
     }
 
     #[test]
@@ -163,7 +194,7 @@ mod tests {
 
     #[test]
     fn the_env_override_wins_either_way() {
-        let small = Groth16Inputs { card_eligible: false, ..big_card(0) };
+        let small = Groth16Inputs { card_eligible: false, vram_free: None, ..big_card(0) };
         assert!(use_gpu(&Groth16Inputs { override_env: Some("1"), ..small }).0);
         assert!(!use_gpu(&Groth16Inputs { override_env: Some("0"), ..big_card(256 * GIB) }).0);
         assert!(use_gpu(&Groth16Inputs { override_env: Some("true"), ..small }).0);
@@ -173,32 +204,26 @@ mod tests {
         assert!(!use_gpu(&Groth16Inputs { override_env: Some("yes"), ..small }).0);
     }
 
-    /// A limit anywhere up the cgroup tree caps what the proof may use, and the tightest wins.
     #[test]
-    fn cgroup_limits_cap_available_memory() {
-        let root = tempfile::tempdir().unwrap();
-        let leaf = root.path().join("user.slice/worker.scope");
-        std::fs::create_dir_all(&leaf).unwrap();
-        let set = |dir: &std::path::Path, max: &str, current: &str| {
-            std::fs::write(dir.join("memory.max"), max).unwrap();
-            std::fs::write(dir.join("memory.current"), current).unwrap();
+    fn a_failed_gpu_proof_falls_back_to_the_cpu_prover() {
+        use std::cell::Cell;
+        let cpu_runs = Cell::new(0);
+        let cpu = || {
+            cpu_runs.set(cpu_runs.get() + 1);
+            Ok("cpu")
         };
-        // No limits anywhere: no opinion.
-        set(&leaf, "max\n", "100\n");
-        assert_eq!(cgroup_headroom(root.path(), "/user.slice/worker.scope"), None);
-        // The leaf has 24 GiB with 20 GiB in use; its parent allows more.
-        set(&leaf, &(24 * GIB).to_string(), &(20 * GIB).to_string());
-        set(&root.path().join("user.slice"), &(64 * GIB).to_string(), &(30 * GIB).to_string());
-        assert_eq!(cgroup_headroom(root.path(), "/user.slice/worker.scope"), Some(4 * GIB));
-        // Now the parent is the tighter one.
-        set(&root.path().join("user.slice"), &(32 * GIB).to_string(), &(31 * GIB).to_string());
-        assert_eq!(cgroup_headroom(root.path(), "/user.slice/worker.scope"), Some(GIB));
-    }
+        assert_eq!(prove_preferring_gpu(true, || Ok("gpu"), cpu).unwrap(), "gpu");
+        assert_eq!(cpu_runs.get(), 0, "the CPU prover ran after the GPU prover succeeded");
+        let failed = || Err(anyhow::anyhow!("verification failed 3 times"));
+        assert_eq!(prove_preferring_gpu(true, failed, cpu).unwrap(), "cpu");
+        let panicked = || -> anyhow::Result<&str> { panic!("helper exited 101") };
+        assert_eq!(prove_preferring_gpu(true, panicked, cpu).unwrap(), "cpu");
+        assert_eq!(cpu_runs.get(), 2);
 
-    #[test]
-    fn host_memory_is_readable_here() {
-        if cfg!(target_os = "linux") {
-            assert!(host_mem_available().is_some_and(|bytes| bytes > 0));
-        }
+        // Without the GPU prover, it is not tried; and a CPU failure is the result.
+        let untried = || -> anyhow::Result<&str> { unreachable!("the GPU prover was not chosen") };
+        assert_eq!(prove_preferring_gpu(false, untried, cpu).unwrap(), "cpu");
+        let cpu_failed = || -> anyhow::Result<&str> { Err(anyhow::anyhow!("helper failed")) };
+        assert!(prove_preferring_gpu(true, failed, cpu_failed).is_err());
     }
 }

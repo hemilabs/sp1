@@ -57,6 +57,12 @@ sp1-verifier = { workspace = true, features = ["std"] }
 name = "groth16_concurrent_witnesses"
 required-features = ["native", "cuda"]
 
+# Its own `main`, which calls `run_groth16_cpu_helper_if_requested` first, as a prover's must.
+[[test]]
+name = "self_hosted_cpu_helper"
+harness = false
+required-features = ["native"]
+
 [[example]]
 name = "bench_groth16"
 required-features = ["native"]
@@ -111,8 +117,8 @@ path = "src/bin/groth16_cpu_helper.rs"
 required-features = ["native"]
 
 # Subprocess helper invoked by sp1-prover's recursion task to run the GPU
-# PLONK final wrap in a clean child process. Same rationale as the Groth16
-# helper above. The `cuda` feature gates the GPU-accelerated PLONK code paths
+# PLONK final wrap in a clean child process. Same rationale as
+# `groth16_gpu_helper` above. The `cuda` feature gates the GPU-accelerated PLONK code paths
 # in `sp1-gpu-plonk` (despite the name, both HIP and CUDA backends are gated
 # by it; runtime backend is selected by SP1_GPU_BACKEND / sp1-gpu-sys
 # build.rs).

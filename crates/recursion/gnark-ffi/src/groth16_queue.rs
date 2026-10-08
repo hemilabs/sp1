@@ -2,29 +2,31 @@
 //!
 //! The final wrap needs far more host memory than the rest of an SP1 proof. On the v6.1.0 circuit,
 //! gnark's CPU Groth16 prover peaks at ~16 GB in its own process (~24 GB when it also keeps the
-//! circuit cached), and the GPU path's parent solve and helper together need ~26 GB. Every prover
-//! process on the host reaches this step on its own schedule, for example one `sp1-gpu-server` per
-//! GPU, so two at once can exhaust RAM even when either alone fits.
+//! circuit cached), and the GPU path needs ~13 GB beyond the prover's own. Every prover process on
+//! the host reaches this step on its own schedule, for example one `sp1-gpu-server` per GPU, so two
+//! at once can exhaust RAM even when either alone fits.
 //!
-//! [`acquire`] takes one of a fixed number of slots shared by every process on the host:
+//! [`final_wrap_slot`] takes one of a fixed number of slots shared by every process on the host:
 //! - A slot is a lock file, `.sp1_groth16_slot<i>.lock` under `SP1_GROTH16_QUEUE_DIR` (default
-//!   `/dev/shm`, else the temp dir). Holding a slot means holding an exclusive `flock` on its file,
-//!   which the kernel releases once every process holding the descriptor has exited, however they
-//!   exit. Helpers spawned through `subprocess` inherit the descriptor, so a slot outlives a parent
-//!   that dies before its helper.
+//!   `/run/lock` where this user can write to it, else `/dev/shm`, else the temp dir). Holding a
+//!   slot means holding an exclusive `flock` on its file, which the kernel releases once every
+//!   process holding the descriptor has exited, however they exit. Helpers spawned through
+//!   `subprocess` inherit the descriptor, so a slot outlives a parent that dies before its helper.
 //! - `SP1_GROTH16_SLOTS` sets the number of slots; 0 disables the limit. The default is one slot
 //!   per 48 GiB of host RAM, at least one. Every process on the host must agree on it: a process
 //!   allowed two slots can take slot 1 while a process allowed one holds slot 0.
-//! - The queue spans the processes that share the directory. Containers with private `/dev/shm`
-//!   mounts each get their own queue unless `SP1_GROTH16_QUEUE_DIR` names a shared mount. Lock
-//!   files must never be deleted while provers run.
+//! - The queue spans the processes that share the directory. Containers with private `/run/lock`
+//!   or `/dev/shm` mounts each get their own queue unless `SP1_GROTH16_QUEUE_DIR` names a shared
+//!   mount. Lock files must never be deleted while provers run, which is why the default is not
+//!   `/dev/shm`: systemd-logind (`RemoveIPC=yes`) empties a user's files there when their last
+//!   session ends.
 //! - Ordering is not FIFO: waiters poll, and whichever finds a slot free first takes it. With a
 //!   handful of provers per host that is fair enough; ordering by deadline belongs in a scheduler.
 //! - When the queue cannot be used (an unusable directory, persistent lock errors, a non-Unix
 //!   host), proving proceeds without it and says so once. A missed limit risks running out of
 //!   memory, while refusing to prove loses the job for certain.
-//! - Within one thread, acquiring again while a slot is held returns at once instead of waiting
-//!   for itself. The guard cannot leave its thread.
+//! - Within one thread, acquiring again inside a final wrap returns at once instead of waiting for
+//!   itself, or retrying a queue that just proved unusable. The guard cannot leave its thread.
 
 use std::cell::Cell;
 use std::fs::File;
@@ -47,25 +49,42 @@ const REPORT_EVERY: Duration = Duration::from_secs(60);
 /// How long lock errors may persist before the queue is given up as unusable.
 const ERRORS_TOLERATED_FOR: Duration = Duration::from_secs(60);
 
+/// What this thread's outermost guard holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Held {
+    Nothing,
+    /// A slot, by its descriptor, which helpers spawned under it inherit.
+    Slot(i32),
+    /// A final wrap that runs without the queue (disabled, or unusable).
+    Unqueued,
+}
+
 thread_local! {
-    /// The descriptor of the slot this thread holds, if it holds one, so that a nested acquire
-    /// does not wait for itself and helpers spawned under the slot can inherit it.
-    static HELD: Cell<Option<i32>> = const { Cell::new(None) };
+    /// So that a nested acquire returns at once, neither waiting for this thread's own slot nor
+    /// paying again for a queue that just proved unusable.
+    static HELD: Cell<Held> = const { Cell::new(Held::Nothing) };
 }
 
 /// A held slot, or the absence of the limit. Dropping it frees the slot.
 #[must_use = "the slot is freed as soon as the guard is dropped"]
-pub struct Groth16Slot {
-    /// The locked slot file. `None` when proving without the queue, or when nested inside a slot
-    /// this thread already holds.
+pub struct FinalWrapSlot {
+    /// The locked slot file. `None` when proving without the queue, or when nested.
     file: Option<File>,
+    /// Whether this guard set `HELD`, and so clears it. False when nested inside another.
+    outermost: bool,
     /// Bound to its thread: `HELD` is per thread.
     _not_send: PhantomData<*const ()>,
 }
 
-impl Groth16Slot {
-    fn unqueued() -> Self {
-        Self { file: None, _not_send: PhantomData }
+impl FinalWrapSlot {
+    fn nested() -> Self {
+        Self { file: None, outermost: false, _not_send: PhantomData }
+    }
+
+    fn outermost(file: Option<File>) -> Self {
+        let held = file.as_ref().map_or(Held::Unqueued, |file| Held::Slot(raw_fd(file)));
+        HELD.with(|cell| cell.set(held));
+        Self { file, outermost: true, _not_send: PhantomData }
     }
 
     /// Whether this guard holds a slot of its own.
@@ -75,10 +94,12 @@ impl Groth16Slot {
     }
 }
 
-impl Drop for Groth16Slot {
+impl Drop for FinalWrapSlot {
     fn drop(&mut self) {
+        if self.outermost {
+            HELD.with(|held| held.set(Held::Nothing));
+        }
         if let Some(file) = &self.file {
-            HELD.with(|held| held.set(None));
             // Clear the holder label before the lock goes, so waiters do not report a holder that
             // has left. Closing the file then releases the lock, unless a helper still holds it.
             let _ = file.set_len(0);
@@ -88,7 +109,10 @@ impl Drop for Groth16Slot {
 
 /// The descriptor of the slot this thread holds, for a helper process to inherit.
 pub(crate) fn held_slot_fd() -> Option<i32> {
-    HELD.with(Cell::get)
+    match HELD.with(Cell::get) {
+        Held::Slot(fd) => Some(fd),
+        Held::Nothing | Held::Unqueued => None,
+    }
 }
 
 /// Where the slots live and how many there are.
@@ -116,9 +140,35 @@ impl QueueConfig {
         let dir = std::env::var_os("SP1_GROTH16_QUEUE_DIR")
             .filter(|dir| !dir.is_empty())
             .map(PathBuf::from)
-            .unwrap_or_else(crate::gpu_cache::default_root);
+            .unwrap_or_else(default_dir);
         Self { dir, slots }
     }
+}
+
+/// `/run/lock` where this user may create files in it, else `/dev/shm` or the temp dir; see the
+/// module docs.
+fn default_dir() -> PathBuf {
+    let run_lock = Path::new("/run/lock");
+    if writable_dir(run_lock) {
+        run_lock.to_path_buf()
+    } else {
+        crate::gpu_cache::default_root()
+    }
+}
+
+#[cfg(unix)]
+fn writable_dir(dir: &Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    let Ok(path) = std::ffi::CString::new(dir.as_os_str().as_bytes()) else {
+        return false;
+    };
+    // SAFETY: `path` is a valid C string for the call.
+    dir.is_dir() && unsafe { libc::access(path.as_ptr(), libc::W_OK | libc::X_OK) } == 0
+}
+
+#[cfg(not(unix))]
+fn writable_dir(_dir: &Path) -> bool {
+    false
 }
 
 /// One slot per [`BYTES_PER_DEFAULT_SLOT`] of host RAM, at least one.
@@ -136,10 +186,21 @@ fn mem_total() -> Option<u64> {
     })
 }
 
-/// Takes a host-wide slot, waiting until one is free. `what` names the caller in logs.
-pub(crate) fn acquire(what: &str) -> Groth16Slot {
-    if held_slot_fd().is_some() {
-        return Groth16Slot::unqueued();
+/// Takes a host-wide final-wrap slot for this thread, waiting until one is free; see the module
+/// docs. `what` names the caller in logs.
+///
+/// The GPU and CPU Groth16 provers take one themselves (`prove_isolated`, `prove_gpu_subprocess`,
+/// `prove_gpu`); `Groth16Bn254Prover::prove` and the PLONK provers do not. A caller that must
+/// decide something under the slot, such as measuring free memory, or that proves PLONK, takes it
+/// first; the provers' own acquire on the same thread then returns at once.
+pub fn final_wrap_slot(what: &str) -> FinalWrapSlot {
+    acquire(what)
+}
+
+/// [`final_wrap_slot`].
+pub(crate) fn acquire(what: &str) -> FinalWrapSlot {
+    if HELD.with(Cell::get) != Held::Nothing {
+        return FinalWrapSlot::nested();
     }
     static CONFIG: OnceLock<QueueConfig> = OnceLock::new();
     let config = CONFIG.get_or_init(|| {
@@ -150,15 +211,12 @@ pub(crate) fn acquire(what: &str) -> Groth16Slot {
     acquire_with(config, what)
 }
 
-pub(crate) fn acquire_with(config: &QueueConfig, what: &str) -> Groth16Slot {
+pub(crate) fn acquire_with(config: &QueueConfig, what: &str) -> FinalWrapSlot {
     if config.slots == 0 {
-        return Groth16Slot::unqueued();
+        return FinalWrapSlot::outermost(None);
     }
     match acquire_in(&config.dir, config.slots, what) {
-        Ok(file) => {
-            HELD.with(|held| held.set(Some(raw_fd(&file))));
-            Groth16Slot { file: Some(file), _not_send: PhantomData }
-        }
+        Ok(file) => FinalWrapSlot::outermost(Some(file)),
         Err(e) => {
             static WARNED: AtomicBool = AtomicBool::new(false);
             let message = format!(
@@ -170,7 +228,7 @@ pub(crate) fn acquire_with(config: &QueueConfig, what: &str) -> Groth16Slot {
             } else {
                 tracing::warn!("{message}");
             }
-            Groth16Slot::unqueued()
+            FinalWrapSlot::outermost(None)
         }
     }
 }
@@ -337,6 +395,60 @@ pub(crate) mod tests {
         assert!(host_lock::is_current(&holder, &path));
     }
 
+    /// The same, where it matters: a waiter whose slot file was replaced while it waited must wait
+    /// for whoever holds the new file, not take the old one's lock.
+    #[test]
+    fn a_waiter_does_not_take_a_replaced_slot() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".sp1_groth16_slot0.lock");
+        let first = acquire_in(dir.path(), 1, "first holder").unwrap();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let waiter_dir = dir.path().to_path_buf();
+        let waiter = std::thread::spawn(move || {
+            let slot = acquire_in(&waiter_dir, 1, "waiter").unwrap();
+            done_tx.send(()).unwrap();
+            slot
+        });
+        std::thread::sleep(POLL * 2);
+        // Replace the file under the waiter, lock the new one, and only then let the old one go.
+        std::fs::remove_file(&path).unwrap();
+        let second = host_lock::open(&path).unwrap();
+        assert!(host_lock::try_lock(&second).unwrap());
+        drop(first);
+        assert!(
+            done_rx.recv_timeout(POLL * 6).is_err(),
+            "the waiter took the slot while the new file was locked"
+        );
+        drop(second);
+        done_rx.recv_timeout(Duration::from_secs(10)).expect("the waiter never took the slot");
+        let slot = waiter.join().unwrap();
+        assert!(host_lock::is_current(&slot, &path));
+    }
+
+    /// Inside a final wrap that runs without the queue, a nested acquire returns at once rather
+    /// than retrying it (an unusable queue costs a minute of retries each time).
+    #[test]
+    fn nesting_inside_an_unqueued_wrap_returns_at_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let disabled = QueueConfig { dir: dir.path().to_path_buf(), slots: 0 };
+        let outer = acquire_with(&disabled, "test");
+        assert!(!outer.is_queued());
+        assert_eq!(HELD.with(Cell::get), Held::Unqueued);
+        let start = Instant::now();
+        let nested = acquire("test nested");
+        assert!(start.elapsed() < Duration::from_millis(100));
+        assert!(!nested.is_queued());
+        drop(nested);
+        assert_eq!(
+            HELD.with(Cell::get),
+            Held::Unqueued,
+            "a nested guard must not clear its parent"
+        );
+        drop(outer);
+        assert_eq!(HELD.with(Cell::get), Held::Nothing);
+        assert!(held_slot_fd().is_none());
+    }
+
     /// Provers in different processes, as on a host with one prover per GPU. Every child waits at
     /// a start line so they really contend, and logs when it held the slot on the system-wide
     /// monotonic clock.
@@ -456,7 +568,10 @@ pub(crate) mod tests {
         assert_eq!(QueueConfig::from_env(gib(96)).slots, 2, "nonsense must give the default");
 
         std::env::set_var("SP1_GROTH16_QUEUE_DIR", "");
-        assert_eq!(QueueConfig::from_env(gib(28)).dir, crate::gpu_cache::default_root());
+        assert_eq!(QueueConfig::from_env(gib(28)).dir, default_dir());
+        if writable_dir(Path::new("/run/lock")) {
+            assert_eq!(default_dir(), Path::new("/run/lock"));
+        }
 
         std::env::remove_var("SP1_GROTH16_SLOTS");
         std::env::remove_var("SP1_GROTH16_QUEUE_DIR");

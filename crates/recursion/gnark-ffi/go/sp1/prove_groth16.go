@@ -47,10 +47,9 @@ func ProveGroth16(dataDir string, witnessPath string) Proof {
 		globalR1csInitialized = true
 		fmt.Printf("Reading R1CS took %s\n", time.Since(start))
 	}
-	globalMutex.Unlock()
 
-	// Read the proving key.
-	globalMutex.Lock()
+	// Read the proving key, under the same lock: ReleaseCaches must not reset the R1CS
+	// between the two.
 	if !globalPkInitialized {
 		start = time.Now()
 		pkFile, err := os.Open(dataDir + "/" + groth16PkPath)
@@ -63,6 +62,8 @@ func ProveGroth16(dataDir string, witnessPath string) Proof {
 		globalPkInitialized = true
 		fmt.Printf("Reading proving key took %s\n", time.Since(start))
 	}
+	// Prove with these, not the globals, which ReleaseCaches may replace meanwhile.
+	r1cs, pk := globalR1cs, globalPk
 	globalMutex.Unlock()
 
 	start = time.Now()
@@ -93,7 +94,7 @@ func ProveGroth16(dataDir string, witnessPath string) Proof {
 
 	start = time.Now()
 	// Generate the proof.
-	proof, err := groth16.Prove(globalR1cs, globalPk, witness)
+	proof, err := groth16.Prove(r1cs, pk, witness)
 	if err != nil {
 		fmt.Printf("Error: %v\n", err)
 		panic(err)

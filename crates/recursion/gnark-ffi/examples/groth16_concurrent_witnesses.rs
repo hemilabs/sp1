@@ -20,13 +20,15 @@
 //! # The whole real path for one witness (prepare, GPU helper), then verify the proof.
 //! groth16_concurrent_witnesses prove <build_dir> <witness.json>
 //!
-//! # The CPU prover's real path for one witness (host-wide queue slot, groth16_cpu_helper), then
-//! # verify. Run several at once to exercise the queue.
+//! # The CPU prover's real path for one witness (host-wide queue slot, then this binary re-run as
+//! # the CPU helper), then verify. Run several at once to exercise the queue.
 //! groth16_concurrent_witnesses prove-cpu <build_dir> <witness.json>
 //! ```
 //!
 //! `prove` needs `SP1_GROTH16_GPU_HELPER` to point at `groth16_gpu_helper`, since examples live
 //! one directory below the binaries. `prove-cpu` needs nothing: this binary is its own CPU helper.
+//! The example builds only with `native,cuda`, even for `prove-cpu`. `pk`, `prepare` and `prove`
+//! do not take a queue slot, so do not run them beside a live prover.
 
 // A CLI test tool: its results are its output.
 #![allow(clippy::print_stdout)]

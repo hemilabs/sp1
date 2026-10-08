@@ -284,22 +284,30 @@ pub fn prove_groth16_bn254(data_dir: &str, witness_path: &str) -> Groth16Bn254Pr
 /// Proves with the R1CS at `r1cs_path` (typically the stripped circuit) and keeps nothing in the Go
 /// runtime afterwards, unlike [`prove_groth16_bn254`], which caches the R1CS and proving key for
 /// the life of the process. For a short-lived process such as `groth16_cpu_helper`.
+///
+/// `Err` only when the R1CS cannot be read, so the caller can try another; any other failure
+/// panics in Go, which ends the process.
 pub fn prove_groth16_bn254_with_r1cs(
     data_dir: &str,
     r1cs_path: &str,
     witness_path: &str,
-) -> Groth16Bn254Proof {
+) -> Result<Groth16Bn254Proof, String> {
     let data_dir = CString::new(data_dir).expect("CString::new failed");
     let r1cs_path = CString::new(r1cs_path).expect("CString::new failed");
     let witness_path = CString::new(witness_path).expect("CString::new failed");
     unsafe {
+        let mut r1cs_err: *mut c_char = std::ptr::null_mut();
         let proof = bind::ProveGroth16Bn254WithR1cs(
             data_dir.as_ptr() as *mut c_char,
             r1cs_path.as_ptr() as *mut c_char,
             witness_path.as_ptr() as *mut c_char,
+            &mut r1cs_err,
         );
+        if !r1cs_err.is_null() {
+            return Err(ptr_to_string_freed(r1cs_err));
+        }
         assert!(!proof.is_null(), "ProveGroth16Bn254WithR1cs returned no proof");
-        groth16_bn254_proof_from_raw(proof)
+        Ok(groth16_bn254_proof_from_raw(proof))
     }
 }
 

@@ -1,5 +1,5 @@
-//! Running the provers' helper processes (`groth16_cpu_helper`, `groth16_gpu_helper`,
-//! `r1cs_solve_plan`).
+//! Running the final wrap's helper processes (the Groth16 CPU and GPU helpers, `plonk_gpu_helper`,
+//! `r1cs_solve_plan`, `scs_solve_plan`).
 //!
 //! [`run`] makes a helper part of its parent's proof:
 //! - It inherits the final-wrap queue slot this thread holds (see `groth16_queue`), so the slot is
@@ -11,11 +11,15 @@
 //! - It is killed if it runs longer than `SP1_GROTH16_HELPER_TIMEOUT_SECS` (default 1800; 0 for no
 //!   limit). A hung helper would otherwise hold the host-wide slot, and stall every prover on the
 //!   host, for ever.
-//! - Its stdin is closed, and its stderr is passed through and kept, so that a failure's message
-//!   says why rather than just "exit status: 2".
+//! - Its stdin is `/dev/null`, and its stderr is passed through and kept, so that a failure's
+//!   message says why rather than just "exit status: 2".
+//!
+//! All of this reaches the helper itself, not processes it starts: a wrapper script given as a
+//! helper must `exec` the real one.
 
 use std::collections::VecDeque;
 use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
@@ -25,6 +29,9 @@ use anyhow::{Context, Result};
 const STDERR_TAIL_BYTES: usize = 4096;
 /// Helper run time when `SP1_GROTH16_HELPER_TIMEOUT_SECS` is unset.
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(1800);
+/// How long to wait for a killed helper to be gone. One stuck in the kernel (a GPU driver hang, say)
+/// never goes, and must not take this thread with it.
+const REAP_WITHIN: Duration = Duration::from_secs(30);
 
 /// How a helper ended.
 #[derive(Debug)]
@@ -89,33 +96,39 @@ pub(crate) fn run_with_timeout(
 ) -> Result<Finished> {
     cmd.stdin(Stdio::null()).stderr(Stdio::piped());
     bind_to_parent(&mut cmd);
-    let mut child = cmd.spawn().with_context(|| format!("failed to start {what}"))?;
+    let child = cmd.spawn().with_context(|| format!("failed to start {what}"))?;
+    // From here on, any way out of this function other than the child's own exit kills it first,
+    // so it never runs on unsupervised, for example beside the CPU prover after a GPU failure.
+    let mut child = KillOnDrop(Some(child));
 
-    let mut stderr = child.stderr.take().expect("stderr is piped");
+    let mut stderr = child.get().stderr.take().expect("stderr is piped");
     let tail =
         std::sync::Arc::new(std::sync::Mutex::new(VecDeque::with_capacity(STDERR_TAIL_BYTES)));
     let (eof_tx, eof_rx) = std::sync::mpsc::channel::<()>();
     {
         let tail = tail.clone();
-        std::thread::spawn(move || {
-            let mut buf = [0u8; 8192];
-            loop {
-                match stderr.read(&mut buf) {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => {
-                        let _ = std::io::stderr().write_all(&buf[..n]);
-                        let mut tail = tail.lock().unwrap_or_else(|e| e.into_inner());
-                        for &byte in &buf[..n] {
-                            if tail.len() == STDERR_TAIL_BYTES {
-                                tail.pop_front();
+        std::thread::Builder::new()
+            .name("helper-stderr".into())
+            .spawn(move || {
+                let mut buf = [0u8; 8192];
+                loop {
+                    match stderr.read(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            let _ = std::io::stderr().write_all(&buf[..n]);
+                            let mut tail = tail.lock().unwrap_or_else(|e| e.into_inner());
+                            for &byte in &buf[..n] {
+                                if tail.len() == STDERR_TAIL_BYTES {
+                                    tail.pop_front();
+                                }
+                                tail.push_back(byte);
                             }
-                            tail.push_back(byte);
                         }
                     }
                 }
-            }
-            let _ = eof_tx.send(());
-        });
+                let _ = eof_tx.send(());
+            })
+            .with_context(|| format!("failed to start a thread to read {what}'s stderr"))?;
     }
     // What stderr said, once it has said it all. A process the helper started can keep the pipe
     // open after the helper itself is gone, so wait for the end only briefly.
@@ -128,23 +141,78 @@ pub(crate) fn run_with_timeout(
     let deadline = timeout.map(|timeout| Instant::now() + timeout);
     let status = loop {
         if let Some(status) =
-            child.try_wait().with_context(|| format!("failed to wait for {what}"))?
+            child.get().try_wait().with_context(|| format!("failed to wait for {what}"))?
         {
+            child.0 = None;
             break status;
         }
         if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
-            let _ = child.kill();
-            let _ = child.wait();
+            let gone = child.kill_and_reap();
             anyhow::bail!(
-                "{what} ran longer than {:?} (SP1_GROTH16_HELPER_TIMEOUT_SECS) and was killed; its \
-                 stderr ended with:\n{}",
+                "{what} ran longer than {:?} (SP1_GROTH16_HELPER_TIMEOUT_SECS) and was killed{}; \
+                 its stderr ended with:\n{}",
                 timeout.unwrap_or_default(),
+                if gone { "" } else { ", but has not exited (stuck in the kernel?)" },
                 take_tail().trim()
             );
         }
         std::thread::sleep(Duration::from_millis(100));
     };
     Ok(Finished { status, stderr_tail: take_tail() })
+}
+
+/// A running helper, killed and reaped unless it has been waited for.
+struct KillOnDrop(Option<std::process::Child>);
+
+impl KillOnDrop {
+    fn get(&mut self) -> &mut std::process::Child {
+        self.0.as_mut().expect("the helper has not been reaped")
+    }
+
+    /// Kills the helper and waits up to [`REAP_WITHIN`] for it to go. Whether it went.
+    fn kill_and_reap(&mut self) -> bool {
+        let Some(mut child) = self.0.take() else {
+            return true;
+        };
+        let _ = child.kill();
+        let deadline = Instant::now() + REAP_WITHIN;
+        loop {
+            match child.try_wait() {
+                Ok(Some(_)) | Err(_) => return true,
+                Ok(None) if Instant::now() >= deadline => return false,
+                Ok(None) => std::thread::sleep(Duration::from_millis(50)),
+            }
+        }
+    }
+}
+
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        self.kill_and_reap();
+    }
+}
+
+/// How many times a memory limit on this process's cgroup, or on one above it, has been hit (the
+/// `oom` counts in cgroup v2's `memory.events`). A helper is in its parent's cgroup, so a rise
+/// while it ran means it ran into a limit, and that the same proof would again. `None` without
+/// cgroup v2.
+pub(crate) fn cgroup_limit_hits() -> Option<u64> {
+    limit_hits_in(Path::new("/sys/fs/cgroup"), &crate::host_memory::own_cgroup()?)
+}
+
+/// [`cgroup_limit_hits`] for the cgroup at `path` under `root`: its own count, which includes its
+/// descendants, plus each ancestor's local count, which leaves out its other children.
+fn limit_hits_in(root: &Path, path: &str) -> Option<u64> {
+    let oom = |file: PathBuf| -> Option<u64> {
+        let events = std::fs::read_to_string(file).ok()?;
+        events.lines().find_map(|line| line.strip_prefix("oom ")?.trim().parse().ok())
+    };
+    let mut dir = root.join(path.trim_start_matches('/'));
+    let mut total = oom(dir.join("memory.events"))?;
+    while dir != root && dir.pop() {
+        total += oom(dir.join("memory.events.local")).unwrap_or(0);
+    }
+    Some(total)
 }
 
 /// Lets the child inherit this thread's queue slot and die with its parent. Everything here runs
@@ -193,14 +261,35 @@ fn bind_to_parent(_cmd: &mut Command) {}
 mod tests {
     use super::*;
     use crate::groth16_queue::tests::{lock_within, wait_for_file, ChildTest, CHILD_ENV};
-    use crate::groth16_queue::{acquire_with, QueueConfig};
+    use crate::groth16_queue::{acquire_with, held_slot_fd, QueueConfig};
     use crate::host_lock;
-    use std::path::Path;
 
     fn sh(script: &str) -> Command {
         let mut cmd = Command::new("sh");
         cmd.args(["-c", script]);
         cmd
+    }
+
+    /// Writes the shell's pid to `<dir>/helper.pid` in one step, so a reader never sees it empty.
+    fn record_pid(dir: &Path) -> String {
+        format!(
+            "echo $$ > {0}/helper.pid.tmp && mv {0}/helper.pid.tmp {0}/helper.pid",
+            dir.display()
+        )
+    }
+
+    fn read_pid(dir: &Path) -> i32 {
+        wait_for_file(&dir.join("helper.pid"));
+        std::fs::read_to_string(dir.join("helper.pid")).unwrap().trim().parse().unwrap()
+    }
+
+    /// Whether `pid` is running. A zombie is not: a killed helper whose new parent (PID 1, which
+    /// in a container may never reap) has not collected it yet.
+    fn alive(pid: i32) -> bool {
+        std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| {
+            stat.rsplit_once(')').and_then(|(_, rest)| rest.trim_start().chars().next())
+                != Some('Z')
+        })
     }
 
     #[test]
@@ -221,7 +310,7 @@ mod tests {
     #[test]
     fn only_the_end_of_a_long_stderr_is_kept() {
         let finished = run_with_timeout(
-            sh("head -c 100000 /dev/zero | tr '\\0' x >&2; echo END >&2"),
+            sh("head -c 6000 /dev/zero | tr '\\0' x >&2; echo END >&2"),
             "test",
             None,
         )
@@ -232,25 +321,30 @@ mod tests {
 
     #[test]
     fn a_hung_helper_is_killed_at_the_deadline() {
+        let dir = tempfile::tempdir().unwrap();
         let start = Instant::now();
         let err = run_with_timeout(
-            sh("echo started >&2; exec sleep 60"),
+            sh(&format!("{}; echo started >&2; exec sleep 60", record_pid(dir.path()))),
             "test",
-            Some(Duration::from_secs(1)),
+            Some(Duration::from_secs(2)),
         )
         .unwrap_err();
-        assert!(start.elapsed() < Duration::from_secs(10), "{:?}", start.elapsed());
+        assert!(start.elapsed() < Duration::from_secs(15), "{:?}", start.elapsed());
         let message = format!("{err:#}");
         assert!(message.contains("ran longer than") && message.contains("started"), "{message}");
+        assert!(!message.contains("has not exited"), "{message}");
+        assert!(!alive(read_pid(dir.path())), "the hung helper is still running");
     }
 
     #[test]
-    fn stdin_is_closed() {
-        // `cat` on an inherited terminal or pipe would block; on /dev/null it ends at once.
-        let finished =
-            run_with_timeout(sh("cat; echo done >&2"), "test", Some(Duration::from_secs(10)))
-                .unwrap();
-        assert!(finished.status.success());
+    fn stdin_is_dev_null() {
+        let finished = run_with_timeout(
+            sh(r#"[ "$(readlink /proc/self/fd/0)" = /dev/null ] || { cat; exit 1; }"#),
+            "test",
+            Some(Duration::from_secs(10)),
+        )
+        .unwrap();
+        assert!(finished.status.success(), "{}", finished.describe());
     }
 
     #[test]
@@ -258,6 +352,34 @@ mod tests {
         let err =
             run_with_timeout(Command::new("/nonexistent/helper"), "the helper", None).unwrap_err();
         assert!(format!("{err:#}").contains("failed to start the helper"));
+    }
+
+    /// The helper gets the slot's descriptor, so the slot stays taken while it runs, whatever
+    /// happens to its parent. Nothing else does: in the parent the descriptor stays close-on-exec.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_helper_inherits_the_slot() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = QueueConfig { dir: dir.path().to_path_buf(), slots: 1 };
+        let slot = acquire_with(&config, "test");
+        let fd = held_slot_fd().expect("a slot is held");
+        let show = format!("readlink /proc/self/fd/{fd} >&2 || true");
+
+        let helper = run_with_timeout(sh(&show), "test", Some(Duration::from_secs(10))).unwrap();
+        assert!(
+            helper.stderr_tail.trim_end().ends_with(".sp1_groth16_slot0.lock"),
+            "the helper did not get the slot: {:?}",
+            helper.stderr_tail
+        );
+        let plain = sh(&show).output().unwrap();
+        assert!(
+            !String::from_utf8_lossy(&plain.stderr).contains(".sp1_groth16_slot0.lock"),
+            "a plain spawn got the slot"
+        );
+
+        drop(slot);
+        let unslotted = run_with_timeout(sh(&show), "test", Some(Duration::from_secs(10))).unwrap();
+        assert!(!unslotted.stderr_tail.contains(".sp1_groth16_slot0.lock"));
     }
 
     /// The case the inherited slot exists for: the prover dies while its helper still runs. The
@@ -270,7 +392,7 @@ mod tests {
             let config = QueueConfig { dir: dir.to_path_buf(), slots: 1 };
             let _slot = acquire_with(&config, "prover");
             // `exec`, so the helper is one process, as the real ones are.
-            let script = format!("echo $$ > {}/helper.pid; exec sleep 60", dir.display());
+            let script = format!("{}; exec sleep 60", record_pid(dir));
             let _ = run_with_timeout(sh(&script), "helper", None);
             return;
         }
@@ -280,16 +402,11 @@ mod tests {
             "a_helper_holds_the_slot_and_dies_with_its_parent",
             dir.path(),
         );
-        wait_for_file(&dir.path().join("helper.pid"));
-        std::thread::sleep(Duration::from_millis(100));
-        let helper: i32 =
-            std::fs::read_to_string(dir.path().join("helper.pid")).unwrap().trim().parse().unwrap();
+        let helper = read_pid(dir.path());
         let probe = host_lock::open(&dir.path().join(".sp1_groth16_slot0.lock")).unwrap();
         assert!(!host_lock::try_lock(&probe).unwrap(), "the prover does not hold the slot");
 
         prover.kill();
-        // SAFETY: signal 0 only checks existence.
-        let alive = |pid: i32| unsafe { libc::kill(pid, 0) } == 0;
         let deadline = Instant::now() + Duration::from_secs(5);
         while alive(helper) && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(20));
@@ -298,17 +415,16 @@ mod tests {
         assert!(lock_within(&probe, Duration::from_secs(5)), "the slot was not freed");
     }
 
-    /// Without the inherited slot the prover's death alone frees it, even while the helper runs.
-    /// Shows the test above can tell the difference: here the helper keeps the slot after its
-    /// parent is gone, because PDEATHSIG is not set by a plain spawn.
+    /// A plain spawn neither passes the slot's descriptor to the helper nor sets PDEATHSIG, so here
+    /// the helper outlives its parent and the slot is freed anyway. This only tells "both" from
+    /// "neither"; `the_helper_inherits_the_slot` checks the descriptor on its own.
     #[test]
     fn an_unbound_helper_does_not_hold_the_slot() {
         if let Ok(dir) = std::env::var(CHILD_ENV) {
             let dir = Path::new(&dir);
             let config = QueueConfig { dir: dir.to_path_buf(), slots: 1 };
             let _slot = acquire_with(&config, "prover");
-            let mut cmd = sh(&format!("echo $$ > {}/helper.pid; exec sleep 30", dir.display()));
-            let _ = cmd.status();
+            let _ = sh(&format!("{}; exec sleep 30", record_pid(dir))).status();
             return;
         }
         let dir = tempfile::tempdir().unwrap();
@@ -317,16 +433,39 @@ mod tests {
             "an_unbound_helper_does_not_hold_the_slot",
             dir.path(),
         );
-        wait_for_file(&dir.path().join("helper.pid"));
-        std::thread::sleep(Duration::from_millis(100));
-        let helper: i32 =
-            std::fs::read_to_string(dir.path().join("helper.pid")).unwrap().trim().parse().unwrap();
+        let helper = read_pid(dir.path());
         let probe = host_lock::open(&dir.path().join(".sp1_groth16_slot0.lock")).unwrap();
         prover.kill();
         // The slot frees with the prover although the helper is still alive.
         assert!(lock_within(&probe, Duration::from_secs(5)));
-        // SAFETY: signal 0 only checks existence; SIGKILL cleans up the orphan.
-        assert_eq!(unsafe { libc::kill(helper, 0) }, 0, "expected an orphaned helper");
+        assert!(alive(helper), "expected an orphaned helper");
+        // SAFETY: SIGKILL cleans up the orphan.
         unsafe { libc::kill(helper, libc::SIGKILL) };
+    }
+
+    /// A limit counts if this cgroup or one above it hit it, but not if a sibling hit its own.
+    #[test]
+    fn cgroup_limit_hits_are_counted_up_the_tree() {
+        let root = tempfile::tempdir().unwrap();
+        let parent = root.path().join("user.slice");
+        let leaf = parent.join("worker.scope");
+        let sibling = parent.join("other.scope");
+        for dir in [&leaf, &sibling] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        let events = |dir: &Path, file: &str, oom: u64| {
+            std::fs::write(dir.join(file), format!("low 0\nhigh 0\nmax 3\noom {oom}\noom_kill 1\n"))
+                .unwrap()
+        };
+        assert_eq!(limit_hits_in(root.path(), "/user.slice/worker.scope"), None);
+        events(&leaf, "memory.events", 2);
+        assert_eq!(limit_hits_in(root.path(), "/user.slice/worker.scope"), Some(2));
+        // The parent's own limit: its local count.
+        events(&parent, "memory.events.local", 1);
+        // Its hierarchical count also has the sibling's, which is not ours.
+        events(&parent, "memory.events", 9);
+        events(&sibling, "memory.events", 6);
+        assert_eq!(limit_hits_in(root.path(), "/user.slice/worker.scope"), Some(3));
+        assert_eq!(limit_hits_in(root.path(), "user.slice/worker.scope"), Some(3));
     }
 }

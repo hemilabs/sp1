@@ -11,6 +11,7 @@ import (
 
 	"github.com/consensys/gnark-crypto/ecc"
 	"github.com/consensys/gnark/backend/groth16"
+	"github.com/consensys/gnark/constraint"
 	"github.com/consensys/gnark/frontend"
 )
 
@@ -22,21 +23,19 @@ import (
 // larger forever. This is for a short-lived process instead: groth16_cpu_helper runs one proof and
 // exits, which gives all of its memory back to the host. r1csPath is typically the stripped
 // circuit (see ExportGroth16StrippedR1cs), which loads several times faster than the full one.
-func ProveGroth16WithR1cs(dataDir string, r1csPath string, witnessPath string) Proof {
+//
+// The one error it returns is an R1CS it cannot read, so that the caller can try another (a
+// stripped copy can be corrupt, or written by a gnark that serialized differently). Anything else
+// panics.
+func ProveGroth16WithR1cs(dataDir string, r1csPath string, witnessPath string) (Proof, error) {
 	os.Setenv("CONSTRAINTS_JSON", dataDir+"/"+constraintsJsonFile)
 	os.Setenv("GROTH16", "1")
 
 	start := time.Now()
-	r1cs := groth16.NewCS(ecc.BN254)
-	r1csFile, err := os.Open(r1csPath)
+	r1cs, err := readR1cs(r1csPath)
 	if err != nil {
-		panic(fmt.Sprintf("failed to open R1CS %s: %v", r1csPath, err))
+		return Proof{}, err
 	}
-	if _, err := r1cs.ReadFrom(bufio.NewReaderSize(r1csFile, 1024*1024)); err != nil {
-		r1csFile.Close()
-		panic(fmt.Sprintf("failed to read R1CS %s: %v", r1csPath, err))
-	}
-	r1csFile.Close()
 	fmt.Printf("Reading R1CS (%s) took %s\n", r1csPath, time.Since(start))
 
 	start = time.Now()
@@ -76,7 +75,27 @@ func ProveGroth16WithR1cs(dataDir string, r1csPath string, witnessPath string) P
 	}
 	fmt.Printf("Generating proof took %s\n", time.Since(start))
 
-	return NewSP1Groth16Proof(&proof, witnessInput)
+	return NewSP1Groth16Proof(&proof, witnessInput), nil
+}
+
+// readR1cs reads the constraint system at path, returning a panic in gnark's reader as an error
+// too: a corrupt file can make it index out of bounds rather than fail cleanly.
+func readR1cs(path string) (r1cs constraint.ConstraintSystem, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			r1cs, err = nil, fmt.Errorf("failed to read R1CS %s: %v", path, r)
+		}
+	}()
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open R1CS %s: %w", path, err)
+	}
+	defer file.Close()
+	r1cs = groth16.NewCS(ecc.BN254)
+	if _, err := r1cs.ReadFrom(bufio.NewReaderSize(file, 1024*1024)); err != nil {
+		return nil, fmt.Errorf("failed to read R1CS %s: %w", path, err)
+	}
+	return r1cs, nil
 }
 
 // ExportGroth16StrippedR1cs writes the R1CS in dataDir to outputPath without its debug

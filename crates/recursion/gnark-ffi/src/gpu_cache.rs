@@ -15,13 +15,16 @@
 //!   half-written files as "partial".
 //! - The build goes to a staging directory that is synced and then renamed into place with the
 //!   marker already inside, so a crash at any point leaves either nothing or a complete cache,
-//!   never a partial one under the real name. The marker lists every file's size, so a cache torn
-//!   by a crash (on disk, before the sync) is detected and rebuilt rather than trusted. Staging
-//!   directories left by a crashed builder are removed by the next one.
+//!   never a partial one under the real name. The marker lists every file's size, so a cache whose
+//!   files were later truncated or removed (by hand, or by storage that lost synced data) is
+//!   detected and rebuilt rather than trusted. Staging directories left by a crashed builder are
+//!   removed by the next one.
 //!
 //! Per-proof files must never go into these directories; see [`proof_tempdir`].
 
+use std::fs::File;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
 
@@ -72,28 +75,7 @@ pub(crate) fn ensure_built(
     std::fs::create_dir_all(parent)
         .with_context(|| format!("failed to create cache root {}", parent.display()))?;
 
-    // The lock lives beside the cache, not in it, so it is never removed along with a partial
-    // directory and every process keeps locking the same inode.
-    let lock_path = parent.join(format!(".{name}.lock"));
-    let _lock = loop {
-        let file = host_lock::open(&lock_path)
-            .with_context(|| format!("failed to open cache lock {}", lock_path.display()))?;
-        if !host_lock::try_lock(&file)
-            .with_context(|| format!("failed to lock {}", lock_path.display()))?
-        {
-            tracing::info!(
-                "waiting for another prover to finish building the cache at {}",
-                dir.display()
-            );
-            host_lock::lock(&file)
-                .with_context(|| format!("failed to lock {}", lock_path.display()))?;
-        }
-        // Someone deleted the lock file while we waited: lock the one that is there now, or two
-        // builders would each hold "the" lock.
-        if host_lock::is_current(&file, &lock_path) {
-            break file;
-        }
-    };
+    let _lock = lock_cache(dir, parent, &name)?;
 
     if is_complete(dir, marker) {
         return Ok(CacheOutcome::BuiltElsewhere);
@@ -110,6 +92,46 @@ pub(crate) fn ensure_built(
         .with_context(|| format!("failed to create a staging directory in {}", parent.display()))?;
     build(staging.path())?;
     publish(staging, dir, parent, marker)
+}
+
+/// Takes the build lock of the cache at `dir`, waiting for a build in progress. The lock lives
+/// beside the cache, not in it, so it is never removed along with a partial directory and every
+/// process keeps locking the same inode.
+fn lock_cache(dir: &Path, parent: &Path, name: &str) -> Result<File> {
+    let lock_path = parent.join(format!(".{name}.lock"));
+    loop {
+        let file = host_lock::open(&lock_path)
+            .with_context(|| format!("failed to open cache lock {}", lock_path.display()))?;
+        if !host_lock::try_lock(&file)
+            .with_context(|| format!("failed to lock {}", lock_path.display()))?
+        {
+            tracing::info!(
+                "waiting for another prover to finish building the cache at {}",
+                dir.display()
+            );
+            host_lock::lock(&file)
+                .with_context(|| format!("failed to lock {}", lock_path.display()))?;
+        }
+        // Someone deleted the lock file while we waited: lock the one that is there now, or two
+        // builders would each hold "the" lock.
+        if host_lock::is_current(&file, &lock_path) {
+            return Ok(file);
+        }
+    }
+}
+
+/// Removes the cache at `dir`, so that the next [`ensure_built`] builds it again: for a cache that
+/// looks complete but turns out to be unusable. Takes the build lock, so it never removes a build
+/// in progress. Readers that already have its files open keep reading them.
+pub(crate) fn discard(dir: &Path) -> Result<()> {
+    let (parent, name) = parent_and_name(dir)?;
+    let _lock = lock_cache(dir, parent, &name)?;
+    if dir.exists() {
+        tracing::warn!("removing the unusable cache at {}", dir.display());
+        std::fs::remove_dir_all(dir)
+            .with_context(|| format!("failed to remove {}", dir.display()))?;
+    }
+    Ok(())
 }
 
 /// Syncs the staged files, writes the marker listing them, and renames the directory into place.
@@ -163,28 +185,50 @@ fn sync_path(path: &Path) -> Result<()> {
         .with_context(|| format!("failed to sync {}", path.display()))
 }
 
-/// A fresh directory for one proof's files, beside the caches when there is a cache root, so it
-/// lands on the same filesystem (by default RAM-backed `/dev/shm`). Removed when dropped.
-///
-/// A prover killed mid-proof cannot remove its own, and in `/dev/shm` each one holds RAM (a GPU
-/// witness is several GB), so the name carries the owner's pid and every call first removes the
-/// directories of owners that no longer exist.
-pub(crate) fn proof_tempdir(cache_dir: Option<&Path>, prefix: &str) -> Result<tempfile::TempDir> {
-    let root = match cache_dir.and_then(Path::parent) {
-        Some(root) => root.to_path_buf(),
-        None => default_root(),
-    };
-    std::fs::create_dir_all(&root)
-        .with_context(|| format!("failed to create {}", root.display()))?;
-    sweep_dead_owners(&root, prefix);
-    tempfile::Builder::new()
-        .prefix(&format!("{prefix}{}_", std::process::id()))
-        .tempdir_in(&root)
-        .with_context(|| format!("failed to create a {prefix}* directory in {}", root.display()))
+/// One proof's own directory; see [`proof_tempdir`]. Removed when dropped.
+pub(crate) struct ProofDir {
+    // Dropped in this order: the directory goes while its owner's lock is still held.
+    dir: tempfile::TempDir,
+    _owner: Option<File>,
 }
 
-/// Removes `<root>/<prefix><pid>_*` entries whose pid is not running.
-fn sweep_dead_owners(root: &Path, prefix: &str) {
+impl ProofDir {
+    pub(crate) fn path(&self) -> &Path {
+        self.dir.path()
+    }
+}
+
+/// How old a directory must be before a sweep may judge it abandoned. Its owner locks it right
+/// after creating it; this covers the moment in between.
+const SWEEP_MIN_AGE: Duration = Duration::from_secs(60);
+
+/// A fresh directory for one proof's files under `root` (by default RAM-backed `/dev/shm`), named
+/// `<prefix><pid>_<random>`. Removed when dropped.
+///
+/// A prover killed mid-proof cannot remove its own, and in `/dev/shm` each one holds RAM (a GPU
+/// witness is several GB), so every call first removes those of provers that are gone. The owner
+/// holds a lock on its directory for as long as it exists, which is what tells the two apart. The
+/// pid in the name is not enough: a shared directory (a mounted cache, or `/dev/shm` shared between
+/// containers) can hold directories of provers in other pid namespaces, which look dead from here.
+pub(crate) fn proof_tempdir(root: Option<&Path>, prefix: &str) -> Result<ProofDir> {
+    let root = root.map_or_else(default_root, Path::to_path_buf);
+    std::fs::create_dir_all(&root)
+        .with_context(|| format!("failed to create {}", root.display()))?;
+    sweep_abandoned(&root, prefix);
+    let dir = tempfile::Builder::new()
+        .prefix(&format!("{prefix}{}_", std::process::id()))
+        .tempdir_in(&root)
+        .with_context(|| format!("failed to create a {prefix}* directory in {}", root.display()))?;
+    // Best effort: without the lock (no flock on this filesystem) the directory still works, and
+    // is swept only once its pid is gone and it is old.
+    let owner =
+        File::open(dir.path()).ok().filter(|file| host_lock::try_lock(file).unwrap_or(false));
+    Ok(ProofDir { dir, _owner: owner })
+}
+
+/// Removes `<root>/<prefix><pid>_*` directories that their owners have abandoned: the pid is not
+/// running here, the directory is older than [`SWEEP_MIN_AGE`], and no one holds its lock.
+fn sweep_abandoned(root: &Path, prefix: &str) {
     let Ok(entries) = std::fs::read_dir(root) else {
         return;
     };
@@ -197,9 +241,26 @@ fn sweep_dead_owners(root: &Path, prefix: &str) {
         else {
             continue;
         };
-        if !process_alive(pid) {
-            tracing::info!("removing {} left by a prover that is gone", entry.path().display());
-            let _ = std::fs::remove_dir_all(entry.path());
+        let path = entry.path();
+        // `symlink_metadata`: a symlink with the right name is not a directory to sweep.
+        let Ok(meta) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+        let old = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.elapsed().ok())
+            .is_some_and(|age| age >= SWEEP_MIN_AGE);
+        if !meta.is_dir() || !old || process_alive(pid) {
+            continue;
+        }
+        let Ok(dir) = File::open(&path) else {
+            continue;
+        };
+        // Held while removing, so its owner cannot be mid-way through using it.
+        if host_lock::try_lock(&dir).unwrap_or(false) {
+            tracing::info!("removing {} left by a prover that is gone", path.display());
+            let _ = std::fs::remove_dir_all(&path);
         }
     }
 }
@@ -222,7 +283,8 @@ fn process_alive(_pid: u32) -> bool {
     true
 }
 
-/// `/dev/shm` where it exists, otherwise the system temp directory.
+/// `/dev/shm` where it exists, otherwise the system temp directory: where the GPU path's large
+/// per-circuit caches and per-proof files go unless configured otherwise.
 pub(crate) fn default_root() -> PathBuf {
     let shm = Path::new("/dev/shm");
     if shm.is_dir() {
@@ -403,15 +465,17 @@ mod tests {
     }
 
     #[test]
-    fn proof_dirs_are_private_and_removed_on_drop() {
+    fn proof_dirs_are_private_locked_and_removed_on_drop() {
         let root = tempfile::tempdir().unwrap();
-        let cache = root.path().join("cache");
-        let a = proof_tempdir(Some(&cache), "witness_").unwrap();
-        let b = proof_tempdir(Some(&cache), "witness_").unwrap();
+        let a = proof_tempdir(Some(root.path()), "witness_").unwrap();
+        let b = proof_tempdir(Some(root.path()), "witness_").unwrap();
         assert_ne!(a.path(), b.path());
         assert_eq!(a.path().parent(), Some(root.path()));
         let name = a.path().file_name().unwrap().to_string_lossy().into_owned();
         assert!(name.starts_with(&format!("witness_{}_", std::process::id())), "{name}");
+        // Its owner's lock is what keeps a sweep off it.
+        let probe = File::open(a.path()).unwrap();
+        assert!(!host_lock::try_lock(&probe).unwrap(), "the owner does not hold its directory");
         let (a_path, b_path) = (a.path().to_path_buf(), b.path().to_path_buf());
         drop(a);
         assert!(!a_path.exists());
@@ -419,27 +483,57 @@ mod tests {
     }
 
     /// A prover killed mid-proof leaves its scratch directory behind; the next proof removes it,
-    /// and only it.
+    /// and nothing else: not a live prover's (here, or in another pid namespace, where its pid
+    /// looks dead), not one just created, and not a cache whose name merely shares the prefix.
     #[cfg(unix)]
     #[test]
-    fn scratch_of_dead_provers_is_swept() {
+    fn only_abandoned_scratch_is_swept() {
         let root = tempfile::tempdir().unwrap();
-        let cache = root.path().join("cache");
         // A pid that certainly no longer runs: a child we started and reaped.
         let mut child = std::process::Command::new("true").spawn().unwrap();
         let dead = child.id();
         child.wait().unwrap();
-        let dead_dir = root.path().join(format!("witness_{dead}_abc"));
-        let live_dir = root.path().join(format!("witness_{}_def", std::process::id()));
-        let other_dir = root.path().join("unrelated_1_x");
-        for dir in [&dead_dir, &live_dir, &other_dir] {
-            std::fs::create_dir_all(dir).unwrap();
+        let dir = |name: String| {
+            let dir = root.path().join(name);
+            std::fs::create_dir_all(&dir).unwrap();
             std::fs::write(dir.join("wire_values.bin"), b"x").unwrap();
+            dir
+        };
+        let age = |dir: &Path| {
+            let old = std::time::SystemTime::now() - SWEEP_MIN_AGE * 2;
+            File::open(dir).unwrap().set_modified(old).unwrap();
+        };
+        let abandoned = dir(format!("witness_{dead}_abc"));
+        let elsewhere = dir(format!("witness_{dead}_def"));
+        let fresh = dir(format!("witness_{dead}_ghi"));
+        let mine = dir(format!("witness_{}_jkl", std::process::id()));
+        let pid_1 = dir("witness_1_mno".into());
+        let unrelated = dir(format!("unrelated_{dead}_x"));
+        let pk_cache = dir("sp1_groth16_pk_cache_4388a2".into());
+        let prep_cache = dir("sp1_groth16_prep_circuit_4388a2".into());
+        for dir in [&abandoned, &elsewhere, &mine, &pid_1, &unrelated, &pk_cache, &prep_cache] {
+            age(dir);
         }
-        let _mine = proof_tempdir(Some(&cache), "witness_").unwrap();
-        assert!(!dead_dir.exists(), "the dead prover's scratch was not removed");
-        assert!(live_dir.exists(), "a running prover's scratch was removed");
-        assert!(other_dir.exists(), "an unrelated directory was removed");
+        // A prover in another pid namespace: its pid is dead here, but it holds its directory.
+        let other_namespace = File::open(&elsewhere).unwrap();
+        assert!(host_lock::try_lock(&other_namespace).unwrap());
+
+        let _new = proof_tempdir(Some(root.path()), "witness_").unwrap();
+        sweep_abandoned(root.path(), "sp1_groth16_pk_");
+        sweep_abandoned(root.path(), "sp1_groth16_prep_");
+
+        assert!(!abandoned.exists(), "the dead prover's scratch was not removed");
+        for (dir, what) in [
+            (&elsewhere, "a live prover's in another pid namespace"),
+            (&fresh, "a just-created one"),
+            (&mine, "this process's"),
+            (&pid_1, "one whose pid is running (as another user)"),
+            (&unrelated, "an unrelated directory"),
+            (&pk_cache, "the PK cache"),
+            (&prep_cache, "the prep-circuit cache"),
+        ] {
+            assert!(dir.exists(), "{what} was removed");
+        }
     }
 
     #[test]
@@ -469,6 +563,40 @@ mod tests {
         // A listed file that disappeared counts the same.
         std::fs::remove_file(dir.join("a.bin")).unwrap();
         assert!(!is_complete(&dir, MARKER));
+    }
+
+    /// A cache that looks complete but cannot be used is discarded and then rebuilt, never while
+    /// a build of it is in progress.
+    #[test]
+    fn a_discarded_cache_is_rebuilt() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("cache");
+        let builds = AtomicUsize::new(0);
+        ensure_built(&dir, MARKER, slow_build(&builds)).unwrap();
+        discard(&dir).unwrap();
+        assert!(!dir.exists());
+        discard(&dir).unwrap();
+        assert_eq!(ensure_built(&dir, MARKER, slow_build(&builds)).unwrap(), CacheOutcome::Built);
+        assert_eq!(builds.load(Ordering::SeqCst), 2);
+
+        // Waits for a build in progress rather than removing it.
+        let barrier = Barrier::new(2);
+        let other = root.path().join("other");
+        std::thread::scope(|scope| {
+            let building = scope.spawn(|| {
+                ensure_built(&other, MARKER, |out| {
+                    barrier.wait();
+                    std::thread::sleep(Duration::from_millis(300));
+                    std::fs::write(out.join("a.bin"), b"a")?;
+                    Ok(())
+                })
+                .unwrap()
+            });
+            barrier.wait();
+            discard(&other).unwrap();
+            assert_eq!(building.join().unwrap(), CacheOutcome::Built);
+            assert!(!other.exists(), "discard ran before the build it waited for had finished");
+        });
     }
 
     /// Several processes racing on one cold cache, as provers on different GPUs do. Each child

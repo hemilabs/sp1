@@ -5,11 +5,14 @@ mod cpu_helper;
 pub mod ffi;
 #[cfg(feature = "native")]
 mod gpu_cache;
+#[cfg(feature = "native")]
+mod gpu_device;
 pub mod groth16_bn254;
 #[cfg(feature = "native")]
 mod groth16_queue;
 #[cfg(feature = "native")]
 mod host_lock;
+pub mod host_memory;
 pub mod plonk_bn254;
 #[cfg(feature = "native")]
 pub mod plonk_helper_server;
@@ -32,7 +35,9 @@ pub use witness::*;
 #[cfg(feature = "native")]
 pub use cpu_helper::{cpu_helper_main, run_groth16_cpu_helper_if_requested, CPU_HELPER_ARG};
 #[cfg(feature = "native")]
-pub use groth16_queue::Groth16Slot;
+pub use gpu_device::{free_memory as gpu_free_memory, reset_requested as gpu_reset_requested};
+#[cfg(feature = "native")]
+pub use groth16_queue::{final_wrap_slot, FinalWrapSlot};
 
 /// Lets this binary act as its own Groth16 CPU helper; see `cpu_helper`. Without the `native`
 /// feature there is no CPU helper, and this does nothing.
