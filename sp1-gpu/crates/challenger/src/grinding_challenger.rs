@@ -9,7 +9,6 @@ use slop_symmetric::CryptographicPermutation;
 use sp1_gpu_cudart::sys::challenger::{grind_koala_bear, grind_multi_field32};
 use sp1_gpu_cudart::sys::runtime::KernelPtr;
 use sp1_gpu_cudart::{args, DeviceBuffer, TaskScope};
-use sp1_primitives::fri_params::SP1_PROOF_OF_WORK_BITS;
 use sp1_primitives::SP1DiffusionMatrix;
 
 /// Poseidon2 permutation type for KoalaBear grinding.
@@ -41,22 +40,40 @@ where
     let cpu_challenger: DuplexChallenger<F, _> = challenger.clone().into();
 
     let mut result = DeviceBuffer::with_capacity_in(1, scope.clone());
-    let mut found_flag = DeviceBuffer::<bool>::with_capacity_in(1, scope.clone());
+    // FOUR bytes, not one, even though the kernel takes a `bool*`.
+    //
+    // `grindKernel` signals a hit with `atomicExch((int*)found_flag, 1)` (challenger.cuh), and CUDA has
+    // no 1-byte atomic — so a `DeviceBuffer::<bool>` of one element means a 4-byte atomic writing three
+    // bytes past a 1-byte allocation, on every successful grind. compute-sanitizer names it exactly:
+    // `Invalid __global__ atomic of size 4 bytes ... nearest allocation ... of size 1 bytes`.
+    //
+    // Harmless wherever the allocator leaves slack after a 1-byte block, which is why it has gone
+    // unnoticed; fatal on Blackwell (sm_120), where it faults and takes the whole proof down as
+    // `unspecified launch failure`. Allocating the flag at the width the atomic actually uses is the
+    // fix, and it keeps the kernel side untouched: `atomicExch` stores `0x00000001`, so byte 0 is 1 and
+    // the kernel's `*found_flag` bool read still sees `true` on any little-endian target, which CUDA is.
+    let mut found_flag = DeviceBuffer::<u32>::from_host_slice(&[0u32], scope).unwrap();
     let mut gpu_challenger = cpu_challenger.to_device_sync(scope).unwrap();
 
-    let block_dim: usize = 512;
-    let grid_dim: usize = (1 << (bits.saturating_sub(SP1_PROOF_OF_WORK_BITS))).max(512);
+    // Kernel is compiled with __launch_bounds__(256, 1) in
+    // sp1-gpu/crates/sys/lib/challenger/challenger.cu; using 512 here
+    // triggers "invalid argument" at cudaLaunchKernel/hipLaunchKernel.
+    let block_dim: usize = 256;
+    // Scale grid to ~4x expected nonces needed (2^bits), capped at 1M threads.
+    // Over-provisioning wastes GPU cycles on unnecessary Poseidon2 permutations.
+    let target_threads = (4usize << bits).min(1 << 20);
+    let grid_dim: usize = target_threads.div_ceil(block_dim).max(1);
     let n = F::ORDER_U64;
 
     unsafe {
         result.assume_init();
-        found_flag.assume_init();
         let args = args!(
             gpu_challenger.as_mut_raw(),
             result.as_mut_ptr(),
             bits,
             n,
-            found_flag.as_mut_ptr()
+            // Cast back to the `bool*` the kernel declares; only the ALLOCATION width changes.
+            found_flag.as_mut_ptr() as *mut bool
         );
         scope.launch_kernel(grind_kernel(), (grid_dim, 1, 1), block_dim, &args, 0).unwrap();
     }
@@ -102,22 +119,28 @@ where
     let cpu_challenger: MultiField32Challenger<F, PF, _> = challenger.clone().into();
 
     let mut result = DeviceBuffer::with_capacity_in(1, scope.clone());
-    let mut found_flag = DeviceBuffer::<bool>::with_capacity_in(1, scope.clone());
+    // found_flag MUST be host-initialized to false. The kernel no longer
+    // resets it (that reset raced with late waves clobbering a found witness).
+    // Four bytes for the kernel's 4-byte `atomicExch`; see `grind_duplex_challenger_on_device`.
+    let mut found_flag = DeviceBuffer::<u32>::from_host_slice(&[0u32], scope).unwrap();
     let mut gpu_challenger = cpu_challenger.to_device_sync(scope).unwrap();
 
-    let block_dim: usize = 512;
-    let grid_dim: usize = 1;
+    // Kernel is compiled __launch_bounds__(256, 1); block_dim must be <= 256.
+    // Use a real grid (mirrors grind_duplex_challenger_on_device) so the witness
+    // search is parallel — grid=1/block=512 left only ~512 threads scanning 2^31.
+    let block_dim: usize = 256;
+    let target_threads = (4usize << bits).min(1 << 20);
+    let grid_dim: usize = target_threads.div_ceil(block_dim).max(1);
     let n = F::ORDER_U64;
 
     unsafe {
         result.assume_init();
-        found_flag.assume_init();
         let args = args!(
             gpu_challenger.as_mut_raw(),
             result.as_mut_ptr(),
             bits,
             n,
-            found_flag.as_mut_ptr()
+            found_flag.as_mut_ptr() as *mut bool
         );
         scope
             .launch_kernel(multi_field32_grind_kernel(), (grid_dim, 1, 1), block_dim, &args, 0)

@@ -1,9 +1,6 @@
 #pragma once
 
-#include <cooperative_groups.h>
-#include <cooperative_groups/reduce.h>
-
-namespace cg = cooperative_groups;
+#include "runtime/gpu_compat.cuh"
 
 // Block-level reduction of one F-typed value per thread to one F per block.
 //

@@ -13,6 +13,13 @@
 #include <util/gpu_t.cuh>
 
 #include "parameters.cuh"
+
+#ifdef __HIPCC__
+# define noop() do { asm volatile("s_nop 0" ::: "memory"); } while(0)
+#else
+# define noop()
+#endif
+
 #include "kernels.cu"
 
 class NTT {
@@ -121,7 +128,11 @@ private:
 
         if (lg_domain_size <= 10) {
             params.step(lg_domain_size);
+#ifdef __HIPCC__
+        } else if (lg_domain_size <= 20) {
+#else
         } else if (lg_domain_size <= 17) {
+#endif
             int step = lg_domain_size / 2;
             params.step(step + lg_domain_size % 2);
             params.step(step);
@@ -151,7 +162,11 @@ private:
 
         if (lg_domain_size <= 10) {
             params.step(lg_domain_size);
+#ifdef __HIPCC__
+        } else if (lg_domain_size <= 20) {
+#else
         } else if (lg_domain_size <= 17) {
+#endif
             int step = lg_domain_size / 2;
             params.step(step);
             params.step(step + lg_domain_size % 2);
@@ -306,9 +321,9 @@ public:
         //1. check params
         size_t shared_sz = sizeof(fr_t) * block_size;
         if (shMemPerBlock() < shared_sz)
-            CUDA_UNWRAP_SPPARK(cudaFuncSetAttribute(LDE_spread_distribute_powers, 
-                                cudaFuncAttributeMaxDynamicSharedMemorySize, 
-                                shared_sz));
+            CUDA_UNWRAP_SPPARK(cudaFuncSetAttribute((const void*)LDE_spread_distribute_powers,
+                                cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                (int)shared_sz));
 
         if (num_blocks == 0 || block_size == 0) {
             int blockSize, minGridSize;
@@ -367,7 +382,7 @@ public:
                 NTTParameters::all()[gpu_id()].partial_group_gen_powers;
             
             cudaEvent_t event;
-            CUDA_UNWRAP_SPPARK(cudaEventCreate(&event, cudaEventDisableTiming));
+            CUDA_UNWRAP_SPPARK(cudaEventCreateWithFlags(&event, cudaEventDisableTiming));
 
 
             if (aux_out != nullptr) {

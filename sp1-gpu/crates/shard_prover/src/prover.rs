@@ -289,8 +289,23 @@ where
 
         let pk = Arc::new(pk);
 
-        let main_trace_data =
-            MainTraceData { traces: pk, public_values, shard_chips: chip_set, permit };
+        // `setup_from_preprocessed_data_and_traces` wrapped the freshly-built
+        // buffer in a pool of N=1. `full_tracegen_permit` already filled both
+        // preprocessed + main slots, so we just need to acquire that one
+        // buffer as a `Worker` for prove to hold through `prove_shard_with_data`.
+        // Explicit annotation pins `Self::PreprocessedData`, which the trait
+        // resolver otherwise can't concretize here.
+        let trace_data: &Mutex<CudaShardProverData<GC, PC::Air>> = &pk.preprocessed_data;
+        let pool = trace_data.lock().await.trace_buffer_pool.clone();
+        let trace_buffer = pool.pop().await.expect("acquire trace buffer from setup pool");
+
+        let main_trace_data = MainTraceData {
+            traces: pk,
+            public_values,
+            shard_chips: chip_set,
+            permit,
+            trace_buffer,
+        };
 
         // Create a chanllenger
         let mut challenger = GC::default_challenger();
@@ -329,7 +344,7 @@ where
 
         let buffer = self.inner.get_buffer().await;
 
-        let (public_values, chip_set, permit) = main_tracegen_permit(
+        let (public_values, chip_set, permit, trace_buffer) = main_tracegen_permit(
             &self.inner.machine,
             record,
             &pk.preprocessed_data,
@@ -349,6 +364,7 @@ where
                 public_values,
                 shard_chips: chip_set,
                 permit,
+                trace_buffer,
             },
         };
 
@@ -374,15 +390,11 @@ where
     async fn preprocessed_table_heights(
         pk: Arc<ProvingKey<GC, ShardContextImpl<GC, PC::C, PC::Air>, Self>>,
     ) -> BTreeMap<String, usize> {
-        // Access through pk.preprocessed_data which is of type CudaShardProverData
+        // After #3 the heights are cached on the shared (read-only) part of
+        // `CudaShardProverData`, so a brief lock just to clone the BTreeMap
+        // suffices — no need to reach into a trace buffer.
         let preprocessed_data = pk.preprocessed_data.lock().await;
-        preprocessed_data
-            .preprocessed_traces
-            .dense()
-            .preprocessed_table_index
-            .iter()
-            .map(|(name, offset)| (name.clone(), offset.poly_size))
-            .collect()
+        preprocessed_data.preprocessed_table_heights().clone()
     }
 }
 
@@ -516,12 +528,22 @@ impl<GC: IopCtx<F = Felt, EF = Ext>, PC: CudaShardProverComponents<GC>>
 
         let log_stacking_height = self.basefold_prover.log_height as usize;
 
+        sp1_gpu_cudart::vram_reset_peak();
         let (sumcheck_proof, component_poly_evals, column_evals) =
             tracing::debug_span!("jagged sumcheck").in_scope(|| {
                 jagged_sumcheck(sumcheck_poly, challenger, sumcheck_claim, log_stacking_height)
             });
+        let (cur_mib, peak_mib) = sp1_gpu_cudart::vram_snapshot_mib();
+        tracing::debug!(
+            target: "sp1_gpu_vram",
+            phase = "basefold_jagged_sumcheck",
+            current_mib = cur_mib,
+            peak_mib = peak_mib,
+            "phase peak"
+        );
         let final_eval_point = sumcheck_proof.point_and_eval.0.clone();
 
+        sp1_gpu_cudart::vram_reset_peak();
         // Use sync GPU jagged evaluation proof
         let jagged_eval_proof = tracing::debug_span!("jagged evaluation proof").in_scope(|| {
             prove_jagged_evaluation_sync::<Felt, Ext, GC::Challenger, PC::DeviceChallenger>(
@@ -534,6 +556,14 @@ impl<GC: IopCtx<F = Felt, EF = Ext>, PC: CudaShardProverComponents<GC>>
                 &backend,
             )
         });
+        let (cur_mib, peak_mib) = sp1_gpu_cudart::vram_snapshot_mib();
+        tracing::debug!(
+            target: "sp1_gpu_vram",
+            phase = "basefold_jagged_eval",
+            current_mib = cur_mib,
+            peak_mib = peak_mib,
+            "phase peak"
+        );
 
         let (row_counts, column_counts): (Rounds<_>, Rounds<_>) = prover_data
             .iter()
@@ -562,6 +592,7 @@ impl<GC: IopCtx<F = Felt, EF = Ext>, PC: CudaShardProverComponents<GC>>
             challenger.observe_ext_element(evaluation);
         }
 
+        sp1_gpu_cudart::vram_reset_peak();
         let pcs_proof = tracing::debug_span!("prove trusted evaluations basefold")
             .in_scope(|| {
                 self.basefold_prover.prove_trusted_evaluations_basefold(
@@ -573,6 +604,14 @@ impl<GC: IopCtx<F = Felt, EF = Ext>, PC: CudaShardProverComponents<GC>>
                 )
             })
             .unwrap();
+        let (cur_mib, peak_mib) = sp1_gpu_cudart::vram_snapshot_mib();
+        tracing::debug!(
+            target: "sp1_gpu_vram",
+            phase = "basefold_prove",
+            current_mib = cur_mib,
+            peak_mib = peak_mib,
+            "phase peak"
+        );
 
         let row_counts_and_column_counts: Rounds<Vec<(usize, usize)>> = row_counts
             .into_iter()
@@ -636,20 +675,40 @@ impl<GC: IopCtx<F = Felt, EF = Ext>, PC: CudaShardProverComponents<GC>>
             sp1_gpu_jagged_assist::BranchingProgramKernel<GC::F, GC::EF, PC::DeviceChallenger>,
     {
         let ShardData { main_trace_data } = data;
-        let MainTraceData { traces, public_values, shard_chips, permit } = main_trace_data;
+        let MainTraceData { traces: pk, public_values, shard_chips, permit, trace_buffer } =
+            main_trace_data;
 
         let shard_chips = self.machine().smallest_cluster(&shard_chips).unwrap();
 
         // Observe the public values.
         challenger.observe_slice(&public_values);
 
-        let locked_preprocessed_data = traces.preprocessed_data.blocking_lock();
-        let traces = &locked_preprocessed_data.preprocessed_traces;
-        let preprocessed_data = &locked_preprocessed_data.preprocessed_data;
+        // #3: the per-shard trace MLE buffer travels through `MainTraceData`
+        // as an owned `Worker` (popped from the PK's pool by tracegen);
+        // `Drop` returns it to the pool when this function returns. The
+        // shared (read-only) PCS data is cloned out of the brief outer Mutex
+        // so no lock is held during prove.
+        let shared = pk.preprocessed_data.blocking_lock().shared.clone();
+        let traces = &*trace_buffer;
+        let preprocessed_data = &shared.preprocessed_data;
 
+        // Per-phase VRAM peak tracking. `vram_reset_peak()` snaps peak to
+        // current at the start of each phase so the next `vram_snapshot_mib()`
+        // reports just that phase's high-water mark. Used to attribute the
+        // single-shard prove peak (~26 GiB on 5090 at 100K) to specific
+        // phases and prioritise VRAM-reduction work.
+        sp1_gpu_cudart::vram_reset_peak();
         // Commit to the traces.
         let (main_commit, main_data) =
             tracing::debug_span!("commit traces").in_scope(|| self.commit_traces(traces, false));
+        let (cur_mib, peak_mib) = sp1_gpu_cudart::vram_snapshot_mib();
+        tracing::debug!(
+            target: "sp1_gpu_vram",
+            phase = "commit_traces",
+            current_mib = cur_mib,
+            peak_mib = peak_mib,
+            "phase peak"
+        );
         // Observe the commitments.
         <GC::Challenger as CanObserve<GC::Digest>>::observe(&mut challenger, main_commit);
         challenger.observe(GC::F::from_canonical_usize(shard_chips.len()));
@@ -663,6 +722,7 @@ impl<GC: IopCtx<F = Felt, EF = Ext>, PC: CudaShardProverComponents<GC>>
             }
         }
 
+        sp1_gpu_cudart::vram_reset_peak();
         let logup_gkr_proof = tracing::debug_span!("logup gkr proof").in_scope(|| {
             prove_logup_gkr::<GC, _>(
                 shard_chips,
@@ -675,6 +735,14 @@ impl<GC: IopCtx<F = Felt, EF = Ext>, PC: CudaShardProverComponents<GC>>
                 &mut challenger,
             )
         });
+        let (cur_mib, peak_mib) = sp1_gpu_cudart::vram_snapshot_mib();
+        tracing::debug!(
+            target: "sp1_gpu_vram",
+            phase = "logup_gkr",
+            current_mib = cur_mib,
+            peak_mib = peak_mib,
+            "phase peak"
+        );
         // Get the challenge for batching constraints.
         let batching_challenge = challenger.sample_ext_element::<GC::EF>();
         // Get the challenge for batching the evaluations from the GKR proof.
@@ -684,6 +752,7 @@ impl<GC: IopCtx<F = Felt, EF = Ext>, PC: CudaShardProverComponents<GC>>
         // The bytecode is compiled + uploaded once per machine at prover
         // construction (see `machine_bytecode`); `zerocheck` just selects
         // this shard's chips from it.
+        sp1_gpu_cudart::vram_reset_peak();
         let (shard_open_values, zerocheck_partial_sumcheck_proof) =
             tracing::debug_span!("zerocheck").in_scope(|| {
                 zerocheck(
@@ -698,6 +767,14 @@ impl<GC: IopCtx<F = Felt, EF = Ext>, PC: CudaShardProverComponents<GC>>
                     self.max_log_row_count,
                 )
             });
+        let (cur_mib, peak_mib) = sp1_gpu_cudart::vram_snapshot_mib();
+        tracing::debug!(
+            target: "sp1_gpu_vram",
+            phase = "zerocheck",
+            current_mib = cur_mib,
+            peak_mib = peak_mib,
+            "phase peak"
+        );
 
         // Get the evaluation point for the trace polynomials.
         let evaluation_point = zerocheck_partial_sumcheck_proof.point_and_eval.0.clone();
@@ -745,6 +822,7 @@ impl<GC: IopCtx<F = Felt, EF = Ext>, PC: CudaShardProverComponents<GC>>
             once(preprocessed_data).chain(once(&main_data)).collect::<Rounds<_>>();
 
         // Generate the evaluation proof (sync call).
+        sp1_gpu_cudart::vram_reset_peak();
         let evaluation_proof = tracing::debug_span!("prove evaluation claims").in_scope(|| {
             self.prove_trusted_evaluations(
                 evaluation_point,
@@ -755,6 +833,14 @@ impl<GC: IopCtx<F = Felt, EF = Ext>, PC: CudaShardProverComponents<GC>>
             )
             .unwrap()
         });
+        let (cur_mib, peak_mib) = sp1_gpu_cudart::vram_snapshot_mib();
+        tracing::debug!(
+            target: "sp1_gpu_vram",
+            phase = "basefold_eval",
+            current_mib = cur_mib,
+            peak_mib = peak_mib,
+            "phase peak"
+        );
 
         let proof = ShardProof {
             main_commitment: main_commit,
@@ -764,6 +850,18 @@ impl<GC: IopCtx<F = Felt, EF = Ext>, PC: CudaShardProverComponents<GC>>
             zerocheck_proof: zerocheck_partial_sumcheck_proof,
             public_values,
         };
+
+        // #3 follow-on: per-shard VRAM telemetry. `current` reflects live
+        // device bytes at this instant; `peak` is the high-water mark since
+        // process start (or last `vram_reset_peak()`). The peak tells us the
+        // single-shard prove budget — N>1 needs ~N× this to fit on the GPU.
+        let (cur_mib, peak_mib) = sp1_gpu_cudart::vram_snapshot_mib();
+        tracing::debug!(
+            target: "sp1_gpu_vram",
+            current_mib = cur_mib,
+            peak_mib = peak_mib,
+            "prove_shard_with_data done"
+        );
 
         (proof, permit)
     }

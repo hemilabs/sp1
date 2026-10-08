@@ -3,6 +3,8 @@
 #include "fields/kb31_t.cuh"
 #include "fields/bn254_t.cuh"
 
+// Full BN254 Poseidon2 implementation for both CUDA and HIP
+
 namespace poseidon2_bn254_3 {
 
 namespace constants {

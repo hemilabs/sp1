@@ -21,6 +21,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"runtime"
+	"runtime/debug"
 	"sync"
 	"unsafe"
 
@@ -121,20 +123,59 @@ func ProveGroth16Bn254(dataDir *C.char, witnessPath *C.char) *C.C_Groth16Bn254Pr
 	witnessPathString := C.GoString(witnessPath)
 
 	sp1Groth16Bn254Proof := sp1.ProveGroth16(dataDirString, witnessPathString)
+	return groth16ProofToC(sp1Groth16Bn254Proof)
+}
 
+// ProveGroth16Bn254WithR1cs returns nil and sets *r1csErr when the R1CS cannot be read; see
+// sp1.ProveGroth16WithR1cs.
+//
+//export ProveGroth16Bn254WithR1cs
+func ProveGroth16Bn254WithR1cs(dataDir *C.char, r1csPath *C.char, witnessPath *C.char, r1csErr **C.char) *C.C_Groth16Bn254Proof {
+	proof, err := sp1.ProveGroth16WithR1cs(C.GoString(dataDir), C.GoString(r1csPath), C.GoString(witnessPath))
+	if err != nil {
+		*r1csErr = C.CString(err.Error())
+		return nil
+	}
+	return groth16ProofToC(proof)
+}
+
+//export ReleaseGroth16Caches
+func ReleaseGroth16Caches() {
+	sp1.ReleaseCaches()
+}
+
+//export ExportGroth16StrippedR1cs
+func ExportGroth16StrippedR1cs(dataDir *C.char, outputPath *C.char) (errStr *C.char) {
+	// The full circuit read below is ~9 GB of garbage afterwards, whether or not the export
+	// succeeds. The CPU helper proves right after this in the same process, so return it to the
+	// host before that prove's own peak. Deferred first, so it runs after the recover below.
+	defer func() {
+		runtime.GC()
+		debug.FreeOSMemory()
+	}()
+	defer func() {
+		if r := recover(); r != nil {
+			errStr = C.CString(fmt.Sprintf("[groth16-strip] panic: %v", r))
+		}
+	}()
+	sp1.ExportGroth16StrippedR1cs(C.GoString(dataDir), C.GoString(outputPath))
+	return nil
+}
+
+func groth16ProofToC(proof sp1.Proof) *C.C_Groth16Bn254Proof {
 	ms := C.malloc(C.sizeof_C_Groth16Bn254Proof)
 	if ms == nil {
 		return nil
 	}
 
 	structPtr := (*C.C_Groth16Bn254Proof)(ms)
-	structPtr.PublicInputs[0] = C.CString(sp1Groth16Bn254Proof.PublicInputs[0])
-	structPtr.PublicInputs[1] = C.CString(sp1Groth16Bn254Proof.PublicInputs[1])
-	structPtr.PublicInputs[2] = C.CString(sp1Groth16Bn254Proof.PublicInputs[2])
-	structPtr.PublicInputs[3] = C.CString(sp1Groth16Bn254Proof.PublicInputs[3])
-	structPtr.PublicInputs[4] = C.CString(sp1Groth16Bn254Proof.PublicInputs[4])
-	structPtr.EncodedProof = C.CString(sp1Groth16Bn254Proof.EncodedProof)
-	structPtr.RawProof = C.CString(sp1Groth16Bn254Proof.RawProof)
+	structPtr.PublicInputs[0] = C.CString(proof.PublicInputs[0])
+	structPtr.PublicInputs[1] = C.CString(proof.PublicInputs[1])
+	structPtr.PublicInputs[2] = C.CString(proof.PublicInputs[2])
+	structPtr.PublicInputs[3] = C.CString(proof.PublicInputs[3])
+	structPtr.PublicInputs[4] = C.CString(proof.PublicInputs[4])
+	structPtr.EncodedProof = C.CString(proof.EncodedProof)
+	structPtr.RawProof = C.CString(proof.RawProof)
 	return structPtr
 }
 
@@ -148,6 +189,56 @@ func FreeGroth16Bn254Proof(proof *C.C_Groth16Bn254Proof) {
 	C.free(unsafe.Pointer(proof.PublicInputs[3]))
 	C.free(unsafe.Pointer(proof.PublicInputs[4]))
 	C.free(unsafe.Pointer(proof))
+}
+
+//export ExportGroth16GpuData
+func ExportGroth16GpuData(dataDir *C.char, outputDir *C.char) (errStr *C.char) {
+	// The export reads the full circuit and proving key (~9 GB of garbage afterwards); return it
+	// to the host either way rather than leave a long-lived prover that much larger.
+	defer func() {
+		runtime.GC()
+		debug.FreeOSMemory()
+	}()
+	defer func() {
+		if r := recover(); r != nil {
+			errStr = C.CString(fmt.Sprintf("[groth16-export] panic: %v", r))
+		}
+	}()
+	sp1.ExportGroth16GpuData(C.GoString(dataDir), C.GoString(outputDir))
+	return nil
+}
+
+//export ExportGroth16GpuWitness
+func ExportGroth16GpuWitness(dataDir *C.char, witnessPath *C.char, pkDir *C.char, outputDir *C.char) (errStr *C.char) {
+	defer func() {
+		if r := recover(); r != nil {
+			errStr = C.CString(fmt.Sprintf("[groth16-witness] panic: %v", r))
+		}
+	}()
+	sp1.ExportGroth16GpuWitness(C.GoString(dataDir), C.GoString(witnessPath), C.GoString(pkDir), C.GoString(outputDir))
+	return nil
+}
+
+//export ExportPlonkGpuData
+func ExportPlonkGpuData(dataDir *C.char, outputDir *C.char) (errStr *C.char) {
+	defer func() {
+		if r := recover(); r != nil {
+			errStr = C.CString(fmt.Sprintf("[plonk-export] panic: %v", r))
+		}
+	}()
+	sp1.ExportPlonkData(C.GoString(dataDir), C.GoString(outputDir))
+	return nil
+}
+
+//export ExportPlonkGpuWitness
+func ExportPlonkGpuWitness(dataDir *C.char, witnessPath *C.char, outputDir *C.char) (errStr *C.char) {
+	defer func() {
+		if r := recover(); r != nil {
+			errStr = C.CString(fmt.Sprintf("[plonk-witness] panic: %v", r))
+		}
+	}()
+	sp1.ExportSolvedWitness(C.GoString(dataDir), C.GoString(witnessPath), C.GoString(outputDir))
+	return nil
 }
 
 //export BuildGroth16Bn254

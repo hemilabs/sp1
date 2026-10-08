@@ -48,7 +48,7 @@ impl CudaTracegenAir<F> for GlobalChip {
 
         // "Round 1": call the decompress kernel.
         unsafe {
-            const BLOCK_DIM: usize = 64;
+            const BLOCK_DIM: usize = 128;
             let grid_dim = height.div_ceil(BLOCK_DIM);
             // args:
             // kb31_t *trace,
@@ -192,7 +192,7 @@ impl CudaTracegenAir<F> for GlobalChip {
 
         // "Round 3": call the finalize kernel.
         unsafe {
-            const BLOCK_DIM: usize = 64;
+            const BLOCK_DIM: usize = 128;
             let grid_dim = height.div_ceil(BLOCK_DIM);
             // args:
             // kb31_t *trace,
