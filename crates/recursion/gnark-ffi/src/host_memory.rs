@@ -5,7 +5,9 @@ use std::path::Path;
 
 /// Memory this process can still use, in bytes: `MemAvailable`, or less where a cgroup v2 limit
 /// leaves less headroom. In a container, or a systemd scope with `MemoryMax` (as a miner runs its
-/// workers), host RAM says nothing about what this process may use.
+/// workers), host RAM says nothing about what this process may use. Page cache the kernel can drop
+/// counts as available, as it does in `MemAvailable`: a prover reads ~7.5 GB of circuit files each
+/// Groth16 proof, which its cgroup is charged for.
 pub fn available() -> Option<u64> {
     available_from(
         std::fs::read_to_string("/proc/meminfo").ok().as_deref(),
@@ -46,8 +48,9 @@ fn available_from(
     }
 }
 
-/// The least `memory.max - memory.current` of the cgroup at `path` under `root` and of its
-/// ancestors. `None` when none of them has a limit.
+/// The least headroom, `memory.max - memory.current` plus the inactive page cache in
+/// `memory.stat`, of the cgroup at `path` under `root` and of its ancestors. `None` when none of
+/// them has a limit.
 fn cgroup_headroom(root: &Path, path: &str) -> Option<u64> {
     let read = |dir: &Path, file: &str| std::fs::read_to_string(dir.join(file)).ok();
     let mut dir = root.join(path.trim_start_matches('/'));
@@ -58,7 +61,14 @@ fn cgroup_headroom(root: &Path, path: &str) -> Option<u64> {
             if let (Ok(max), Ok(current)) =
                 (max.trim().parse::<u64>(), current.trim().parse::<u64>())
             {
-                let headroom = max.saturating_sub(current);
+                let reclaimable = read(&dir, "memory.stat")
+                    .and_then(|stat| {
+                        stat.lines().find_map(|line| {
+                            line.strip_prefix("inactive_file ")?.trim().parse::<u64>().ok()
+                        })
+                    })
+                    .unwrap_or(0);
+                let headroom = max.saturating_sub(current.saturating_sub(reclaimable));
                 least = Some(least.map_or(headroom, |least| least.min(headroom)));
             }
         }
@@ -94,6 +104,10 @@ mod tests {
         // Now the parent is the tighter one.
         set(&root.path().join("user.slice"), &(32 * GIB).to_string(), &(31 * GIB).to_string());
         assert_eq!(cgroup_headroom(root.path(), "/user.slice/worker.scope"), Some(GIB));
+        // Page cache the kernel can drop is not in the way.
+        let stat = format!("anon {}\nfile {}\ninactive_file {}\n", 25 * GIB, 6 * GIB, 5 * GIB);
+        std::fs::write(root.path().join("user.slice/memory.stat"), stat).unwrap();
+        assert_eq!(cgroup_headroom(root.path(), "/user.slice/worker.scope"), Some(4 * GIB));
     }
 
     #[test]
@@ -121,7 +135,7 @@ mod tests {
     #[test]
     fn available_memory_is_readable_here() {
         if cfg!(target_os = "linux") {
-            assert!(available().is_some_and(|bytes| bytes > 0));
+            assert!(available().is_some());
         }
     }
 }

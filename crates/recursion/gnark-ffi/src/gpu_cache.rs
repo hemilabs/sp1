@@ -123,15 +123,40 @@ fn lock_cache(dir: &Path, parent: &Path, name: &str) -> Result<File> {
 /// Removes the cache at `dir`, so that the next [`ensure_built`] builds it again: for a cache that
 /// looks complete but turns out to be unusable. Takes the build lock, so it never removes a build
 /// in progress. Readers that already have its files open keep reading them.
-pub(crate) fn discard(dir: &Path) -> Result<()> {
+///
+/// `seen` is the [`identity`] of the copy found unusable. If the cache has been rebuilt since
+/// (another prover found it unusable first), the new copy is left alone.
+pub(crate) fn discard(dir: &Path, seen: Option<Identity>) -> Result<()> {
     let (parent, name) = parent_and_name(dir)?;
     let _lock = lock_cache(dir, parent, &name)?;
-    if dir.exists() {
-        tracing::warn!("removing the unusable cache at {}", dir.display());
-        std::fs::remove_dir_all(dir)
-            .with_context(|| format!("failed to remove {}", dir.display()))?;
+    if !dir.exists() {
+        return Ok(());
     }
-    Ok(())
+    if seen.is_some() && identity(dir) != seen {
+        tracing::info!("{} has been rebuilt since it failed; keeping it", dir.display());
+        return Ok(());
+    }
+    tracing::warn!("removing the unusable cache at {}", dir.display());
+    std::fs::remove_dir_all(dir).with_context(|| format!("failed to remove {}", dir.display()))
+}
+
+/// Which copy of a cache directory this is: its inode and change time. Each build publishes a new
+/// directory by renaming it into place, so this changes whenever it is rebuilt (the inode alone
+/// would not do: a freed inode number is soon reused).
+pub(crate) type Identity = (u64, i64, i64);
+
+/// The [`Identity`] of the directory at `dir`; `None` where it cannot be told.
+pub(crate) fn identity(dir: &Path) -> Option<Identity> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::metadata(dir).ok().map(|meta| (meta.ino(), meta.ctime(), meta.ctime_nsec()))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = dir;
+        None
+    }
 }
 
 /// Syncs the staged files, writes the marker listing them, and renames the directory into place.
@@ -573,11 +598,20 @@ mod tests {
         let dir = root.path().join("cache");
         let builds = AtomicUsize::new(0);
         ensure_built(&dir, MARKER, slow_build(&builds)).unwrap();
-        discard(&dir).unwrap();
+        let first = identity(&dir);
+        discard(&dir, first).unwrap();
         assert!(!dir.exists());
-        discard(&dir).unwrap();
+        discard(&dir, first).unwrap();
         assert_eq!(ensure_built(&dir, MARKER, slow_build(&builds)).unwrap(), CacheOutcome::Built);
         assert_eq!(builds.load(Ordering::SeqCst), 2);
+
+        // A prover that found the first copy unusable does not remove the rebuilt one.
+        #[cfg(unix)]
+        {
+            assert_ne!(identity(&dir), first);
+            discard(&dir, first).unwrap();
+            assert!(is_complete(&dir, MARKER), "a rebuilt cache was discarded");
+        }
 
         // Waits for a build in progress rather than removing it.
         let barrier = Barrier::new(2);
@@ -593,7 +627,7 @@ mod tests {
                 .unwrap()
             });
             barrier.wait();
-            discard(&other).unwrap();
+            discard(&other, None).unwrap();
             assert_eq!(building.join().unwrap(), CacheOutcome::Built);
             assert!(!other.exists(), "discard ran before the build it waited for had finished");
         });

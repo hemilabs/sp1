@@ -33,38 +33,39 @@ func ProveGroth16(dataDir string, witnessPath string) Proof {
 	os.Setenv("GROTH16", "1")
 	fmt.Printf("Setting environment variables took %s\n", time.Since(start))
 
-	// Read the R1CS.
-	globalMutex.Lock()
-	if !globalR1csInitialized {
-		start = time.Now()
-		r1csFile, err := os.Open(dataDir + "/" + groth16CircuitPath)
-		if err != nil {
-			panic(err)
+	// Read the R1CS and the proving key, under one lock: ReleaseCaches must not reset one
+	// between the two. Deferred, so a panic cannot leave the lock held. Prove with what this
+	// returns, not the globals, which ReleaseCaches may replace meanwhile.
+	r1cs, pk := func() (constraint.ConstraintSystem, groth16.ProvingKey) {
+		globalMutex.Lock()
+		defer globalMutex.Unlock()
+		if !globalR1csInitialized {
+			start = time.Now()
+			r1csFile, err := os.Open(dataDir + "/" + groth16CircuitPath)
+			if err != nil {
+				panic(err)
+			}
+			r1csReader := bufio.NewReaderSize(r1csFile, 1024*1024)
+			globalR1cs.ReadFrom(r1csReader)
+			defer r1csFile.Close()
+			globalR1csInitialized = true
+			fmt.Printf("Reading R1CS took %s\n", time.Since(start))
 		}
-		r1csReader := bufio.NewReaderSize(r1csFile, 1024*1024)
-		globalR1cs.ReadFrom(r1csReader)
-		defer r1csFile.Close()
-		globalR1csInitialized = true
-		fmt.Printf("Reading R1CS took %s\n", time.Since(start))
-	}
 
-	// Read the proving key, under the same lock: ReleaseCaches must not reset the R1CS
-	// between the two.
-	if !globalPkInitialized {
-		start = time.Now()
-		pkFile, err := os.Open(dataDir + "/" + groth16PkPath)
-		if err != nil {
-			panic(err)
+		if !globalPkInitialized {
+			start = time.Now()
+			pkFile, err := os.Open(dataDir + "/" + groth16PkPath)
+			if err != nil {
+				panic(err)
+			}
+			pkReader := bufio.NewReaderSize(pkFile, 1024*1024)
+			globalPk.ReadDump(pkReader)
+			defer pkFile.Close()
+			globalPkInitialized = true
+			fmt.Printf("Reading proving key took %s\n", time.Since(start))
 		}
-		pkReader := bufio.NewReaderSize(pkFile, 1024*1024)
-		globalPk.ReadDump(pkReader)
-		defer pkFile.Close()
-		globalPkInitialized = true
-		fmt.Printf("Reading proving key took %s\n", time.Since(start))
-	}
-	// Prove with these, not the globals, which ReleaseCaches may replace meanwhile.
-	r1cs, pk := globalR1cs, globalPk
-	globalMutex.Unlock()
+		return globalR1cs, globalPk
+	}()
 
 	start = time.Now()
 	// Read the file.

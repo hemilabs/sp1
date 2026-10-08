@@ -50,7 +50,7 @@ fn shm_named_tempfile() -> tempfile::NamedTempFile {
 /// published atomically (see `gpu_cache`), and only read afterwards.
 /// Per-proof files go to their own directories beside it (`witness_dir`).
 /// Override the cache root via SP1_GROTH16_PK_CACHE.
-/// Set `SP1_GROTH16_PK_CACHE_DISABLE=1` to fall back to the previous
+/// Set `SP1_GROTH16_PK_CACHE_DISABLE` (to anything) to fall back to the previous
 /// per-prove tempdir behavior.
 #[cfg(feature = "native")]
 fn pk_cache_dir(vkey_hash_hex: &str) -> Option<std::path::PathBuf> {
@@ -122,9 +122,10 @@ fn witness_dir(vkey_hash_hex: &str) -> crate::gpu_cache::ProofDir {
         .expect("failed to create a per-proof witness directory")
 }
 
-/// The CPU helper's peak with Go's default GC: 16.0 GiB measured on the v6.1.0 circuit.
+/// The CPU helper's peak with Go's default GC (16.0 GiB measured on the v6.1.0 circuit), plus 2 GiB
+/// of margin: below this much available memory, its Go heap is limited.
 #[cfg(feature = "native")]
-const CPU_HELPER_PEAK_BYTES: u64 = 17 << 30;
+const CPU_HELPER_PEAK_BYTES: u64 = 18 << 30;
 /// The tightest Go heap limit worth giving the CPU helper. Its live data is ~13 GB, so a lower limit
 /// only slows it down. Measured: 12 GiB peaks at 13.3 GB and takes 18% longer.
 #[cfg(feature = "native")]
@@ -142,11 +143,21 @@ fn cpu_helper_heap_limit(available: Option<u64>) -> Option<u64> {
     Some(available.saturating_sub(CPU_HELPER_NON_HEAP_BYTES).max(CPU_HELPER_MIN_HEAP_LIMIT))
 }
 
+/// [`crate::host_memory::available`], which tests can replace.
+#[cfg(feature = "native")]
+fn memory_available() -> Option<u64> {
+    #[cfg(all(test, target_os = "linux"))]
+    if let Some(available) = isolated_tests::FAKE_AVAILABLE.with(std::cell::Cell::get) {
+        return available;
+    }
+    crate::host_memory::available()
+}
+
 /// The stripped-R1CS cache's marker and file; see `Groth16Bn254Prover::ensure_stripped_r1cs`.
 #[cfg(feature = "native")]
-const R1CS_CACHE_MARKER: &str = ".sp1_r1cs_cache_complete";
+pub(crate) const R1CS_CACHE_MARKER: &str = ".sp1_r1cs_cache_complete";
 #[cfg(feature = "native")]
-const STRIPPED_R1CS: &str = "groth16_circuit_stripped.bin";
+pub(crate) const STRIPPED_R1CS: &str = "groth16_circuit_stripped.bin";
 
 /// The `groth16_gpu_helper` binary: `SP1_GROTH16_GPU_HELPER` when set (and only there), else next
 /// to this executable, else on `PATH`.
@@ -427,11 +438,16 @@ impl Groth16Bn254Prover {
     /// on purpose, which suits a host with memory to spare, and so do builds with `groth16-cuda`,
     /// whose in-process prover uses icicle.
     ///
-    /// Where less memory is available than the helper's usual peak (~16 GiB), its Go heap is
-    /// limited to what is (`GOMEMLIMIT`, unless set already), down to the ~12 GiB it cannot do
-    /// without. A helper killed by a signal is retried once, unless this process's cgroup ran into
-    /// its memory limit meanwhile: then the OOM killer did it, and would again. One killed for
-    /// running past `SP1_GROTH16_HELPER_TIMEOUT_SECS` is not retried.
+    /// Where less than ~18 GiB is available (the helper peaks at ~16 GiB), its Go heap is limited
+    /// (`GOMEMLIMIT`, unless set already) to the available memory less 2 GiB, never below the
+    /// 12 GiB it cannot do without.
+    ///
+    /// A failed helper is retried once in two cases. If it was killed by a signal, unless this
+    /// process's cgroup reached its memory limit meanwhile (the `oom` count in `memory.events`),
+    /// since that would recur. And if it ended itself while proving with the cached stripped
+    /// circuit, which is then discarded in case it caused the crash, so the retry rebuilds it. A
+    /// helper that fails for a reason it reports (bad arguments, no readable circuit, nowhere to
+    /// write), or that runs past `SP1_GROTH16_HELPER_TIMEOUT_SECS`, is not retried.
     #[cfg(feature = "native")]
     pub fn prove_isolated<C: Config>(
         &self,
@@ -496,18 +512,27 @@ impl Groth16Bn254Prover {
                 .arg("--out")
                 .arg(&out_path);
             if std::env::var_os("GOMEMLIMIT").is_none() {
-                let available = crate::host_memory::available();
+                let available = memory_available();
                 if let Some(limit) = cpu_helper_heap_limit(available) {
+                    let available = available.unwrap_or(0);
+                    if available < limit + CPU_HELPER_NON_HEAP_BYTES {
+                        tracing::warn!(
+                            "only {} GiB of memory is available, and the Groth16 CPU helper needs \
+                             ~13 GiB however its heap is limited; it will likely be OOM-killed",
+                            available >> 30
+                        );
+                    }
                     tracing::info!(
                         "{} GiB of memory is available and the Groth16 CPU helper peaks at ~16 \
                          GiB: limiting its Go heap to {} GiB, which makes it up to ~20% slower",
-                        available.unwrap_or(0) >> 30,
+                        available >> 30,
                         limit >> 30
                     );
                     cmd.env("GOMEMLIMIT", format!("{}MiB", limit >> 20));
                 }
             }
             tracing::info!("Proving Groth16 with the {what}");
+            crate::cpu_helper::StrippedUse::clear(&out_path);
             let limit_hits = crate::subprocess::cgroup_limit_hits();
             let finished = crate::subprocess::run(cmd, &what)?;
             if finished.status.success() {
@@ -520,7 +545,13 @@ impl Groth16Bn254Prover {
                 return Ok(proof);
             }
             let _ = std::fs::remove_file(&out_path);
-            if let (1, Some(signal)) = (attempt, finished.signal()) {
+            if attempt == 2 {
+                anyhow::bail!("the {what} failed again: {}", finished.describe());
+            }
+            if let Some(signal) = finished.signal() {
+                // A kill at this cgroup's memory limit would recur. A host-wide OOM kill, or any
+                // other signal, may not: memory may have been freed meanwhile, and the retry
+                // limits the helper's heap to what is available then.
                 if limit_hits.is_some() && crate::subprocess::cgroup_limit_hits() > limit_hits {
                     anyhow::bail!(
                         "the {what} was killed (signal {signal}) when this process's cgroup reached \
@@ -529,6 +560,26 @@ impl Groth16Bn254Prover {
                     );
                 }
                 tracing::warn!("the {what} was killed by signal {signal}; retrying once");
+                continue;
+            }
+            // The helper ended itself. Some damage to the cached stripped circuit makes gnark end
+            // the process (a panic in its decoding goroutines, or a fatal out-of-memory error from
+            // a corrupt length) rather than report an error the helper could act on. When it was
+            // proving with one, discard that copy and retry: the retry builds a new one.
+            let used = crate::cpu_helper::StrippedUse::read(&out_path);
+            let code = finished.status.code();
+            if let Some(used) =
+                used.filter(|_| !code.is_some_and(crate::cpu_helper::failure_is_final))
+            {
+                tracing::warn!(
+                    "the {what} failed while proving with the stripped circuit in {}; discarding \
+                     it in case it is the cause, and retrying once: {}",
+                    used.dir.display(),
+                    finished.describe()
+                );
+                if let Err(e) = crate::gpu_cache::discard(&used.dir, used.seen) {
+                    tracing::warn!("{e:#}");
+                }
                 continue;
             }
             anyhow::bail!("the {what} failed: {}", finished.describe());
@@ -546,30 +597,19 @@ impl Groth16Bn254Prover {
     /// directory (e.g. `~/.sp1/circuits/groth16/`), then `<temp dir>/sp1-groth16` if anything fails
     /// there, the build included. Disk is preferred on purpose: the file is read for every proof,
     /// the page cache keeps it warm, and unlike `/dev/shm` the kernel can reclaim it when memory is
-    /// short. Building reads the full circuit (~9 GB of memory), so it belongs in the short-lived
+    /// short. Building reads the full circuit (~14 GB at peak, ~26 s), so it belongs in the short-lived
     /// helper, not in a long-lived prover. `None` too for a non-UTF-8 `build_dir`.
     #[cfg(feature = "native")]
     pub(crate) fn ensure_stripped_r1cs(build_dir: &Path) -> Option<std::path::PathBuf> {
         use crate::ffi::export_groth16_stripped_r1cs;
 
-        if std::env::var_os("SP1_GROTH16_R1CS_CACHE_DISABLE").is_some() {
+        let dirs = Self::stripped_r1cs_dirs(build_dir);
+        if dirs.is_empty() {
             return None;
         }
-        let roots: Vec<std::path::PathBuf> =
-            match std::env::var_os("SP1_GROTH16_R1CS_CACHE").filter(|root| !root.is_empty()) {
-                Some(root) => vec![root.into()],
-                None => build_dir
-                    .parent()
-                    .filter(|parent| !parent.as_os_str().is_empty())
-                    .map(Path::to_path_buf)
-                    .into_iter()
-                    .chain(std::iter::once(std::env::temp_dir().join("sp1-groth16")))
-                    .collect(),
-            };
-        let vkey_hash_hex = hex::encode(Self::get_vkey_hash(build_dir));
         let build_dir_str = build_dir.to_str()?;
-        for root in roots {
-            let dir = root.join(format!("sp1_groth16_r1cs_v1_{vkey_hash_hex}"));
+        for dir in dirs {
+            let root = dir.parent().unwrap_or(&dir).to_path_buf();
             let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 crate::gpu_cache::ensure_built(&dir, R1CS_CACHE_MARKER, |out| {
                     let path = out.join(STRIPPED_R1CS);
@@ -590,6 +630,39 @@ impl Groth16Bn254Prover {
         }
         tracing::warn!("using the full circuit");
         None
+    }
+
+    /// Where [`Self::ensure_stripped_r1cs`] looks, in order; empty when the cache is disabled.
+    #[cfg(feature = "native")]
+    pub(crate) fn stripped_r1cs_dirs(build_dir: &Path) -> Vec<std::path::PathBuf> {
+        if std::env::var_os("SP1_GROTH16_R1CS_CACHE_DISABLE").is_some() {
+            return vec![];
+        }
+        let roots: Vec<std::path::PathBuf> =
+            match std::env::var_os("SP1_GROTH16_R1CS_CACHE").filter(|root| !root.is_empty()) {
+                Some(root) => vec![root.into()],
+                None => build_dir
+                    .parent()
+                    .filter(|parent| !parent.as_os_str().is_empty())
+                    .map(Path::to_path_buf)
+                    .into_iter()
+                    .chain(std::iter::once(std::env::temp_dir().join("sp1-groth16")))
+                    .collect(),
+            };
+        let vkey_hash_hex = hex::encode(Self::get_vkey_hash(build_dir));
+        roots
+            .into_iter()
+            .map(|root| root.join(format!("sp1_groth16_r1cs_v1_{vkey_hash_hex}")))
+            .collect()
+    }
+
+    /// The stripped circuit if a complete copy is cached already. Never builds one.
+    #[cfg(feature = "native")]
+    pub(crate) fn stripped_r1cs_ready(build_dir: &Path) -> Option<std::path::PathBuf> {
+        Self::stripped_r1cs_dirs(build_dir)
+            .into_iter()
+            .find(|dir| crate::gpu_cache::is_complete(dir, R1CS_CACHE_MARKER))
+            .map(|dir| dir.join(STRIPPED_R1CS))
     }
 
     /// Generates a Groth16 proof using the GPU-accelerated prover.
@@ -855,8 +928,8 @@ impl Groth16Bn254Prover {
         // - CUDA build: GLV is HIP-only (sppark's MSM doesn't use the
         //   endomorphism path), so the helper *must* see SP1_GPU_GLV=0
         //   or it will panic at the first MSM with "GLV MSM is HIP-
-        //   only". The auto-detect doesn't know it's running on a CUDA
-        //   build, so we force it here.
+        //   only". The helper's auto-detect checks the backend too; this
+        //   is a second guard, keyed on SP1_GPU_BACKEND.
         let mut cmd = std::process::Command::new(&helper_path);
         cmd.arg("--gpu-dir")
             .arg(&prepared.pk.dir)
@@ -1009,14 +1082,23 @@ mod pk_cache_tests {
 mod isolated_tests {
     use super::*;
     use crate::groth16_queue::{acquire_with, held_slot_fd, QueueConfig};
-    use std::os::unix::fs::PermissionsExt;
+
+    thread_local! {
+        /// What `memory_available` reports instead, while set.
+        pub(super) static FAKE_AVAILABLE: std::cell::Cell<Option<Option<u64>>> =
+            const { std::cell::Cell::new(None) };
+    }
+
+    const GIB: u64 = 1 << 30;
 
     struct Setup {
-        dir: tempfile::TempDir,
         build_dir: std::path::PathBuf,
         witness: std::path::PathBuf,
         runs: std::path::PathBuf,
+        /// The fake cgroup's `memory.events`, which a helper can make record a limit hit.
+        memory_events: std::path::PathBuf,
         _slot: crate::FinalWrapSlot,
+        _dir: tempfile::TempDir,
     }
 
     impl Setup {
@@ -1024,46 +1106,71 @@ mod isolated_tests {
         fn runs(&self) -> usize {
             std::fs::read_to_string(&self.runs).map_or(0, |runs| runs.lines().count())
         }
+
+        fn root(&self) -> &Path {
+            self.build_dir.parent().unwrap()
+        }
+    }
+
+    impl Drop for Setup {
+        fn drop(&mut self) {
+            FAKE_AVAILABLE.with(|fake| fake.set(None));
+            crate::subprocess::tests::FAKE_CGROUP.with(|fake| *fake.borrow_mut() = None);
+            for var in ["SP1_GROTH16_CPU_HELPER", "SP1_GROTH16_HELPER_TIMEOUT_SECS", "GOMEMLIMIT"] {
+                std::env::remove_var(var);
+            }
+        }
     }
 
     fn setup() -> Setup {
         let dir = tempfile::tempdir().unwrap();
-        let build_dir = dir.path().join("v6.1.0");
+        // Canonical, so it compares equal to what the kernel reports (/proc/self/fd).
+        let root = dir.path().canonicalize().unwrap();
+        let build_dir = root.join("v6.1.0");
         std::fs::create_dir_all(&build_dir).unwrap();
         std::fs::write(build_dir.join("groth16_vk.bin"), b"pretend vk").unwrap();
-        let witness = dir.path().join("witness.json");
+        let witness = root.join("witness.json");
         std::fs::write(&witness, b"{}").unwrap();
         for var in [
             "SP1_GROTH16_IN_PROCESS",
             "SP1_GROTH16_HELPER_TIMEOUT_SECS",
             "SP1_GROTH16_R1CS_CACHE",
             "SP1_GROTH16_R1CS_CACHE_DISABLE",
+            "GOMEMLIMIT",
         ] {
             std::env::remove_var(var);
         }
-        let queue = QueueConfig { dir: dir.path().join("queue"), slots: 1 };
+        // Plenty of memory, and a cgroup of this test's own, unless a test says otherwise.
+        FAKE_AVAILABLE.with(|fake| fake.set(Some(Some(64 * GIB))));
+        let cgroup = root.join("cgroup/worker.scope");
+        std::fs::create_dir_all(&cgroup).unwrap();
+        let memory_events = cgroup.join("memory.events");
+        std::fs::write(&memory_events, "oom 0\noom_kill 0\n").unwrap();
+        crate::subprocess::tests::FAKE_CGROUP
+            .with(|fake| *fake.borrow_mut() = Some((root.join("cgroup"), "/worker.scope".into())));
+        let queue = QueueConfig { dir: root.join("queue"), slots: 1 };
         let slot = acquire_with(&queue, "test");
         assert!(held_slot_fd().is_some());
-        let runs = dir.path().join("runs");
-        Setup { dir, build_dir, witness, runs, _slot: slot }
+        let runs = root.join("runs");
+        Setup { build_dir, witness, runs, memory_events, _slot: slot, _dir: dir }
     }
 
     /// A fake helper. It records each run, and fails unless it got the right arguments and holds
     /// this test's slot; then `body` runs with `$out` set to the value of `--out`.
     fn helper(setup: &Setup, name: &str, body: &str) -> std::path::PathBuf {
-        let path = setup.dir.path().join(name);
-        let slot = setup.dir.path().join("queue/.sp1_groth16_slot0.lock");
+        let path = setup.root().join(name);
+        let slot = setup.root().join("queue/.sp1_groth16_slot0.lock");
         let script = format!(
             r#"#!/bin/sh
-echo run >> {runs}
+echo run >> '{runs}'
 while [ $# -gt 0 ]; do
   case "$1" in
     --build-dir) build=$2 ;; --witness-json) witness=$2 ;; --out) out=$2 ;;
   esac
   shift
 done
-[ "$build" = {build} ] && [ "$witness" = {witness} ] || {{ echo "bad arguments" >&2; exit 64; }}
-[ "$(readlink /proc/self/fd/{fd})" = {slot} ] || {{ echo "no slot" >&2; exit 70; }}
+[ "$build" = '{build}' ] && [ "$witness" = '{witness}' ] || {{ echo "bad arguments" >&2; exit 64; }}
+[ "$(readlink /proc/self/fd/{fd})" = '{slot}' ] || {{ echo "no slot" >&2; exit 70; }}
 {body}
 "#,
             runs = setup.runs.display(),
@@ -1072,8 +1179,16 @@ done
             fd = held_slot_fd().unwrap(),
             slot = slot.display(),
         );
-        std::fs::write(&path, script).unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // Written by a child process: a file this process held open for writing could be inherited
+        // by a fork in another test's thread, and exec'ing it would then fail ("text file busy").
+        let mut writer = std::process::Command::new("sh")
+            .args(["-c", r#"cat > "$1" && chmod 755 "$1""#, "sh"])
+            .arg(&path)
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        writer.stdin.take().unwrap().write_all(script.as_bytes()).unwrap();
+        assert!(writer.wait().unwrap().success());
         std::env::set_var("SP1_GROTH16_CPU_HELPER", &path);
         path
     }
@@ -1084,9 +1199,71 @@ done
         Groth16Bn254Prover::prove_isolated_json(&setup.witness, &setup.build_dir)
     }
 
-    fn cleanup() {
-        std::env::remove_var("SP1_GROTH16_CPU_HELPER");
-        std::env::remove_var("SP1_GROTH16_HELPER_TIMEOUT_SECS");
+    /// Killed at its cgroup's memory limit: a retry would only be killed again.
+    #[test]
+    fn a_helper_killed_at_the_cgroup_limit_is_not_retried() {
+        let _env = crate::test_env::lock();
+        let setup = setup();
+        let body = format!(
+            "printf 'oom 1\\noom_kill 1\\n' > '{}'; kill -9 $$",
+            setup.memory_events.display()
+        );
+        helper(&setup, "oom_killed", &body);
+        let message = format!("{:#}", prove(&setup).unwrap_err());
+        assert!(message.contains("memory limit"), "{message}");
+        assert_eq!(setup.runs(), 1);
+    }
+
+    /// Gnark can end the process on a damaged stripped circuit rather than report it, and the
+    /// helper cannot then discard it itself. Its prover does, from what the helper recorded, and
+    /// retries; the retry builds a new copy.
+    #[test]
+    fn a_helper_that_dies_on_the_stripped_circuit_has_it_discarded_and_is_retried() {
+        let _env = crate::test_env::lock();
+        let setup = setup();
+        let cache = setup.root().join("sp1_groth16_r1cs_v1_abc");
+        std::fs::create_dir_all(&cache).unwrap();
+        let record = format!("printf '\\n%s' '{}' > \"$out.stripped\"", cache.display());
+        let body = format!(
+            "{record}; [ $(wc -l < '{runs}') -ge 2 ] || exit 2; {PROOF}",
+            runs = setup.runs.display()
+        );
+        helper(&setup, "dies_on_stripped", &body);
+        assert_eq!(prove(&setup).unwrap().raw_proof, "r");
+        assert_eq!(setup.runs(), 2);
+        assert!(!cache.exists(), "the stripped circuit it died on was kept");
+
+        // Not when the helper says why it failed, nor when it was not using a cached copy.
+        std::fs::create_dir_all(&cache).unwrap();
+        std::fs::remove_file(&setup.runs).unwrap();
+        helper(&setup, "no_circuit", &format!("{record}; exit 65"));
+        assert!(prove(&setup).is_err());
+        assert_eq!(setup.runs(), 1);
+        assert!(cache.exists());
+        std::fs::remove_file(&setup.runs).unwrap();
+        helper(&setup, "crashes", "exit 2");
+        assert!(prove(&setup).is_err());
+        assert_eq!(setup.runs(), 1);
+    }
+
+    /// Where memory is short, the helper's Go heap is limited to it; an operator's limit stands.
+    #[test]
+    fn the_helper_gets_a_heap_limit_where_memory_is_short() {
+        let _env = crate::test_env::lock();
+        let setup = setup();
+        let seen = setup.root().join("gomemlimit");
+        let body = format!("echo \"${{GOMEMLIMIT:-unset}}\" > '{}'; {PROOF}", seen.display());
+        helper(&setup, "records_its_limit", &body);
+        let limit = || std::fs::read_to_string(&seen).unwrap().trim().to_string();
+
+        prove(&setup).unwrap();
+        assert_eq!(limit(), "unset");
+        FAKE_AVAILABLE.with(|fake| fake.set(Some(Some(15 * GIB))));
+        prove(&setup).unwrap();
+        assert_eq!(limit(), "13312MiB");
+        std::env::set_var("GOMEMLIMIT", "5GiB");
+        prove(&setup).unwrap();
+        assert_eq!(limit(), "5GiB");
     }
 
     #[test]
@@ -1098,7 +1275,6 @@ done
         assert_eq!(proof.raw_proof, "r");
         assert_eq!(proof.groth16_vkey_hash, Groth16Bn254Prover::get_vkey_hash(&setup.build_dir));
         assert_eq!(setup.runs(), 1);
-        cleanup();
     }
 
     #[test]
@@ -1109,7 +1285,6 @@ done
         let message = format!("{:#}", prove(&setup).unwrap_err());
         assert!(message.contains("out of disk") && message.contains("exit status: 3"), "{message}");
         assert_eq!(setup.runs(), 1);
-        cleanup();
     }
 
     #[test]
@@ -1129,19 +1304,17 @@ done
         let message = format!("{:#}", prove(&setup).unwrap_err());
         assert!(message.contains("signal: 9"), "{message}");
         assert_eq!(setup.runs(), 2, "retried more than once");
-        cleanup();
     }
 
     #[test]
     fn a_helper_that_runs_too_long_is_killed_and_not_retried() {
         let _env = crate::test_env::lock();
         let setup = setup();
-        std::env::set_var("SP1_GROTH16_HELPER_TIMEOUT_SECS", "1");
+        std::env::set_var("SP1_GROTH16_HELPER_TIMEOUT_SECS", "3");
         helper(&setup, "hangs", "exec sleep 30");
         let message = format!("{:#}", prove(&setup).unwrap_err());
         assert!(message.contains("ran longer than"), "{message}");
         assert_eq!(setup.runs(), 1);
-        cleanup();
     }
 
     #[test]
@@ -1150,23 +1323,21 @@ done
         let setup = setup();
         helper(&setup, "silent", "exit 0");
         assert!(format!("{:#}", prove(&setup).unwrap_err()).contains("wrote no proof"));
-        cleanup();
     }
 
     #[test]
     fn a_wrong_explicit_helper_is_an_error_not_a_fallback() {
         let _env = crate::test_env::lock();
         let setup = setup();
-        std::env::set_var("SP1_GROTH16_CPU_HELPER", setup.dir.path().join("missing"));
+        std::env::set_var("SP1_GROTH16_CPU_HELPER", setup.root().join("missing"));
         assert!(format!("{:#}", prove(&setup).unwrap_err()).contains("SP1_GROTH16_CPU_HELPER"));
-        cleanup();
     }
 
     #[test]
     fn the_stripped_circuit_cache_is_found_and_can_be_disabled() {
         let _env = crate::test_env::lock();
         let setup = setup();
-        let root = setup.dir.path().join("r1cs-root");
+        let root = setup.root().join("r1cs-root");
         std::env::set_var("SP1_GROTH16_R1CS_CACHE", &root);
         // A complete cache, as a previous helper would have left it; a hit calls no Go.
         let key = hex::encode(Groth16Bn254Prover::get_vkey_hash(&setup.build_dir));
@@ -1185,12 +1356,11 @@ done
         std::env::remove_var("SP1_GROTH16_R1CS_CACHE_DISABLE");
         // Only an explicit root is tried: one that is a file gives no cache, rather than another
         // root.
-        let file = setup.dir.path().join("a-file");
+        let file = setup.root().join("a-file");
         std::fs::write(&file, b"").unwrap();
         std::env::set_var("SP1_GROTH16_R1CS_CACHE", &file);
         assert_eq!(Groth16Bn254Prover::ensure_stripped_r1cs(&setup.build_dir), None);
         std::env::remove_var("SP1_GROTH16_R1CS_CACHE");
-        cleanup();
     }
 }
 

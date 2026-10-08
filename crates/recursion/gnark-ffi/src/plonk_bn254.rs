@@ -575,11 +575,14 @@ impl PlonkBn254Prover {
         // at 17-19 s on a clean GPU.
         let helper_devices_override = std::env::var("SP1_PLONK_GPU_HELPER_DEVICES").ok();
 
-        // Sleep briefly + log free VRAM so operators can see whether the
-        // parent's VRAM was actually released. NVML / cuda_mem_get_info
-        // would be nicer but adds a dependency; the log timing alone is
-        // a useful triage signal.
-        std::thread::sleep(std::time::Duration::from_millis(500));
+        // Log free VRAM, so operators can see whether the helper has room (after a reset, give
+        // the driver a moment to return the memory first).
+        if crate::gpu_device::reset_requested() {
+            std::thread::sleep(std::time::Duration::from_millis(500));
+        }
+        if let Some(free) = crate::gpu_device::free_memory() {
+            tracing::info!("[plonk] {} MiB of GPU memory is free for the helper", free >> 20);
+        }
 
         // Phase 1 long-lived server mode (opt-in, default OFF). When
         // SP1_PLONK_GPU_SERVER=1, route through `plonk_helper_server` which

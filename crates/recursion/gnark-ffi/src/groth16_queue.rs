@@ -7,6 +7,10 @@
 //! at once can exhaust RAM even when either alone fits.
 //!
 //! [`final_wrap_slot`] takes one of a fixed number of slots shared by every process on the host:
+//! - The queue is for prover hosts: it is on in binaries that host the Groth16 CPU helper (see
+//!   `cpu_helper`; `sp1-gpu-server` and `node` do) and wherever `SP1_GROTH16_SLOTS`,
+//!   `SP1_GROTH16_QUEUE_DIR` or `SP1_GROTH16_CPU_HELPER` is set. Elsewhere, as for a library user
+//!   of the SDK, final wraps run unqueued, as upstream SP1's do.
 //! - A slot is a lock file, `.sp1_groth16_slot<i>.lock` under `SP1_GROTH16_QUEUE_DIR` (default
 //!   `/run/lock` where this user can write to it, else `/dev/shm`, else the temp dir). Holding a
 //!   slot means holding an exclusive `flock` on its file, which the kernel releases once every
@@ -15,11 +19,14 @@
 //! - `SP1_GROTH16_SLOTS` sets the number of slots; 0 disables the limit. The default is one slot
 //!   per 48 GiB of host RAM, at least one. Every process on the host must agree on it: a process
 //!   allowed two slots can take slot 1 while a process allowed one holds slot 0.
-//! - The queue spans the processes that share the directory. Containers with private `/run/lock`
-//!   or `/dev/shm` mounts each get their own queue unless `SP1_GROTH16_QUEUE_DIR` names a shared
-//!   mount. Lock files must never be deleted while provers run, which is why the default is not
-//!   `/dev/shm`: systemd-logind (`RemoveIPC=yes`) empties a user's files there when their last
+//! - The queue spans the processes that share the directory. The default directory is chosen per
+//!   process, so provers that differ in whether they can write `/run/lock` (it is root-only on some
+//!   distributions, and read-only under `ProtectSystem=strict`) do not share a queue; neither do
+//!   containers with private `/run/lock` mounts. Set `SP1_GROTH16_QUEUE_DIR` on every prover in
+//!   those cases. Lock files must never be deleted while provers run, which is why the default is
+//!   not `/dev/shm`: systemd-logind (`RemoveIPC=yes`) empties a user's files there when their last
 //!   session ends.
+//! - The `SP1_GROTH16_*` names predate PLONK's use of the queue, and govern it too.
 //! - Ordering is not FIFO: waiters poll, and whichever finds a slot free first takes it. With a
 //!   handful of provers per host that is fair enough; ordering by deadline belongs in a scheduler.
 //! - When the queue cannot be used (an unusable directory, persistent lock errors, a non-Unix
@@ -125,9 +132,10 @@ pub(crate) struct QueueConfig {
 
 impl QueueConfig {
     /// From `SP1_GROTH16_QUEUE_DIR` and `SP1_GROTH16_SLOTS`, with `mem_total` (host RAM, if known)
-    /// sizing the default.
-    pub(crate) fn from_env(mem_total: Option<u64>) -> Self {
-        let default_slots = default_slots(mem_total);
+    /// sizing the default. Without `SP1_GROTH16_SLOTS`, the queue is off unless `prover_host`
+    /// says this process is on a prover host (see the module docs).
+    pub(crate) fn from_env(mem_total: Option<u64>, prover_host: bool) -> Self {
+        let default_slots = if prover_host { default_slots(mem_total) } else { 0 };
         let slots = match std::env::var("SP1_GROTH16_SLOTS") {
             Ok(value) => value.trim().parse::<usize>().unwrap_or_else(|_| {
                 tracing::warn!(
@@ -199,19 +207,35 @@ pub fn final_wrap_slot(what: &str) -> FinalWrapSlot {
 
 /// [`final_wrap_slot`].
 pub(crate) fn acquire(what: &str) -> FinalWrapSlot {
+    // Checked before the configuration is read, so that a nested acquire never depends on it.
     if HELD.with(Cell::get) != Held::Nothing {
         return FinalWrapSlot::nested();
     }
     static CONFIG: OnceLock<QueueConfig> = OnceLock::new();
     let config = CONFIG.get_or_init(|| {
-        let config = QueueConfig::from_env(mem_total());
-        tracing::info!("final-wrap queue: {} slot(s) in {}", config.slots, config.dir.display());
+        let prover_host = crate::cpu_helper::self_hosted()
+            || ["SP1_GROTH16_QUEUE_DIR", "SP1_GROTH16_CPU_HELPER"]
+                .iter()
+                .any(|var| std::env::var_os(var).is_some_and(|value| !value.is_empty()));
+        let config = QueueConfig::from_env(mem_total(), prover_host);
+        if config.slots == 0 {
+            tracing::info!("final-wrap queue: off (see SP1_GROTH16_SLOTS)");
+        } else {
+            tracing::info!(
+                "final-wrap queue: {} slot(s) in {}",
+                config.slots,
+                config.dir.display()
+            );
+        }
         config
     });
     acquire_with(config, what)
 }
 
 pub(crate) fn acquire_with(config: &QueueConfig, what: &str) -> FinalWrapSlot {
+    if HELD.with(Cell::get) != Held::Nothing {
+        return FinalWrapSlot::nested();
+    }
     if config.slots == 0 {
         return FinalWrapSlot::outermost(None);
     }
@@ -435,8 +459,9 @@ pub(crate) mod tests {
         assert!(!outer.is_queued());
         assert_eq!(HELD.with(Cell::get), Held::Unqueued);
         let start = Instant::now();
-        let nested = acquire("test nested");
-        assert!(start.elapsed() < Duration::from_millis(100));
+        let unusable = QueueConfig { dir: dir.path().join("missing/and/unwritable\0"), slots: 1 };
+        let nested = acquire_with(&unusable, "test nested");
+        assert!(start.elapsed() < Duration::from_secs(1));
         assert!(!nested.is_queued());
         drop(nested);
         assert_eq!(
@@ -525,7 +550,7 @@ pub(crate) mod tests {
         let slot = acquire_with(&config, "test");
         assert!(slot.is_queued());
         assert!(held_slot_fd().is_some());
-        let nested = acquire("test nested");
+        let nested = acquire_with(&config, "test nested");
         assert!(!nested.is_queued());
         drop(nested);
         assert!(held_slot_fd().is_some(), "a nested guard must not release its parent");
@@ -554,21 +579,29 @@ pub(crate) mod tests {
         let gib = |n: u64| Some(n << 30);
 
         std::env::remove_var("SP1_GROTH16_SLOTS");
-        assert_eq!(QueueConfig::from_env(gib(28)).slots, 1);
-        assert_eq!(QueueConfig::from_env(gib(96)).slots, 2);
-        assert_eq!(QueueConfig::from_env(gib(512)).slots, 10);
-        assert_eq!(QueueConfig::from_env(None).slots, 1);
-        assert_eq!(QueueConfig::from_env(gib(28)).dir, dir.path());
+        let prover = |mem| QueueConfig::from_env(mem, true);
+        assert_eq!(prover(gib(28)).slots, 1);
+        assert_eq!(prover(gib(96)).slots, 2);
+        assert_eq!(prover(gib(512)).slots, 10);
+        assert_eq!(prover(None).slots, 1);
+        assert_eq!(prover(gib(28)).dir, dir.path());
+        // Off by default where this is not a prover host.
+        assert_eq!(QueueConfig::from_env(gib(96), false).slots, 0);
 
         std::env::set_var("SP1_GROTH16_SLOTS", "0");
-        assert_eq!(QueueConfig::from_env(gib(96)).slots, 0);
+        assert_eq!(prover(gib(96)).slots, 0);
         std::env::set_var("SP1_GROTH16_SLOTS", " 3 ");
-        assert_eq!(QueueConfig::from_env(gib(28)).slots, 3);
+        assert_eq!(prover(gib(28)).slots, 3);
+        assert_eq!(
+            QueueConfig::from_env(gib(28), false).slots,
+            3,
+            "an explicit count always holds"
+        );
         std::env::set_var("SP1_GROTH16_SLOTS", "many");
-        assert_eq!(QueueConfig::from_env(gib(96)).slots, 2, "nonsense must give the default");
+        assert_eq!(prover(gib(96)).slots, 2, "nonsense must give the default");
 
         std::env::set_var("SP1_GROTH16_QUEUE_DIR", "");
-        assert_eq!(QueueConfig::from_env(gib(28)).dir, default_dir());
+        assert_eq!(prover(gib(28)).dir, default_dir());
         if writable_dir(Path::new("/run/lock")) {
             assert_eq!(default_dir(), Path::new("/run/lock"));
         }

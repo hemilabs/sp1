@@ -36,6 +36,64 @@ var (
 	gpuWitnessPkDataDir      string
 )
 
+// gpuWitnessCircuit returns the R1CS and proving key for dataDir, loading what is not cached. The
+// cache only ever holds a value that loaded completely, and the lock is released however this
+// returns: a corrupt file can make gnark panic, the cgo export recovers that, and a lock left held
+// would make the next ReleaseCaches (run on the Rust side as the failed proof unwinds) wait for
+// ever.
+func gpuWitnessCircuit(dataDir string, pkDir string) (constraint.ConstraintSystem, groth16.ProvingKey) {
+	gpuWitnessMutex.Lock()
+	defer gpuWitnessMutex.Unlock()
+
+	if gpuWitnessR1cs == nil || gpuWitnessR1csDataDir != dataDir {
+		gpuWitnessR1cs, gpuWitnessR1csDataDir = nil, ""
+		start := time.Now()
+		fullPath := dataDir + "/" + groth16CircuitPath
+		// Prefer the stripped R1CS (without debug data) created by ExportGroth16GpuData.
+		// This reduces load time from ~20s to ~5s by skipping ~817MB of unused debug info.
+		strippedPath := filepath.Join(pkDir, "groth16_circuit_stripped.bin")
+		var r1cs constraint.ConstraintSystem
+		if _, err := os.Stat(strippedPath); err == nil {
+			fmt.Printf("[groth16-witness] Using stripped R1CS: %s\n", strippedPath)
+			if r1cs, err = readR1cs(strippedPath); err != nil {
+				// Written by a gnark that serialized differently, or damaged. (A file that makes
+				// gnark's decoding goroutines panic ends the process instead; that cannot be
+				// recovered.)
+				fmt.Printf("[groth16-witness] %v; using the full R1CS\n", err)
+			}
+		}
+		if r1cs == nil {
+			var err error
+			if r1cs, err = readR1cs(fullPath); err != nil {
+				panic(err.Error())
+			}
+		}
+		gpuWitnessR1cs, gpuWitnessR1csDataDir = r1cs, dataDir
+		fmt.Printf("[groth16-witness] Reading R1CS took %s\n", time.Since(start))
+	} else {
+		fmt.Printf("[groth16-witness] Using cached R1CS (saved ~20s)\n")
+	}
+
+	if gpuWitnessPk == nil || gpuWitnessPkDataDir != dataDir {
+		gpuWitnessPk, gpuWitnessPkDataDir = nil, ""
+		start := time.Now()
+		pkFile, err := os.Open(dataDir + "/" + groth16PkPath)
+		if err != nil {
+			panic(fmt.Sprintf("Failed to open PK: %v", err))
+		}
+		defer pkFile.Close()
+		pk := groth16.NewProvingKey(ecc.BN254)
+		if err := pk.ReadDump(bufio.NewReaderSize(pkFile, 1024*1024)); err != nil {
+			panic(fmt.Sprintf("Failed to read PK: %v", err))
+		}
+		gpuWitnessPk, gpuWitnessPkDataDir = pk, dataDir
+		fmt.Printf("[groth16-witness] Reading PK took %s\n", time.Since(start))
+	} else {
+		fmt.Printf("[groth16-witness] Using cached PK (saved ~2s)\n")
+	}
+	return gpuWitnessR1cs, gpuWitnessPk
+}
+
 // ExportGroth16GpuWitness solves the Groth16 R1CS and exports the solved
 // witness vectors (W, A, B, C) plus BSB22 Pedersen commitments as flat
 // binary files for the Rust GPU prover.
@@ -47,59 +105,11 @@ var (
 func ExportGroth16GpuWitness(dataDir string, witnessPath string, pkDir string, outputDir string) {
 	start := time.Now()
 
-	// Load R1CS (cached across calls for the same dataDir)
+	// Load the R1CS and proving key (cached across calls for the same dataDir)
 	os.Setenv("CONSTRAINTS_JSON", dataDir+"/"+constraintsJsonFile)
 	os.Setenv("GROTH16", "1")
 
-	gpuWitnessMutex.Lock()
-	if gpuWitnessR1cs == nil || gpuWitnessR1csDataDir != dataDir {
-		gpuWitnessR1cs = groth16.NewCS(ecc.BN254)
-
-		// Prefer the stripped R1CS (without debug data) created by ExportGroth16GpuData.
-		// This reduces load time from ~20s to ~5s by skipping ~817MB of unused debug info.
-		strippedPath := filepath.Join(pkDir, "groth16_circuit_stripped.bin")
-		r1csPath := dataDir + "/" + groth16CircuitPath
-		if _, err := os.Stat(strippedPath); err == nil {
-			r1csPath = strippedPath
-			fmt.Printf("[groth16-witness] Using stripped R1CS: %s\n", strippedPath)
-		}
-
-		r1csFile, err := os.Open(r1csPath)
-		if err != nil {
-			gpuWitnessMutex.Unlock()
-			panic(fmt.Sprintf("Failed to open R1CS: %v", err))
-		}
-		r1csReader := bufio.NewReaderSize(r1csFile, 1024*1024)
-		gpuWitnessR1cs.ReadFrom(r1csReader)
-		r1csFile.Close()
-		gpuWitnessR1csDataDir = dataDir
-		fmt.Printf("[groth16-witness] Reading R1CS took %s\n", time.Since(start))
-	} else {
-		fmt.Printf("[groth16-witness] Using cached R1CS (saved ~20s)\n")
-	}
-	r1cs := gpuWitnessR1cs
-	gpuWitnessMutex.Unlock()
-
-	// Load proving key (cached across calls for the same dataDir)
-	start = time.Now()
-	gpuWitnessMutex.Lock()
-	if gpuWitnessPk == nil || gpuWitnessPkDataDir != dataDir {
-		gpuWitnessPk = groth16.NewProvingKey(ecc.BN254)
-		pkFile, err := os.Open(dataDir + "/" + groth16PkPath)
-		if err != nil {
-			gpuWitnessMutex.Unlock()
-			panic(fmt.Sprintf("Failed to open PK: %v", err))
-		}
-		pkReader := bufio.NewReaderSize(pkFile, 1024*1024)
-		gpuWitnessPk.ReadDump(pkReader)
-		pkFile.Close()
-		gpuWitnessPkDataDir = dataDir
-		fmt.Printf("[groth16-witness] Reading PK took %s\n", time.Since(start))
-	} else {
-		fmt.Printf("[groth16-witness] Using cached PK (saved ~2s)\n")
-	}
-	pk := gpuWitnessPk
-	gpuWitnessMutex.Unlock()
+	r1cs, pk := gpuWitnessCircuit(dataDir, pkDir)
 
 	// Load and parse witness JSON
 	start = time.Now()

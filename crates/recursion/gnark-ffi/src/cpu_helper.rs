@@ -8,7 +8,7 @@
 //!
 //! `<binary> --sp1-groth16-cpu-helper --prepare --build-dir <dir>` builds the stripped circuit and
 //! exits without proving, so that a prover can do that once at startup rather than in its first
-//! proof (it reads the full circuit: ~25 s and ~9 GB). `--help` describes the rest, and also tells
+//! proof (it reads the full circuit: ~26 s and ~14 GB at peak). `--help` describes the rest, and also tells
 //! whether a binary can serve at all.
 
 use std::ffi::{OsStr, OsString};
@@ -23,18 +23,31 @@ use crate::{ffi::prove_groth16_bn254_with_r1cs, Groth16Bn254Proof, Groth16Bn254P
 /// The first argument that turns a binary into the helper.
 pub const CPU_HELPER_ARG: &str = "--sp1-groth16-cpu-helper";
 
-/// The helper's process name (at most 15 bytes), so that tools that find provers by name, such as a
-/// miner's reaper of stray `sp1-gpu-server`s, do not take it for one.
+/// The helper's process name (at most 15 bytes), so that tools that find provers by their process
+/// name (`/proc/<pid>/comm`), such as a miner's reaper of stray `sp1-gpu-server`s, do not take it
+/// for one. Its command line still names the binary it was started as.
 const PROCESS_NAME: &[u8] = b"sp1-groth16-cpu\0";
 
-/// Exit codes, after sysexits.h. A Go panic exits 2.
+/// Exit codes, after sysexits.h. A Go panic or fatal error exits 2.
 const EXIT_USAGE: i32 = 64;
 const EXIT_UNREADABLE_CIRCUIT: i32 = 65;
 const EXIT_NO_STRIPPED_CIRCUIT: i32 = 69;
 const EXIT_CANNOT_WRITE: i32 = 74;
 
+/// Whether a helper that exited with `code` failed for a reason that running it again cannot fix:
+/// bad arguments, no readable circuit at all, or nowhere to write the proof.
+pub(crate) fn failure_is_final(code: i32) -> bool {
+    matches!(code, EXIT_USAGE | EXIT_UNREADABLE_CIRCUIT | EXIT_CANNOT_WRITE)
+}
+
 /// Whether this binary called [`run_groth16_cpu_helper_if_requested`] and so can be its own helper.
 static SELF_HOSTED: AtomicBool = AtomicBool::new(false);
+
+/// Whether this binary can be its own Groth16 CPU helper, which marks a prover host for
+/// `groth16_queue`.
+pub(crate) fn self_hosted() -> bool {
+    SELF_HOSTED.load(Ordering::Acquire)
+}
 
 /// Lets this binary act as its own Groth16 CPU helper. Call it first thing in `main`, before any
 /// other work. When the process was started as the helper, this proves and exits. Otherwise it
@@ -70,12 +83,14 @@ struct Args {
 
 /// The helper itself. `args` are what follows the program name (and [`CPU_HELPER_ARG`]).
 ///
-/// Returns the exit code: 0 on success (or for `--help`); 64 for bad arguments or a non-UTF-8
-/// path; 65 if no circuit could be read; 69 if `--prepare` could not build the stripped circuit;
-/// 74 if the proof cannot be written. A failed prove does not return: a Go panic exits the process
-/// with status 2, and a Rust panic with 101.
+/// Returns the exit code: 0 on success (or for `--help`); 64 for bad arguments, a non-UTF-8 path,
+/// or a build dir with no circuit; 65 if no circuit could be read; 69 if `--prepare` could not build
+/// the stripped circuit; 74 if the proof cannot be written. A failed prove does not return: a Go
+/// panic or fatal error exits the process with status 2, and a Rust panic with 101.
 pub fn cpu_helper_main(args: impl IntoIterator<Item = OsString>) -> i32 {
     set_process_name();
+    // A process started as the helper is on a prover host, whichever binary it is.
+    SELF_HOSTED.store(true, Ordering::Release);
     // Diagnostics, such as why the stripped circuit is unavailable, go to stderr, which the prover
     // passes through and quotes on failure.
     let _ = tracing_subscriber::fmt()
@@ -108,16 +123,10 @@ fn helper(args: impl IntoIterator<Item = OsString>) -> i32 {
         return EXIT_USAGE;
     }
 
-    let stripped = Groth16Bn254Prover::ensure_stripped_r1cs(&args.build_dir);
     if args.prepare {
-        return match stripped {
-            Some(path) => {
-                tracing::info!("the stripped circuit is ready at {}", path.display());
-                0
-            }
-            None => EXIT_NO_STRIPPED_CIRCUIT,
-        };
+        return prepare(&args.build_dir);
     }
+    let stripped = Groth16Bn254Prover::ensure_stripped_r1cs(&args.build_dir);
     let (Some(witness_json), Some(out)) = (args.witness_json, args.out) else {
         unreachable!("clap requires both without --prepare");
     };
@@ -133,18 +142,23 @@ fn helper(args: impl IntoIterator<Item = OsString>) -> i32 {
     };
     let full = args.build_dir.join("groth16_circuit.bin");
     let proved = match stripped {
-        Some(stripped) => prove(&stripped).or_else(|e| {
+        Some(stripped) => {
             // A stripped circuit that looked complete but cannot be read (corrupt, or written by
-            // a gnark that serialized differently) would fail every proof on the host. Discard it
-            // for the next proof to rebuild, and prove with the full circuit now.
-            tracing::warn!("{e}; discarding it and proving with the full circuit");
-            if let Some(dir) = stripped.parent() {
-                if let Err(e) = crate::gpu_cache::discard(dir) {
+            // a gnark that serialized differently) would fail every proof on the host. When gnark
+            // reports that, discard it for the next proof to rebuild and prove with the full
+            // circuit now. Some damage makes gnark end the process instead; for that, the prover
+            // that started this helper is told which copy it was using (`StrippedUse`).
+            let dir = stripped.parent().unwrap_or(&stripped).to_path_buf();
+            let seen = crate::gpu_cache::identity(&dir);
+            StrippedUse { dir: dir.clone(), seen }.record(&out);
+            prove(&stripped).or_else(|e| {
+                tracing::warn!("{e}; discarding it and proving with the full circuit");
+                if let Err(e) = crate::gpu_cache::discard(&dir, seen) {
                     tracing::warn!("{e:#}");
                 }
-            }
-            prove(&full)
-        }),
+                prove(&full)
+            })
+        }
         None => prove(&full),
     };
     let proof = match proved {
@@ -160,6 +174,68 @@ fn helper(args: impl IntoIterator<Item = OsString>) -> i32 {
         return EXIT_CANNOT_WRITE;
     }
     0
+}
+
+/// `--prepare`: builds the stripped circuit, unless it is built already or the cache is disabled.
+fn prepare(build_dir: &Path) -> i32 {
+    if std::env::var_os("SP1_GROTH16_R1CS_CACHE_DISABLE").is_some() {
+        tracing::info!("SP1_GROTH16_R1CS_CACHE_DISABLE is set: proofs read the full circuit");
+        return 0;
+    }
+    if let Some(path) = Groth16Bn254Prover::stripped_r1cs_ready(build_dir) {
+        tracing::info!("the stripped circuit is ready at {}", path.display());
+        return 0;
+    }
+    // Building reads the full circuit (~14 GB at peak), as much as a proof: take a final-wrap
+    // slot, so that it does not run beside one. (Never while proving: the helper then shares its
+    // prover's slot, and taking another would wait on itself.)
+    let _slot = crate::groth16_queue::acquire("Groth16 (--prepare)");
+    match Groth16Bn254Prover::ensure_stripped_r1cs(build_dir) {
+        Some(path) => {
+            tracing::info!("the stripped circuit is ready at {}", path.display());
+            0
+        }
+        None => EXIT_NO_STRIPPED_CIRCUIT,
+    }
+}
+
+/// Which cached stripped circuit a helper proves with, recorded beside its output before it does,
+/// so that if the helper dies reading it, its prover can discard that copy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StrippedUse {
+    pub dir: PathBuf,
+    pub seen: Option<crate::gpu_cache::Identity>,
+}
+
+impl StrippedUse {
+    fn path(out: &Path) -> PathBuf {
+        let mut name = out.file_name().unwrap_or_default().to_os_string();
+        name.push(".stripped");
+        out.with_file_name(name)
+    }
+
+    /// Best effort: without it, a crash just fails the proof as before.
+    fn record(&self, out: &Path) {
+        let seen = self.seen.map_or(String::new(), |(ino, s, ns)| format!("{ino} {s} {ns}"));
+        let _ = std::fs::write(Self::path(out), format!("{seen}\n{}", self.dir.display()));
+    }
+
+    /// What the helper writing to `out` recorded, if anything.
+    pub(crate) fn read(out: &Path) -> Option<Self> {
+        let text = std::fs::read_to_string(Self::path(out)).ok()?;
+        let (seen, dir) = text.split_once('\n')?;
+        let seen: Vec<i64> = seen.split(' ').filter_map(|n| n.parse().ok()).collect();
+        let seen = match seen[..] {
+            [ino, s, ns] => u64::try_from(ino).ok().map(|ino| (ino, s, ns)),
+            _ => None,
+        };
+        Some(Self { dir: PathBuf::from(dir), seen })
+    }
+
+    /// Removes what the helper writing to `out` recorded.
+    pub(crate) fn clear(out: &Path) {
+        let _ = std::fs::remove_file(Self::path(out));
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -203,7 +279,7 @@ impl HelperExe {
 ///
 /// `Ok(None)` when there is none.
 pub(crate) fn find() -> Result<Option<HelperExe>> {
-    resolve(std::env::var_os("SP1_GROTH16_CPU_HELPER"), SELF_HOSTED.load(Ordering::Acquire), || {
+    resolve(std::env::var_os("SP1_GROTH16_CPU_HELPER"), self_hosted(), || {
         find_executable("groth16_cpu_helper", None)
     })
 }
@@ -346,19 +422,67 @@ mod tests {
         assert_eq!(search("absent", None, Some(first.path()), Some(&path_var)), None);
     }
 
-    /// Argument errors are reported before any Go runs or any circuit is read.
+    /// Argument errors are reported before any Go runs or any circuit is read. (`--help`, which
+    /// prints to stdout, is checked end to end in `tests/self_hosted_cpu_helper.rs`.)
     #[test]
-    fn bad_arguments_are_usage_errors_and_help_is_not() {
+    fn bad_arguments_are_usage_errors() {
+        use clap::Parser;
         let main = |args: &[&str]| helper(args.iter().map(OsString::from));
         assert_eq!(main(&[]), EXIT_USAGE);
         assert_eq!(main(&["--build-dir", "/x", "--bogus"]), EXIT_USAGE);
         assert_eq!(main(&["--build-dir", "/x", "--witness-json", "/w"]), EXIT_USAGE, "no --out");
         assert_eq!(main(&["--build-dir", "/x", "--prepare", "--out", "/o"]), EXIT_USAGE);
-        assert_eq!(main(&["--help"]), 0);
+        assert_eq!(main(&["--build-dir", "/nonexistent", "--prepare"]), EXIT_USAGE, "no circuit");
+        let help = Args::try_parse_from(["groth16_cpu_helper", "--help"]).unwrap_err();
+        assert_eq!(help.exit_code(), 0);
 
         use std::os::unix::ffi::OsStringExt;
         let not_utf8 = OsString::from_vec(b"/tmp/\xff".to_vec());
         let args = [OsString::from("--build-dir"), not_utf8, "--prepare".into()];
         assert_eq!(helper(args), EXIT_USAGE);
+    }
+
+    #[test]
+    fn prepare_builds_nothing_that_is_built_or_disabled() {
+        let _env = crate::test_env::lock();
+        let dir = tempfile::tempdir().unwrap();
+        let build_dir = dir.path().join("v6.1.0");
+        std::fs::create_dir_all(&build_dir).unwrap();
+        std::fs::write(build_dir.join("groth16_vk.bin"), b"pretend vk").unwrap();
+        let build = build_dir.to_str().unwrap();
+        let main = || helper(["--build-dir", build, "--prepare"].map(OsString::from));
+
+        std::env::set_var("SP1_GROTH16_R1CS_CACHE_DISABLE", "1");
+        assert_eq!(main(), 0);
+        std::env::remove_var("SP1_GROTH16_R1CS_CACHE_DISABLE");
+
+        // Already built (a hit calls no Go): ready, without taking a slot.
+        let root = dir.path().join("r1cs-root");
+        std::env::set_var("SP1_GROTH16_R1CS_CACHE", &root);
+        let cache = Groth16Bn254Prover::stripped_r1cs_dirs(&build_dir).remove(0);
+        crate::gpu_cache::ensure_built(&cache, crate::groth16_bn254::R1CS_CACHE_MARKER, |out| {
+            std::fs::write(out.join(crate::groth16_bn254::STRIPPED_R1CS), b"stripped")?;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(main(), 0);
+        std::env::remove_var("SP1_GROTH16_R1CS_CACHE");
+    }
+
+    #[test]
+    fn a_helper_records_which_stripped_circuit_it_uses() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("proof.json");
+        assert_eq!(StrippedUse::read(&out), None);
+        let cache = dir.path().join("sp1_groth16_r1cs_v1_abc");
+        std::fs::create_dir(&cache).unwrap();
+        let used = StrippedUse { dir: cache.clone(), seen: crate::gpu_cache::identity(&cache) };
+        used.record(&out);
+        assert_eq!(StrippedUse::read(&out), Some(used));
+        StrippedUse::clear(&out);
+        assert_eq!(StrippedUse::read(&out), None);
+        // Where the copy cannot be identified, the directory still is.
+        StrippedUse { dir: cache.clone(), seen: None }.record(&out);
+        assert_eq!(StrippedUse::read(&out), Some(StrippedUse { dir: cache, seen: None }));
     }
 }

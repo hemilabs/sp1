@@ -1,13 +1,17 @@
 //! Which prover makes the final Groth16 proof: the GPU prover (`groth16_gpu_helper`) or gnark's
-//! CPU prover.
+//! CPU prover (in its own helper; see `Groth16Bn254Prover::prove_isolated`).
 //!
-//! The GPU prover is faster (60 s against ~95 s for a whole proof on an RTX 4090), but its helper
-//! needs GPU memory of its own, and the prover that starts it keeps its shard-prover state on the
-//! card between proofs (~22 GB of a 24 GB card). So the GPU prover is used only where the card has
-//! the room free, or where this process resets its GPU first (`SP1_GPU_RESET_BEFORE_WRAP`, for a
-//! process that exits after its proof). It also needs more host memory: it solves the circuit in
-//! this process, ~13 GB, then a helper loads the proving key in GPU form, ~13 GB. gnark's CPU
-//! prover, which the v6.0.0 fork always used, needs neither.
+//! The GPU prover's helper needs GPU memory of its own, while the prover that starts it keeps its
+//! shard-prover state on the card between proofs: 21.7 GB of an RTX 4090's 24 GB, and cards above
+//! 24 GiB also keep an 8 GiB memory-pool reserve. So the GPU prover is used only where enough is
+//! free, which in practice means cards of 48 GB or more, or where this process resets its GPU first
+//! (`SP1_GPU_RESET_BEFORE_WRAP`, for a process that exits after its proof). Its host memory comes
+//! in two steps: the in-process solve (13.1 GB, released before the helper starts), then the
+//! helper's GPU-format key (12.9 GB). gnark's CPU prover, which the v6.0.0 fork always used, needs
+//! no GPU memory; its helper peaks at ~16 GiB, less under a heap limit.
+//!
+//! Neither is clearly faster: on an RTX 4090, a whole proof took 59.7 s with the GPU prover (after
+//! a reset, with gnark's solver) and 53 s with the CPU helper.
 
 /// Host memory the GPU prover needs beyond what is in use when it starts, once the GPU-format
 /// proving key has been exported. Measured on the v6.1.0 circuit: 13.1 GB for the in-process solve,
@@ -15,8 +19,10 @@
 pub(crate) const GPU_MIN_AVAILABLE_BYTES: u64 = 16 << 30;
 
 /// Free GPU memory the GPU prover's helper needs. Measured on the v6.1.0 circuit: 14.5 GiB at peak
-/// on an RTX 4090, rounded up.
-pub(crate) const GPU_HELPER_VRAM_BYTES: u64 = 16 << 30;
+/// on an RTX 4090 with gnark's solver (no `r1cs_solve_plan`). The GPU R1CS solver, the default when
+/// `r1cs_solve_plan` is installed, also uploads ~3 GB of circuit data, hence the margin. A helper
+/// that runs out anyway fails, and the CPU prover takes over.
+pub(crate) const GPU_HELPER_VRAM_BYTES: u64 = 18 << 30;
 
 /// Extra host memory for the one-time proving-key export on a cold cache: ~9 GB of files, written
 /// to RAM-backed `/dev/shm` unless `SP1_GROTH16_PK_CACHE` points elsewhere.
@@ -97,6 +103,7 @@ pub(crate) fn use_gpu(inputs: &Groth16Inputs<'_>) -> (bool, String) {
 /// fails, so that a GPU failure costs time rather than the proof. `gpu` may fail by returning an
 /// error or by panicking, which is how its helper reports failure.
 pub(crate) fn prove_preferring_gpu<P>(
+    what: &str,
     use_gpu: bool,
     gpu: impl FnOnce() -> anyhow::Result<P>,
     cpu: impl FnOnce() -> anyhow::Result<P>,
@@ -113,7 +120,7 @@ pub(crate) fn prove_preferring_gpu<P>(
                 .to_string(),
         };
         tracing::warn!(
-            "the GPU Groth16 prover failed: {failure}; proving with gnark's CPU prover instead"
+            "the GPU {what} prover failed: {failure}; proving with gnark's CPU prover instead"
         );
     }
     cpu()
@@ -212,18 +219,18 @@ mod tests {
             cpu_runs.set(cpu_runs.get() + 1);
             Ok("cpu")
         };
-        assert_eq!(prove_preferring_gpu(true, || Ok("gpu"), cpu).unwrap(), "gpu");
+        assert_eq!(prove_preferring_gpu("test", true, || Ok("gpu"), cpu).unwrap(), "gpu");
         assert_eq!(cpu_runs.get(), 0, "the CPU prover ran after the GPU prover succeeded");
         let failed = || Err(anyhow::anyhow!("verification failed 3 times"));
-        assert_eq!(prove_preferring_gpu(true, failed, cpu).unwrap(), "cpu");
+        assert_eq!(prove_preferring_gpu("test", true, failed, cpu).unwrap(), "cpu");
         let panicked = || -> anyhow::Result<&str> { panic!("helper exited 101") };
-        assert_eq!(prove_preferring_gpu(true, panicked, cpu).unwrap(), "cpu");
+        assert_eq!(prove_preferring_gpu("test", true, panicked, cpu).unwrap(), "cpu");
         assert_eq!(cpu_runs.get(), 2);
 
         // Without the GPU prover, it is not tried; and a CPU failure is the result.
         let untried = || -> anyhow::Result<&str> { unreachable!("the GPU prover was not chosen") };
-        assert_eq!(prove_preferring_gpu(false, untried, cpu).unwrap(), "cpu");
+        assert_eq!(prove_preferring_gpu("test", false, untried, cpu).unwrap(), "cpu");
         let cpu_failed = || -> anyhow::Result<&str> { Err(anyhow::anyhow!("helper failed")) };
-        assert!(prove_preferring_gpu(true, failed, cpu_failed).is_err());
+        assert!(prove_preferring_gpu("test", true, failed, cpu_failed).is_err());
     }
 }

@@ -1,13 +1,15 @@
 //! The GPU runtime this process already uses, as seen by the final wrap's GPU helpers.
 //!
-//! The GPU wrap provers run in helper processes that need GPU memory of their own (~15 GB for
-//! Groth16 on the v6.1.0 circuit), while the prover that starts them keeps its shard-prover state on
-//! the card between proofs (~22 GB of a 24 GB card). So:
-//! - [`free_memory`] says what a helper could get, and the GPU path is chosen only where it fits.
-//! - [`reset_if_requested`] frees the card with `cudaDeviceReset` or `hipDeviceReset`. That
-//!   destroys every allocation, stream and pinned buffer this process has, so its next proof
+//! The GPU wrap provers run in helper processes that need GPU memory of their own (14.5 GiB for
+//! Groth16 on the v6.1.0 circuit, measured with gnark's solver; PLONK's ~24 GB), while the prover
+//! that starts them keeps its shard-prover state on the card between proofs (21.7 GB of an RTX
+//! 4090's 24 GB). So:
+//! - [`free_memory`] says what a helper could get on the calling thread's current device, and the
+//!   GPU path is chosen only where it fits.
+//! - [`reset_if_requested`] frees that device with `cudaDeviceReset` or `hipDeviceReset`. That
+//!   destroys every allocation, stream and pinned buffer this process has on it, so its next proof
 //!   crashes (measured: a segfault as the next proof starts). Only a process that exits after its
-//!   wrap can afford it, so it happens only with `SP1_GPU_RESET_BEFORE_WRAP=1`.
+//!   wrap can afford it, so it happens only with `SP1_GPU_RESET_BEFORE_WRAP=1` (or `true`).
 //!
 //! Both use only a runtime library this process has already loaded. Loading one here would start
 //! a second runtime, and on a host with both toolkits installed it could be the wrong one.
@@ -167,6 +169,13 @@ mod tests {
         }
         assert!(free_memory().is_none());
         assert!(loaded().is_none());
-        assert!(!has_runtime(), "looking up the GPU runtime loaded one");
+        let _env = crate::test_env::lock();
+        std::env::set_var("SP1_GPU_RESET_BEFORE_WRAP", "1");
+        assert!(reset_requested());
+        reset_if_requested("test");
+        std::env::set_var("SP1_GPU_RESET_BEFORE_WRAP", "0");
+        assert!(!reset_requested());
+        std::env::remove_var("SP1_GPU_RESET_BEFORE_WRAP");
+        assert!(!has_runtime(), "looking up or resetting the GPU runtime loaded one");
     }
 }

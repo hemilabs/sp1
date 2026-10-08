@@ -1,5 +1,6 @@
-//! Running the final wrap's helper processes (the Groth16 CPU and GPU helpers, `plonk_gpu_helper`,
-//! `r1cs_solve_plan`, `scs_solve_plan`).
+//! Running the final wrap's one-shot helper processes (the Groth16 CPU and GPU helpers,
+//! `plonk_gpu_helper`, `r1cs_solve_plan`, `scs_solve_plan`; not PLONK's long-lived witness worker and
+//! helper server).
 //!
 //! [`run`] makes a helper part of its parent's proof:
 //! - It inherits the final-wrap queue slot this thread holds (see `groth16_queue`), so the slot is
@@ -14,8 +15,12 @@
 //! - Its stdin is `/dev/null`, and its stderr is passed through and kept, so that a failure's
 //!   message says why rather than just "exit status: 2".
 //!
-//! All of this reaches the helper itself, not processes it starts: a wrapper script given as a
-//! helper must `exec` the real one.
+//! `PR_SET_PDEATHSIG` and the timeout's kill reach only the helper itself, while the slot
+//! descriptor is inherited by anything it starts. A wrapper script given as a helper must therefore
+//! `exec` the real one: a child it forks would keep the slot, but neither die with the prover nor
+//! be killed at the deadline.
+//!
+//! The timeout's name predates its use for PLONK's helpers, and governs them too.
 
 use std::collections::VecDeque;
 use std::io::{Read, Write};
@@ -197,6 +202,10 @@ impl Drop for KillOnDrop {
 /// while it ran means it ran into a limit, and that the same proof would again. `None` without
 /// cgroup v2.
 pub(crate) fn cgroup_limit_hits() -> Option<u64> {
+    #[cfg(all(test, unix))]
+    if let Some((root, path)) = tests::FAKE_CGROUP.with(|fake| fake.borrow().clone()) {
+        return limit_hits_in(&root, &path);
+    }
     limit_hits_in(Path::new("/sys/fs/cgroup"), &crate::host_memory::own_cgroup()?)
 }
 
@@ -258,11 +267,17 @@ fn bind_to_parent(cmd: &mut Command) {
 fn bind_to_parent(_cmd: &mut Command) {}
 
 #[cfg(all(test, unix))]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::groth16_queue::tests::{lock_within, wait_for_file, ChildTest, CHILD_ENV};
     use crate::groth16_queue::{acquire_with, held_slot_fd, QueueConfig};
     use crate::host_lock;
+
+    thread_local! {
+        /// A cgroup tree (root, this process's path) for `cgroup_limit_hits` to read instead.
+        pub(crate) static FAKE_CGROUP: std::cell::RefCell<Option<(PathBuf, String)>> =
+            const { std::cell::RefCell::new(None) };
+    }
 
     fn sh(script: &str) -> Command {
         let mut cmd = Command::new("sh");
@@ -270,6 +285,7 @@ mod tests {
         cmd
     }
 
+    #[cfg(target_os = "linux")]
     /// Writes the shell's pid to `<dir>/helper.pid` in one step, so a reader never sees it empty.
     fn record_pid(dir: &Path) -> String {
         format!(
@@ -278,11 +294,13 @@ mod tests {
         )
     }
 
+    #[cfg(target_os = "linux")]
     fn read_pid(dir: &Path) -> i32 {
         wait_for_file(&dir.join("helper.pid"));
         std::fs::read_to_string(dir.join("helper.pid")).unwrap().trim().parse().unwrap()
     }
 
+    #[cfg(target_os = "linux")]
     /// Whether `pid` is running. A zombie is not: a killed helper whose new parent (PID 1, which
     /// in a container may never reap) has not collected it yet.
     fn alive(pid: i32) -> bool {
@@ -319,6 +337,17 @@ mod tests {
         assert!(finished.stderr_tail.ends_with("END\n"));
     }
 
+    /// A helper left running when its runner gives up (a failed wait, say) is killed and reaped.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_dropped_helper_is_killed() {
+        let child = sh("exec sleep 60").spawn().unwrap();
+        let pid = i32::try_from(child.id()).unwrap();
+        drop(KillOnDrop(Some(child)));
+        assert!(!alive(pid), "the helper outlived its runner");
+    }
+
+    #[cfg(target_os = "linux")]
     #[test]
     fn a_hung_helper_is_killed_at_the_deadline() {
         let dir = tempfile::tempdir().unwrap();
@@ -336,6 +365,7 @@ mod tests {
         assert!(!alive(read_pid(dir.path())), "the hung helper is still running");
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn stdin_is_dev_null() {
         let finished = run_with_timeout(
@@ -385,6 +415,7 @@ mod tests {
     /// The case the inherited slot exists for: the prover dies while its helper still runs. The
     /// helper must die with it, and the slot must stay taken until the helper is gone, not just the
     /// prover. The child test holds the slot and runs a helper that records its pid and sleeps.
+    #[cfg(target_os = "linux")]
     #[test]
     fn a_helper_holds_the_slot_and_dies_with_its_parent() {
         if let Ok(dir) = std::env::var(CHILD_ENV) {
@@ -418,6 +449,7 @@ mod tests {
     /// A plain spawn neither passes the slot's descriptor to the helper nor sets PDEATHSIG, so here
     /// the helper outlives its parent and the slot is freed anyway. This only tells "both" from
     /// "neither"; `the_helper_inherits_the_slot` checks the descriptor on its own.
+    #[cfg(target_os = "linux")]
     #[test]
     fn an_unbound_helper_does_not_hold_the_slot() {
         if let Ok(dir) = std::env::var(CHILD_ENV) {

@@ -268,8 +268,8 @@ pub async fn cuda_worker_builder_with_machine(
     // The GPU Groth16 prover is for cards above the 16 GB tier; 16 GB cards use gnark's CPU
     // prover, as the v6.0.0 fork always did. Before each proof the recursion prover also checks
     // that the card has the GPU memory free for the GPU prover's helper (beside this prover's own
-    // state, that rules out 24 GB cards) and the host has the memory, and uses the CPU prover if
-    // not.
+    // state, that rules out cards below 48 GB unless SP1_GPU_RESET_BEFORE_WRAP is set) and the host
+    // has the memory, and uses the CPU prover if not.
     let groth16_gpu = gpu_memory_gb() > 20;
 
     let base_builder = SP1WorkerBuilder::new_with_machine(machine)
