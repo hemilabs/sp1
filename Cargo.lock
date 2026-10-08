@@ -8262,6 +8262,7 @@ dependencies = [
  "dirs",
  "fd-lock",
  "hex",
+ "libc",
  "libloading",
  "num-bigint 0.4.6",
  "serde",

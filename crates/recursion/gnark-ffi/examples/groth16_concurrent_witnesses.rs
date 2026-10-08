@@ -18,6 +18,10 @@
 //!
 //! # The whole real path for one witness (prepare, GPU helper), then verify the proof.
 //! groth16_concurrent_witnesses prove <build_dir> <witness.json>
+//!
+//! # The CPU prover's real path for one witness (host-wide queue slot, groth16_cpu_helper), then
+//! # verify. Run several at once to exercise the queue.
+//! groth16_concurrent_witnesses prove-cpu <build_dir> <witness.json>
 //! ```
 //!
 //! `prove` needs `SP1_GROTH16_GPU_HELPER` to point at `groth16_gpu_helper`, since examples live
@@ -41,11 +45,15 @@ fn main() {
             prepare(Path::new(build_dir), Path::new(out_dir), witnesses)
         }
         (Some("prove"), [build_dir, witness]) => prove(Path::new(build_dir), Path::new(witness)),
+        (Some("prove-cpu"), [build_dir, witness]) => {
+            prove_cpu(Path::new(build_dir), Path::new(witness))
+        }
         _ => {
             eprintln!(
                 "usage: groth16_concurrent_witnesses pk <build_dir>\n       \
                  groth16_concurrent_witnesses prepare <build_dir> <out_dir> <witness.json>...\n       \
-                 groth16_concurrent_witnesses prove <build_dir> <witness.json>"
+                 groth16_concurrent_witnesses prove <build_dir> <witness.json>\n       \
+                 groth16_concurrent_witnesses prove-cpu <build_dir> <witness.json>"
             );
             std::process::exit(2);
         }
@@ -130,12 +138,23 @@ fn prove(build_dir: &Path, witness: &Path) {
     let proof = Groth16Bn254Prover::run_gpu_helper(&prepared);
     drop(prepared);
     assert!(!witness_dir.exists(), "the proof's witness directory must be removed afterwards");
+    verify(build_dir, witness, &proof);
+}
 
+fn prove_cpu(build_dir: &Path, witness: &Path) {
+    init_tracing();
+    let t0 = Instant::now();
+    let proof = Groth16Bn254Prover::prove_isolated_json(witness, build_dir).unwrap();
+    println!("PROVED pid={} after={:?}", std::process::id(), t0.elapsed());
+    verify(build_dir, witness, &proof);
+}
+
+fn verify(build_dir: &Path, witness: &Path, proof: &sp1_recursion_gnark_ffi::Groth16Bn254Proof) {
     let pubs: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(witness).unwrap()).unwrap();
     let field = |name: &str| -> BigUint { pubs[name].as_str().unwrap().parse().unwrap() };
     let result = Groth16Bn254Prover::new().verify(
-        &proof,
+        proof,
         &field("vkey_hash"),
         &field("committed_values_digest"),
         &field("exit_code"),

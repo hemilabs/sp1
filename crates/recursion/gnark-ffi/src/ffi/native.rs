@@ -281,6 +281,45 @@ pub fn prove_groth16_bn254(data_dir: &str, witness_path: &str) -> Groth16Bn254Pr
     }
 }
 
+/// Proves with the R1CS at `r1cs_path` (typically the stripped circuit) and keeps nothing in the Go
+/// runtime afterwards, unlike [`prove_groth16_bn254`], which caches the R1CS and proving key for
+/// the life of the process. For a short-lived process such as `groth16_cpu_helper`.
+pub fn prove_groth16_bn254_with_r1cs(
+    data_dir: &str,
+    r1cs_path: &str,
+    witness_path: &str,
+) -> Groth16Bn254Proof {
+    let data_dir = CString::new(data_dir).expect("CString::new failed");
+    let r1cs_path = CString::new(r1cs_path).expect("CString::new failed");
+    let witness_path = CString::new(witness_path).expect("CString::new failed");
+    unsafe {
+        let proof = bind::ProveGroth16Bn254WithR1cs(
+            data_dir.as_ptr() as *mut c_char,
+            r1cs_path.as_ptr() as *mut c_char,
+            witness_path.as_ptr() as *mut c_char,
+        );
+        assert!(!proof.is_null(), "ProveGroth16Bn254WithR1cs returned no proof");
+        groth16_bn254_proof_from_raw(proof)
+    }
+}
+
+/// Writes the Groth16 R1CS in `data_dir` to `output_path` without its debug information, which
+/// the prover does not use and which makes up about a third of the file.
+pub fn export_groth16_stripped_r1cs(data_dir: &str, output_path: &str) {
+    let data_dir_cstring = CString::new(data_dir).expect("CString::new failed");
+    let output_path_cstring = CString::new(output_path).expect("CString::new failed");
+    unsafe {
+        let err = bind::ExportGroth16StrippedR1cs(
+            data_dir_cstring.as_ptr() as *mut c_char,
+            output_path_cstring.as_ptr() as *mut c_char,
+        );
+        if !err.is_null() {
+            let msg = ptr_to_string_freed(err);
+            panic!("ExportGroth16StrippedR1cs failed: {msg}");
+        }
+    }
+}
+
 pub fn verify_groth16_bn254(
     data_dir: &str,
     proof: &str,

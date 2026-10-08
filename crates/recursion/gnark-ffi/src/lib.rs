@@ -4,6 +4,8 @@ pub mod ffi;
 pub mod groth16_bn254;
 #[cfg(feature = "native")]
 mod gpu_cache;
+#[cfg(feature = "native")]
+mod groth16_queue;
 pub mod plonk_bn254;
 #[cfg(feature = "native")]
 pub mod plonk_helper_server;

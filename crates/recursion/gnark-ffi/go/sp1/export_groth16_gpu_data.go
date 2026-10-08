@@ -40,24 +40,8 @@ func ExportGroth16GpuData(dataDir string, outputDir string) {
 	fmt.Printf("[groth16-export] Reading R1CS took %s\n", time.Since(start))
 
 	// Create stripped R1CS (without debug data) for faster loading in ExportGroth16GpuWitness.
-	// DebugInfo + MDebug + SymbolTable account for ~33% of the 2.4GB file (~817MB) and are
-	// unused during proving. Stripping them reduces load time from ~20s to ~5s.
 	os.MkdirAll(outputDir, 0755)
-	strippedPath := filepath.Join(outputDir, "groth16_circuit_stripped.bin")
-	start = time.Now()
-	_r1cs := r1cs.(*cs.R1CS)
-	_r1cs.DebugInfo = nil
-	_r1cs.MDebug = nil
-	_r1cs.SymbolTable = debug.SymbolTable{}
-	strippedFile, err := os.Create(strippedPath)
-	if err != nil {
-		panic(fmt.Sprintf("Failed to create stripped R1CS: %v", err))
-	}
-	strippedWriter := bufio.NewWriterSize(strippedFile, 1024*1024)
-	r1cs.WriteTo(strippedWriter)
-	strippedWriter.Flush()
-	strippedFile.Close()
-	fmt.Printf("[groth16-export] Wrote stripped R1CS (%s) in %s\n", strippedPath, time.Since(start))
+	writeStrippedR1cs(r1cs, filepath.Join(outputDir, "groth16_circuit_stripped.bin"))
 
 	// Load proving key
 	start = time.Now()
@@ -240,4 +224,32 @@ func writeG2File(path string, points []bn254.G2Affine) {
 		reverseBytes(buf[96:128], raw[96:128])
 		w.Write(buf)
 	}
+}
+
+// writeStrippedR1cs writes r1cs to path without its debug information. DebugInfo + MDebug +
+// SymbolTable account for ~33% of the 2.4GB file (~817MB) and are unused during proving.
+// Stripping them reduces load time from ~20s to ~5s. Modifies r1cs.
+func writeStrippedR1cs(r1cs constraint.ConstraintSystem, path string) {
+	start := time.Now()
+	_r1cs := r1cs.(*cs.R1CS)
+	_r1cs.DebugInfo = nil
+	_r1cs.MDebug = nil
+	_r1cs.SymbolTable = debug.SymbolTable{}
+	strippedFile, err := os.Create(path)
+	if err != nil {
+		panic(fmt.Sprintf("Failed to create stripped R1CS: %v", err))
+	}
+	strippedWriter := bufio.NewWriterSize(strippedFile, 1024*1024)
+	if _, err := r1cs.WriteTo(strippedWriter); err != nil {
+		strippedFile.Close()
+		panic(fmt.Sprintf("Failed to write stripped R1CS: %v", err))
+	}
+	if err := strippedWriter.Flush(); err != nil {
+		strippedFile.Close()
+		panic(fmt.Sprintf("Failed to flush stripped R1CS: %v", err))
+	}
+	if err := strippedFile.Close(); err != nil {
+		panic(fmt.Sprintf("Failed to close stripped R1CS: %v", err))
+	}
+	fmt.Printf("[groth16-export] Wrote stripped R1CS (%s) in %s\n", path, time.Since(start))
 }

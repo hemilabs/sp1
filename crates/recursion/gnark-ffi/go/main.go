@@ -21,6 +21,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"runtime"
+	"runtime/debug"
 	"sync"
 	"unsafe"
 
@@ -121,20 +123,44 @@ func ProveGroth16Bn254(dataDir *C.char, witnessPath *C.char) *C.C_Groth16Bn254Pr
 	witnessPathString := C.GoString(witnessPath)
 
 	sp1Groth16Bn254Proof := sp1.ProveGroth16(dataDirString, witnessPathString)
+	return groth16ProofToC(sp1Groth16Bn254Proof)
+}
 
+//export ProveGroth16Bn254WithR1cs
+func ProveGroth16Bn254WithR1cs(dataDir *C.char, r1csPath *C.char, witnessPath *C.char) *C.C_Groth16Bn254Proof {
+	proof := sp1.ProveGroth16WithR1cs(C.GoString(dataDir), C.GoString(r1csPath), C.GoString(witnessPath))
+	return groth16ProofToC(proof)
+}
+
+//export ExportGroth16StrippedR1cs
+func ExportGroth16StrippedR1cs(dataDir *C.char, outputPath *C.char) (errStr *C.char) {
+	defer func() {
+		if r := recover(); r != nil {
+			errStr = C.CString(fmt.Sprintf("[groth16-strip] panic: %v", r))
+		}
+	}()
+	sp1.ExportGroth16StrippedR1cs(C.GoString(dataDir), C.GoString(outputPath))
+	// The full circuit read above is ~9 GB of garbage now. groth16_cpu_helper proves right after
+	// this in the same process, so return it to the host before that prove's own peak.
+	runtime.GC()
+	debug.FreeOSMemory()
+	return nil
+}
+
+func groth16ProofToC(proof sp1.Proof) *C.C_Groth16Bn254Proof {
 	ms := C.malloc(C.sizeof_C_Groth16Bn254Proof)
 	if ms == nil {
 		return nil
 	}
 
 	structPtr := (*C.C_Groth16Bn254Proof)(ms)
-	structPtr.PublicInputs[0] = C.CString(sp1Groth16Bn254Proof.PublicInputs[0])
-	structPtr.PublicInputs[1] = C.CString(sp1Groth16Bn254Proof.PublicInputs[1])
-	structPtr.PublicInputs[2] = C.CString(sp1Groth16Bn254Proof.PublicInputs[2])
-	structPtr.PublicInputs[3] = C.CString(sp1Groth16Bn254Proof.PublicInputs[3])
-	structPtr.PublicInputs[4] = C.CString(sp1Groth16Bn254Proof.PublicInputs[4])
-	structPtr.EncodedProof = C.CString(sp1Groth16Bn254Proof.EncodedProof)
-	structPtr.RawProof = C.CString(sp1Groth16Bn254Proof.RawProof)
+	structPtr.PublicInputs[0] = C.CString(proof.PublicInputs[0])
+	structPtr.PublicInputs[1] = C.CString(proof.PublicInputs[1])
+	structPtr.PublicInputs[2] = C.CString(proof.PublicInputs[2])
+	structPtr.PublicInputs[3] = C.CString(proof.PublicInputs[3])
+	structPtr.PublicInputs[4] = C.CString(proof.PublicInputs[4])
+	structPtr.EncodedProof = C.CString(proof.EncodedProof)
+	structPtr.RawProof = C.CString(proof.RawProof)
 	return structPtr
 }
 

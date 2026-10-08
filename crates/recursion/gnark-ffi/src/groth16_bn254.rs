@@ -199,6 +199,29 @@ fn witness_dir(vkey_hash_hex: &str) -> tempfile::TempDir {
         .expect("failed to create a per-proof witness directory")
 }
 
+/// The stripped-R1CS cache's marker and file; see `Groth16Bn254Prover::ensure_stripped_r1cs`.
+#[cfg(feature = "native")]
+const R1CS_CACHE_MARKER: &str = ".sp1_r1cs_cache_complete";
+#[cfg(feature = "native")]
+const STRIPPED_R1CS: &str = "groth16_circuit_stripped.bin";
+
+/// Finds a helper binary: `env_var` when set (and only there), else next to this executable, else
+/// on `PATH`. `None` when it is not where it should be.
+#[cfg(feature = "native")]
+fn find_helper(name: &str, env_var: &str) -> Option<std::path::PathBuf> {
+    if let Some(path) = std::env::var_os(env_var) {
+        let path = std::path::PathBuf::from(path);
+        return path.is_file().then_some(path);
+    }
+    let beside = std::env::current_exe().ok().and_then(|exe| Some(exe.parent()?.join(name)));
+    if let Some(beside) = beside.filter(|path| path.is_file()) {
+        return Some(beside);
+    }
+    std::env::split_paths(&std::env::var_os("PATH")?)
+        .map(|dir| dir.join(name))
+        .find(|path| path.is_file())
+}
+
 /// Locate the `groth16_gpu_helper` subprocess binary. Priority:
 ///   1. `SP1_GROTH16_GPU_HELPER` env var (absolute path)
 ///   2. Alongside the current executable (standard Cargo target-dir layout)
@@ -432,12 +455,7 @@ impl Groth16Bn254Prover {
     /// `$PATH`).
     #[cfg(feature = "native")]
     pub fn gpu_helper_available() -> bool {
-        let path = resolve_helper_path("groth16_gpu_helper");
-        if path.components().count() > 1 {
-            return path.is_file();
-        }
-        std::env::var_os("PATH")
-            .is_some_and(|paths| std::env::split_paths(&paths).any(|dir| dir.join(&path).is_file()))
+        find_helper("groth16_gpu_helper", "SP1_GROTH16_GPU_HELPER").is_some()
     }
 
     /// Executes the prover in testing mode with a circuit definition and witness.
@@ -460,7 +478,11 @@ impl Groth16Bn254Prover {
         )
     }
 
-    /// Generates a Groth16 proof given a witness.
+    /// Generates a Groth16 proof given a witness, with gnark's CPU prover in this process.
+    ///
+    /// The Go runtime keeps the circuit and proving key (~12 GB on the v6.1.0 circuit) for the
+    /// life of the process, and nothing limits how many processes on the host prove at once.
+    /// Long-lived provers should use [`Self::prove_isolated`].
     pub fn prove<C: Config>(&self, witness: Witness<C>, build_dir: &Path) -> Groth16Bn254Proof {
         // Write witness.
         let mut witness_file = tempfile::NamedTempFile::new().unwrap();
@@ -472,6 +494,129 @@ impl Groth16Bn254Prover {
             prove_groth16_bn254(build_dir.to_str().unwrap(), witness_file.path().to_str().unwrap());
         proof.groth16_vkey_hash = Self::get_vkey_hash(build_dir);
         proof
+    }
+
+    /// Generates a Groth16 proof with gnark's CPU prover in a `groth16_cpu_helper` subprocess,
+    /// one host-wide queue slot at a time.
+    ///
+    /// Two things make [`Self::prove`] unsafe for a long-lived prover. Its process stays ~12 GB
+    /// larger for good, because Go keeps the circuit and proving key. And provers on the same host
+    /// (one per GPU) can each prove at once, at ~24 GB apiece. Here, the helper's memory goes back
+    /// to the host when it exits, and `groth16_queue` admits one Groth16 at a time per host
+    /// (`SP1_GROTH16_SLOTS`). The helper reads the stripped circuit when it can (see
+    /// [`Self::ensure_stripped_r1cs`]).
+    ///
+    /// Without the helper binary, or with `SP1_GROTH16_IN_PROCESS=1`, this proves in this process
+    /// as [`Self::prove`] does, still queued.
+    #[cfg(feature = "native")]
+    pub fn prove_isolated<C: Config>(
+        &self,
+        witness: Witness<C>,
+        build_dir: &Path,
+    ) -> Result<Groth16Bn254Proof> {
+        let mut witness_file = tempfile::NamedTempFile::new()?;
+        serde_json::to_writer(&mut witness_file, &GnarkWitness::new(witness))?;
+        witness_file.flush()?;
+        Self::prove_isolated_json(witness_file.path(), build_dir)
+    }
+
+    /// [`Self::prove_isolated`] for a witness already written as GnarkWitness JSON. Public for the
+    /// queue test (`examples/groth16_concurrent_witnesses.rs`).
+    #[cfg(feature = "native")]
+    #[doc(hidden)]
+    pub fn prove_isolated_json(witness_json: &Path, build_dir: &Path) -> Result<Groth16Bn254Proof> {
+        let _slot = crate::groth16_queue::acquire("Groth16 (CPU)");
+
+        let in_process = std::env::var("SP1_GROTH16_IN_PROCESS").is_ok_and(|v| v == "1");
+        let helper = if in_process {
+            None
+        } else {
+            let helper = find_helper("groth16_cpu_helper", "SP1_GROTH16_CPU_HELPER");
+            if helper.is_none() {
+                tracing::warn!(
+                    "groth16_cpu_helper was not found next to this binary, on PATH, or at \
+                     SP1_GROTH16_CPU_HELPER; proving in this process, which then keeps the \
+                     circuit and key in memory"
+                );
+            }
+            helper
+        };
+        let Some(helper) = helper else {
+            let build_dir_str =
+                build_dir.to_str().ok_or_else(|| anyhow::anyhow!("non-UTF-8 path"))?;
+            let witness_str =
+                witness_json.to_str().ok_or_else(|| anyhow::anyhow!("non-UTF-8 path"))?;
+            let mut proof = prove_groth16_bn254(build_dir_str, witness_str);
+            proof.groth16_vkey_hash = Self::get_vkey_hash(build_dir);
+            return Ok(proof);
+        };
+
+        let out_file = tempfile::NamedTempFile::new()?;
+        tracing::info!("Proving Groth16 in {}", helper.display());
+        let status = std::process::Command::new(&helper)
+            .arg("--build-dir")
+            .arg(build_dir)
+            .arg("--witness-json")
+            .arg(witness_json)
+            .arg("--out")
+            .arg(out_file.path())
+            .status()
+            .map_err(|e| anyhow::anyhow!("failed to start {}: {e}", helper.display()))?;
+        if !status.success() {
+            anyhow::bail!("{} failed: {status}", helper.display());
+        }
+        let mut proof: Groth16Bn254Proof = serde_json::from_slice(&std::fs::read(out_file.path())?)
+            .map_err(|e| anyhow::anyhow!("unreadable proof from {}: {e}", helper.display()))?;
+        proof.groth16_vkey_hash = Self::get_vkey_hash(build_dir);
+        Ok(proof)
+    }
+
+    /// Returns the circuit without its debug information, which loads several times faster than
+    /// the full `groth16_circuit.bin` and is all a prover needs, building it first if no complete
+    /// copy exists. `None` (prove with the full circuit) when disabled with
+    /// `SP1_GROTH16_R1CS_CACHE_DISABLE` or when building fails.
+    ///
+    /// Cached at `<root>/sp1_groth16_r1cs_<vkey_hash>/`, where the root is `SP1_GROTH16_R1CS_CACHE`
+    /// or else the directory holding the circuit artifacts. That is on disk on purpose: the file is
+    /// read for every proof, the page cache keeps it warm, and unlike `/dev/shm` the kernel can
+    /// reclaim it when memory is short. Building reads the full circuit (~9 GB of memory), so it
+    /// belongs in the short-lived helper, not a long-lived prover.
+    #[cfg(feature = "native")]
+    #[doc(hidden)]
+    pub fn ensure_stripped_r1cs(build_dir: &Path) -> Option<std::path::PathBuf> {
+        use crate::ffi::export_groth16_stripped_r1cs;
+
+        if std::env::var_os("SP1_GROTH16_R1CS_CACHE_DISABLE").is_some() {
+            return None;
+        }
+        let root = match std::env::var_os("SP1_GROTH16_R1CS_CACHE") {
+            Some(root) => std::path::PathBuf::from(root),
+            None => build_dir.parent()?.to_path_buf(),
+        };
+        let vkey_hash_hex = hex::encode(Self::get_vkey_hash(build_dir));
+        let dir = root.join(format!("sp1_groth16_r1cs_{vkey_hash_hex}"));
+        let build_dir_str = build_dir.to_str()?;
+        let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            crate::gpu_cache::ensure_built(&dir, R1CS_CACHE_MARKER, |out| {
+                let path = out.join(STRIPPED_R1CS);
+                export_groth16_stripped_r1cs(
+                    build_dir_str,
+                    path.to_str().ok_or_else(|| anyhow::anyhow!("non-UTF-8 path"))?,
+                );
+                Ok(())
+            })
+        }));
+        match built {
+            Ok(Ok(_)) => Some(dir.join(STRIPPED_R1CS)),
+            Ok(Err(e)) => {
+                tracing::warn!("stripped R1CS unavailable ({e:#}); using the full circuit");
+                None
+            }
+            Err(_) => {
+                tracing::warn!("building the stripped R1CS panicked; using the full circuit");
+                None
+            }
+        }
     }
 
     /// Generates a Groth16 proof using the GPU-accelerated prover.
@@ -487,6 +632,9 @@ impl Groth16Bn254Prover {
     #[cfg(feature = "native")]
     pub fn prove_gpu<C: Config>(&self, witness: Witness<C>, build_dir: &Path) -> Groth16Bn254Proof {
         use crate::ffi::export_groth16_gpu_witness;
+
+        // One Groth16 at a time per host; see `groth16_queue`.
+        let _slot = crate::groth16_queue::acquire("Groth16 (GPU, in-process)");
 
         // Write witness to temp file for Go
         // Use /dev/shm (tmpfs) on Linux to avoid disk I/O overhead.
@@ -582,6 +730,9 @@ impl Groth16Bn254Prover {
         witness: Witness<C>,
         build_dir: &Path,
     ) -> Groth16Bn254Proof {
+        // One Groth16 at a time per host; see `groth16_queue`.
+        let _slot = crate::groth16_queue::acquire("Groth16 (GPU)");
+
         // Step 1: write witness JSON (CPU-only, no HIP).
         let mut witness_file = shm_named_tempfile();
         let gnark_witness = GnarkWitness::new(witness);

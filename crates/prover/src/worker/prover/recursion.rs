@@ -835,11 +835,14 @@ impl<A: ArtifactClient, C: SP1ProverComponents> SP1RecursionProver<A, C> {
                 "groth16_wrap",
                 max_retries,
                 || -> Result<_, anyhow::Error> {
+                    // Either way the proof takes the host-wide Groth16 queue slot first, and
+                    // the CPU prover runs in `groth16_cpu_helper`, so this process does not keep
+                    // its ~12 GB of circuit and key afterwards.
                     #[cfg(feature = "native-gnark")]
                     let p = if use_gpu {
                         prover.prove_gpu_subprocess(witness.clone(), &build_dir)
                     } else {
-                        prover.prove(witness.clone(), &build_dir)
+                        prover.prove_isolated(witness.clone(), &build_dir)?
                     };
                     #[cfg(not(feature = "native-gnark"))]
                     let p = prover.prove(witness.clone(), &build_dir);
