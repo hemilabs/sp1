@@ -8260,6 +8260,7 @@ dependencies = [
  "cfg-if",
  "clap",
  "dirs",
+ "fd-lock",
  "hex",
  "libloading",
  "num-bigint 0.4.6",
@@ -8276,6 +8277,7 @@ dependencies = [
  "sp1-verifier",
  "tempfile",
  "tracing",
+ "tracing-subscriber 0.3.23",
 ]
 
 [[package]]

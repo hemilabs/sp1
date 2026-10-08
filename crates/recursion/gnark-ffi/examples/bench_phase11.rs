@@ -162,6 +162,7 @@ fn main() {
         build_dir.to_str().unwrap(),
         witness_path.to_str().unwrap(),
         pk_cache.to_str().unwrap(),
+        pk_cache.to_str().unwrap(),
     );
     let gnark_solve = t.elapsed();
     println!("  gnark.Solve (export_groth16_gpu_witness): {gnark_solve:?}");

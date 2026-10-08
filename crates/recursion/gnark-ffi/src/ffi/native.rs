@@ -210,15 +210,24 @@ pub fn export_groth16_gpu_data(data_dir: &str, output_dir: &str) {
     }
 }
 
-/// Solve Groth16 R1CS and export witness data for GPU prover.
-pub fn export_groth16_gpu_witness(data_dir: &str, witness_path: &str, output_dir: &str) {
+/// Solve Groth16 R1CS and export witness data for GPU prover. `pk_dir` is the directory
+/// `export_groth16_gpu_data` wrote, and is only read. `output_dir` must belong to this proof
+/// alone: provers share `pk_dir`, so per-proof files written there would clobber each other.
+pub fn export_groth16_gpu_witness(
+    data_dir: &str,
+    witness_path: &str,
+    pk_dir: &str,
+    output_dir: &str,
+) {
     let data_dir_cstring = CString::new(data_dir).expect("CString::new failed");
     let witness_path_cstring = CString::new(witness_path).expect("CString::new failed");
+    let pk_dir_cstring = CString::new(pk_dir).expect("CString::new failed");
     let output_dir_cstring = CString::new(output_dir).expect("CString::new failed");
     unsafe {
         let err = bind::ExportGroth16GpuWitness(
             data_dir_cstring.as_ptr() as *mut c_char,
             witness_path_cstring.as_ptr() as *mut c_char,
+            pk_dir_cstring.as_ptr() as *mut c_char,
             output_dir_cstring.as_ptr() as *mut c_char,
         );
         if !err.is_null() {

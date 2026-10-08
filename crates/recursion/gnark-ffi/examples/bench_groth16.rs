@@ -145,6 +145,7 @@ fn main() {
                 build_dir.to_str().unwrap(),
                 witness_temp.path().to_str().unwrap(),
                 gpu_dir_str,
+                gpu_dir_str,
             );
             let solve_elapsed = t.elapsed();
 

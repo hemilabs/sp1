@@ -14,23 +14,6 @@ use sp1_recursion_compiler::{
     ir::{Config, Witness},
 };
 
-/// Create a temp directory in /dev/shm (tmpfs) on Linux, falling back to the
-/// default temp dir on other platforms. This avoids disk I/O for large proving
-/// data files.
-#[cfg(feature = "native")]
-fn shm_tempdir() -> tempfile::TempDir {
-    #[cfg(target_os = "linux")]
-    {
-        let shm = std::path::Path::new("/dev/shm");
-        if shm.exists() {
-            return tempfile::Builder::new()
-                .tempdir_in(shm)
-                .expect("failed to create temp dir in /dev/shm");
-        }
-    }
-    tempfile::TempDir::new().expect("failed to create temp dir")
-}
-
 /// Create a named temp file in /dev/shm (tmpfs) on Linux, falling back to the
 /// default temp dir on other platforms.
 #[cfg(feature = "native")]
@@ -137,12 +120,14 @@ fn try_release_parent_gpu_memory() -> bool {
 /// Cache layout (under /dev/shm or fallback temp):
 ///   sp1_groth16_pk_cache_<vkey_hash_hex>/
 ///     <all flat-binary files written by export_groth16_gpu_data>
-///     .sp1_pk_cache_complete         ← sentinel; only written once
-///                                      every other file is finalized
-///                                      and an explicit fsync has run
+///     .sp1_pk_cache_complete         ← marker; moves into place with the
+///                                      directory, so its presence means
+///                                      the export finished
 ///
-/// The sentinel-file pattern protects against partial caches from a
-/// crashed prior run. Override the cache root via SP1_GROTH16_PK_CACHE.
+/// Every prover on the host shares it: it is built once under a lock and
+/// published atomically (see `gpu_cache`), and only read afterwards.
+/// Per-proof files go to their own directories beside it (`witness_dir`).
+/// Override the cache root via SP1_GROTH16_PK_CACHE.
 /// Set `SP1_GROTH16_PK_CACHE_DISABLE=1` to fall back to the previous
 /// per-prove tempdir behavior.
 #[cfg(feature = "native")]
@@ -163,75 +148,55 @@ fn pk_cache_dir(vkey_hash_hex: &str) -> Option<std::path::PathBuf> {
 #[cfg(feature = "native")]
 const PK_CACHE_SENTINEL: &str = ".sp1_pk_cache_complete";
 
-/// Resolved gpu_dir for one prove, plus a flag indicating whether the
-/// caller needs to run the (expensive) PK export.
+/// The GPU-format proving key one proof reads: the shared per-circuit cache, or this proof's own
+/// export when the cache is disabled.
 #[cfg(feature = "native")]
-struct ResolvedGpuDir {
-    /// The directory the caller should pass to the helper / load from.
-    path: std::path::PathBuf,
-    /// True iff a complete cache was found and PK export can be skipped.
-    cache_hit: bool,
-    /// The cache root, present when caching is enabled. Used to write
-    /// the sentinel file after a successful export.
-    cache_dir: Option<std::path::PathBuf>,
-    /// RAII guard for the per-prove tempdir, only set when the cache is
-    /// disabled. Drop releases the tempdir.
-    _per_prove_tempdir: Option<tempfile::TempDir>,
+struct GpuPk {
+    dir: std::path::PathBuf,
+    /// Only when the cache is disabled: this proof's private export, removed on drop.
+    _private: Option<tempfile::TempDir>,
 }
 
-/// Resolve the gpu_dir for a single prove, applying the PK export cache.
-/// On cache hit, returns the stable cache path with `cache_hit = true`
-/// and the caller should skip `export_groth16_gpu_data`. On miss, returns
-/// either the (empty, freshly created) cache directory or a temp dir
-/// when the cache is disabled. On miss the caller MUST run
-/// `export_groth16_gpu_data` and then call `mark_cache_complete` to
-/// finalize the cache.
+/// Returns the GPU-format proving key for `build_dir`, exporting it first if no complete cache
+/// exists. Concurrent callers, in this process or others, share one export; see `gpu_cache`.
 #[cfg(feature = "native")]
-fn resolve_gpu_dir(vkey_hash_hex: &str) -> ResolvedGpuDir {
-    let cache_dir = pk_cache_dir(vkey_hash_hex);
-    if let Some(cdir) = cache_dir {
-        let sentinel = cdir.join(PK_CACHE_SENTINEL);
-        if sentinel.exists() {
-            tracing::info!(
-                "Using cached Groth16 PK export at {} (sentinel present)",
-                cdir.display()
-            );
-            ResolvedGpuDir {
-                path: cdir.clone(),
-                cache_hit: true,
-                cache_dir: Some(cdir),
-                _per_prove_tempdir: None,
+fn gpu_pk(build_dir: &Path, vkey_hash_hex: &str) -> GpuPk {
+    use crate::ffi::export_groth16_gpu_data;
+    let build_dir_str = build_dir.to_str().unwrap();
+    let export = |out: &Path| {
+        tracing::info!("Exporting Groth16 GPU data to {} (cache miss)...", out.display());
+        let t0 = std::time::Instant::now();
+        export_groth16_gpu_data(build_dir_str, out.to_str().unwrap());
+        tracing::info!("Groth16 PK export completed in {:?}", t0.elapsed());
+    };
+    match pk_cache_dir(vkey_hash_hex) {
+        Some(dir) => {
+            let outcome = crate::gpu_cache::ensure_built(&dir, PK_CACHE_SENTINEL, |out| {
+                export(out);
+                Ok(())
+            })
+            .unwrap_or_else(|e| panic!("Groth16 PK cache at {}: {e:#}", dir.display()));
+            if outcome != crate::gpu_cache::CacheOutcome::Built {
+                tracing::info!("Using cached Groth16 PK export at {} ({outcome:?})", dir.display());
             }
-        } else {
-            if cdir.exists() {
-                tracing::warn!("Removing partial PK cache at {} (no sentinel)", cdir.display());
-                let _ = std::fs::remove_dir_all(&cdir);
-            }
-            std::fs::create_dir_all(&cdir).expect("create PK cache dir");
-            ResolvedGpuDir {
-                path: cdir.clone(),
-                cache_hit: false,
-                cache_dir: Some(cdir),
-                _per_prove_tempdir: None,
-            }
+            GpuPk { dir, _private: None }
         }
-    } else {
-        let td = shm_tempdir();
-        let path = td.path().to_path_buf();
-        ResolvedGpuDir { path, cache_hit: false, cache_dir: None, _per_prove_tempdir: Some(td) }
+        None => {
+            let private = crate::gpu_cache::proof_tempdir(None, "sp1_groth16_pk_")
+                .expect("failed to create a private PK directory");
+            export(private.path());
+            GpuPk { dir: private.path().to_path_buf(), _private: Some(private) }
+        }
     }
 }
 
-/// Mark the PK cache complete by writing the sentinel file. Must be
-/// called only after `export_groth16_gpu_data` has finished writing all
-/// PK files and they are flushed to the page cache.
+/// A directory for one proof's witness files, beside the PK cache. Never the cache itself: provers
+/// share the cache, and a second proof's witness written there would replace this one's before the
+/// GPU prover reads it, giving an invalid proof.
 #[cfg(feature = "native")]
-fn mark_cache_complete(resolved: &ResolvedGpuDir) {
-    if let Some(ref cdir) = resolved.cache_dir {
-        if let Err(e) = std::fs::write(cdir.join(PK_CACHE_SENTINEL), b"ok\n") {
-            tracing::warn!("failed to write PK cache sentinel: {e}");
-        }
-    }
+fn witness_dir(vkey_hash_hex: &str) -> tempfile::TempDir {
+    crate::gpu_cache::proof_tempdir(pk_cache_dir(vkey_hash_hex).as_deref(), "sp1_groth16_witness_")
+        .expect("failed to create a per-proof witness directory")
 }
 
 /// Locate the `groth16_gpu_helper` subprocess binary. Priority:
@@ -304,133 +269,86 @@ fn prep_circuit_cache_dir(vkey_hash_hex: &str) -> Option<std::path::PathBuf> {
 #[cfg(feature = "native")]
 const PREP_CIRCUIT_SENTINEL: &str = ".sp1_prep_circuit_complete";
 
-/// Resolved prep-circuit-dir for the GPU R1CS path. Mirror of
-/// `ResolvedGpuDir` but for the prep-circuit-prod artifacts.
+/// Inputs for the helper's in-process GPU R1CS solver.
 #[cfg(feature = "native")]
-struct ResolvedPrepCircuitDir {
-    path: std::path::PathBuf,
-    cache_hit: bool,
-    cache_dir: Option<std::path::PathBuf>,
-    _per_prove_tempdir: Option<tempfile::TempDir>,
+struct GpuR1csInputs {
+    /// The prep-circuit-prod artifacts: the shared per-circuit cache, or a private build.
+    prep_dir: std::path::PathBuf,
+    /// Only when the cache is disabled: this proof's private build, removed on drop.
+    _prep_private: Option<tempfile::TempDir>,
+    /// This proof's `wires_initial.bin`.
+    wires_initial: tempfile::NamedTempFile,
 }
 
-/// Resolve the prep-circuit-dir, applying the per-vk cache. On hit: returns
-/// the stable cache path. On miss: creates the directory and the caller MUST
-/// run `r1cs_solve_plan prep-circuit-prod` then call `mark_prep_circuit_complete`.
-#[cfg(feature = "native")]
-fn resolve_prep_circuit_dir(vkey_hash_hex: &str) -> ResolvedPrepCircuitDir {
-    let cache_dir = prep_circuit_cache_dir(vkey_hash_hex);
-    if let Some(cdir) = cache_dir {
-        let sentinel = cdir.join(PREP_CIRCUIT_SENTINEL);
-        if sentinel.exists() {
-            tracing::info!(
-                "Using cached GPU R1CS prep-circuit-dir at {} (sentinel present)",
-                cdir.display()
-            );
-            ResolvedPrepCircuitDir {
-                path: cdir.clone(),
-                cache_hit: true,
-                cache_dir: Some(cdir),
-                _per_prove_tempdir: None,
-            }
-        } else {
-            if cdir.exists() {
-                tracing::warn!(
-                    "Removing partial prep-circuit cache at {} (no sentinel)",
-                    cdir.display()
-                );
-                let _ = std::fs::remove_dir_all(&cdir);
-            }
-            std::fs::create_dir_all(&cdir).expect("create prep-circuit cache dir");
-            ResolvedPrepCircuitDir {
-                path: cdir.clone(),
-                cache_hit: false,
-                cache_dir: Some(cdir),
-                _per_prove_tempdir: None,
-            }
-        }
-    } else {
-        let td = shm_tempdir();
-        let path = td.path().to_path_buf();
-        ResolvedPrepCircuitDir {
-            path,
-            cache_hit: false,
-            cache_dir: None,
-            _per_prove_tempdir: Some(td),
-        }
-    }
-}
-
-#[cfg(feature = "native")]
-fn mark_prep_circuit_complete(resolved: &ResolvedPrepCircuitDir) {
-    if let Some(ref cdir) = resolved.cache_dir {
-        if let Err(e) = std::fs::write(cdir.join(PREP_CIRCUIT_SENTINEL), b"ok\n") {
-            tracing::warn!("failed to write prep-circuit cache sentinel: {e}");
-        }
-    }
-}
-
-/// Materialize the prep-circuit-prod artifacts for `build_dir` into the
-/// cache and produce the per-prove `wires_initial.bin`. Returns `Some(prep_dir,
-/// wires_initial_path)` when the GPU R1CS solver path is ready to be used,
-/// or `None` if anything failed (caller falls back to gnark.Solve).
+/// Materialize the prep-circuit-prod artifacts for `build_dir` into the cache and produce the
+/// per-prove `wires_initial.bin`. Returns `None` if anything failed (caller falls back to
+/// gnark.Solve).
 #[cfg(feature = "native")]
 fn try_prepare_gpu_r1cs_inputs(
     build_dir: &Path,
     vkey_hash_hex: &str,
     witness_path: &Path,
-) -> Option<(std::path::PathBuf, tempfile::NamedTempFile)> {
+) -> Option<GpuR1csInputs> {
     let r1cs_bin = resolve_r1cs_solve_plan_path();
-
-    let prep_resolved = resolve_prep_circuit_dir(vkey_hash_hex);
-    if !prep_resolved.cache_hit {
+    let prep = |out: &Path| -> anyhow::Result<()> {
         tracing::info!(
             "Running r1cs_solve_plan prep-circuit-prod (cache miss) for {}...",
-            prep_resolved.path.display()
+            out.display()
         );
         let t0 = std::time::Instant::now();
         let status = std::process::Command::new(&r1cs_bin)
             .arg("prep-circuit-prod")
             .arg(build_dir)
-            .arg(&prep_resolved.path)
-            .status();
-        match status {
-            Ok(s) if s.success() => {
-                tracing::info!("prep-circuit-prod completed in {:?}", t0.elapsed());
-                mark_prep_circuit_complete(&prep_resolved);
-            }
-            Ok(s) => {
-                tracing::warn!(
-                    "prep-circuit-prod failed (exit {s:?}) using {}; falling back to gnark.Solve",
+            .arg(out)
+            .status()
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "failed to spawn r1cs_solve_plan {}: {e}. Set SP1_R1CS_SOLVE_PLAN to the \
+                     binary path or place it next to the current executable",
                     r1cs_bin.display()
-                );
-                return None;
-            }
-            Err(e) => {
-                tracing::warn!(
-                    "failed to spawn r1cs_solve_plan {}: {e}; falling back to gnark.Solve. \
-                     Set SP1_R1CS_SOLVE_PLAN to the binary path or place it next to the current \
-                     executable.",
-                    r1cs_bin.display()
-                );
-                return None;
-            }
+                )
+            })?;
+        if !status.success() {
+            anyhow::bail!(
+                "prep-circuit-prod failed (exit {status:?}) using {}",
+                r1cs_bin.display()
+            );
         }
-    }
+        tracing::info!("prep-circuit-prod completed in {:?}", t0.elapsed());
+        Ok(())
+    };
 
-    let wires_init = shm_named_tempfile();
+    let (prep_dir, prep_private) = match prep_circuit_cache_dir(vkey_hash_hex) {
+        Some(dir) => {
+            if let Err(e) = crate::gpu_cache::ensure_built(&dir, PREP_CIRCUIT_SENTINEL, prep) {
+                tracing::warn!("{e:#}; falling back to gnark.Solve");
+                return None;
+            }
+            (dir, None)
+        }
+        None => {
+            let private = crate::gpu_cache::proof_tempdir(None, "sp1_groth16_prep_").ok()?;
+            if let Err(e) = prep(private.path()) {
+                tracing::warn!("{e:#}; falling back to gnark.Solve");
+                return None;
+            }
+            (private.path().to_path_buf(), Some(private))
+        }
+    };
+
+    let wires_initial = shm_named_tempfile();
     tracing::info!("Running r1cs_solve_plan make-witness-init...");
     let t0 = std::time::Instant::now();
     let status = std::process::Command::new(&r1cs_bin)
         .arg("make-witness-init")
         .arg(build_dir)
         .arg(witness_path)
-        .arg(wires_init.path())
+        .arg(wires_initial.path())
         .status();
     match status {
         Ok(s) if s.success() => {
             tracing::info!("make-witness-init completed in {:?}", t0.elapsed());
-            Some((prep_resolved.path, wires_init))
+            Some(GpuR1csInputs { prep_dir, _prep_private: prep_private, wires_initial })
         }
         Ok(s) => {
             tracing::warn!("make-witness-init failed (exit {s:?}); falling back to gnark.Solve");
@@ -440,6 +358,34 @@ fn try_prepare_gpu_r1cs_inputs(
             tracing::warn!("failed to spawn r1cs_solve_plan: {e}; falling back to gnark.Solve");
             None
         }
+    }
+}
+
+/// One GPU Groth16 proof between its two halves: everything in it belongs to this proof except
+/// `pk`, which every prover of the circuit shares read-only. Dropping it removes the proof's files.
+#[cfg(feature = "native")]
+#[doc(hidden)]
+pub struct PreparedGpuProof {
+    pk: GpuPk,
+    witness_dir: tempfile::TempDir,
+    witness_json: std::path::PathBuf,
+    vkey_hash_hex: String,
+    gpu_r1cs: Option<GpuR1csInputs>,
+    backend_is_cuda: bool,
+}
+
+#[cfg(feature = "native")]
+impl PreparedGpuProof {
+    /// The shared GPU-format proving key this proof reads.
+    #[doc(hidden)]
+    pub fn pk_dir(&self) -> &Path {
+        &self.pk.dir
+    }
+
+    /// This proof's own witness files.
+    #[doc(hidden)]
+    pub fn witness_dir(&self) -> &Path {
+        self.witness_dir.path()
     }
 }
 
@@ -467,6 +413,18 @@ impl Groth16Bn254Prover {
     pub fn gpu_pk_cache_ready(build_dir: &Path) -> bool {
         let vkey_hash_hex = hex::encode(Self::get_vkey_hash(build_dir));
         pk_cache_dir(&vkey_hash_hex).is_some_and(|dir| dir.join(PK_CACHE_SENTINEL).is_file())
+    }
+
+    /// Makes sure this circuit's GPU-format proving key is exported to the shared cache, and
+    /// returns the cache directory; `None` when the cache is disabled. For the concurrency test
+    /// (`examples/groth16_concurrent_witnesses.rs`); provers export through
+    /// [`Self::prove_gpu_subprocess`].
+    #[cfg(feature = "native")]
+    #[doc(hidden)]
+    pub fn ensure_gpu_pk(build_dir: &Path) -> Option<std::path::PathBuf> {
+        let vkey_hash_hex = hex::encode(Self::get_vkey_hash(build_dir));
+        pk_cache_dir(&vkey_hash_hex)?;
+        Some(gpu_pk(build_dir, &vkey_hash_hex).dir)
     }
 
     /// Whether the `groth16_gpu_helper` binary that [`Self::prove_gpu_subprocess`] spawns can be
@@ -528,7 +486,7 @@ impl Groth16Bn254Prover {
     /// 3. Proof is serialized in gnark-compatible format
     #[cfg(feature = "native")]
     pub fn prove_gpu<C: Config>(&self, witness: Witness<C>, build_dir: &Path) -> Groth16Bn254Proof {
-        use crate::ffi::{export_groth16_gpu_data, export_groth16_gpu_witness};
+        use crate::ffi::export_groth16_gpu_witness;
 
         // Write witness to temp file for Go
         // Use /dev/shm (tmpfs) on Linux to avoid disk I/O overhead.
@@ -537,38 +495,26 @@ impl Groth16Bn254Prover {
         let serialized = serde_json::to_string(&gnark_witness).unwrap();
         witness_file.write_all(serialized.as_bytes()).unwrap();
 
-        // Export PK + solve R1CS + export witness via Go.
-        // PK-export cache: the export step is fully determined by
-        // build_dir and reused across all proves of the same circuit.
-        let vkey_hash = Self::get_vkey_hash(build_dir);
-        let vkey_hash_hex = hex::encode(vkey_hash);
-        let resolved = resolve_gpu_dir(&vkey_hash_hex);
-        let gpu_dir_str = resolved.path.to_str().unwrap();
-        let build_dir_str = build_dir.to_str().unwrap();
-
-        if !resolved.cache_hit {
-            tracing::info!("Exporting Groth16 GPU data (cache miss)...");
-            let t0 = std::time::Instant::now();
-            export_groth16_gpu_data(build_dir_str, gpu_dir_str);
-            tracing::info!(
-                "Groth16 PK export completed in {:?}; writing cache sentinel",
-                t0.elapsed()
-            );
-            mark_cache_complete(&resolved);
-        }
+        // Export PK (cached per circuit and shared) + solve R1CS into this proof's own directory.
+        let vkey_hash_hex = hex::encode(Self::get_vkey_hash(build_dir));
+        let pk = gpu_pk(build_dir, &vkey_hash_hex);
+        let witness_dir = witness_dir(&vkey_hash_hex);
+        let pk_dir_str = pk.dir.to_str().unwrap();
+        let witness_dir_str = witness_dir.path().to_str().unwrap();
 
         tracing::info!("Solving R1CS and exporting witness...");
         export_groth16_gpu_witness(
-            build_dir_str,
+            build_dir.to_str().unwrap(),
             witness_file.path().to_str().unwrap(),
-            gpu_dir_str,
+            pk_dir_str,
+            witness_dir_str,
         );
 
         // Load data into Rust GPU prover
         tracing::info!("Loading Groth16 proving data...");
-        let proving_data = sp1_gpu_groth16::types::Groth16ProvingData::load(gpu_dir_str)
+        let proving_data = sp1_gpu_groth16::types::Groth16ProvingData::load(pk_dir_str)
             .expect("failed to load Groth16 proving data");
-        let witness_data = sp1_gpu_groth16::types::Groth16WitnessData::load(gpu_dir_str)
+        let witness_data = sp1_gpu_groth16::types::Groth16WitnessData::load(witness_dir_str)
             .expect("failed to load Groth16 witness data");
 
         // GPU prove
@@ -636,37 +582,33 @@ impl Groth16Bn254Prover {
         witness: Witness<C>,
         build_dir: &Path,
     ) -> Groth16Bn254Proof {
-        use crate::ffi::{export_groth16_gpu_data, export_groth16_gpu_witness};
-
         // Step 1: write witness JSON (CPU-only, no HIP).
         let mut witness_file = shm_named_tempfile();
         let gnark_witness = GnarkWitness::new(witness);
         let serialized = serde_json::to_string(&gnark_witness).unwrap();
         witness_file.write_all(serialized.as_bytes()).unwrap();
 
-        // Compute the cache key early so we can reuse a previously-
-        // exported PK if available.
-        let vkey_hash = Self::get_vkey_hash(build_dir);
-        let vkey_hash_hex = hex::encode(vkey_hash);
+        // Steps 2 and 3. `witness_file` must outlive the helper, which reads it.
+        let prepared = Self::prepare_gpu_proof(build_dir, witness_file.path());
+        Self::run_gpu_helper(&prepared)
+    }
 
-        // Step 2: Go shell-out to solve R1CS + export PK / witness in
-        // GPU-friendly layout (CPU-only, no HIP). PK export is cached
-        // per-vk under /dev/shm; see `resolve_gpu_dir`.
-        let resolved = resolve_gpu_dir(&vkey_hash_hex);
-        let gpu_dir_path = resolved.path.clone();
-        let gpu_dir_str = gpu_dir_path.to_str().unwrap();
-        let build_dir_str = build_dir.to_str().unwrap();
+    /// The in-process half of [`Self::prove_gpu_subprocess`], CPU-only: make sure the circuit's
+    /// GPU-format proving key is exported (once per host, shared by every prover), then solve the
+    /// circuit for the witness at `witness_json` into a directory that belongs to this proof alone.
+    /// Any number of these may run at once, in one process or several. Public so the
+    /// concurrent-witness test (`examples/groth16_concurrent_witnesses.rs`) can drive the real
+    /// steps; provers call `prove_gpu_subprocess`.
+    #[cfg(feature = "native")]
+    #[doc(hidden)]
+    pub fn prepare_gpu_proof(build_dir: &Path, witness_json: &Path) -> PreparedGpuProof {
+        use crate::ffi::export_groth16_gpu_witness;
 
-        if !resolved.cache_hit {
-            tracing::info!("Exporting Groth16 GPU data (cache miss)...");
-            let t0 = std::time::Instant::now();
-            export_groth16_gpu_data(build_dir_str, gpu_dir_str);
-            tracing::info!(
-                "Groth16 PK export completed in {:?}; writing cache sentinel",
-                t0.elapsed()
-            );
-            mark_cache_complete(&resolved);
-        }
+        let vkey_hash_hex = hex::encode(Self::get_vkey_hash(build_dir));
+
+        // Step 2: Go shell-out to export the PK in GPU-friendly layout (cached per circuit; see
+        // `gpu_pk`) and solve the R1CS (CPU-only, no HIP).
+        let pk = gpu_pk(build_dir, &vkey_hash_hex);
 
         // Step 2.5 (Phase 11): if the in-process GPU R1CS solver is enabled,
         // skip gnark.Solve and prepare prep-circuit-prod cache + per-prove
@@ -708,23 +650,41 @@ impl Groth16Bn254Prover {
             solver_env.as_deref().unwrap_or("<unset>")
         );
 
-        let gpu_r1cs_inputs = if want_gpu_r1cs {
-            try_prepare_gpu_r1cs_inputs(build_dir, &vkey_hash_hex, witness_file.path())
+        let gpu_r1cs = if want_gpu_r1cs {
+            try_prepare_gpu_r1cs_inputs(build_dir, &vkey_hash_hex, witness_json)
         } else {
             None
         };
 
-        if gpu_r1cs_inputs.is_none() {
+        // This proof's witness files. With the GPU R1CS solver the helper builds them itself and
+        // this stays empty.
+        let witness_dir = witness_dir(&vkey_hash_hex);
+        if gpu_r1cs.is_none() {
             tracing::info!("Solving R1CS and exporting witness (gnark.Solve)...");
             export_groth16_gpu_witness(
-                build_dir_str,
-                witness_file.path().to_str().unwrap(),
-                gpu_dir_str,
+                build_dir.to_str().unwrap(),
+                witness_json.to_str().unwrap(),
+                pk.dir.to_str().unwrap(),
+                witness_dir.path().to_str().unwrap(),
             );
         } else {
             tracing::info!("Skipping gnark.Solve — using in-process GPU R1CS solver");
         }
 
+        PreparedGpuProof {
+            pk,
+            witness_dir,
+            witness_json: witness_json.to_path_buf(),
+            vkey_hash_hex,
+            gpu_r1cs,
+            backend_is_cuda,
+        }
+    }
+
+    /// The GPU half of [`Self::prove_gpu_subprocess`]: run `groth16_gpu_helper` on a prepared proof.
+    #[cfg(feature = "native")]
+    #[doc(hidden)]
+    pub fn run_gpu_helper(prepared: &PreparedGpuProof) -> Groth16Bn254Proof {
         // Step 3: invoke the helper subprocess. Locate it in the same
         // directory as the current executable; fall back to PATH.
         let helper_path = resolve_helper_path("groth16_gpu_helper");
@@ -754,25 +714,27 @@ impl Groth16Bn254Prover {
         //   build, so we force it here.
         let mut cmd = std::process::Command::new(&helper_path);
         cmd.arg("--gpu-dir")
-            .arg(&gpu_dir_path)
+            .arg(&prepared.pk.dir)
+            .arg("--witness-dir")
+            .arg(prepared.witness_dir.path())
             .arg("--witness-json")
-            .arg(witness_file.path())
+            .arg(&prepared.witness_json)
             .arg("--vkey-hash-hex")
-            .arg(&vkey_hash_hex)
+            .arg(&prepared.vkey_hash_hex)
             .arg("--out")
             .arg(out_file.path());
         // Phase 11: when the GPU R1CS solver was prepared above, point the
         // helper at the prep-circuit cache + the per-prove wires_initial.bin
         // so it builds witness data in-process instead of disk-loading the
         // gnark-solved files (which we did not write in this branch).
-        if let Some((ref prep_dir, ref wires_init)) = gpu_r1cs_inputs {
-            cmd.arg("--prep-circuit-dir").arg(prep_dir);
-            cmd.arg("--wires-initial").arg(wires_init.path());
+        if let Some(ref gpu_r1cs) = prepared.gpu_r1cs {
+            cmd.arg("--prep-circuit-dir").arg(&gpu_r1cs.prep_dir);
+            cmd.arg("--wires-initial").arg(gpu_r1cs.wires_initial.path());
         }
         // CUDA builds need GLV forced off; HIP builds let auto-detect
-        // pick. (`backend_is_cuda` was computed above for the GPU R1CS
+        // pick. (`backend_is_cuda` was computed for the GPU R1CS
         // dispatch.)
-        if backend_is_cuda {
+        if prepared.backend_is_cuda {
             if std::env::var_os("SP1_GPU_GLV").is_none() {
                 cmd.env("SP1_GPU_GLV", "0");
             }
@@ -836,97 +798,51 @@ impl Groth16Bn254Prover {
 mod pk_cache_tests {
     use super::*;
 
-    /// Drive `resolve_gpu_dir` through the miss → complete → hit cycle
-    /// and verify the sentinel logic + partial-cache wipe.
+    /// How proofs use the shared cache: each gets a private witness directory beside it (never
+    /// inside it), and the cache counts as ready only once a finished build has published it. The
+    /// build itself, its locking and crash handling are tested in `gpu_cache`.
+    ///
+    /// One test, because it sets process-wide environment variables.
     #[test]
-    fn resolve_gpu_dir_miss_complete_hit() {
-        // Use a unique cache root for this test so we don't collide with
-        // other tests or any real cache on the dev machine.
-        let tmp = tempfile::tempdir().unwrap();
-        std::env::set_var("SP1_GROTH16_PK_CACHE", tmp.path());
+    fn proofs_share_the_key_and_keep_their_witnesses_apart() {
+        let root = tempfile::tempdir().unwrap();
+        std::env::set_var("SP1_GROTH16_PK_CACHE", root.path());
         std::env::remove_var("SP1_GROTH16_PK_CACHE_DISABLE");
 
-        let key = "deadbeef_pk_cache_unit_test";
+        let build_dir = tempfile::tempdir().unwrap();
+        std::fs::write(build_dir.path().join("groth16_vk.bin"), b"pretend vk").unwrap();
+        let key = hex::encode(Groth16Bn254Prover::get_vkey_hash(build_dir.path()));
+        let cache = pk_cache_dir(&key).unwrap();
 
-        // 1) First call: cache miss, fresh empty directory.
-        let r1 = resolve_gpu_dir(key);
-        assert!(!r1.cache_hit, "first call must be a miss");
-        assert!(r1.path.exists(), "miss path must be a real directory");
-        assert!(
-            !r1.path.join(PK_CACHE_SENTINEL).exists(),
-            "sentinel must not exist before mark_cache_complete"
-        );
-        // Simulate `export_groth16_gpu_data` writing some PK files.
-        std::fs::write(r1.path.join("pk_dummy.bin"), b"pretend pk").unwrap();
-        mark_cache_complete(&r1);
-        assert!(r1.path.join(PK_CACHE_SENTINEL).exists(), "sentinel write failed");
-        let cache_path = r1.path.clone();
+        // Two proofs in flight: distinct directories, both beside the cache, neither inside it.
+        let a = witness_dir(&key);
+        let b = witness_dir(&key);
+        assert_ne!(a.path(), b.path());
+        for dir in [a.path(), b.path()] {
+            assert_eq!(dir.parent(), Some(root.path()));
+            assert!(!dir.starts_with(&cache));
+        }
+        let a_path = a.path().to_path_buf();
+        drop(a);
+        assert!(!a_path.exists(), "a finished proof's witness directory must be removed");
 
-        // 2) Second call: cache hit, same path, sentinel + dummy file
-        // still present.
-        let r2 = resolve_gpu_dir(key);
-        assert!(r2.cache_hit, "second call must be a hit");
-        assert_eq!(r2.path, cache_path);
-        assert!(r2.path.join("pk_dummy.bin").exists(), "cached file must survive");
+        // Ready only once a build has published the cache.
+        assert!(!Groth16Bn254Prover::gpu_pk_cache_ready(build_dir.path()));
+        crate::gpu_cache::ensure_built(&cache, PK_CACHE_SENTINEL, |out| {
+            std::fs::write(out.join("pk_g1_a.bin"), b"pretend pk")?;
+            Ok(())
+        })
+        .unwrap();
+        assert!(Groth16Bn254Prover::gpu_pk_cache_ready(build_dir.path()));
 
-        // 3) Corrupt the cache by removing only the sentinel: next call
-        // is a miss and wipes the partial cache.
-        std::fs::remove_file(cache_path.join(PK_CACHE_SENTINEL)).unwrap();
-        let r3 = resolve_gpu_dir(key);
-        assert!(!r3.cache_hit, "missing sentinel must force a miss");
-        assert!(!r3.path.join("pk_dummy.bin").exists(), "partial cache must have been wiped");
-
-        // Cleanup env var so we don't leak into other tests.
-        std::env::remove_var("SP1_GROTH16_PK_CACHE");
-    }
-
-    /// `SP1_GROTH16_PK_CACHE_DISABLE` must fall back to per-prove tempdir.
-    #[test]
-    fn resolve_gpu_dir_disabled() {
+        // With the cache disabled nothing is shared, and witness directories still work.
         std::env::set_var("SP1_GROTH16_PK_CACHE_DISABLE", "1");
-        let r = resolve_gpu_dir("anything");
-        assert!(!r.cache_hit);
-        assert!(r.cache_dir.is_none(), "disabled cache must not return a cache_dir");
-        assert!(r._per_prove_tempdir.is_some(), "disabled cache must own a tempdir");
-        assert!(r.path.exists());
-        // mark_cache_complete is a no-op when there is no cache_dir.
-        mark_cache_complete(&r);
+        assert!(pk_cache_dir(&key).is_none());
+        assert!(!Groth16Bn254Prover::gpu_pk_cache_ready(build_dir.path()));
+        assert!(witness_dir(&key).path().is_dir());
+
         std::env::remove_var("SP1_GROTH16_PK_CACHE_DISABLE");
-    }
-
-    /// Prep-circuit cache mirrors the PK cache lifecycle: miss → complete →
-    /// hit, plus partial-cache wipe when the sentinel is missing.
-    #[test]
-    fn resolve_prep_circuit_dir_miss_complete_hit() {
-        let tmp = tempfile::tempdir().unwrap();
-        std::env::set_var("SP1_GPU_R1CS_PREP_CACHE", tmp.path());
-        std::env::remove_var("SP1_GPU_R1CS_PREP_CACHE_DISABLE");
-
-        let key = "deadbeef_prep_unit_test";
-
-        let r1 = resolve_prep_circuit_dir(key);
-        assert!(!r1.cache_hit, "first call must be a miss");
-        assert!(r1.path.exists(), "miss path must be a real directory");
-        assert!(
-            !r1.path.join(PREP_CIRCUIT_SENTINEL).exists(),
-            "sentinel must not exist before mark_prep_circuit_complete"
-        );
-        std::fs::write(r1.path.join("coeffs.bin"), b"pretend coeffs").unwrap();
-        mark_prep_circuit_complete(&r1);
-        assert!(r1.path.join(PREP_CIRCUIT_SENTINEL).exists(), "sentinel write failed");
-        let cache_path = r1.path.clone();
-
-        let r2 = resolve_prep_circuit_dir(key);
-        assert!(r2.cache_hit, "second call must be a hit");
-        assert_eq!(r2.path, cache_path);
-        assert!(r2.path.join("coeffs.bin").exists(), "cached file must survive");
-
-        std::fs::remove_file(cache_path.join(PREP_CIRCUIT_SENTINEL)).unwrap();
-        let r3 = resolve_prep_circuit_dir(key);
-        assert!(!r3.cache_hit, "missing sentinel must force a miss");
-        assert!(!r3.path.join("coeffs.bin").exists(), "partial cache must have been wiped");
-
-        std::env::remove_var("SP1_GPU_R1CS_PREP_CACHE");
+        std::env::remove_var("SP1_GROTH16_PK_CACHE");
     }
 }
 

@@ -19,7 +19,7 @@ func TestExportGroth16GpuWitness(t *testing.T) {
 	}
 
 	outputDir := "/tmp/groth16_gpu_exported"
-	ExportGroth16GpuWitness(dataDir, witnessPath, outputDir)
+	ExportGroth16GpuWitness(dataDir, witnessPath, outputDir, outputDir)
 
 	// Verify files exist
 	files := []string{"wire_values.bin", "solution_a.bin", "solution_b.bin", "solution_c.bin",

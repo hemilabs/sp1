@@ -40,8 +40,11 @@ var (
 // witness vectors (W, A, B, C) plus BSB22 Pedersen commitments as flat
 // binary files for the Rust GPU prover.
 //
-// This must be called with the same dataDir used for ExportGroth16GpuData.
-func ExportGroth16GpuWitness(dataDir string, witnessPath string, outputDir string) {
+// This must be called with the same dataDir used for ExportGroth16GpuData. pkDir is the
+// directory ExportGroth16GpuData wrote, which is only read (for the stripped R1CS). outputDir
+// receives this witness's files and must belong to this call alone: several provers can share
+// one pkDir, so per-proof files must never be written there.
+func ExportGroth16GpuWitness(dataDir string, witnessPath string, pkDir string, outputDir string) {
 	start := time.Now()
 
 	// Load R1CS (cached across calls for the same dataDir)
@@ -54,7 +57,7 @@ func ExportGroth16GpuWitness(dataDir string, witnessPath string, outputDir strin
 
 		// Prefer the stripped R1CS (without debug data) created by ExportGroth16GpuData.
 		// This reduces load time from ~20s to ~5s by skipping ~817MB of unused debug info.
-		strippedPath := filepath.Join(outputDir, "groth16_circuit_stripped.bin")
+		strippedPath := filepath.Join(pkDir, "groth16_circuit_stripped.bin")
 		r1csPath := dataDir + "/" + groth16CircuitPath
 		if _, err := os.Stat(strippedPath); err == nil {
 			r1csPath = strippedPath

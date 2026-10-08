@@ -7,10 +7,13 @@
 //! a CLEAN child process — no shared HIP state.
 //!
 //! Inputs (CLI):
-//!   --gpu-dir <path>        Directory with PK + witness exported by the Go
-//!                           ExportGroth16GpuData / ExportGroth16GpuWitness
-//!                           shell-out (already done by parent before invoking
-//!                           this helper).
+//!   --gpu-dir <path>        Directory with the PK exported by the Go
+//!                           ExportGroth16GpuData shell-out. Shared by every
+//!                           prover of the circuit; only read.
+//!   --witness-dir <path>    Directory with this proof's witness, exported by
+//!                           ExportGroth16GpuWitness. Private to this proof.
+//!                           Defaults to --gpu-dir, the layout before per-proof
+//!                           witness directories.
 //!   --witness-json <path>   Path to the GnarkWitness JSON used to read public
 //!                           inputs (vkey_hash, committed_values_digest, ...).
 //!   --vkey-hash-hex <hex>   The 32-byte vkey hash of the build_dir, hex-encoded.
@@ -26,7 +29,7 @@
 //!   --wires-initial <p>     Per-prove wires_initial.bin (n_wires × 32 bytes,
 //!                           Mont form: ONE + witness public + secret + zeros).
 //!   When BOTH are provided, the helper runs the GPU R1CS solver in-process
-//!   instead of loading wire_values/solution_a/b/c from --gpu-dir. This skips
+//!   instead of loading wire_values/solution_a/b/c from --witness-dir. This skips
 //!   the parent's gnark.Solve shell-out (~5.4 s on CPU) and produces witness
 //!   data via the Phase 8 cooperative kernel (~1.4 s on RTX 5090). On HIP or
 //!   when the GPU solver fails to initialize, the helper falls back to the
@@ -44,6 +47,9 @@ use num_bigint::BigUint;
 struct Args {
     #[arg(long)]
     gpu_dir: PathBuf,
+    /// This proof's witness files. Defaults to --gpu-dir.
+    #[arg(long)]
+    witness_dir: Option<PathBuf>,
     #[arg(long)]
     witness_json: PathBuf,
     #[arg(long)]
@@ -84,8 +90,9 @@ fn main() {
             std::process::exit(2);
         });
 
+    let witness_dir = args.witness_dir.as_deref().unwrap_or(&args.gpu_dir);
     let witness_data = load_witness_data(
-        gpu_dir_str,
+        witness_dir.to_str().expect("--witness-dir is not valid UTF-8"),
         args.prep_circuit_dir.as_deref(),
         args.wires_initial.as_deref(),
     );
@@ -170,7 +177,7 @@ fn main() {
 /// caller's gnark.Solve-produced wire_values/solution_a/b/c can still be
 /// consumed. This keeps the helper backward-compatible.
 fn load_witness_data(
-    gpu_dir_str: &str,
+    witness_dir_str: &str,
     prep_circuit_dir: Option<&std::path::Path>,
     wires_initial: Option<&std::path::Path>,
 ) -> sp1_gpu_groth16::types::Groth16WitnessData {
@@ -185,13 +192,13 @@ fn load_witness_data(
                     "[groth16-gpu-helper] WARN: GPU R1CS solver path failed ({e}); \
                      falling back to disk-load. The parent must have already run \
                      gnark.Solve and exported wire_values.bin / solution_*.bin into \
-                     --gpu-dir for the fallback to succeed."
+                     --witness-dir for the fallback to succeed."
                 );
             }
         }
     }
-    eprintln!("[groth16-gpu-helper] loading witness data from {gpu_dir_str}");
-    sp1_gpu_groth16::types::Groth16WitnessData::load(gpu_dir_str).unwrap_or_else(|e| {
+    eprintln!("[groth16-gpu-helper] loading witness data from {witness_dir_str}");
+    sp1_gpu_groth16::types::Groth16WitnessData::load(witness_dir_str).unwrap_or_else(|e| {
         eprintln!("[groth16-gpu-helper] failed to load Groth16WitnessData: {e}");
         std::process::exit(2);
     })

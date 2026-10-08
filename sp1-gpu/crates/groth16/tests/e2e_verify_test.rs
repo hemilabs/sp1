@@ -98,6 +98,7 @@ fn test_groth16_e2e_gnark_verify() {
         build_dir.to_str().unwrap(),
         witness_path.to_str().unwrap(),
         gpu_dir_str,
+        gpu_dir_str,
     );
 
     eprintln!("Loading Groth16 proving data...");
