@@ -30,12 +30,9 @@ use sp1_curves::{
 };
 use sp1_jit::{RiscRegister, SyscallContext};
 
-// Used by the x86_64 JIT executor. When profiling is enabled, only compiled for tests.
-#[cfg(all(
-    target_arch = "x86_64",
-    target_endian = "little",
-    any(not(feature = "profiling"), test)
-))]
+// Used by the x86_64 JIT executor, wherever `arch` builds it: only on Linux, and with profiling
+// enabled only for tests.
+#[cfg(any(sp1_use_native_executor, all(sp1_native_executor_available, test)))]
 pub(super) extern "C" fn sp1_ecall_handler(ctx: *mut sp1_jit::JitContext) -> u64 {
     let ctx = unsafe { &mut *ctx };
     let code = SyscallCode::from_u32(ctx.rr(RiscRegister::X5) as u32);

@@ -18,5 +18,7 @@ sp1-core-machine = { workspace = true }
 sp1-recursion-executor = { workspace = true }
 sp1-recursion-machine = { workspace = true }
 cmake = { version = "0.1" }
+# MSVC's environment for CMake's Ninja generator (see build.rs); already a dependency of cmake.
+cc = "1"
 cbindgen = { workspace = true }
 pathdiff = { workspace = true }

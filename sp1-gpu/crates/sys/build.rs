@@ -333,6 +333,10 @@ fn main() {
             if let Ok(cuda_archs) = env::var("CUDA_ARCHS") {
                 cmake_config.define("CUDA_ARCHS", &cuda_archs);
             }
+
+            if env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc") {
+                configure_msvc_ninja(&mut cmake_config);
+            }
         }
     }
 
@@ -368,6 +372,7 @@ fn main() {
     println!("cargo:rustc-link-search=native={}/lib", dst.display());
     println!("cargo:rustc-link-lib=static=sys-cuda");
 
+    let msvc = env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc");
     match backend {
         GpuBackend::Hip => {
             // ROCm / HIP library search paths
@@ -390,6 +395,15 @@ fn main() {
             // HIP device runtime for relocatable device code (GPU linking)
             println!("cargo:rustc-link-lib=hiprtc");
         }
+        GpuBackend::Cuda if msvc => {
+            // A Windows toolkit keeps its libraries in lib\x64. The runtime is linked
+            // statically, so the server needs no cudart64_*.dll beside it.
+            if let Ok(cuda_path) = env::var("CUDA_PATH") {
+                println!("cargo:rustc-link-search=native={cuda_path}/lib/x64");
+            }
+            println!("cargo:rustc-link-lib=cudart_static");
+            println!("cargo:rustc-link-lib=cudadevrt");
+        }
         GpuBackend::Cuda => {
             // Add CUDA library search paths
             if let Ok(cuda_path) = env::var("CUDA_PATH") {
@@ -403,6 +417,12 @@ fn main() {
             println!("cargo:rustc-link-lib=cudart");
             println!("cargo:rustc-link-lib=cudadevrt");
         }
+    }
+
+    // MSVC links its own C++ runtime, and has no libdl; OpenMP is only used on the HIP path.
+    if msvc {
+        println!("cargo:include={}", out_include_dir.display());
+        return;
     }
 
     // Link system libraries
@@ -424,4 +444,42 @@ fn main() {
 
     // Add include directories for compilation if needed
     println!("cargo:include={}", out_include_dir.display());
+}
+
+/// On MSVC, builds with Ninja rather than CMake's default Visual Studio generator.
+///
+/// The Visual Studio generator does not perform the device link `CUDA_RESOLVE_DEVICE_SYMBOLS`
+/// asks for on a static library (the Ninja and Makefile generators do), so `sys-cuda.lib` would
+/// lack the `__cudaRegisterLinkedBinary_*` symbols its relocatable objects reference. It also
+/// compiles CUDA through Visual Studio's build customization for the newest toolkit installed,
+/// rather than the one `CUDA_PATH` names.
+///
+/// Ninja needs what a Developer shell provides: `cc` finds cl.exe and its environment (INCLUDE,
+/// LIB, PATH), and Visual Studio ships a ninja.exe when none is on PATH. The compilers are named
+/// explicitly, so CMake cannot pick up another on PATH (a MinGW gcc, say).
+fn configure_msvc_ninja(cmake_config: &mut cmake::Config) {
+    println!("cargo:rerun-if-env-changed=CUDA_PATH");
+    let cl = cc::Build::new().cpp(true).get_compiler();
+    for (key, value) in cl.env() {
+        cmake_config.env(key, value);
+    }
+    cmake_config.generator("Ninja");
+    cmake_config.define("CMAKE_C_COMPILER", cl.path());
+    cmake_config.define("CMAKE_CXX_COMPILER", cl.path());
+    if let Ok(cuda_path) = env::var("CUDA_PATH") {
+        let nvcc = PathBuf::from(cuda_path).join("bin").join("nvcc.exe");
+        cmake_config.define("CMAKE_CUDA_COMPILER", nvcc.to_string_lossy().replace('\\', "/"));
+    }
+    let ninja_on_path = std::process::Command::new("ninja").arg("--version").output().is_ok();
+    if !ninja_on_path {
+        // cl.exe is at <VS>\VC\Tools\MSVC\<version>\bin\Host<arch>\<arch>\cl.exe: eight up.
+        let bundled = cl
+            .path()
+            .ancestors()
+            .nth(8)
+            .map(|vs| vs.join(r"Common7\IDE\CommonExtensions\Microsoft\CMake\Ninja\ninja.exe"));
+        if let Some(ninja) = bundled.filter(|ninja| ninja.is_file()) {
+            cmake_config.define("CMAKE_MAKE_PROGRAM", ninja.to_string_lossy().replace('\\', "/"));
+        }
+    }
 }

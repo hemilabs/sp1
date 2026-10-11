@@ -16,7 +16,19 @@ fn main() {
             let out_dir = env::var("OUT_DIR").unwrap();
             let dest_path = PathBuf::from(&out_dir);
             let lib_name = "sp1gnark";
-            let dest = dest_path.join(format!("lib{lib_name}.a"));
+
+            // On Windows the library is a DLL, not a static archive. A Go c-archive starts its
+            // runtime from a MinGW-style global constructor (`.ctors`), which an MSVC-linked
+            // binary never runs (and cgo there needs a MinGW C compiler: set CC through
+            // SP1_GNARK_FFI_GO_ENVS). A DLL must resolve every symbol when it is linked, so the
+            // two KoalaBear callbacks the archive leaves to this crate are passed in at runtime
+            // instead: see go/koalabear_windows.c and ffi::native::register_callbacks.
+            let windows = env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows");
+            let (dest, header_name) = if windows {
+                (dest_path.join(format!("{lib_name}.dll")), format!("{lib_name}.h"))
+            } else {
+                (dest_path.join(format!("lib{lib_name}.a")), format!("lib{lib_name}.h"))
+            };
 
             // Parse custom environment for the `go build` command, e.g. to support cross-compilation.
             // The variable may contain a semi-colon-separated list of name=value pairs.
@@ -57,18 +69,20 @@ fn main() {
                 "-tags=debug"
             };
 
-            let status = Command::new("go")
-                .current_dir("go")
-                .env("CGO_ENABLED", "1")
-                .envs(go_envs)
-                .args([
-                    "build",
-                    tags,
-                    "-o",
-                    dest.to_str().unwrap(),
-                    "-buildmode=c-archive",
-                    ".",
-                ])
+            let mut go_build = Command::new("go");
+            go_build.current_dir("go").env("CGO_ENABLED", "1").envs(go_envs).args(["build", tags]);
+            if windows {
+                // The import library MSVC links against, written by the DLL's linker. Quoted for
+                // Go's flag parsing, which splits -extldflags on spaces.
+                let implib = dest_path.join(format!("{lib_name}.lib"));
+                let implib = implib.to_str().unwrap().replace('\\', "/");
+                go_build.arg(format!("-ldflags=-extldflags='-Wl,--out-implib,{implib}'"));
+                go_build.arg("-buildmode=c-shared");
+            } else {
+                go_build.arg("-buildmode=c-archive");
+            }
+            let status = go_build
+                .args(["-o", dest.to_str().unwrap(), "."])
                 .status()
                 .expect("Failed to build Go library");
             if !status.success() {
@@ -81,7 +95,7 @@ fn main() {
             std::fs::copy(header_src, header_dest).unwrap();
 
             // Generate bindings using bindgen
-            let header_path = dest_path.join(format!("lib{lib_name}.h"));
+            let header_path = dest_path.join(header_name);
             let bindings = bindgen::Builder::default()
                 .header(header_path.to_str().unwrap())
                 .generate()
@@ -95,7 +109,19 @@ fn main() {
 
             // Link the Go library
             println!("cargo:rustc-link-search=native={}", dest_path.display());
-            println!("cargo:rustc-link-lib=static={lib_name}");
+            if windows {
+                println!("cargo:rustc-link-lib=dylib={lib_name}");
+                // Windows loads a DLL from beside the executable: copy it to where cargo puts
+                // binaries (target/<profile>) and tests (its deps/). A release ships it beside
+                // the binary that links this crate.
+                if let Some(profile_dir) = dest_path.ancestors().nth(3) {
+                    for dir in [profile_dir.to_path_buf(), profile_dir.join("deps")] {
+                        let _ = std::fs::copy(&dest, dir.join(format!("{lib_name}.dll")));
+                    }
+                }
+            } else {
+                println!("cargo:rustc-link-lib=static={lib_name}");
+            }
 
             // Static linking doesn't really work on macos, so we need to link some system libs
             if cfg!(target_os = "macos") {

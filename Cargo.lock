@@ -7245,6 +7245,7 @@ name = "sp1-gpu-sys"
 version = "6.0.2"
 dependencies = [
  "cbindgen",
+ "cc",
  "cmake",
  "pathdiff",
  "slop-koala-bear",

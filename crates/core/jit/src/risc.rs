@@ -1,6 +1,9 @@
+#[cfg(unix)]
 use crate::shm::ConsumerGuard;
 
-use std::{marker::PhantomData, ops::Deref, sync::Arc};
+#[cfg(unix)]
+use std::ops::Deref;
+use std::{marker::PhantomData, sync::Arc};
 
 use memmap2::Mmap;
 use serde::{Deserialize, Serialize};
@@ -132,6 +135,8 @@ pub struct TraceChunkHeader {
 #[derive(Clone)]
 pub enum TraceChunkRaw {
     Mmap(Arc<Mmap>),
+    /// A chunk in the runner's shared-memory ring (Unix only, as that ring is).
+    #[cfg(unix)]
     Shm(Arc<ConsumerGuard>),
 }
 
@@ -148,6 +153,7 @@ impl TraceChunkRaw {
     /// # Safety
     ///
     /// See TraceChunkRaw::new for similar safety requirements
+    #[cfg(unix)]
     pub unsafe fn from_shm(inner: ConsumerGuard) -> Self {
         Self::Shm(Arc::new(inner))
     }
@@ -155,6 +161,7 @@ impl TraceChunkRaw {
     fn as_ref(&self) -> &[u8] {
         match self {
             Self::Mmap(mmap) => mmap.as_ref(),
+            #[cfg(unix)]
             Self::Shm(shm) => shm.deref(),
         }
     }
@@ -162,6 +169,7 @@ impl TraceChunkRaw {
     fn as_ptr(&self) -> *const u8 {
         match self {
             Self::Mmap(mmap) => mmap.as_ptr(),
+            #[cfg(unix)]
             Self::Shm(shm) => shm.deref().as_ptr(),
         }
     }
@@ -169,6 +177,7 @@ impl TraceChunkRaw {
     fn len(&self) -> usize {
         match self {
             Self::Mmap(mmap) => mmap.len(),
+            #[cfg(unix)]
             Self::Shm(shm) => shm.deref().len(),
         }
     }

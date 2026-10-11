@@ -1,6 +1,12 @@
 use crate::{debug, MemValue, RiscRegister, TraceChunkHeader};
 use memmap2::{MmapMut, MmapOptions};
-use std::{collections::VecDeque, io, os::fd::RawFd, ptr::NonNull, sync::mpsc};
+#[cfg(unix)]
+use std::os::fd::RawFd;
+use std::{collections::VecDeque, io, ptr::NonNull, sync::mpsc};
+
+/// Off Unix there are no file descriptors; this keeps [`JitContext`]'s `repr(C)` layout the same.
+#[cfg(not(unix))]
+type RawFd = i32;
 
 pub trait SyscallContext {
     /// Read a value from a register.
@@ -288,6 +294,7 @@ impl JitContext {
 
     /// Enter the unconstrained context, this will create a COW memory map of the memory file
     /// descriptor.
+    #[cfg(unix)]
     pub fn enter_unconstrained(&mut self) -> io::Result<()> {
         // SAFETY: The memory is allocated by the [JitFunction] and is valid, not aliased, and has
         // enough space for the alignment.
@@ -322,6 +329,16 @@ impl JitContext {
         self.is_unconstrained = 1;
 
         Ok(())
+    }
+
+    /// Off Unix there is no memory descriptor to map: only the native executor (x86-64 Linux)
+    /// builds a [`JitContext`] with one.
+    #[cfg(not(unix))]
+    pub fn enter_unconstrained(&mut self) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "unconstrained JIT memory needs a Unix file descriptor",
+        ))
     }
 
     /// Exit the unconstrained context, this will restore the original memory map.

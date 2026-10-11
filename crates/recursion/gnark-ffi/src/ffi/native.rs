@@ -18,6 +18,24 @@ mod bind {
 }
 use bind::*;
 
+/// Hands the Go library its KoalaBear inversion callbacks, before its first use.
+///
+/// On Windows the Go library is a DLL, which cannot resolve `koalabearinv` and `koalabearextinv`
+/// against this binary at link time as the static archive used elsewhere does, so it takes them
+/// as function pointers instead (see `go/koalabear_windows.c`). Elsewhere this does nothing.
+fn register_callbacks() {
+    #[cfg(windows)]
+    {
+        static REGISTERED: std::sync::Once = std::sync::Once::new();
+        REGISTERED.call_once(|| unsafe {
+            SP1GnarkSetKoalaBear(
+                crate::koalabear::koalabearinv as *mut std::ffi::c_void,
+                crate::koalabear::koalabearextinv as *mut std::ffi::c_void,
+            )
+        });
+    }
+}
+
 enum ProofSystem {
     Plonk,
     Groth16,
@@ -74,6 +92,7 @@ enum ProveFunction {
 }
 
 fn build(system: ProofSystem, data_dir: &str) {
+    register_callbacks();
     let data_dir = CString::new(data_dir).expect("CString::new failed");
     unsafe {
         (system.build_fn())(data_dir.as_ptr() as *mut c_char);
@@ -81,6 +100,7 @@ fn build(system: ProofSystem, data_dir: &str) {
 }
 
 fn prove(system: ProofSystem, data_dir: &str, witness_path: &str) -> ProofResult {
+    register_callbacks();
     let data_dir = CString::new(data_dir).expect("CString::new failed");
     let witness_path = CString::new(witness_path).expect("CString::new failed");
 
@@ -111,6 +131,7 @@ fn verify(
     vk_root: &str,
     proof_nonce: &str,
 ) -> Result<(), String> {
+    register_callbacks();
     let data_dir = CString::new(data_dir).expect("CString::new failed");
     let proof = CString::new(proof).expect("CString::new failed");
     let vkey_hash = CString::new(vkey_hash).expect("CString::new failed");
@@ -142,6 +163,7 @@ fn verify(
 }
 
 fn test(system: ProofSystem, witness_json: &str, constraints_json: &str) {
+    register_callbacks();
     unsafe {
         let witness_json = CString::new(witness_json).expect("CString::new failed");
         let constraints_json = CString::new(constraints_json).expect("CString::new failed");
@@ -231,6 +253,7 @@ pub fn test_groth16_bn254(witness_json: &str, constraints_json: &str) {
 }
 
 pub fn test_koalabear_poseidon2() {
+    register_callbacks();
     unsafe {
         let err_ptr = bind::TestPoseidonKoalaBear2();
         if !err_ptr.is_null() {

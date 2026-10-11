@@ -10,6 +10,9 @@ pub mod pk;
 /// The server startup logic.
 mod server;
 
+/// The client/server connection: a Unix socket, or a named pipe on Windows.
+pub mod transport;
+
 mod error;
 pub use error::CudaClientError;
 
