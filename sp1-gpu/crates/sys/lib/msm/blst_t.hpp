@@ -10,6 +10,8 @@
 #include <cstdint>
 #include <cstring>
 
+#include "int128.hpp"
+
 typedef uint64_t limb_t;
 typedef uint64_t vec256[4];
 #define TO_LIMB_T(limb64) limb64
@@ -65,9 +67,9 @@ struct blst_256_t {
     // ---- Modular addition: (a + b) mod P ----
     blst_256_t operator+(const blst_256_t& b) const {
         blst_256_t r;
-        unsigned __int128 carry = 0;
+        u128_t carry = 0;
         for (int i = 0; i < 4; i++) {
-            carry += (unsigned __int128)val[i] + b.val[i];
+            carry += (u128_t)val[i] + b.val[i];
             r.val[i] = (uint64_t)carry;
             carry >>= 64;
         }
@@ -81,9 +83,9 @@ struct blst_256_t {
     // ---- Modular subtraction: (a - b) mod P ----
     blst_256_t operator-(const blst_256_t& b) const {
         blst_256_t r;
-        __int128 borrow = 0;
+        i128_t borrow = 0;
         for (int i = 0; i < 4; i++) {
-            __int128 diff = (__int128)val[i] - b.val[i] + borrow;
+            i128_t diff = (i128_t)val[i] - b.val[i] + borrow;
             r.val[i] = (uint64_t)diff;
             borrow = diff >> 127 ? -1 : 0; // sign-extend borrow
         }
@@ -97,9 +99,9 @@ struct blst_256_t {
     blst_256_t operator-() const {
         if (is_zero()) return *this;
         blst_256_t r;
-        __int128 borrow = 0;
+        i128_t borrow = 0;
         for (int i = 0; i < 4; i++) {
-            __int128 diff = (__int128)MOD[i] - val[i] + borrow;
+            i128_t diff = (i128_t)MOD[i] - val[i] + borrow;
             r.val[i] = (uint64_t)diff;
             borrow = diff >> 127 ? -1 : 0;
         }
@@ -113,13 +115,13 @@ struct blst_256_t {
 
         for (int i = 0; i < 4; i++) {
             // Step 1: t += a[i] * b
-            unsigned __int128 carry = 0;
+            u128_t carry = 0;
             for (int j = 0; j < 4; j++) {
-                carry += (unsigned __int128)val[i] * b.val[j] + t[j];
+                carry += (u128_t)val[i] * b.val[j] + t[j];
                 t[j] = (uint64_t)carry;
                 carry >>= 64;
             }
-            unsigned __int128 sum = (unsigned __int128)t[4] + (uint64_t)carry;
+            u128_t sum = (u128_t)t[4] + (uint64_t)carry;
             t[4] = (uint64_t)sum;
             t[5] = (uint64_t)(sum >> 64);
 
@@ -127,11 +129,11 @@ struct blst_256_t {
             uint64_t m = t[0] * M0;
             carry = 0;
             for (int j = 0; j < 4; j++) {
-                carry += (unsigned __int128)m * MOD[j] + t[j];
+                carry += (u128_t)m * MOD[j] + t[j];
                 t[j] = (uint64_t)carry;
                 carry >>= 64;
             }
-            sum = (unsigned __int128)t[4] + (uint64_t)carry;
+            sum = (u128_t)t[4] + (uint64_t)carry;
             t[4] = (uint64_t)sum;
             t[5] += (uint64_t)(sum >> 64);
 
@@ -168,9 +170,9 @@ struct blst_256_t {
     blst_256_t operator<<(unsigned int shift) const {
         blst_256_t r = *this;
         for (unsigned int s = 0; s < shift; s++) {
-            unsigned __int128 carry = 0;
+            u128_t carry = 0;
             for (int i = 0; i < 4; i++) {
-                carry += (unsigned __int128)r.val[i] + r.val[i];
+                carry += (u128_t)r.val[i] + r.val[i];
                 r.val[i] = (uint64_t)carry;
                 carry >>= 64;
             }
@@ -228,8 +230,14 @@ struct blst_256_t {
     // ---- Element access (uint32_t view into uint64_t array) ----
     // Use may_alias attribute to prevent GCC -O2 strict-aliasing miscompilation
     // when accessing uint64_t storage as uint32_t limbs.
+    // MSVC has no such attribute, and does no type-based alias analysis for it to guard against.
+#if defined(_MSC_VER) && !defined(__clang__)
+    typedef uint32_t u32_alias;
+    typedef const uint32_t const_u32_alias;
+#else
     typedef uint32_t __attribute__((may_alias)) u32_alias;
     typedef const uint32_t __attribute__((may_alias)) const_u32_alias;
+#endif
 
     const_u32_alias& operator[](size_t i) const {
         return reinterpret_cast<const_u32_alias*>(val)[i];
@@ -250,9 +258,9 @@ private:
 
     // val -= MOD
     static void sub_mod(uint64_t v[4]) {
-        __int128 borrow = 0;
+        i128_t borrow = 0;
         for (int i = 0; i < 4; i++) {
-            __int128 diff = (__int128)v[i] - MOD[i] + borrow;
+            i128_t diff = (i128_t)v[i] - MOD[i] + borrow;
             v[i] = (uint64_t)diff;
             borrow = diff >> 127 ? -1 : 0;
         }
@@ -260,9 +268,9 @@ private:
 
     // val += MOD
     static void add_mod(uint64_t v[4]) {
-        unsigned __int128 carry = 0;
+        u128_t carry = 0;
         for (int i = 0; i < 4; i++) {
-            carry += (unsigned __int128)v[i] + MOD[i];
+            carry += (u128_t)v[i] + MOD[i];
             v[i] = (uint64_t)carry;
             carry >>= 64;
         }

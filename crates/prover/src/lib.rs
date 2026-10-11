@@ -16,6 +16,9 @@ pub use components::*;
 /// This string should be updated whenever any step in verifying an SP1 proof changes, including
 /// core, recursion, and plonk-bn254. This string is used to download SP1 artifacts and the gnark
 /// docker image.
-pub const SP1_CIRCUIT_VERSION: &str = include_str!("../SP1_CIRCUIT_VERSION");
+// The repo-root file, not this crate's `SP1_CIRCUIT_VERSION`: that is a symlink to it, which a
+// checkout without symlink support (cargo's git checkout on Windows) writes as a text file holding
+// the link's target, `../../SP1_CIRCUIT_VERSION`, and that would become the version.
+pub const SP1_CIRCUIT_VERSION: &str = include_str!("../../../SP1_CIRCUIT_VERSION");
 
 pub use sp1_hypercube::{HashableKey, SP1VerifyingKey};

@@ -255,8 +255,12 @@ else()
     set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} --expt-relaxed-constexpr")
     set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} --use_fast_math")
     set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -lineinfo")
-    set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -Xcompiler -fopenmp")
-    set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -Xcompiler -fPIE")
+    # GCC host flags. MSVC rejects them, and needs neither: OpenMP is used only on the HIP path,
+    # and Windows code is position-independent as it stands.
+    if(NOT MSVC)
+        set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -Xcompiler -fopenmp")
+        set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -Xcompiler -fPIE")
+    endif()
 
     # Enable relocatable device code for cross-file device function calls
     set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -rdc=true")
@@ -367,7 +371,9 @@ else()
         CUDA_RESOLVE_DEVICE_SYMBOLS ON
     )
 
-    if(CMAKE_CUDA_COMPILER_VERSION VERSION_LESS 12.9)
+    # The sources use NVTX3 (<nvtx3/nvToolsExt.h>), which is header-only, so the v2 library is
+    # linked only where the toolkit has one: Windows toolkits ship NVTX3 headers alone.
+    if(CMAKE_CUDA_COMPILER_VERSION VERSION_LESS 12.9 AND TARGET CUDA::nvToolsExt)
         target_link_libraries(sys-cuda PRIVATE
             CUDA::cudart
             CUDA::nvToolsExt

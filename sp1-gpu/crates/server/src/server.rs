@@ -2,6 +2,7 @@ use sp1_core_executor::SP1Context;
 use sp1_cuda::{
     api::{Request, Response},
     client::socket_path,
+    transport::{Listener, ServerStream},
 };
 use sp1_gpu_cudart::TaskScope;
 use sp1_gpu_prover::cuda_worker_builder_with_machine;
@@ -12,10 +13,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use std::io;
-use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
-    net::{UnixListener, UnixStream},
-};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 /// A cached proving key and verifying key.
 #[derive(Clone)]
@@ -46,18 +44,14 @@ impl Server {
         );
         let socket_path = socket_path(self.cuda_device_id);
 
-        // Try to remove the socket file socket incase the file was never cleaned up.
-        if let Err(e) = std::fs::remove_file(&socket_path) {
-            tracing::warn!("Failed to remove orphaned socket: {}", e);
-        }
-
-        let listener = UnixListener::bind(&socket_path).expect("Failed to bind to socket addr");
+        // A Unix socket (replacing one a dead server left behind), or a named pipe on Windows.
+        let mut listener = Listener::bind(&socket_path).expect("Failed to bind to socket addr");
 
         tracing::info!("Server listening @ {}", socket_path.display());
         loop {
             tokio::select! {
                 res = listener.accept() => {
-                    if let Ok((stream, _)) = res {
+                    if let Ok(stream) = res {
                         tracing::info!("Connection accepted");
 
                         let task_scope = task_scope.clone();
@@ -82,9 +76,7 @@ impl Server {
                     tracing::info!("Ctrl-C received, shutting down");
 
                     // Remove the socket file, explicitly.
-                    if let Err(e) = std::fs::remove_file(&socket_path) {
-                        tracing::error!("Failed to remove orphaned socket: {}", e);
-                    }
+                    listener.cleanup();
 
                     break;
                 }
@@ -94,7 +86,7 @@ impl Server {
 
     async fn handle_connection(
         task_scope: TaskScope,
-        stream: &mut UnixStream,
+        stream: &mut ServerStream,
     ) -> Result<(), io::Error> {
         let mut ctx =
             ConnectionCtx { pk_cache: Default::default(), prover: Default::default(), task_scope };
@@ -197,7 +189,7 @@ fn sha256(data: &[u8]) -> [u8; 32] {
     hasher.finalize().into()
 }
 
-async fn send_response(stream: &mut UnixStream, response: Response) -> Result<(), io::Error> {
+async fn send_response(stream: &mut ServerStream, response: Response) -> Result<(), io::Error> {
     let response_bytes = bincode::serialize(&response).unwrap();
     let len = response_bytes.len() as u32;
     stream.write_all(&len.to_le_bytes()).await?;

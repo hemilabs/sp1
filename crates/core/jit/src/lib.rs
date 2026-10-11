@@ -8,17 +8,22 @@ pub mod context;
 pub mod debug;
 pub mod instructions;
 mod macros;
+// memfd and POSIX shared memory and semaphores: for the native executor (x86-64 Linux) and the
+// standalone runner. Elsewhere the portable executor runs, and Windows has none of them.
+#[cfg(unix)]
 pub mod memory;
 pub mod risc;
+#[cfg(unix)]
 pub mod shm;
 
 use dynasmrt::ExecutableBuffer;
 use hashbrown::HashMap;
+#[cfg(unix)]
+use std::os::fd::AsRawFd;
 use std::{
     collections::VecDeque,
     io,
     ops::{Deref, DerefMut},
-    os::fd::AsRawFd,
     ptr::NonNull,
     sync::{mpsc, Arc},
 };
@@ -165,7 +170,15 @@ pub trait Debuggable {
 }
 
 /// A trait representing JIT memory.
+#[cfg(unix)]
 pub trait JitMemory: Sized + Deref<Target = [u8]> + DerefMut + AsRawFd {
+    fn new(memory_size: usize) -> Self;
+}
+
+/// A trait representing JIT memory. Without the native executor (and off Unix) there is no file
+/// descriptor to map it from.
+#[cfg(not(unix))]
+pub trait JitMemory: Sized + Deref<Target = [u8]> + DerefMut {
     fn new(memory_size: usize) -> Self;
 }
 

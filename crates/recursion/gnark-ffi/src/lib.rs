@@ -54,7 +54,9 @@ pub fn run_groth16_cpu_helper_if_requested() {}
 /// This string should be updated whenever any step in verifying an SP1 proof changes, including
 /// core, recursion, and plonk-bn254. This string is used to download SP1 artifacts and the gnark
 /// docker image.
-const SP1_CIRCUIT_VERSION: &str = include_str!("../assets/SP1_CIRCUIT_VERSION");
+// The repo-root file, not `assets/SP1_CIRCUIT_VERSION`, a symlink to it: see sp1-prover's
+// SP1_CIRCUIT_VERSION.
+const SP1_CIRCUIT_VERSION: &str = include_str!("../../../../SP1_CIRCUIT_VERSION");
 
 /// Serializes tests that change process-wide environment variables, so that none of them sees
 /// another's settings half applied.

@@ -4,7 +4,6 @@
 mod native {
     use crate::CudaClientError;
     use std::{
-        os::unix::process::CommandExt,
         path::{Path, PathBuf},
         process::Stdio,
     };
@@ -19,8 +18,11 @@ mod native {
     pub(crate) async fn start_server(cuda_id: u32) -> Result<Child, CudaClientError> {
         const PATH: &str = ".sp1/bin/sp1-gpu-server";
 
-        // Get the path to where the server binary is located.
-        let path = PathBuf::from(std::env::var("HOME").expect("$HOME is not set")).join(PATH);
+        // Get the path to where the server binary is located. Windows sets USERPROFILE, not HOME.
+        let home = std::env::var_os("HOME")
+            .or_else(|| std::env::var_os("USERPROFILE"))
+            .expect("$HOME is not set");
+        let path = PathBuf::from(home).join(format!("{PATH}{}", std::env::consts::EXE_SUFFIX));
 
         // Download the server binary if it doesn't exist.
         maybe_download_server(&path).await?;
@@ -69,13 +71,28 @@ mod native {
                 //
                 // NOTE: If a user is running a CUDA prover, across different versions,
                 // on the same machine, this will cause other instances to crash!
-                let mut cmd = Command::new("systemctl");
-                cmd.arg("--user").arg("stop").arg(r#"sp1-gpu-server-\*"#);
+                #[cfg(target_os = "linux")]
+                {
+                    let mut cmd = Command::new("systemctl");
+                    cmd.arg("--user").arg("stop").arg(r#"sp1-gpu-server-\*"#);
 
-                let _ = cmd.status().await.map_err(|e| {
-                    CudaClientError::new_download_io(e, "Could not stop `sp1-gpu-server`")
-                })?;
+                    let _ = cmd.status().await.map_err(|e| {
+                        CudaClientError::new_download_io(e, "Could not stop `sp1-gpu-server`")
+                    })?;
+                }
             }
+        }
+
+        // The release published for download is a Linux x86-64 build. Elsewhere the server must
+        // already be installed, built from source.
+        if download && !cfg!(target_os = "linux") {
+            return Err(CudaClientError::Unexpected(format!(
+                "no `sp1-gpu-server` {} at {}: there is no release to download for this \
+                 platform, so build it from source (`cargo install sp1-gpu-server`) and place it \
+                 there",
+                sp1_primitives::SP1_CRATE_VERSION,
+                path.display()
+            )));
         }
 
         if download {

@@ -13,7 +13,6 @@ use std::{
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    net::UnixStream,
     process::Child,
     sync::Mutex,
 };
@@ -21,6 +20,7 @@ use tokio::{
 use crate::{
     api::{Request, Response},
     pk::CudaProvingKey,
+    transport::ClientStream,
     CudaClientError,
 };
 
@@ -77,7 +77,7 @@ impl CudaClient {
         }
     }
 
-    async fn lock(&self) -> tokio::sync::MutexGuard<'_, UnixStream> {
+    async fn lock(&self) -> tokio::sync::MutexGuard<'_, ClientStream> {
         self.inner.stream.as_ref().expect("expected a valid stream").lock().await
     }
 }
@@ -103,20 +103,23 @@ impl CudaClient {
     /// Sends a [`Request`] message to the server.
     pub(crate) async fn send(
         &self,
-        stream: &mut UnixStream,
+        stream: &mut ClientStream,
         request: Request,
     ) -> Result<(), CudaClientError> {
         self.inner.send(stream, request).await
     }
 
     /// Reads a [`Response`] message from the server.
-    pub(crate) async fn recv(&self, stream: &mut UnixStream) -> Result<Response, CudaClientError> {
+    pub(crate) async fn recv(
+        &self,
+        stream: &mut ClientStream,
+    ) -> Result<Response, CudaClientError> {
         self.inner.recv(stream).await
     }
 }
 
 struct CudaClientInner {
-    stream: Option<Mutex<UnixStream>>,
+    stream: Option<Mutex<ClientStream>>,
     _child: Child,
 }
 
@@ -147,7 +150,7 @@ impl CudaClientInner {
     }
 
     /// Connects to the server at [`CUDA_SOCKET`], retrying if the server is not running yet.
-    async fn connect_inner(cuda_id: u32) -> Result<UnixStream, CudaClientError> {
+    async fn connect_inner(cuda_id: u32) -> Result<ClientStream, CudaClientError> {
         let socket_path = socket_path(cuda_id);
 
         // Retry a few times, just in case the server hasnt started yet.
@@ -166,8 +169,8 @@ impl CudaClientInner {
     }
 
     /// Connects to the server at the given path.
-    async fn connect_once(path: &Path) -> Result<UnixStream, CudaClientError> {
-        let stream = UnixStream::connect(path).await.map_err(|e| {
+    async fn connect_once(path: &Path) -> Result<ClientStream, CudaClientError> {
+        let stream = crate::transport::connect(path).await.map_err(|e| {
             CudaClientError::new_connect(e, "Could not connect to `sp1-gpu-server` socket")
         })?;
 
@@ -177,7 +180,7 @@ impl CudaClientInner {
     /// Sends a [`Request`] message to the server.
     pub(crate) async fn send(
         &self,
-        stream: &mut UnixStream,
+        stream: &mut ClientStream,
         request: Request,
     ) -> Result<(), CudaClientError> {
         let request_bytes = bincode::serialize(&request).map_err(CudaClientError::Serialize)?;
@@ -190,7 +193,10 @@ impl CudaClientInner {
     }
 
     /// Reads a [`Response`] message from the server.
-    pub(crate) async fn recv(&self, stream: &mut UnixStream) -> Result<Response, CudaClientError> {
+    pub(crate) async fn recv(
+        &self,
+        stream: &mut ClientStream,
+    ) -> Result<Response, CudaClientError> {
         // Read the length of the response.
         let mut len_le = [0; 4];
         stream.read_exact(&mut len_le).await.map_err(CudaClientError::Read)?;
@@ -207,11 +213,17 @@ impl CudaClientInner {
     }
 }
 
-/// The socket path for the given CUDA device id.
+/// The socket path for the given CUDA device id: a named pipe on Windows (see [`crate::transport`]).
 pub fn socket_path(cuda_id: u32) -> PathBuf {
-    const CUDA_SOCKET_BASE: &str = "/tmp/sp1-cuda-";
-
-    format!("{CUDA_SOCKET_BASE}{cuda_id}.sock").into()
+    #[cfg(unix)]
+    {
+        const CUDA_SOCKET_BASE: &str = "/tmp/sp1-cuda-";
+        format!("{CUDA_SOCKET_BASE}{cuda_id}.sock").into()
+    }
+    #[cfg(windows)]
+    {
+        format!(r"\\.\pipe\sp1-cuda-{cuda_id}").into()
+    }
 }
 
 impl Drop for CudaClientInner {
