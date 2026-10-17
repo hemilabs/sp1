@@ -168,15 +168,17 @@ mod tests {
     fn test_batch_coset_dft() {
         let mut rng = thread_rng();
 
-        let log_degrees = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
+        // Up to 2^21 outputs: every split of the stages into global passes and a tile. (2^21 inputs
+        // would exceed the 65535-block grid limit of the input transpose below on CUDA and HIP.)
+        let log_degrees = 1..=20;
         let log_blowup = 1;
         let shift = SP1Field::generator();
-        let batch_size = 16;
 
         let p3_dft = Radix2DitParallel;
 
-        for log_d in log_degrees.iter() {
+        for log_d in log_degrees {
             let d = 1 << log_d;
+            let batch_size = if log_d > 15 { 3 } else { 16 };
 
             let tensor_h = Tensor::<SP1Field>::rand(&mut rng, [d, batch_size]);
 
