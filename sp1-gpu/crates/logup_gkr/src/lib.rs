@@ -714,7 +714,11 @@ mod tests {
             }
 
             let mut prover_challenger = challenger.clone();
-            let proof = super::prove_logup_gkr::<TestGC, RiscvAir<Felt>>(
+            let proof = super::prove_logup_gkr::<
+                TestGC,
+                RiscvAir<Felt>,
+                sp1_gpu_challenger::DuplexChallenger<Felt, TaskScope>,
+            >(
                 shard_chips,
                 all_interactions,
                 &jagged_trace_data,

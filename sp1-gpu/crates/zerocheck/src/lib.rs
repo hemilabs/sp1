@@ -2236,6 +2236,11 @@ pub mod tests {
 
             let logup_evaluations = LogUpEvaluations { point: zeta, chip_openings };
 
+            let mut device_challenger =
+                <sp1_gpu_challenger::DuplexChallenger<Felt, sp1_gpu_cudart::TaskScope> as sp1_gpu_challenger::FromHostChallengerSync<_>>::from_host_challenger_sync(
+                    &challenger_prover,
+                    slop_alloc::HasBackend::backend(&trace_mle.dense_data),
+                );
             let (opened_values, zerocheck_proof) = zerocheck(
                 &chips,
                 &cache,
@@ -2245,6 +2250,7 @@ pub mod tests {
                 &logup_evaluations,
                 public_values.clone(),
                 &mut challenger_prover,
+                &mut device_challenger,
                 max_log_row_count as u32,
             );
 
@@ -2344,6 +2350,11 @@ pub mod tests {
 
             let logup_evaluations = LogUpEvaluations { point: zeta, chip_openings };
 
+            let mut device_challenger =
+                <sp1_gpu_challenger::DuplexChallenger<Felt, sp1_gpu_cudart::TaskScope> as sp1_gpu_challenger::FromHostChallengerSync<_>>::from_host_challenger_sync(
+                    &challenger_prover,
+                    slop_alloc::HasBackend::backend(&trace_mle.dense_data),
+                );
             let (opened_values, zerocheck_proof) = zerocheck(
                 chips,
                 &cache,
@@ -2353,6 +2364,7 @@ pub mod tests {
                 &logup_evaluations,
                 public_values.clone(),
                 &mut challenger_prover,
+                &mut device_challenger,
                 max_log_row_count,
             );
 
