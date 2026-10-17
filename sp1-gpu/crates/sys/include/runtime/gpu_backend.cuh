@@ -282,8 +282,15 @@ inline unsigned long long __umul64hi(unsigned long long a, unsigned long long b)
 
 namespace sp1sycl {
 
-// The signature every kernel pointer has in the SYCL build: see `cuda_launch_kernel`.
-using launch_fn = void (*)(void* queue, dim3 grid, dim3 block, void** args, size_t shared_mem);
+// The signature every kernel pointer has in the SYCL build: see `cuda_launch_kernel`. With
+// `want_event` the launch returns its event (for the optional kernel timing), else an empty one.
+using launch_fn = sycl::event (*)(
+    void* queue,
+    dim3 grid,
+    dim3 block,
+    void** args,
+    size_t shared_mem,
+    bool want_event);
 
 // The kernel object a launch submits: the arguments by value, as CUDA copies them at launch, and
 // the sub-group size as a kernel property.
@@ -309,12 +316,13 @@ struct KernelFunctor {
 };
 
 template <auto& F, typename... A, size_t... I>
-void launch_impl(
+sycl::event launch_impl(
     sycl::queue& q,
     dim3 grid,
     dim3 block,
     void** args,
     size_t shared_mem,
+    bool want_event,
     std::index_sequence<I...>) {
     using Tuple = std::tuple<std::decay_t<A>...>;
     KernelFunctor<F, Tuple> kernel{Tuple{*static_cast<std::decay_t<A>*>(args[I])...}};
@@ -330,23 +338,43 @@ void launch_impl(
     syclex::launch_config config{
         sycl::nd_range<3>(global, local),
         syclex::properties{syclex::work_group_scratch_size(scratch)}};
+    if (want_event) {
+        return q.submit([&](sycl::handler& h) { syclex::nd_launch(h, config, kernel); });
+    }
     syclex::nd_launch(q, config, kernel);
+    return sycl::event();
 }
 
 template <auto& F, typename... A>
-void launch_dispatch(
+sycl::event launch_dispatch(
     sycl::queue& q,
     dim3 grid,
     dim3 block,
     void** args,
     size_t shared_mem,
+    bool want_event,
     void (*)(A...)) {
-    launch_impl<F, A...>(q, grid, block, args, shared_mem, std::index_sequence_for<A...>{});
+    return launch_impl<F, A...>(
+        q,
+        grid,
+        block,
+        args,
+        shared_mem,
+        want_event,
+        std::index_sequence_for<A...>{});
 }
 
 template <auto& F>
-void launch_thunk(void* queue, dim3 grid, dim3 block, void** args, size_t shared_mem) {
-    launch_dispatch<F>(*static_cast<sycl::queue*>(queue), grid, block, args, shared_mem, &F);
+sycl::event
+launch_thunk(void* queue, dim3 grid, dim3 block, void** args, size_t shared_mem, bool want_event) {
+    return launch_dispatch<F>(
+        *static_cast<sycl::queue*>(queue),
+        grid,
+        block,
+        args,
+        shared_mem,
+        want_event,
+        &F);
 }
 
 }  // namespace sp1sycl
@@ -355,10 +383,14 @@ void launch_thunk(void* queue, dim3 grid, dim3 block, void** args, size_t shared
 
 // A kernel's launch pointer, for the `extern "C"` kernel getters: the kernel itself on CUDA and
 // HIP, its launch thunk on SYCL. Variadic so that template arguments may contain commas.
+//
+// The pointer passes through `sp1_kernel_named`, which records the kernel's name for the optional
+// per-kernel GPU timing (runtime/kernel_profile.hpp) and otherwise just returns it.
+extern "C" void* sp1_kernel_named(void* kernel, const char* name);
 #ifdef SP1_SYCL
-#define SP1_KERNEL_PTR(...) ((void*)&::sp1sycl::launch_thunk<__VA_ARGS__>)
+#define SP1_KERNEL_PTR(...) sp1_kernel_named((void*)&::sp1sycl::launch_thunk<__VA_ARGS__>, #__VA_ARGS__)
 #else
-#define SP1_KERNEL_PTR(...) ((void*)(__VA_ARGS__))
+#define SP1_KERNEL_PTR(...) sp1_kernel_named((void*)(__VA_ARGS__), #__VA_ARGS__)
 #endif
 
 // Shared memory, declared at kernel scope (on SYCL every work item must reach the declaration).

@@ -7,6 +7,7 @@ using cudaStream_t = hipStream_t;
 using cudaEvent_t = hipEvent_t;
 #define cudaDeviceSynchronize hipDeviceSynchronize
 #define cudaEventCreateWithFlags hipEventCreateWithFlags
+#define cudaEventCreate hipEventCreate
 #define cudaEventDisableTiming hipEventDisableTiming
 #define cudaEventDestroy hipEventDestroy
 #define cudaEventRecord hipEventRecord
@@ -241,6 +242,108 @@ static hipError_t cachedHipFree(void* p, hipStream_t stream) {
 #define cudaFreeAsync cachedHipFree
 #endif // __HIPCC__
 
+// ---------------------------------------------------------------------------------------------
+// Optional per-kernel GPU timing (runtime/kernel_profile.hpp): a pair of timing events around
+// each launch, copy or profiled scope, resolved in batches off the launch path.
+// ---------------------------------------------------------------------------------------------
+
+#include <deque>
+#include "runtime/kernel_profile.hpp"
+
+namespace {
+
+struct GpuProfiler {
+    struct Pending {
+        const char* name;
+        cudaEvent_t start;
+        cudaEvent_t end;
+    };
+    std::mutex m;
+    std::deque<Pending> pending;
+    std::vector<cudaEvent_t> spare;
+
+    static GpuProfiler& get() {
+        static GpuProfiler* p = [] {
+            auto* p = new GpuProfiler();
+            std::atexit([] {
+                GpuProfiler::get().resolve(0);
+                sp1prof::totals().write();
+            });
+            return p;
+        }();
+        return *p;
+    }
+
+    cudaEvent_t event() {
+        std::lock_guard<std::mutex> lock(m);
+        if (!spare.empty()) {
+            cudaEvent_t e = spare.back();
+            spare.pop_back();
+            return e;
+        }
+        cudaEvent_t e = nullptr;
+        if (cudaEventCreate(&e) != cudaSuccess) return nullptr;
+        return e;
+    }
+
+    cudaEvent_t begin(cudaStream_t stream) {
+        cudaEvent_t e = event();
+        if (e) cudaEventRecord(e, stream);
+        return e;
+    }
+
+    void end(cudaEvent_t start, const char* name, cudaStream_t stream) {
+        if (!start) return;
+        cudaEvent_t e = event();
+        if (!e) return;
+        cudaEventRecord(e, stream);
+        bool full;
+        {
+            std::lock_guard<std::mutex> lock(m);
+            pending.push_back({name, start, e});
+            full = pending.size() > 4096;
+        }
+        if (full) resolve(2048);
+    }
+
+    // Times the oldest entries until at most `keep` are pending.
+    void resolve(size_t keep) {
+        for (;;) {
+            Pending p;
+            {
+                std::lock_guard<std::mutex> lock(m);
+                if (pending.size() <= keep) return;
+                p = pending.front();
+                pending.pop_front();
+            }
+            float ms = 0;
+            if (cudaEventSynchronize(p.end) == cudaSuccess &&
+                cudaEventElapsedTime(&ms, p.start, p.end) == cudaSuccess) {
+                sp1prof::totals().add(p.name, ms);
+            }
+            std::lock_guard<std::mutex> lock(m);
+            spare.push_back(p.start);
+            spare.push_back(p.end);
+        }
+    }
+};
+
+}  // namespace
+
+extern "C" void* sp1_kernel_named(void* kernel, const char* name) {
+    if (sp1prof::enabled()) sp1prof::totals().name(kernel, name);
+    return kernel;
+}
+
+extern "C" void* sp1_profile_begin(void* stream) {
+    if (!sp1prof::enabled()) return nullptr;
+    return GpuProfiler::get().begin((cudaStream_t)stream);
+}
+
+extern "C" void sp1_profile_end(void* token, const char* name, void* stream) {
+    if (token) GpuProfiler::get().end((cudaEvent_t)token, name, (cudaStream_t)stream);
+}
+
 // Create an nvtx domain.
 
 extern "C" nvtxDomainHandle_t nvtxDomainCreateARust(char* name) {
@@ -408,7 +511,9 @@ extern "C" rustCudaError_t cuda_mem_copy_device_to_device_async(
     const void* src,
     size_t count,
     cudaStream_t stream) {
+    void* prof = sp1_profile_begin(stream);
     CUDA_OK(cudaMemcpyAsync(dst, src, count, cudaMemcpyDeviceToDevice, stream));
+    sp1_profile_end(prof, "copy: device to device", stream);
     return CUDA_SUCCESS_CSL;
 }
 
@@ -438,9 +543,13 @@ cuda_mem_copy_host_to_device_async(void* dst, const void* src, size_t count, cud
     const bool pinned = isPinnedHost(src);
     if (!pinned) CUDA_OK(cudaStreamSynchronize(stream));
 #endif
+    void* prof = sp1_profile_begin(stream);
     CUDA_OK(cudaMemcpyAsync(dst, src, count, cudaMemcpyHostToDevice, stream));
 #ifdef __HIPCC__
+    sp1_profile_end(prof, pinned ? "copy: host to device" : "copy: host to device (pageable)", stream);
     if (!pinned) CUDA_OK(cudaStreamSynchronize(stream));
+#else
+    sp1_profile_end(prof, "copy: host to device", stream);
 #endif
     return CUDA_SUCCESS_CSL;
 }
@@ -455,7 +564,9 @@ cuda_mem_copy_device_to_host_async(void* dst, const void* src, size_t count, cud
     const bool pinned = isPinnedHost(dst);
     if (!pinned) CUDA_OK(cudaStreamSynchronize(stream));
 #endif
+    void* prof = sp1_profile_begin(stream);
     CUDA_OK(cudaMemcpyAsync(dst, src, count, cudaMemcpyDeviceToHost, stream));
+    sp1_profile_end(prof, "copy: device to host", stream);
 #ifdef __HIPCC__
     if (!pinned) CUDA_OK(cudaStreamSynchronize(stream));
 #endif
@@ -491,6 +602,12 @@ extern "C" rustCudaError_t cuda_launch_kernel(
     void** args,
     size_t shared_mem,
     cudaStream_t stream) {
+    if (sp1prof::enabled()) {
+        void* prof = sp1_profile_begin(stream);
+        CUDA_OK(cudaLaunchKernel(kernel, grid, block, args, shared_mem, stream));
+        sp1_profile_end(prof, sp1prof::totals().name_of(kernel), stream);
+        return CUDA_SUCCESS_CSL;
+    }
     CUDA_OK(cudaLaunchKernel(kernel, grid, block, args, shared_mem, stream));
     return CUDA_SUCCESS_CSL;
 }
