@@ -5,7 +5,11 @@
 #ifndef __NTT_KERNELS_CU__
 #define __NTT_KERNELS_CU__
 
-#include <cooperative_groups.h>
+#if defined(__NVCC__)
+# include <cooperative_groups.h>
+#elif defined(__HIPCC__)
+# include <hip/hip_cooperative_groups.h>
+#endif
 
 template<typename T>
 __device__ __forceinline__

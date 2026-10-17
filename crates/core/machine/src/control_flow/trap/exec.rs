@@ -1,6 +1,6 @@
 use hashbrown::HashMap;
 use itertools::Itertools;
-use rayon::iter::{ParallelBridge, ParallelIterator};
+use slop_maybe_rayon::prelude::{IndexedParallelIterator, ParallelIterator, ParallelSlice, ParallelSliceMut};
 use sp1_core_executor::{
     events::{ByteLookupEvent, ByteRecord},
     ByteOpcode, ExecutionRecord, Program, CLK_INC,
@@ -101,9 +101,8 @@ impl<F: PrimeField32> MachineAir<F> for TrapExecChip {
         let values = unsafe { core::slice::from_raw_parts_mut(buffer_ptr, padded_nb_rows * width) };
 
         let blu_events = values
-            .chunks_mut(chunk_size * width)
+            .par_chunks_mut(chunk_size * width)
             .enumerate()
-            .par_bridge()
             .map(|(i, rows)| {
                 let mut blu: HashMap<ByteLookupEvent, usize> = HashMap::new();
                 rows.chunks_mut(width).enumerate().for_each(|(j, row)| {

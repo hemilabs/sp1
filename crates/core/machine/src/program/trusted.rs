@@ -8,7 +8,7 @@ use crate::{air::ProgramAirBuilder, program::InstructionCols, utils::next_multip
 use slop_air::{Air, BaseAir, PairBuilder};
 use slop_algebra::PrimeField32;
 use slop_matrix::Matrix;
-use slop_maybe_rayon::prelude::{ParallelBridge, ParallelIterator};
+use slop_maybe_rayon::prelude::{IndexedParallelIterator, ParallelIterator, ParallelSliceMut};
 use sp1_core_executor::{ExecutionRecord, Program};
 use sp1_derive::AlignedBorrow;
 use sp1_hypercube::air::{MachineAir, SP1AirBuilder};
@@ -104,9 +104,8 @@ impl<F: PrimeField32> MachineAir<F> for ProgramChip {
         let chunk_size = std::cmp::max((nb_rows + 1) / num_cpus::get(), 1);
 
         values
-            .chunks_mut(chunk_size * NUM_PROGRAM_PREPROCESSED_COLS)
+            .par_chunks_mut(chunk_size * NUM_PROGRAM_PREPROCESSED_COLS)
             .enumerate()
-            .par_bridge()
             .for_each(|(i, rows)| {
                 rows.chunks_mut(NUM_PROGRAM_PREPROCESSED_COLS).enumerate().for_each(|(j, row)| {
                     let mut idx = i * chunk_size + j;
@@ -278,7 +277,7 @@ impl<F: PrimeField32> MachineAir<F> for ProgramChip {
 
         let chunk_size = std::cmp::max(nb_instructions / num_cpus::get(), 1);
 
-        values.chunks_mut(chunk_size * NUM_PROGRAM_MULT_COLS).enumerate().par_bridge().for_each(
+        values.par_chunks_mut(chunk_size * NUM_PROGRAM_MULT_COLS).enumerate().for_each(
             |(i, rows)| {
                 rows.chunks_mut(NUM_PROGRAM_MULT_COLS).enumerate().for_each(|(j, row)| {
                     let idx = i * chunk_size + j;

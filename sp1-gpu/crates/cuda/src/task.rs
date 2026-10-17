@@ -44,9 +44,18 @@ static POOL_ID: AtomicUsize = AtomicUsize::new(0);
 
 pub struct TaskPoolBuilder {
     device: CudaDevice,
-    mem_release_threshold: u64,
+    /// `None` means: auto-derive at `build()` time from the device VRAM and
+    /// the `SP1_GPU_MEM_RELEASE_THRESHOLD` env var.
+    mem_release_threshold: Option<u64>,
     capacity: Option<usize>,
 }
+
+/// 24 GiB cutoff — devices at or below this (RTX 4090) keep the conservative
+/// "release on every sync" behaviour to avoid OOM; devices above (RTX 5090
+/// 32 GiB, H100, etc.) get a non-zero pool retention to amortise
+/// `cudaMalloc` syscall latency over per-shard / per-round allocations.
+const MEM_RELEASE_24GIB_CUTOFF: u64 = 24 * 1024 * 1024 * 1024;
+const MEM_RELEASE_HIGH_VRAM_DEFAULT: u64 = 8 * 1024 * 1024 * 1024;
 
 pub(crate) fn global_task_pool() -> &'static Arc<TaskPool> {
     GLOBAL_TASK_POOL.get_or_init(|| Arc::new(TaskPoolBuilder::new().build().unwrap()))
@@ -149,7 +158,36 @@ pub enum GlobalTaskPoolBuildError {
 
 impl TaskPoolBuilder {
     pub fn new() -> Self {
-        Self { capacity: None, device: CudaDevice(0), mem_release_threshold: u64::MAX }
+        // `mem_release_threshold: None` selects the auto path in `build()`:
+        // 0 on ≤24 GiB devices (RTX 4090 OOM-safe behaviour); 8 GiB on larger
+        // devices (RTX 5090 32 GiB, H100, etc.) to amortise per-shard /
+        // per-round `cudaMallocAsync` syscall latency. Override with the
+        // `SP1_GPU_MEM_RELEASE_THRESHOLD` env var (bytes) or the
+        // `.mem_release_threshold()` setter.
+        Self { capacity: None, device: CudaDevice(0), mem_release_threshold: None }
+    }
+
+    /// Resolve `mem_release_threshold` honouring (in order):
+    /// 1. The `SP1_GPU_MEM_RELEASE_THRESHOLD` env var (parsed as bytes), if set.
+    /// 2. The explicit `.mem_release_threshold(t)` builder setter, if used.
+    /// 3. Device-VRAM-based default: 0 on ≤24 GiB, 8 GiB above.
+    ///
+    /// Falls back to 0 on any query failure (matches the previous default).
+    fn resolve_mem_release_threshold(&self) -> u64 {
+        if let Ok(v) = std::env::var("SP1_GPU_MEM_RELEASE_THRESHOLD") {
+            if let Ok(parsed) = v.trim().parse::<u64>() {
+                return parsed;
+            }
+        }
+        if let Some(explicit) = self.mem_release_threshold {
+            return explicit;
+        }
+        match crate::device::cuda_memory_info() {
+            Ok((_free, total)) if (total as u64) > MEM_RELEASE_24GIB_CUTOFF => {
+                MEM_RELEASE_HIGH_VRAM_DEFAULT
+            }
+            _ => 0,
+        }
     }
 
     pub fn num_tasks(mut self, num_tasks: usize) -> Self {
@@ -169,7 +207,7 @@ impl TaskPoolBuilder {
     /// This setting will affect the memory release threshold for the entire device, not just the
     /// current task pool being built.
     pub fn mem_release_threshold(mut self, threshold: u64) -> Self {
-        self.mem_release_threshold = threshold;
+        self.mem_release_threshold = Some(threshold);
         self
     }
 
@@ -184,6 +222,12 @@ impl TaskPoolBuilder {
     pub fn build(self) -> Result<TaskPool, TaskPoolBuildError> {
         let id = self.allocate_new_id();
         let num_tasks = self.capacity.unwrap_or(DEFAULT_NUM_TASKS);
+        let mem_release_threshold = self.resolve_mem_release_threshold();
+        tracing::debug!(
+            target: "sp1_gpu_cudart",
+            mem_release_threshold,
+            "task pool: mem_release_threshold resolved"
+        );
 
         // Set the memory release threshold
         unsafe {
@@ -195,7 +239,7 @@ impl TaskPoolBuilder {
             .unwrap();
             CudaError::result_from_ffi(cuda_mem_pool_set_release_threshold(
                 mem_pool,
-                self.mem_release_threshold,
+                mem_release_threshold,
             ))
             .unwrap();
         };
@@ -203,8 +247,15 @@ impl TaskPoolBuilder {
         let mut tasks = Vec::with_capacity(num_tasks);
         for (i, _) in (0..num_tasks).enumerate() {
             let stream = CudaStream::create().map_err(TaskPoolBuildError::StreamCreationFailed)?;
+            // Auxiliary stream dedicated to large H2D copies, used via
+            // `TaskScope::copy_host_to_device_aux_async`. Splitting H2D off
+            // the primary stream avoids the driver's stream-queue
+            // back-pressure that nsys 2026-06-18 attributed 24.7s of
+            // wall-time to (see project_5090_optimization_plan.md #2).
+            let aux_stream =
+                CudaStream::create().map_err(TaskPoolBuildError::StreamCreationFailed)?;
             let end_event = CudaEvent::create().map_err(TaskPoolBuildError::EventCreationFailed)?;
-            tasks.push(Task { owner_id: id, id: i, stream, end_event });
+            tasks.push(Task { owner_id: id, id: i, stream, aux_stream, end_event });
         }
         let inner = Arc::new(WorkerQueue::new(tasks));
 
@@ -429,6 +480,63 @@ impl TaskScope {
         dst.copy_from_slice(src, self)
     }
 
+    /// Enqueue a large H2D copy on the task's auxiliary stream, with
+    /// event-based ordering so the primary stream sees the copy completed
+    /// before any subsequent op. Use this for big transfers (trace data,
+    /// codeword inputs) where the primary stream is also handling kernel
+    /// work — running them concurrently on different streams avoids the
+    /// driver's command-queue back-pressure that turns `cudaMemcpyAsync`
+    /// from "fire and forget" into a 41 ms-per-call host stall (nsys
+    /// 2026-06-18 attributes 24.7 s of 5090 100K wall to this).
+    ///
+    /// Ordering: the aux stream is told to wait on a freshly-recorded
+    /// event from the primary stream so any pending `cudaMallocAsync`
+    /// for `dst` retires before the copy begins; the primary stream is
+    /// then told to wait on a freshly-recorded event from the aux stream
+    /// so the next kernel launched on the primary sees the H2D's bytes.
+    /// Host returns essentially immediately — both events and the memcpy
+    /// itself are enqueued, not awaited.
+    ///
+    /// # Safety
+    /// `dst` must be a valid device pointer for `byte_count` bytes of
+    /// writes (allocated on this task's primary backend, typically via
+    /// `cudaMallocAsync` on the primary stream). `src` must point to
+    /// pinned host memory for `byte_count` bytes that stays live until
+    /// the copy completes. The caller must NOT free `dst` or unpin `src`
+    /// before subsequent work on the primary stream synchronises (which
+    /// it will implicitly via the recorded event).
+    pub unsafe fn copy_host_to_device_aux_async(
+        &self,
+        dst: *mut std::ffi::c_void,
+        src: *const std::ffi::c_void,
+        byte_count: usize,
+    ) -> Result<(), CudaError> {
+        use sp1_gpu_sys::runtime::{
+            cuda_event_record, cuda_mem_copy_host_to_device_async, cuda_stream_wait_event,
+        };
+
+        // 1. Record a sync point on the primary stream so the aux stream
+        //    can wait for any pending allocations / prior work on `dst`.
+        let alloc_done = CudaEvent::create()?;
+        CudaError::result_from_ffi(cuda_event_record(alloc_done.0, self.stream.0))?;
+        CudaError::result_from_ffi(cuda_stream_wait_event(self.aux_stream.0, alloc_done.0))?;
+
+        // 2. Issue the H2D on the aux stream — the actual memcpy work.
+        CudaError::result_from_ffi(cuda_mem_copy_host_to_device_async(
+            dst,
+            src,
+            byte_count,
+            self.aux_stream.0,
+        ))?;
+
+        // 3. Record a sync point on the aux stream so any subsequent kernel
+        //    on the primary stream sees the H2D's writes happen-before.
+        let copy_done = CudaEvent::create()?;
+        CudaError::result_from_ffi(cuda_event_record(copy_done.0, self.aux_stream.0))?;
+        CudaError::result_from_ffi(cuda_stream_wait_event(self.stream.0, copy_done.0))?;
+        Ok(())
+    }
+
     /// Waits for all work enqueued so far in this task to finish.
     ///
     /// This function can be useful in case there is work to be enqueued but for some reason this
@@ -560,6 +668,12 @@ pub struct Task {
     pub(crate) owner_id: usize,
     pub(crate) id: usize,
     pub(crate) stream: CudaStream,
+    /// Auxiliary stream for large H2D copies; see
+    /// `TaskScope::copy_host_to_device_aux_async`. Routes long transfers
+    /// off the primary stream to avoid driver-level command-queue
+    /// back-pressure (the 591-call / 24.7s host stall identified by the
+    /// 2026-06-18 nsys profile).
+    pub(crate) aux_stream: CudaStream,
     end_event: CudaEvent,
 }
 
@@ -583,6 +697,7 @@ impl Drop for Task {
         unsafe {
             self.end_event.query().expect("attempting to drop a task that did not finish");
             self.stream.query().expect("attempting to drop a task that did not finish");
+            self.aux_stream.query().expect("attempting to drop a task with aux stream busy");
         }
     }
 }

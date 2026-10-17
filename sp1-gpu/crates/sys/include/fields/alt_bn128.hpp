@@ -2,10 +2,24 @@
 // Licensed under the Apache License, Version 2.0, see LICENSE for details.
 // SPDX-License-Identifier: Apache-2.0
 
-// #ifndef __SPPARK_FF_ALT_BN128_HPP__
-// #define __SPPARK_FF_ALT_BN128_HPP__
+#ifndef __SPPARK_FF_ALT_BN128_HPP__
+#define __SPPARK_FF_ALT_BN128_HPP__
 
 #include <cstdint>
+
+// HIP compatibility macros
+#ifdef __HIPCC__
+#ifndef __SPPARK_UTIL_CUDA2HIP_HPP__
+// __align__ is CUDA-specific; HIP uses __attribute__((aligned(n)))
+#ifndef __align__
+#define __align__(n) __attribute__((aligned(n)))
+#endif
+// __forceinline__ is CUDA-specific; use always_inline attribute on HIP
+#ifndef __forceinline__
+#define __forceinline__ __inline__ __attribute__((always_inline))
+#endif
+#endif
+#endif
 
 namespace device {
 
@@ -48,14 +62,14 @@ static __device__ __constant__ __align__(16) const uint32_t ALT_BN128_r[8] = {
     TO_CUDA_T(0x30644e72e131a029)};
 
 static __device__ __constant__ __align__(16) const uint32_t ALT_BN128_rRR[8] = {
-    /* (1<<512)%P */
+    /* (1<<512)%r */
     TO_CUDA_T(0x1bb8e645ae216da7),
     TO_CUDA_T(0x53fe3ab1e35c59e3),
     TO_CUDA_T(0x8c49833d53bb8085),
     TO_CUDA_T(0x0216d0b17f4e44a5)};
 
 static __device__ __constant__ __align__(16) const uint32_t ALT_BN128_rone[8] = {
-    /* (1<<256)%P */
+    /* (1<<256)%r */
     TO_CUDA_T(0xac96341c4ffffffb),
     TO_CUDA_T(0x36fc76959f60cd29),
     TO_CUDA_T(0x666ea36f7879462e),
@@ -72,8 +86,11 @@ static __device__ __constant__ const uint32_t ALT_BN128_m0 = 0xefffffff;
 
 } // namespace device
 
+#ifndef __HIPCC__
 #include "mont_t.cuh"
+#endif
 
+#ifndef __HIPCC__
 typedef mont_t<
     254,
     (254 + 31) / 32,
@@ -93,3 +110,5 @@ typedef mont_t<
     device::ALT_BN128_rone,
     device::ALT_BN128_rx4>
     fr_mont;
+#endif // !__HIPCC__
+#endif // __SPPARK_FF_ALT_BN128_HPP__

@@ -33,10 +33,17 @@ fn proof_mode_from_string(s: &str) -> ProofMode {
     }
 }
 
+fn main() {
+    // First: when started as its own Groth16 CPU helper, prove and exit here. See
+    // `sp1_recursion_gnark_ffi::run_groth16_cpu_helper_if_requested`.
+    sp1_recursion_gnark_ffi::run_groth16_cpu_helper_if_requested();
+    run();
+}
+
 #[tokio::main]
 #[allow(clippy::field_reassign_with_default)]
 #[allow(clippy::print_stdout)]
-async fn main() {
+async fn run() {
     let args = Args::parse();
 
     // Load the environment variables.
@@ -85,13 +92,11 @@ async fn main() {
         let client =
             SP1LocalNodeBuilder::from_worker_client_builder(worker_builder).build().await.unwrap();
 
-        let time = tokio::time::Instant::now();
         let context = SP1Context::default();
-        tracing::info!("executing the program");
-        let (_, _, report) = client.execute(&elf, stdin.clone(), context.clone()).await.unwrap();
-        let execute_time = time.elapsed();
-        let cycles = report.total_instruction_count() as usize;
-        tracing::info!("execute time: {:?}", execute_time);
+
+        // Skip separate execute() — the Controller re-executes internally anyway.
+        // We'll get cycles from the proof's public values after proving.
+        let execute_time = std::time::Duration::ZERO;
 
         let time = tokio::time::Instant::now();
         let vk = client.setup(&elf).await.unwrap();
@@ -110,10 +115,21 @@ async fn main() {
             let proof_time = time.elapsed();
             tracing::info!("proof time: {:?}", proof_time);
 
-            let num_shards = if let SP1Proof::Core(ref shard_proofs) = &proof.proof {
-                shard_proofs.len()
+            let (num_shards, cycles) = if let SP1Proof::Core(ref shard_proofs) = &proof.proof {
+                use sp1_hypercube::air::PublicValues;
+                use std::borrow::Borrow;
+                let max_ts = shard_proofs
+                    .iter()
+                    .map(|p| {
+                        let pv: &PublicValues<[_; 4], [_; 3], [_; 4], _> =
+                            p.public_values.as_slice().borrow();
+                        pv.range().timestamp_range.1
+                    })
+                    .max()
+                    .unwrap_or(0);
+                (shard_proofs.len(), max_ts as usize)
             } else {
-                0
+                (0, 0)
             };
 
             // Verify the proof
@@ -145,6 +161,18 @@ async fn main() {
             println!("{measurement}");
             measurements.push(measurement);
         }
+
+        // Exit explicitly once all proofs are produced and verified, while still
+        // inside the GPU task scope. The Groth16/PLONK wrap path calls
+        // `cudaDeviceReset` in the parent to free VRAM for the helper subprocess,
+        // which invalidates the parent's remaining CUDA-backed objects (caching
+        // allocator, device buffers, task scope). Letting the scope unwind then
+        // runs their `Drop` impls, which call `cudaFree` on dead pointers and
+        // segfault. All work is done here, so skip destructors and exit cleanly.
+        println!("All {} measurements done", measurements.len());
+        std::io::Write::flush(&mut std::io::stdout()).ok();
+        std::process::exit(0);
+        #[allow(unreachable_code)]
         measurements
     })
     .await

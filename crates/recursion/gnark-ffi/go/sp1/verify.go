@@ -94,7 +94,7 @@ func VerifyGroth16(verifyCmdDataDir string, verifyCmdProof string, verifyCmdVkey
 	}
 	proof := groth16.NewProof(ecc.BN254)
 	if _, err := proof.ReadFrom(bytes.NewReader(proofDecodedBytes)); err != nil {
-		panic(err)
+		return err
 	}
 
 	// Read the verifier key.
