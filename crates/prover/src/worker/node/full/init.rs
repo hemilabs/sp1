@@ -662,8 +662,10 @@ impl TaskOutput {
                 }
             }
             TaskStatus::FailedRetryable => {
+                // Under the same id: a new one (`submit_task`) left whoever waits on this task
+                // waiting forever, though the retry itself succeeded.
                 let task = task_data.unwrap();
-                match worker_client.resubmit_task(task_type, task).await {
+                match worker_client.resubmit_task(task_id.clone(), task_type, task).await {
                     Ok(Some(_)) => {}
                     Ok(None) => {
                         tracing::error!(
