@@ -103,10 +103,8 @@ impl<F: PrimeField32> MachineAir<F> for ProgramChip {
         };
         let chunk_size = std::cmp::max((nb_rows + 1) / num_cpus::get(), 1);
 
-        values
-            .par_chunks_mut(chunk_size * NUM_PROGRAM_PREPROCESSED_COLS)
-            .enumerate()
-            .for_each(|(i, rows)| {
+        values.par_chunks_mut(chunk_size * NUM_PROGRAM_PREPROCESSED_COLS).enumerate().for_each(
+            |(i, rows)| {
                 rows.chunks_mut(NUM_PROGRAM_PREPROCESSED_COLS).enumerate().for_each(|(j, row)| {
                     let mut idx = i * chunk_size + j;
                     if idx >= nb_rows {
@@ -123,7 +121,8 @@ impl<F: PrimeField32> MachineAir<F> for ProgramChip {
                     let instruction = program.instructions[idx];
                     cols.instruction.populate(&instruction);
                 });
-            });
+            },
+        );
     }
 
     fn generate_dependencies(&self, _input: &ExecutionRecord, _output: &mut ExecutionRecord) {
@@ -140,114 +139,128 @@ impl<F: PrimeField32> MachineAir<F> for ProgramChip {
 
         // Collect the number of times each instruction is called from the cpu events.
         // Store it as a map of PC -> count.
-        let mut instruction_counts = HashMap::new();
+        // Dense per-instruction counters instead of a SipHash `HashMap<pc, count>`: the
+        // multiplicity of row `idx` is the number of events with `pc == pc_base + 4 * idx`, and
+        // events at any other pc (untrusted code, see below) are never read, so they are dropped.
+        // Same counts, ~10x less host time (this chip was the slowest host tracegen chip).
+        let nb_instructions = input.program.instructions.len();
+        let pc_base = input.program.pc_base;
+        let mut instruction_counts = vec![0u32; nb_instructions];
+        let mut count_pc = |pc: u64| {
+            let off = pc.wrapping_sub(pc_base);
+            if off % 4 == 0 {
+                if let Some(c) = instruction_counts.get_mut((off / 4) as usize) {
+                    *c += 1;
+                }
+            }
+        };
         input.alu_x0_events.iter().for_each(|event| {
             let pc = event.0.pc;
-            instruction_counts.entry(pc).and_modify(|count| *count += 1).or_insert(1);
+            count_pc(pc);
         });
         input.add_events.iter().for_each(|event| {
             let pc = event.0.pc;
-            instruction_counts.entry(pc).and_modify(|count| *count += 1).or_insert(1);
+            count_pc(pc);
         });
         input.addw_events.iter().for_each(|event| {
             let pc = event.0.pc;
-            instruction_counts.entry(pc).and_modify(|count| *count += 1).or_insert(1);
+            count_pc(pc);
         });
         input.addi_events.iter().for_each(|event| {
             let pc = event.0.pc;
-            instruction_counts.entry(pc).and_modify(|count| *count += 1).or_insert(1);
+            count_pc(pc);
         });
         input.sub_events.iter().for_each(|event| {
             let pc = event.0.pc;
-            instruction_counts.entry(pc).and_modify(|count| *count += 1).or_insert(1);
+            count_pc(pc);
         });
         input.subw_events.iter().for_each(|event| {
             let pc = event.0.pc;
-            instruction_counts.entry(pc).and_modify(|count| *count += 1).or_insert(1);
+            count_pc(pc);
         });
         input.bitwise_events.iter().for_each(|event| {
             let pc = event.0.pc;
-            instruction_counts.entry(pc).and_modify(|count| *count += 1).or_insert(1);
+            count_pc(pc);
         });
         input.mul_events.iter().for_each(|event| {
             let pc = event.0.pc;
-            instruction_counts.entry(pc).and_modify(|count| *count += 1).or_insert(1);
+            count_pc(pc);
         });
         input.divrem_events.iter().for_each(|event| {
             let pc = event.0.pc;
-            instruction_counts.entry(pc).and_modify(|count| *count += 1).or_insert(1);
+            count_pc(pc);
         });
         input.lt_events.iter().for_each(|event| {
             let pc = event.0.pc;
-            instruction_counts.entry(pc).and_modify(|count| *count += 1).or_insert(1);
+            count_pc(pc);
         });
         input.shift_left_events.iter().for_each(|event| {
             let pc = event.0.pc;
-            instruction_counts.entry(pc).and_modify(|count| *count += 1).or_insert(1);
+            count_pc(pc);
         });
         input.shift_right_events.iter().for_each(|event| {
             let pc = event.0.pc;
-            instruction_counts.entry(pc).and_modify(|count| *count += 1).or_insert(1);
+            count_pc(pc);
         });
         input.branch_events.iter().for_each(|event| {
             let pc = event.0.pc;
-            instruction_counts.entry(pc).and_modify(|count| *count += 1).or_insert(1);
+            count_pc(pc);
         });
         input.memory_load_byte_events.iter().for_each(|event| {
             let pc = event.0.pc;
-            instruction_counts.entry(pc).and_modify(|count| *count += 1).or_insert(1);
+            count_pc(pc);
         });
         input.memory_load_half_events.iter().for_each(|event| {
             let pc = event.0.pc;
-            instruction_counts.entry(pc).and_modify(|count| *count += 1).or_insert(1);
+            count_pc(pc);
         });
         input.memory_load_word_events.iter().for_each(|event| {
             let pc = event.0.pc;
-            instruction_counts.entry(pc).and_modify(|count| *count += 1).or_insert(1);
+            count_pc(pc);
         });
         input.memory_load_x0_events.iter().for_each(|event| {
             let pc = event.0.pc;
-            instruction_counts.entry(pc).and_modify(|count| *count += 1).or_insert(1);
+            count_pc(pc);
         });
         input.memory_load_double_events.iter().for_each(|event| {
             let pc = event.0.pc;
-            instruction_counts.entry(pc).and_modify(|count| *count += 1).or_insert(1);
+            count_pc(pc);
         });
         input.memory_store_byte_events.iter().for_each(|event| {
             let pc = event.0.pc;
-            instruction_counts.entry(pc).and_modify(|count| *count += 1).or_insert(1);
+            count_pc(pc);
         });
         input.memory_store_half_events.iter().for_each(|event| {
             let pc = event.0.pc;
-            instruction_counts.entry(pc).and_modify(|count| *count += 1).or_insert(1);
+            count_pc(pc);
         });
         input.memory_store_word_events.iter().for_each(|event| {
             let pc = event.0.pc;
-            instruction_counts.entry(pc).and_modify(|count| *count += 1).or_insert(1);
+            count_pc(pc);
         });
         input.memory_store_double_events.iter().for_each(|event| {
             let pc = event.0.pc;
-            instruction_counts.entry(pc).and_modify(|count| *count += 1).or_insert(1);
+            count_pc(pc);
         });
         input.jal_events.iter().for_each(|event| {
             let pc = event.0.pc;
-            instruction_counts.entry(pc).and_modify(|count| *count += 1).or_insert(1);
+            count_pc(pc);
         });
         input.jalr_events.iter().for_each(|event| {
             let pc = event.0.pc;
-            instruction_counts.entry(pc).and_modify(|count| *count += 1).or_insert(1);
+            count_pc(pc);
         });
         input.utype_events.iter().for_each(|event| {
             let pc = event.0.pc;
-            instruction_counts.entry(pc).and_modify(|count| *count += 1).or_insert(1);
+            count_pc(pc);
         });
         input.syscall_events.iter().for_each(|event| {
             let pc = event.0.pc;
-            instruction_counts.entry(pc).and_modify(|count| *count += 1).or_insert(1);
+            count_pc(pc);
         });
         input.trap_load_store_events.iter().for_each(|event| {
             let pc = event.0.pc;
-            instruction_counts.entry(pc).and_modify(|count| *count += 1).or_insert(1);
+            count_pc(pc);
         });
 
         // Note: The program table should only count trusted (i.e. not untrusted instructions.)
@@ -260,7 +273,6 @@ impl<F: PrimeField32> MachineAir<F> for ProgramChip {
         // instructions.
 
         let padded_nb_rows = <ProgramChip as MachineAir<F>>::num_rows(self, input).unwrap();
-        let nb_instructions = input.program.instructions.len();
 
         unsafe {
             let padding_start = nb_instructions * NUM_PROGRAM_MULT_COLS;
@@ -282,10 +294,8 @@ impl<F: PrimeField32> MachineAir<F> for ProgramChip {
                 rows.chunks_mut(NUM_PROGRAM_MULT_COLS).enumerate().for_each(|(j, row)| {
                     let idx = i * chunk_size + j;
                     if idx < nb_instructions {
-                        let pc = input.program.pc_base + idx as u64 * 4;
                         let cols: &mut ProgramMultiplicityCols<F> = row.borrow_mut();
-                        cols.multiplicity =
-                            F::from_canonical_usize(*instruction_counts.get(&pc).unwrap_or(&0));
+                        cols.multiplicity = F::from_canonical_u32(instruction_counts[idx]);
                     }
                 });
             },
@@ -354,5 +364,60 @@ mod tests {
         let trace: RowMajorMatrix<SP1Field> =
             chip.generate_trace(&shard, &mut ExecutionRecord::default());
         println!("{:?}", trace.values)
+    }
+
+    #[test]
+    fn program_multiplicities_match_hashmap_reference() {
+        use rand::{rngs::StdRng, Rng, SeedableRng};
+        use slop_algebra::{AbstractField, PrimeField32};
+        use slop_matrix::Matrix;
+        use sp1_core_executor::events::{AluEvent, MemoryReadRecord, MemoryRecordEnum};
+        use sp1_core_executor::RTypeRecord;
+        use std::collections::HashMap;
+        let n = 1000usize;
+        let pc_base = 0x1000u64;
+        let instructions = vec![Instruction::new(Opcode::ADD, 31, 30, 29, false, false); n];
+        let mut rng = StdRng::seed_from_u64(7);
+        let rec = RTypeRecord {
+            op_a: 0,
+            a: MemoryRecordEnum::Read(MemoryReadRecord::default()),
+            op_b: 0,
+            b: MemoryRecordEnum::Read(MemoryReadRecord::default()),
+            op_c: 0,
+            c: MemoryRecordEnum::Read(MemoryReadRecord::default()),
+            is_untrusted: false,
+        };
+        let mut events = Vec::new();
+        for _ in 0..200_000 {
+            let pc = match rng.gen_range(0..10) {
+                // in range, aligned
+                0..=6 => pc_base + 4 * rng.gen_range(0..n as u64),
+                // misaligned
+                7 => pc_base + 4 * rng.gen_range(0..n as u64) + rng.gen_range(1..4),
+                // below / above the program
+                8 => rng.gen_range(0..pc_base),
+                _ => pc_base + 4 * n as u64 + rng.gen_range(0..1u64 << 40),
+            };
+            events.push((AluEvent::new(0, pc, Opcode::ADD, 0, 0, 0, false), rec));
+        }
+        let mut reference: HashMap<u64, usize> = HashMap::new();
+        for (e, _) in &events {
+            *reference.entry(e.pc).or_insert(0) += 1;
+        }
+        let mut program = Program::new(instructions, pc_base, pc_base);
+        program.pc_base = pc_base;
+        let shard = ExecutionRecord {
+            program: Arc::new(program),
+            add_events: events,
+            ..Default::default()
+        };
+        let trace: RowMajorMatrix<SP1Field> =
+            ProgramChip::new().generate_trace(&shard, &mut ExecutionRecord::default());
+        for idx in 0..trace.height() {
+            let expected =
+                if idx < n { *reference.get(&(pc_base + 4 * idx as u64)).unwrap_or(&0) } else { 0 };
+            assert_eq!(trace.values[idx].as_canonical_u32() as usize, expected, "row {idx}");
+            let _ = SP1Field::zero();
+        }
     }
 }
