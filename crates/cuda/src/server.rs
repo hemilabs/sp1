@@ -16,13 +16,15 @@ mod native {
     ///
     /// Note: This method may cause race conditions, it should be called in a critical section.
     pub(crate) async fn start_server(cuda_id: u32) -> Result<Child, CudaClientError> {
-        const PATH: &str = ".sp1/bin/sp1-gpu-server";
-
         // Get the path to where the server binary is located. Windows sets USERPROFILE, not HOME.
         let home = std::env::var_os("HOME")
             .or_else(|| std::env::var_os("USERPROFILE"))
             .expect("$HOME is not set");
-        let path = PathBuf::from(home).join(format!("{PATH}{}", std::env::consts::EXE_SUFFIX));
+        let path = PathBuf::from(home).join(".sp1").join("bin").join(format!(
+            "{}{}",
+            server_name(),
+            std::env::consts::EXE_SUFFIX
+        ));
 
         // Download the server binary if it doesn't exist.
         maybe_download_server(&path).await?;
@@ -31,6 +33,18 @@ mod native {
         let child = start_binary(cuda_id, &path).await?;
 
         Ok(child)
+    }
+
+    /// The default server's name, the only one there is a release of to download.
+    const DEFAULT_SERVER_NAME: &str = "sp1-gpu-server";
+
+    /// The server binary's name in `~/.sp1/bin`: `sp1-gpu-server`, unless `SP1_GPU_SERVER_NAME`
+    /// names another build installed beside it, such as one for AMD (HIP) or Intel (SYCL) GPUs.
+    fn server_name() -> String {
+        std::env::var("SP1_GPU_SERVER_NAME")
+            .ok()
+            .filter(|name| !name.is_empty())
+            .unwrap_or_else(|| DEFAULT_SERVER_NAME.to_string())
     }
 
     /// Start the server binary, ideally with systemd-run. If systemd (--user) is not available,
@@ -83,9 +97,9 @@ mod native {
             }
         }
 
-        // The release published for download is a Linux x86-64 build. Elsewhere the server must
-        // already be installed, built from source.
-        if download && !cfg!(target_os = "linux") {
+        // The release published for download is a Linux x86-64 CUDA build. Elsewhere, and for any
+        // other build of the server, it must already be installed, built from source.
+        if download && (!cfg!(target_os = "linux") || server_name() != DEFAULT_SERVER_NAME) {
             return Err(CudaClientError::Unexpected(format!(
                 "no `sp1-gpu-server` {} at {}: there is no release to download for this \
                  platform, so build it from source (`cargo install sp1-gpu-server`) and place it \
