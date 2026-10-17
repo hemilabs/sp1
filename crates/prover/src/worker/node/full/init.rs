@@ -632,8 +632,10 @@ impl TaskOutput {
                 }
             }
             TaskStatus::FailedRetryable => {
+                // Under the same id: a new one (`submit_task`) left whoever waits on this task
+                // waiting forever, though the retry itself succeeded.
                 let task = task_data.unwrap();
-                let res = worker_client.submit_task(task_type, task).await;
+                let res = worker_client.retry_task(task_id.clone(), task_type, task).await;
                 if let Err(e) = res {
                     tracing::error!("Failed to submit retry, task: {:?}, error: {:?}", task_id, e);
                 }
