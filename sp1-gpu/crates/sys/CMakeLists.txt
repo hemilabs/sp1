@@ -48,8 +48,9 @@ if(USE_HIP)
     # set(CMAKE_HIP_FLAGS "${CMAKE_HIP_FLAGS} -fgpu-rdc")
     set(CMAKE_HIP_FLAGS "${CMAKE_HIP_FLAGS} -ffast-math")
     set(CMAKE_HIP_FLAGS "${CMAKE_HIP_FLAGS} -munsafe-fp-atomics")
-    set(CMAKE_HIP_FLAGS "${CMAKE_HIP_FLAGS} -fopenmp")
-    set(CMAKE_HIP_FLAGS "${CMAKE_HIP_FLAGS} -fPIE")
+    if(NOT WIN32)
+        set(CMAKE_HIP_FLAGS "${CMAKE_HIP_FLAGS} -fPIE")
+    endif()
 
     # HIP's compiler handles CUDA API mapping natively in ROCm 7.2+.
     # No need for cuda2hip.hpp global include.

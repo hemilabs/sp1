@@ -93,7 +93,11 @@ where
     fs::create_dir_all(target_dir).unwrap();
     let _ = fs::remove_file(&link);
     let relpath = pathdiff::diff_paths(original, target_dir).unwrap();
-    symlink(relpath, link).unwrap();
+    // These links are for IDEs only. Windows allows creating symlinks only with Developer Mode
+    // or as an administrator, so don't fail the build over one.
+    if let Err(e) = symlink(relpath, link.as_ref()) {
+        println!("cargo:warning=could not link {}: {e}", link.as_ref().display());
+    }
 }
 
 /// Check if CUDA is available on this system.
@@ -299,28 +303,22 @@ fn main() {
             // Tell CMakeLists.txt to use the HIP path
             cmake_config.define("USE_HIP", "ON");
 
-            // Determine ROCm path
-            let rocm_path =
-                env::var("ROCM_PATH").or_else(|_| env::var("HIP_PATH")).unwrap_or_else(|_| {
-                    // Auto-detect: check versioned paths first, then generic
-                    for candidate in &["/opt/rocm-7.2.0", "/opt/rocm"] {
-                        if std::path::Path::new(candidate).join("bin/hipcc").exists() {
-                            return candidate.to_string();
-                        }
-                    }
-                    "/opt/rocm".to_string()
-                });
+            let rocm_path = rocm_path();
 
             // Point CMake at the ROCm installation
             cmake_config.define("CMAKE_PREFIX_PATH", &rocm_path);
 
-            // Use the AMD clang compiler directly (CMake 4.x rejects hipcc wrapper).
-            // The ROCm clang at lib/llvm/bin/clang++ handles HIP natively.
-            let clang_path = format!("{}/lib/llvm/bin/clang++", rocm_path);
-            if std::path::Path::new(&clang_path).exists() {
-                cmake_config.define("CMAKE_HIP_COMPILER", &clang_path);
+            if env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc") {
+                configure_msvc_hip(&mut cmake_config, &rocm_path);
+            } else {
+                // Use the AMD clang compiler directly (CMake 4.x rejects hipcc wrapper).
+                // The ROCm clang at lib/llvm/bin/clang++ handles HIP natively.
+                let clang_path = format!("{}/lib/llvm/bin/clang++", rocm_path);
+                if std::path::Path::new(&clang_path).exists() {
+                    cmake_config.define("CMAKE_HIP_COMPILER", &clang_path);
+                }
+                // If clang++ not found, let CMake auto-detect
             }
-            // If clang++ not found, let CMake auto-detect
 
             // Pass HIP architectures if explicitly set
             if let Ok(hip_archs) = env::var("HIP_ARCHS") {
@@ -376,15 +374,7 @@ fn main() {
     match backend {
         GpuBackend::Hip => {
             // ROCm / HIP library search paths
-            let rocm_path =
-                env::var("ROCM_PATH").or_else(|_| env::var("HIP_PATH")).unwrap_or_else(|_| {
-                    for candidate in &["/opt/rocm-7.2.0", "/opt/rocm"] {
-                        if std::path::Path::new(candidate).exists() {
-                            return candidate.to_string();
-                        }
-                    }
-                    "/opt/rocm".to_string()
-                });
+            let rocm_path = rocm_path();
 
             println!("cargo:rustc-link-search=native={}/lib", rocm_path);
             println!("cargo:rustc-link-search=native={}/lib64", rocm_path);
@@ -419,7 +409,7 @@ fn main() {
         }
     }
 
-    // MSVC links its own C++ runtime, and has no libdl; OpenMP is only used on the HIP path.
+    // MSVC links its own C++ runtime, and has no libdl.
     if msvc {
         println!("cargo:include={}", out_include_dir.display());
         return;
@@ -428,22 +418,63 @@ fn main() {
     // Link system libraries
     println!("cargo:rustc-link-lib=stdc++");
     println!("cargo:rustc-link-lib=dl");
-    match backend {
-        GpuBackend::Hip => {
-            // HIP uses LLVM's OpenMP runtime (libomp), not GNU's (libgomp)
-            let rocm_link = env::var("ROCM_PATH")
-                .or_else(|_| env::var("HIP_PATH"))
-                .unwrap_or_else(|_| "/opt/rocm-7.2.0".to_string());
-            println!("cargo:rustc-link-search=native={}/lib/llvm/lib", rocm_link);
-            println!("cargo:rustc-link-lib=omp");
-        }
-        GpuBackend::Cuda => {
-            println!("cargo:rustc-link-lib=gomp");
-        }
+    if backend == GpuBackend::Cuda {
+        println!("cargo:rustc-link-lib=gomp");
     }
 
     // Add include directories for compilation if needed
     println!("cargo:include={}", out_include_dir.display());
+}
+
+/// The ROCm installation: `ROCM_PATH`, then `HIP_PATH` (what the Windows HIP SDK sets), then the
+/// usual Linux locations.
+fn rocm_path() -> String {
+    env::var("ROCM_PATH").or_else(|_| env::var("HIP_PATH")).unwrap_or_else(|_| {
+        // Auto-detect: check versioned paths first, then generic
+        for candidate in &["/opt/rocm-7.2.0", "/opt/rocm"] {
+            if std::path::Path::new(candidate).join("bin/hipcc").exists() {
+                return candidate.to_string();
+            }
+        }
+        "/opt/rocm".to_string()
+    })
+}
+
+/// On MSVC, builds the HIP path with Ninja and the HIP SDK's clang for both C++ and HIP.
+///
+/// CMake refuses to mix clang with cl.exe in one project, and the Windows HIP SDK keeps its clang
+/// in `bin` (it has no `lib/llvm`). That clang targets MSVC and links the dynamic C runtime by
+/// default, as rustc does; cl.exe's environment (INCLUDE, LIB, PATH) is passed through for the
+/// MSVC headers and libraries.
+fn configure_msvc_hip(cmake_config: &mut cmake::Config, rocm_path: &str) {
+    let cl = cc::Build::new().cpp(true).get_compiler();
+    for (key, value) in cl.env() {
+        cmake_config.env(key, value);
+    }
+    let clang = PathBuf::from(rocm_path).join("bin").join("clang++.exe");
+    // The flags the cmake crate passes come from this: clang's, not cl.exe's (`-nologo`, ...).
+    cmake_config.init_cxx_cfg(cc::Build::new().cpp(true).compiler(&clang).to_owned());
+    let clang = clang.to_string_lossy().replace('\\', "/");
+    cmake_config.generator("Ninja");
+    cmake_config.define("CMAKE_CXX_COMPILER", &clang);
+    cmake_config.define("CMAKE_HIP_COMPILER", &clang);
+    if let Some(ninja) = bundled_ninja(&cl) {
+        cmake_config.define("CMAKE_MAKE_PROGRAM", ninja);
+    }
+}
+
+/// Visual Studio's ninja.exe, when there is no ninja on PATH.
+fn bundled_ninja(cl: &cc::Tool) -> Option<String> {
+    if std::process::Command::new("ninja").arg("--version").output().is_ok() {
+        return None;
+    }
+    // cl.exe is at <VS>\VC\Tools\MSVC\<version>\bin\Host<arch>\<arch>\cl.exe: eight up.
+    cl.path()
+        .ancestors()
+        .nth(8)
+        .map(|vs| vs.join(r"Common7\IDE\CommonExtensions\Microsoft\CMake\Ninja\ninja.exe"))
+        .filter(|ninja| ninja.is_file())
+        .map(|ninja| ninja.to_string_lossy().replace('\\', "/"))
 }
 
 /// On MSVC, builds with Ninja rather than CMake's default Visual Studio generator.
@@ -470,16 +501,7 @@ fn configure_msvc_ninja(cmake_config: &mut cmake::Config) {
         let nvcc = PathBuf::from(cuda_path).join("bin").join("nvcc.exe");
         cmake_config.define("CMAKE_CUDA_COMPILER", nvcc.to_string_lossy().replace('\\', "/"));
     }
-    let ninja_on_path = std::process::Command::new("ninja").arg("--version").output().is_ok();
-    if !ninja_on_path {
-        // cl.exe is at <VS>\VC\Tools\MSVC\<version>\bin\Host<arch>\<arch>\cl.exe: eight up.
-        let bundled = cl
-            .path()
-            .ancestors()
-            .nth(8)
-            .map(|vs| vs.join(r"Common7\IDE\CommonExtensions\Microsoft\CMake\Ninja\ninja.exe"));
-        if let Some(ninja) = bundled.filter(|ninja| ninja.is_file()) {
-            cmake_config.define("CMAKE_MAKE_PROGRAM", ninja.to_string_lossy().replace('\\', "/"));
-        }
+    if let Some(ninja) = bundled_ninja(&cl) {
+        cmake_config.define("CMAKE_MAKE_PROGRAM", ninja);
     }
 }
