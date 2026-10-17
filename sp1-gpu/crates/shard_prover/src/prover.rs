@@ -526,11 +526,7 @@ impl<GC: IopCtx<F = Felt, EF = Ext>, PC: CudaShardProverComponents<GC>>
 
         let (sumcheck_proof, component_poly_evals) = tracing::debug_span!("jagged sumcheck")
             .in_scope(|| {
-                sp1_gpu_jagged_sumcheck::jagged_sumcheck(
-                    sumcheck_poly,
-                    challenger,
-                    sumcheck_claim,
-                )
+                sp1_gpu_jagged_sumcheck::jagged_sumcheck(sumcheck_poly, challenger, sumcheck_claim)
             });
 
         let final_eval_point = sumcheck_proof.point_and_eval.0.clone();
@@ -701,9 +697,7 @@ impl<GC: IopCtx<F = Felt, EF = Ext>, PC: CudaShardProverComponents<GC>>
         // Create a device challenger for GPU-side Fiat-Shamir in zerocheck.
         let zc_backend = traces.dense_data.backend();
         let mut device_challenger =
-            PC::DeviceChallenger::from_host_challenger_sync(
-                &challenger, &zc_backend,
-            );
+            PC::DeviceChallenger::from_host_challenger_sync(&challenger, &zc_backend);
         let (shard_open_values, zerocheck_partial_sumcheck_proof) =
             tracing::debug_span!("zerocheck").in_scope(|| {
                 zerocheck(
@@ -779,6 +773,11 @@ impl<GC: IopCtx<F = Felt, EF = Ext>, PC: CudaShardProverComponents<GC>>
             zerocheck_proof: zerocheck_partial_sumcheck_proof,
             public_values,
         };
+
+        // A proving key kept between proofs gives back the room its main traces took.
+        drop(main_data);
+        let mut locked_preprocessed_data = locked_preprocessed_data;
+        locked_preprocessed_data.release_main_traces();
 
         (proof, permit)
     }
