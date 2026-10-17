@@ -345,8 +345,7 @@ fn annotate_forwarding(bc: &mut ChunkBytecode) {
     let mut writer = vec![usize::MAX; bc.max_reg as usize];
     let mut only_next = vec![true; n];
     let mut flags = vec![0u8; n];
-    for i in 0..n {
-        let ins = bc.instrs[i];
+    for (i, &ins) in bc.instrs.iter().enumerate() {
         let srcs: &[u16] = match ins.opcode {
             x if x == BcOp::AddF as u8 || x == BcOp::SubF as u8 || x == BcOp::MulF as u8 => {
                 &[ins.a, ins.b]
@@ -368,11 +367,11 @@ fn annotate_forwarding(bc: &mut ChunkBytecode) {
     for &(r, _) in &bc.asserts {
         only_next[writer[r as usize]] = false;
     }
-    for i in 0..n {
-        if only_next[i] {
-            flags[i] |= FLAG_NO_STORE;
+    for ((ins, mut flag), only_next) in bc.instrs.iter_mut().zip(flags).zip(only_next) {
+        if only_next {
+            flag |= FLAG_NO_STORE;
         }
-        bc.instrs[i]._pad = flags[i];
+        ins._pad = flag;
     }
 }
 

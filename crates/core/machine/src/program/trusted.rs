@@ -2,7 +2,6 @@ use core::{
     borrow::{Borrow, BorrowMut},
     mem::{size_of, MaybeUninit},
 };
-use std::collections::HashMap;
 
 use crate::{air::ProgramAirBuilder, program::InstructionCols, utils::next_multiple_of_32};
 use slop_air::{Air, BaseAir, PairBuilder};
@@ -137,18 +136,17 @@ impl<F: PrimeField32> MachineAir<F> for ProgramChip {
     ) {
         // Generate the trace rows for each event.
 
-        // Collect the number of times each instruction is called from the cpu events.
-        // Store it as a map of PC -> count.
-        // Dense per-instruction counters instead of a SipHash `HashMap<pc, count>`: the
-        // multiplicity of row `idx` is the number of events with `pc == pc_base + 4 * idx`, and
-        // events at any other pc (untrusted code, see below) are never read, so they are dropped.
-        // Same counts, ~10x less host time (this chip was the slowest host tracegen chip).
+        // Count how many times each instruction is called from the cpu events, with dense
+        // per-instruction counters instead of a SipHash `HashMap<pc, count>`: the multiplicity of
+        // row `idx` is the number of events with `pc == pc_base + 4 * idx`, and events at any
+        // other pc (untrusted code, see below) are never read, so they are dropped. Same counts,
+        // ~10x less host time (this chip was the slowest host tracegen chip).
         let nb_instructions = input.program.instructions.len();
         let pc_base = input.program.pc_base;
         let mut instruction_counts = vec![0u32; nb_instructions];
         let mut count_pc = |pc: u64| {
             let off = pc.wrapping_sub(pc_base);
-            if off % 4 == 0 {
+            if off.is_multiple_of(4) {
                 if let Some(c) = instruction_counts.get_mut((off / 4) as usize) {
                     *c += 1;
                 }
