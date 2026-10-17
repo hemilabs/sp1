@@ -33,17 +33,21 @@ use sp1_gpu_cudart::sys::kernels::{
     zerocheck_fused_sequential_bivariate_kb_256_kernel,
     zerocheck_fused_sequential_bivariate_kb_32_kernel,
     zerocheck_fused_sequential_bivariate_kb_512_kernel,
-    zerocheck_fused_sequential_bivariate_kb_64_kernel, zerocheck_fused_sequential_ext_1024_kernel,
-    zerocheck_fused_sequential_ext_128_kernel, zerocheck_fused_sequential_ext_256_kernel,
-    zerocheck_fused_sequential_ext_32_kernel, zerocheck_fused_sequential_ext_512_kernel,
-    zerocheck_fused_sequential_ext_64_kernel, zerocheck_fused_sequential_kb_1024_kernel,
-    zerocheck_fused_sequential_kb_128_kernel, zerocheck_fused_sequential_kb_256_kernel,
-    zerocheck_fused_sequential_kb_32_kernel, zerocheck_fused_sequential_kb_512_kernel,
-    zerocheck_fused_sequential_kb_64_kernel, zerocheck_geq_corrections_bivariate_kernel,
-    zerocheck_geq_corrections_kernel, zerocheck_gkr_corner_sweep_kb_kernel,
-    zerocheck_gkr_sweep_ext_kernel, zerocheck_gkr_sweep_kb_kernel, zerocheck_pad_adj_1024_kernel,
-    zerocheck_pad_adj_128_kernel, zerocheck_pad_adj_256_kernel, zerocheck_pad_adj_32_kernel,
-    zerocheck_pad_adj_512_kernel, zerocheck_pad_adj_64_kernel,
+    zerocheck_fused_sequential_bivariate_kb_64_kernel,
+    zerocheck_fused_sequential_bivariate_vec12_kb_128_kernel,
+    zerocheck_fused_sequential_bivariate_vec2_kb_128_kernel,
+    zerocheck_fused_sequential_bivariate_vec4_kb_128_kernel,
+    zerocheck_fused_sequential_ext_1024_kernel, zerocheck_fused_sequential_ext_128_kernel,
+    zerocheck_fused_sequential_ext_256_kernel, zerocheck_fused_sequential_ext_32_kernel,
+    zerocheck_fused_sequential_ext_512_kernel, zerocheck_fused_sequential_ext_64_kernel,
+    zerocheck_fused_sequential_kb_1024_kernel, zerocheck_fused_sequential_kb_128_kernel,
+    zerocheck_fused_sequential_kb_256_kernel, zerocheck_fused_sequential_kb_32_kernel,
+    zerocheck_fused_sequential_kb_512_kernel, zerocheck_fused_sequential_kb_64_kernel,
+    zerocheck_geq_corrections_bivariate_kernel, zerocheck_geq_corrections_kernel,
+    zerocheck_gkr_corner_sweep_kb_kernel, zerocheck_gkr_sweep_ext_kernel,
+    zerocheck_gkr_sweep_kb_kernel, zerocheck_pad_adj_1024_kernel, zerocheck_pad_adj_128_kernel,
+    zerocheck_pad_adj_256_kernel, zerocheck_pad_adj_32_kernel, zerocheck_pad_adj_512_kernel,
+    zerocheck_pad_adj_64_kernel,
 };
 use sp1_gpu_cudart::sys::runtime::KernelPtr;
 use sp1_gpu_cudart::{args, DeviceBuffer, DeviceCopy, DevicePoint, TaskScope};
@@ -720,7 +724,7 @@ pub(crate) struct ZeroCheckJaggedPoly<'b, K: Field> {
     /// (see `compile_chips`). Indexed by `chip_idx`.
     pub chip_alpha_offset: Vec<u32>,
     /// Per-shard, per-tier precomputed kernel-launch state.
-    pub seq_tiers: [SeqTierStatic; 2],
+    pub seq_tiers: [SeqTierStatic; NUM_SEQ_TIERS],
     /// Per-chip geq state on device. One entry per active chip, indexed by
     /// `chip_idx`. Uploaded at shard init then mutated in place by the
     /// `zerocheck_fix_geq_state` kernel after each fold — no host iteration
@@ -753,7 +757,7 @@ pub(crate) struct ZeroCheckJaggedPoly<'b, K: Field> {
     // `extend_from_host_slice()`. These caches hold the prior round's
     // buffer and refill in place; only re-allocate when the new payload
     // exceeds the cached capacity.
-    pub cached_seq_dispatch: [Option<Buffer<BlockDispatchC, TaskScope>>; 2],
+    pub cached_seq_dispatch: [Option<Buffer<BlockDispatchC, TaskScope>>; NUM_SEQ_TIERS],
     pub cached_gkr_dispatch: Option<Buffer<BlockDispatchC, TaskScope>>,
 
     // ---- Fold-metadata scan bookkeeping (per-shard, sized once) ----
@@ -1042,7 +1046,7 @@ where
         n_geq_chips,
         chip_gkr_info_dev,
         gkr_active_chips,
-        cached_seq_dispatch: [None, None],
+        cached_seq_dispatch: Default::default(),
         cached_gkr_dispatch: None,
         scan_block_counter,
         scan_flags,
@@ -1063,6 +1067,10 @@ where
 /// Sequential chunks, otherwise the launch fragmentation cost outweighs the
 /// per-thread footprint win.
 const TIER_SPLIT_MAX_REG: u16 = 256;
+
+/// Number of Sequential tiers: 0 = low-reg interpreter, 1 = high-reg
+/// interpreter.
+pub(crate) const NUM_SEQ_TIERS: usize = 2;
 
 /// Per-chip total GKR width (`main_width + prep_width`) above which we use
 /// the dedicated `zerocheck_gkr_sweep` kernel (warp-per-row, lane-strided
@@ -1087,7 +1095,7 @@ fn build_seq_tiers(
     compiled: &[CompiledChipDevice],
     chip_alpha_offset: &[u32],
     scope: &TaskScope,
-) -> [SeqTierStatic; 2] {
+) -> [SeqTierStatic; NUM_SEQ_TIERS] {
     let mut tier1_candidate_count = 0usize;
     let mut total_seq_count = 0usize;
     for chip in compiled.iter() {
@@ -1104,7 +1112,7 @@ fn build_seq_tiers(
         && tier1_candidate_count > 0
         && tier1_candidate_count * 10 <= total_seq_count;
 
-    let mut tiers: [SeqTierStatic; 2] = std::array::from_fn(|_| SeqTierStatic {
+    let mut tiers: [SeqTierStatic; NUM_SEQ_TIERS] = std::array::from_fn(|_| SeqTierStatic {
         static_host: Vec::new(),
         chip_indices: Vec::new(),
         max_reg: 0,
@@ -1206,7 +1214,7 @@ fn pad_adj_kernel_for(max_reg_in_tier: u16) -> KernelPtr {
 /// is `coeff · 0`), so summing only Sequential chunks is exact.
 fn compute_padded_row_adjustment(
     n_chips: usize,
-    seq_tiers: &[SeqTierStatic; 2],
+    seq_tiers: &[SeqTierStatic; NUM_SEQ_TIERS],
     public_values: &Buffer<Felt, TaskScope>,
     powers_of_alpha: &Buffer<Ext, TaskScope>,
     scope: &TaskScope,
@@ -1515,7 +1523,7 @@ where
     // For each Sequential chunk in the tier, emit `ceil(row_count / tile)`
     // BlockDispatch entries. The kernel reads one entry per block and
     // strides through `n_rows` rows of `chunk_id`.
-    let mut dispatch_tiers: [Vec<BlockDispatchC>; 2] = [Vec::new(), Vec::new()];
+    let mut dispatch_tiers: [Vec<BlockDispatchC>; NUM_SEQ_TIERS] = Default::default();
     for (t, tier) in poly.seq_tiers.iter().enumerate() {
         let tile = block_size_for(t) * ROWS_PER_THREAD;
         for (chunk_idx_in_tier, &chip_idx) in tier.chip_indices.iter().enumerate() {
@@ -1560,9 +1568,9 @@ where
     }
 
     // ---- Slot allocation in the shared output ----
-    let mut tier_slot: [usize; 2] = [0, 0];
+    let mut tier_slot: [usize; NUM_SEQ_TIERS] = [0; NUM_SEQ_TIERS];
     let mut total_slots: usize = 0;
-    for t in 0..2 {
+    for t in 0..NUM_SEQ_TIERS {
         tier_slot[t] = total_slots;
         total_slots += dispatch_tiers[t].len() * NUM_EVAL_POINT;
     }
@@ -1598,7 +1606,7 @@ where
     //
     // Per-tier dispatch buffers are pooled in `poly.cached_seq_dispatch`
     // (grow-only) so we don't pay a CUDA malloc per round per tier.
-    for t in 0..2 {
+    for t in 0..NUM_SEQ_TIERS {
         if dispatch_tiers[t].is_empty() {
             continue;
         }
@@ -1874,7 +1882,28 @@ fn launch_chunk_into<K: Field>(
 // ============================================================================
 
 /// The tiered bivariate fused-sequential kernel for the first round's base-field trace.
+/// Grid nodes per interpreter pass in the bivariate kernel
+/// (`SP1_GPU_ZEROCHECK_BIV_G` ∈ {1, 2, 4, 12}; 1 = legacy scalar kernel).
+fn bivariate_nodes_per_pass() -> u32 {
+    static G: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *G.get_or_init(|| {
+        std::env::var("SP1_GPU_ZEROCHECK_BIV_G")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|g| [1, 2, 4, 12].contains(g))
+            .unwrap_or(2)
+    })
+}
+
 fn bivariate_sequential_kernel_for(max_reg_in_tier: u16) -> KernelPtr {
+    if max_reg_in_tier <= 128 {
+        match bivariate_nodes_per_pass() {
+            2 => return unsafe { zerocheck_fused_sequential_bivariate_vec2_kb_128_kernel() },
+            4 => return unsafe { zerocheck_fused_sequential_bivariate_vec4_kb_128_kernel() },
+            12 => return unsafe { zerocheck_fused_sequential_bivariate_vec12_kb_128_kernel() },
+            _ => {}
+        }
+    }
     unsafe {
         if max_reg_in_tier <= 32 {
             zerocheck_fused_sequential_bivariate_kb_32_kernel()
@@ -1939,7 +1968,7 @@ pub(crate) fn evaluate_zerocheck_bivariate(
     };
 
     // ---- Per-tier dispatch tables over row QUADRUPLES ----
-    let mut dispatch_tiers: [Vec<BlockDispatchC>; 2] = [Vec::new(), Vec::new()];
+    let mut dispatch_tiers: [Vec<BlockDispatchC>; NUM_SEQ_TIERS] = Default::default();
     for (t, tier) in poly.seq_tiers.iter().enumerate() {
         let tile = block_size_for(t) * ROWS_PER_THREAD;
         for (chunk_idx_in_tier, &chip_idx) in tier.chip_indices.iter().enumerate() {
@@ -1990,9 +2019,9 @@ pub(crate) fn evaluate_zerocheck_bivariate(
     // Two shared buffers by output stride: the node buffer ([group][e] with
     // 12 slots per group — sequential tiers + geq chips) and the corner
     // buffer (4 slots per corner-sweep block).
-    let mut tier_slot: [usize; 2] = [0, 0];
+    let mut tier_slot: [usize; NUM_SEQ_TIERS] = [0; NUM_SEQ_TIERS];
     let mut node_slots: usize = 0;
-    for t in 0..2 {
+    for t in 0..NUM_SEQ_TIERS {
         tier_slot[t] = node_slots;
         node_slots += dispatch_tiers[t].len() * NUM_NODES;
     }
@@ -2012,7 +2041,7 @@ pub(crate) fn evaluate_zerocheck_bivariate(
     let corner_partials_ptr = corner_partials.as_mut_ptr();
 
     // ---- Launch one bivariate fused kernel per non-empty tier ----
-    for t in 0..2 {
+    for t in 0..NUM_SEQ_TIERS {
         if dispatch_tiers[t].is_empty() {
             continue;
         }

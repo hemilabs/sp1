@@ -61,6 +61,9 @@ extern "C" {
     pub fn zerocheck_fused_sequential_bivariate_kb_256_kernel() -> KernelPtr;
     pub fn zerocheck_fused_sequential_bivariate_kb_512_kernel() -> KernelPtr;
     pub fn zerocheck_fused_sequential_bivariate_kb_1024_kernel() -> KernelPtr;
+    pub fn zerocheck_fused_sequential_bivariate_vec2_kb_128_kernel() -> KernelPtr;
+    pub fn zerocheck_fused_sequential_bivariate_vec4_kb_128_kernel() -> KernelPtr;
+    pub fn zerocheck_fused_sequential_bivariate_vec12_kb_128_kernel() -> KernelPtr;
 
     // zerocheck (DAG-native): ColumnTile lowering kernels.
     pub fn zerocheck_column_tile_kb_kernel() -> KernelPtr;
