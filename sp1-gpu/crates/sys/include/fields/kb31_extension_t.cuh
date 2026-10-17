@@ -119,6 +119,7 @@ class kb31_extension_t {
         kb31_t a0 = value[0], a1 = value[1], a2 = value[2], a3 = value[3];
         kb31_t b0 = b.value[0], b1 = b.value[1], b2 = b.value[2], b3 = b.value[3];
 
+        // Base-field products, reduced (on SYCL operator* is already the 32-bit multiply).
         #define MUL(x, y) (kb31_t)((x) * (y))
         // W-multiply: x*3 = x+x+x (2 full-rate adds vs 1 quarter-rate mul on RDNA3)
         #define MULW(x) ((x) + (x) + (x))

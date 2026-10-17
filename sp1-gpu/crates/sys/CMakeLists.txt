@@ -56,7 +56,9 @@ if(USE_HIP)
     # No need for cuda2hip.hpp global include.
 
     # Release optimization
-    set(CMAKE_HIP_FLAGS_RELEASE "-O3")
+    # NDEBUG: device asserts cost a load or more each in hot kernels, and on Windows, which has no
+    # HIP trap handler, a failing one cannot report anyway.
+    set(CMAKE_HIP_FLAGS_RELEASE "-O3 -DNDEBUG")
     set(CMAKE_HIP_FLAGS_DEBUG "-O3")
 
     # Get the actual source directory

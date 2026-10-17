@@ -168,7 +168,17 @@ class kb31_t {
 
     static inline kb31_t from_bool(bool x) { return kb31_t(x * one().val); }
 
-    inline uint32_t as_canonical_u32() const { return monty_reduce((uint64_t)val); }
+    inline uint32_t as_canonical_u32() const {
+#ifdef SP1_SYCL
+        // val * 2^-32 mod MOD in 32-bit operations: mul() with a high word of 0.
+        uint32_t red = val * M;
+        uint32_t r = sycl::mul_hi(red, MOD) + (val != 0 ? 1u : 0u);
+        final_sub(r);
+        return r;
+#else
+        return monty_reduce((uint64_t)val);
+#endif
+    }
 
     inline kb31_t exp_power_of_two(size_t log_power) {
         kb31_t ret = *this;
@@ -351,11 +361,20 @@ class kb31_t {
     }
 
   public:
+#ifdef SP1_SYCL
+    // The 32-bit multiply (see mul): the accel_t product below is 64-bit arithmetic, which Intel
+    // GPUs emulate. Nothing on SYCL keeps a product unreduced.
+    inline kb31_t operator*(const kb31_t b) const {
+        kb31_t t = *this;
+        return t.mul(b);
+    }
+#else
     inline accel_t operator*(const kb31_t b) const {
         uint64_t t;
         mul_wide(t, val, b.val);
         return accel_t(t);
     }
+#endif
 
     inline kb31_t& operator*=(const kb31_t a) { return mul(a); }
 
@@ -685,6 +704,17 @@ __device__ __forceinline__ kb31_t::accel_t& kb31_t::accel_t::operator-=(const kb
     return *this;
 }
 
+#ifdef SP1_SYCL
+// kb31_t * kb31_t is reduced on SYCL; an accel_t of r << 32 converts back to exactly r.
+__device__ __forceinline__ kb31_t::accel_t kb31_t::accel_t::operator*(const kb31_t& b) const {
+    kb31_t t = kb31_t(*this) * b;
+    return accel_t((uint64_t)t.val << 32);
+}
+
+__device__ __forceinline__ kb31_t::accel_t& kb31_t::accel_t::operator*=(const kb31_t& b) {
+    return *this = *this * b;
+}
+#else
 __device__ __forceinline__ kb31_t::accel_t kb31_t::accel_t::operator*(const kb31_t& b) const {
     kb31_t t(*this);
     return t * b;
@@ -694,6 +724,7 @@ __device__ __forceinline__ kb31_t::accel_t& kb31_t::accel_t::operator*=(const kb
     kb31_t t(*this);
     return *this = t * b;
 }
+#endif
 
 __device__ __forceinline__ kb31_t::accel_t kb31_t::accel_t::operator+(const kb31_t& b) const {
     accel_t t(*this);
