@@ -12,6 +12,15 @@ pub const fn is_hip_backend() -> bool {
     cfg!(hip_backend)
 }
 
+/// The GPU backend this crate was built for: "cuda", "hip" (AMD) or "sycl" (Intel).
+pub const BACKEND: &str = if cfg!(hip_backend) {
+    "hip"
+} else if cfg!(sycl_backend) {
+    "sycl"
+} else {
+    "cuda"
+};
+
 pub mod algebra;
 pub mod basefold;
 pub mod challenger;

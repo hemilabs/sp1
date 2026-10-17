@@ -214,15 +214,22 @@ impl CudaClientInner {
 }
 
 /// The socket path for the given CUDA device id: a named pipe on Windows (see [`crate::transport`]).
+///
+/// Named `sp1-cuda-<id>`, or after the server build when `SP1_GPU_SERVER_NAME` names another one
+/// (the server inherits the variable from the client that starts it): servers for different GPU
+/// vendors on one machine number their devices from 0 each, and must not share a socket.
 pub fn socket_path(cuda_id: u32) -> PathBuf {
+    let base = match std::env::var("SP1_GPU_SERVER_NAME") {
+        Ok(name) if !name.is_empty() && name != "sp1-gpu-server" => name,
+        _ => "sp1-cuda".to_string(),
+    };
     #[cfg(unix)]
     {
-        const CUDA_SOCKET_BASE: &str = "/tmp/sp1-cuda-";
-        format!("{CUDA_SOCKET_BASE}{cuda_id}.sock").into()
+        format!("/tmp/{base}-{cuda_id}.sock").into()
     }
     #[cfg(windows)]
     {
-        format!(r"\\.\pipe\sp1-cuda-{cuda_id}").into()
+        format!(r"\\.\pipe\{base}-{cuda_id}").into()
     }
 }
 
