@@ -21,7 +21,10 @@
 #include <unordered_set>
 #include <vector>
 
+#include <deque>
+
 #include "runtime/gpu_backend.cuh"
+#include "runtime/kernel_profile.hpp"
 
 struct RustCudaError {
     const char* message;
@@ -75,7 +78,18 @@ struct Runtime {
     }
 
     sycl::queue* new_queue() {
-        auto* q = new sycl::queue(context, device, sycl::property_list{sycl::property::queue::in_order{}});
+        // Profiling queues timestamp every command, so only when the kernel timing is on.
+        auto* q = sp1prof::enabled()
+                      ? new sycl::queue(
+                            context,
+                            device,
+                            sycl::property_list{
+                                sycl::property::queue::in_order{},
+                                sycl::property::queue::enable_profiling{}})
+                      : new sycl::queue(
+                            context,
+                            device,
+                            sycl::property_list{sycl::property::queue::in_order{}});
         std::lock_guard<std::mutex> lock(queues_mutex);
         queues.insert(q);
         return q;
@@ -119,6 +133,58 @@ Runtime& rt() {
 sycl::queue& queue_of(void* stream) {
     return stream ? *static_cast<sycl::queue*>(stream) : *rt().default_queue;
 }
+
+// ---------------------------------------------------------------------------------------------
+// Optional per-kernel GPU timing (runtime/kernel_profile.hpp): each launch's or copy's own event,
+// resolved in batches off the launch path.
+// ---------------------------------------------------------------------------------------------
+
+struct GpuProfiler {
+    std::mutex m;
+    std::deque<std::pair<const char*, sycl::event>> pending;
+
+    static GpuProfiler& get() {
+        static GpuProfiler* p = [] {
+            auto* p = new GpuProfiler();
+            std::atexit([] {
+                GpuProfiler::get().resolve(0);
+                sp1prof::totals().write();
+            });
+            return p;
+        }();
+        return *p;
+    }
+
+    void add(const char* name, sycl::event e) {
+        bool full;
+        {
+            std::lock_guard<std::mutex> lock(m);
+            pending.emplace_back(name, std::move(e));
+            full = pending.size() > 4096;
+        }
+        if (full) resolve(2048);
+    }
+
+    void resolve(size_t keep) {
+        for (;;) {
+            std::pair<const char*, sycl::event> p;
+            {
+                std::lock_guard<std::mutex> lock(m);
+                if (pending.size() <= keep) return;
+                p = std::move(pending.front());
+                pending.pop_front();
+            }
+            try {
+                p.second.wait();
+                auto start =
+                    p.second.get_profiling_info<sycl::info::event_profiling::command_start>();
+                auto end = p.second.get_profiling_info<sycl::info::event_profiling::command_end>();
+                sp1prof::totals().add(p.first, (double)(end - start) * 1e-6);
+            } catch (const sycl::exception&) {
+            }
+        }
+    }
+};
 
 bool is_usm(const void* ptr) {
     return sycl::get_pointer_type(ptr, rt().context) != sycl::usm::alloc::unknown;
@@ -240,6 +306,11 @@ rustCudaError_t cached_free(void* p, sycl::queue* q) {
 
 }  // namespace
 
+// For the other SYCL sources (lib/sycl/ntt.cpp): times a submission if the kernel timing is on.
+void sp1_sycl_profile_event(const char* name, const sycl::event& e) {
+    if (sp1prof::enabled()) GpuProfiler::get().add(name, e);
+}
+
 #define SP1_TRY(body)                                                                              \
     try {                                                                                          \
         body                                                                                       \
@@ -256,6 +327,15 @@ extern const void* const DEFAULT_STREAM = nullptr;
 
 // The queue of a stream handle (the default queue for null), for the other SYCL sources.
 void* sp1_sycl_queue_of(void* stream) { return &queue_of(stream); }
+
+void* sp1_kernel_named(void* kernel, const char* name) {
+    if (sp1prof::enabled()) sp1prof::totals().name(kernel, name);
+    return kernel;
+}
+
+// Scopes are timed per submission here (sp1_sycl_profile_event); these are for the HIP/CUDA API.
+void* sp1_profile_begin(void*) { return nullptr; }
+void sp1_profile_end(void*, const char*, void*) {}
 
 // ---------------------------------------------------------------------------------------------
 // Memory
@@ -446,7 +526,8 @@ rustCudaError_t cuda_mem_set_async(void* dst, uint8_t value, size_t count, void*
 rustCudaError_t
 cuda_mem_copy_device_to_device_async(void* dst, const void* src, size_t count, void* stream) {
     SP1_TRY({
-        queue_of(stream).memcpy(dst, src, count);
+        auto e = queue_of(stream).memcpy(dst, src, count);
+        if (sp1prof::enabled()) GpuProfiler::get().add("copy: device to device", e);
         return SP1_SUCCESS;
     })
 }
@@ -457,8 +538,14 @@ rustCudaError_t
 cuda_mem_copy_host_to_device_async(void* dst, const void* src, size_t count, void* stream) {
     SP1_TRY({
         auto& q = queue_of(stream);
+        const bool pinned = is_usm(src);
         auto e = q.memcpy(dst, src, count);
-        if (!is_usm(src)) e.wait_and_throw();
+        if (sp1prof::enabled()) {
+            GpuProfiler::get().add(
+                pinned ? "copy: host to device" : "copy: host to device (pageable)",
+                e);
+        }
+        if (!pinned) e.wait_and_throw();
         return SP1_SUCCESS;
     })
 }
@@ -468,7 +555,13 @@ cuda_mem_copy_device_to_host_async(void* dst, const void* src, size_t count, voi
     SP1_TRY({
         auto& q = queue_of(stream);
         auto e = q.memcpy(dst, src, count);
-        if (!is_usm(dst)) e.wait_and_throw();
+        const bool pinned = is_usm(dst);
+        if (sp1prof::enabled()) {
+            GpuProfiler::get().add(
+                pinned ? "copy: device to host" : "copy: device to host (pageable)",
+                e);
+        }
+        if (!pinned) e.wait_and_throw();
         return SP1_SUCCESS;
     })
 }
@@ -495,7 +588,12 @@ cuda_launch_kernel(void* kernel, dim3 grid, dim3 block, void** args, size_t shar
     SP1_TRY({
         if (grid.x == 0 || grid.y == 0 || grid.z == 0) return SP1_SUCCESS;
         auto launch = reinterpret_cast<::sp1sycl::launch_fn>(kernel);
-        launch(&queue_of(stream), grid, block, args, shared_mem);
+        if (sp1prof::enabled()) {
+            auto e = launch(&queue_of(stream), grid, block, args, shared_mem, true);
+            GpuProfiler::get().add(sp1prof::totals().name_of(kernel), std::move(e));
+            return SP1_SUCCESS;
+        }
+        launch(&queue_of(stream), grid, block, args, shared_mem, false);
         return SP1_SUCCESS;
     })
 }
