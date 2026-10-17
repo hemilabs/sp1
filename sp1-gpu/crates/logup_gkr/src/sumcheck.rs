@@ -1028,11 +1028,13 @@ unsafe impl<F, PF> ObserveAndSampleCubicKernel
 /// polynomial, observes coefficients with the device challenger, samples alpha, evaluates
 /// p(alpha) for next_claim, and writes alpha + next_claim to device buffers.
 #[allow(clippy::too_many_arguments)]
+/// `round_out` gets alpha at index 0 and the next claim at index 1, so that one copy brings both
+/// back: every device-to-host copy is a full stream synchronization, and there are two per round
+/// otherwise, over hundreds of rounds a shard.
 fn launch_observe_and_sample_cubic<DC: AsMutRawChallenger + ObserveAndSampleCubicKernel>(
     reduced_evals: &DeviceTensor<Ext>,
     device_challenger: &mut DC,
-    alpha_buf: &mut DeviceBuffer<Ext>,
-    next_claim_buf: &mut DeviceBuffer<Ext>,
+    round_out: &mut DeviceBuffer<Ext>,
     claim: Ext,
     padding_adjustment: Ext,
     eq_adjustment: Ext,
@@ -1044,9 +1046,9 @@ fn launch_observe_and_sample_cubic<DC: AsMutRawChallenger + ObserveAndSampleCubi
         let args = args!(
             reduced_evals.as_ptr(),
             challenger_raw,
-            alpha_buf.as_mut_ptr(),
+            round_out.as_mut_ptr(),
             claim,
-            next_claim_buf.as_mut_ptr(),
+            round_out.as_mut_ptr().add(1),
             padding_adjustment,
             eq_adjustment,
             point_last
@@ -1090,16 +1092,11 @@ where
     // Create device challenger from the current CPU challenger state.
     let mut device_challenger = DC::from_host_challenger_sync(challenger, &backend);
 
-    // Allocate reusable device buffers for alpha and next_claim (16 bytes each).
-    let mut alpha_buf = DeviceBuffer::<Ext>::with_capacity_in(1, backend.clone());
-    let mut next_claim_buf = DeviceBuffer::<Ext>::with_capacity_in(1, backend.clone());
+    // A reusable device buffer for each round's alpha and next claim.
+    let mut round_out = DeviceBuffer::<Ext>::with_capacity_in(2, backend.clone());
     unsafe {
-        alpha_buf.set_len(1);
-        next_claim_buf.set_len(1);
+        round_out.set_len(2);
     }
-    // Pre-allocated pinned staging buffers for D2H of alpha and claim (avoid per-round Vec alloc).
-    let mut alpha_staging = sp1_gpu_cudart::pinned::PinnedBuffer::<Ext>::with_capacity(1);
-    let mut claim_staging = sp1_gpu_cudart::pinned::PinnedBuffer::<Ext>::with_capacity(1);
 
     // Save reduced evals and poly snapshots for batch D2H at the end.
     let mut saved_reduced_evals: Vec<DeviceTensor<Ext>> =
@@ -1126,8 +1123,7 @@ where
         launch_observe_and_sample_cubic(
             &reduced_evals,
             &mut device_challenger,
-            &mut alpha_buf,
-            &mut next_claim_buf,
+            &mut round_out,
             current_claim,
             poly.padding_adjustment,
             poly.eq_adjustment,
@@ -1137,8 +1133,9 @@ where
 
         saved_reduced_evals.push(reduced_evals);
 
-        let alpha = alpha_buf.to_host().unwrap()[0];
-        current_claim = next_claim_buf.to_host().unwrap()[0];
+        let out = round_out.to_host().unwrap();
+        let alpha = out[0];
+        current_claim = out[1];
         gpu_claims.push(current_claim);
         point.push(alpha);
     }
@@ -1172,8 +1169,7 @@ where
         let current_alpha = point[0];
 
         // Use _with_reduction variant to avoid a separate sum_dim kernel dispatch.
-        let mut reduced_output =
-            Tensor::<Ext, TaskScope>::zeros_in([3], backend.clone());
+        let mut reduced_output = Tensor::<Ext, TaskScope>::zeros_in([3], backend.clone());
         let (_raw_evals, next_poly) = fix_and_sum_materialized_round_raw_with_reduction(
             poly,
             current_alpha,
@@ -1193,8 +1189,7 @@ where
         launch_observe_and_sample_cubic(
             &reduced_evals,
             &mut device_challenger,
-            &mut alpha_buf,
-            &mut next_claim_buf,
+            &mut round_out,
             current_claim,
             poly.padding_adjustment,
             poly.eq_adjustment,
@@ -1204,8 +1199,9 @@ where
 
         saved_reduced_evals.push(reduced_evals);
 
-        let alpha = alpha_buf.to_host().unwrap()[0];
-        current_claim = next_claim_buf.to_host().unwrap()[0];
+        let out = round_out.to_host().unwrap();
+        let alpha = out[0];
+        current_claim = out[1];
         gpu_claims.push(current_claim);
         point.insert(0, alpha);
     }
@@ -1214,7 +1210,8 @@ where
     poly = fix_last_variable_materialized_round(poly, point[0]);
 
     // --- Batch D2H of reduced evals and reconstruct uni_polys ---
-    let (uni_polys, _) = replay_and_reconstruct(&saved_reduced_evals, &saved_params, &point, claim, &gpu_claims);
+    let (uni_polys, _) =
+        replay_and_reconstruct(&saved_reduced_evals, &saved_params, &point, claim, &gpu_claims);
 
     // Compute final evaluation
     let eval = uni_polys.last().unwrap().eval_at_point(point[0]);
