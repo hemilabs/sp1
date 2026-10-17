@@ -226,6 +226,8 @@ fn select_gpu_backend() -> Option<GpuBackend> {
 }
 
 fn main() {
+    println!("cargo::rustc-check-cfg=cfg(hip_backend)");
+    println!("cargo::rustc-check-cfg=cfg(sycl_backend)");
     // Directives for tracking changes in folders
     println!("cargo:rerun-if-changed=include/");
     println!("cargo:rerun-if-changed=lib/");
