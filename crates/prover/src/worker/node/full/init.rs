@@ -5,7 +5,7 @@ use sp1_core_machine::riscv::RiscvAir;
 use sp1_hypercube::{prover::ProverSemaphore, Machine};
 use sp1_primitives::SP1Field;
 use sp1_prover_types::{
-    ArtifactClient, ArtifactType, InMemoryArtifactClient, TaskStatus, TaskType,
+    ArtifactClient, ArtifactType, InMemoryArtifactClient, ProofArtifacts, TaskStatus, TaskType,
 };
 use tokio::{sync::mpsc, task::JoinSet};
 use tracing::Instrument;
@@ -47,8 +47,11 @@ impl<C: SP1ProverComponents> SP1LocalNodeBuilder<C> {
     /// This method can be used to initialize a node from a worker client builder that has already
     /// been configured with the desired prover components.
     pub fn from_worker_client_builder(builder: SP1WorkerBuilder<C>) -> Self {
-        let artifact_client = InMemoryArtifactClient::new();
-        let (worker_client, channels) = LocalWorkerClient::init();
+        // One shared per-proof artifact index: the worker client records a
+        // proof's artifacts, the artifact client prunes them as they're deleted.
+        let artifact_index = ProofArtifacts::default();
+        let artifact_client = InMemoryArtifactClient::with_index(artifact_index.clone());
+        let (worker_client, channels) = LocalWorkerClient::init_with_index(artifact_index);
         let machine = builder.machine().clone();
         let worker_builder =
             builder.with_artifact_client(artifact_client).with_worker_client(worker_client);
@@ -335,9 +338,18 @@ impl<C: SP1ProverComponents> SP1LocalNodeBuilder<C> {
                                 .await
                                 .unwrap();
                             let tx = task_tx.clone();
+                            let artifact_client = worker.artifact_client().clone();
                             task_set.spawn(
                                 async move {
-                                    let result = handle.await;
+                                    // Outer `Err` = panicked/aborted task (pass through);
+                                    // recover the task's result if a prior delivery already
+                                    // completed it (all outputs exist).
+                                    let result = match handle.await {
+                                        Ok(task_result) => Ok(request
+                                            .recover_if_complete(task_result, &artifact_client)
+                                            .await),
+                                        join_err => join_err,
+                                    };
                                     TaskOutput::handle_worker_result(result, &tx, proof_id, id, request, TaskType::ProveShard);
                                 }.instrument(span)
                            );
@@ -375,8 +387,17 @@ impl<C: SP1ProverComponents> SP1LocalNodeBuilder<C> {
                                 .await
                                 .unwrap();
                             let tx = task_tx.clone();
+                            let artifact_client = worker.artifact_client().clone();
                             task_set.spawn(async move {
-                                let result = handle.await;
+                                // Outer `Err` = panicked/aborted task (pass through);
+                                // recover the task's result if a prior delivery already
+                                // completed it (all outputs exist).
+                                let result = match handle.await {
+                                    Ok(task_result) => Ok(request
+                                        .recover_if_complete(task_result, &artifact_client)
+                                        .await),
+                                    join_err => join_err,
+                                };
                                 TaskOutput::handle_worker_result(result, &tx, proof_id, id, request, TaskType::RecursionReduce);
                             }.instrument(span)
                           );
@@ -458,8 +479,7 @@ impl<C: SP1ProverComponents> SP1LocalNodeBuilder<C> {
                                 .prover_engine()
                                 .run_shrink_wrap(request.clone())
                                 .instrument(span)
-                                .await
-                                .map(|_| TaskMetadata::default());
+                                .await;
                             TaskOutput::handle_worker_result(Ok(result), &task_tx, proof_id, id, request, TaskType::ShrinkWrap);
                         }
                         Some(output) = task_rx.recv() => {
@@ -643,9 +663,31 @@ impl TaskOutput {
             }
             TaskStatus::FailedRetryable => {
                 let task = task_data.unwrap();
-                let res = worker_client.submit_task(task_type, task).await;
-                if let Err(e) = res {
-                    tracing::error!("Failed to submit retry, task: {:?}, error: {:?}", task_id, e);
+                match worker_client.resubmit_task(task_type, task).await {
+                    Ok(Some(_)) => {}
+                    Ok(None) => {
+                        tracing::error!(
+                            "task {:?} exhausted its retry budget, failing it",
+                            task_id
+                        );
+                        let res = worker_client
+                            .update_task_status(task_id.clone(), TaskStatus::FailedFatal)
+                            .await;
+                        if let Err(e) = res {
+                            tracing::error!(
+                                "Failed to fail retry-exhausted task {:?}: {:?}",
+                                task_id,
+                                e
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            "Failed to submit retry, task: {:?}, error: {:?}",
+                            task_id,
+                            e
+                        );
+                    }
                 }
             }
             TaskStatus::FailedFatal => {

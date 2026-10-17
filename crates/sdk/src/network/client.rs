@@ -5,6 +5,7 @@
 use std::{
     result::Result::Ok as StdOk,
     str::FromStr,
+    sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -15,12 +16,18 @@ use reqwest_middleware::ClientWithMiddleware as HttpClientWithMiddleware;
 use serde::{de::DeserializeOwned, Serialize};
 use sp1_core_machine::io::SP1Stdin;
 use sp1_prover::{HashableKey, SP1VerifyingKey};
-use tonic::{transport::Channel, Code};
+use tokio::sync::OnceCell;
+use tonic::{
+    codegen::InterceptedService,
+    transport::{Channel, Identity},
+    Code,
+};
 
 use super::{
+    auth::{BearerTokenInterceptor, NetworkBearerToken},
     grpc,
     retry::{self, RetryableRpc, DEFAULT_RETRY_TIMEOUT},
-    signer::NetworkSigner,
+    signer::{NetworkSigner, SignerSource},
     utils::{sign_message, Signable},
     NetworkMode, MAINNET_EXPLORER_URL, RESERVED_EXPLORER_URL,
 };
@@ -34,6 +41,7 @@ use crate::network::proto::{
         CancelRequestRequestBody as AuctionCancelRequestRequestBody,
         GetBalanceRequest as AuctionGetBalanceRequest,
         GetFilteredProofRequestsRequest as AuctionGetFilteredProofRequestsRequest,
+        GetMarketPricePerPguRequest as AuctionGetMarketPricePerPguRequest,
         GetNonceRequest as AuctionGetNonceRequest, GetProgramRequest as AuctionGetProgramRequest,
         GetProofRequestParamsRequest as AuctionGetProofRequestParamsRequest,
         GetProofRequestStatusRequest as AuctionGetProofRequestStatusRequest,
@@ -47,8 +55,11 @@ use crate::network::proto::{
         GetBalanceRequest as BaseGetBalanceRequest,
         GetFilteredProofRequestsRequest as BaseGetFilteredProofRequestsRequest,
         GetNonceRequest as BaseGetNonceRequest, GetProgramRequest as BaseGetProgramRequest,
+        GetProofRequestDetailsRequest as BaseGetProofRequestDetailsRequest,
+        GetProofRequestDetailsResponse as BaseGetProofRequestDetailsResponse,
         GetProofRequestStatusRequest as BaseGetProofRequestStatusRequest,
-        MessageFormat as BaseMessageFormat, RequestProofRequest as BaseRequestProofRequest,
+        MessageFormat as BaseMessageFormat, ProofRequest as BaseProofRequest,
+        RequestProofRequest as BaseRequestProofRequest,
         RequestProofRequestBody as BaseRequestProofRequestBody,
     },
     // Import standard types (auction by default for backwards compatibility).
@@ -68,13 +79,43 @@ use crate::network::proto::{
     RequestProofResponse,
 };
 
+type AuthenticatedChannel = InterceptedService<Channel, BearerTokenInterceptor>;
+
+/// Current market `max_price_per_pgu` returned by [`NetworkClient::get_market_price_per_pgu`].
+/// Returned to callers who want the raw market signal; the SDK's own auto-default path
+/// uses `GetProofRequestParams.max_price_per_pgu` instead and does not consume this type.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MarketPrice {
+    /// Current market price in PROVE wei per PGU.
+    pub wei: u128,
+    /// Unix timestamp (seconds) the `wei` value applies to. Advances whenever any input
+    /// that feeds it moves. Callers do their own staleness check; the SDK does not.
+    pub as_of: u64,
+}
+
+pub(super) fn parse_fulfillment_status(
+    raw_status: i32,
+    request_id: B256,
+) -> Result<FulfillmentStatus> {
+    FulfillmentStatus::try_from(raw_status).with_context(|| {
+        format!(
+            "unsupported fulfillment status {raw_status} while getting proof request status for request 0x{}",
+            hex::encode(request_id)
+        )
+    })
+}
+
 /// A client for interacting with the network.
 #[derive(Clone)]
 pub struct NetworkClient {
-    pub(crate) signer: NetworkSigner,
+    pub(crate) signer: SignerSource,
     pub(crate) http: HttpClientWithMiddleware,
     pub(crate) rpc_url: String,
     pub(crate) network_mode: NetworkMode,
+    pub(crate) client_identity: Option<Identity>,
+    pub(crate) bearer_token: Option<NetworkBearerToken>,
+    /// Lazily-established gRPC channel, shared across clones and reused across calls.
+    pub(crate) channel: Arc<OnceCell<Channel>>,
 }
 
 #[async_trait]
@@ -112,12 +153,28 @@ impl NetworkClient {
         rpc_url: impl Into<String>,
         network_mode: NetworkMode,
     ) -> Self {
+        Self::new_with_signer_source(signer.into(), rpc_url, network_mode)
+    }
+
+    pub(crate) fn new_with_signer_source(
+        signer: SignerSource,
+        rpc_url: impl Into<String>,
+        network_mode: NetworkMode,
+    ) -> Self {
         let client = reqwest::Client::builder()
             .pool_max_idle_per_host(0)
             .pool_idle_timeout(Duration::from_secs(240))
             .build()
             .unwrap();
-        Self { signer, http: client.into(), rpc_url: rpc_url.into(), network_mode }
+        Self {
+            signer,
+            http: client.into(),
+            rpc_url: rpc_url.into(),
+            network_mode,
+            client_identity: None,
+            bearer_token: None,
+            channel: Arc::new(OnceCell::new()),
+        }
     }
 
     /// Get the explorer URL for the current network mode.
@@ -296,9 +353,7 @@ impl NetworkClient {
         elf: &[u8],
     ) -> Result<CreateProgramResponse> {
         // Create the program artifact.
-        let mut store = self.artifact_store_client().await?;
-        let program_uri =
-            self.create_artifact_with_content(&mut store, ArtifactType::Program, &elf).await?;
+        let program_uri = self.create_artifact_with_content(ArtifactType::Program, &elf).await?;
 
         // Serialize the verifying key.
         let vk_encoded = bincode::serialize(&vk)?;
@@ -353,6 +408,37 @@ impl NetworkClient {
                 .await
             }
             NetworkMode::Reserved => Ok(GetProofRequestParamsResponse::Unsupported),
+        }
+    }
+
+    /// Returns the current market price per prover gas unit, in PROVE wei. Tracks the
+    /// network's market signal; callers apply their own buffer before passing it as
+    /// `max_price_per_pgu`. Mainnet (auction) mode only.
+    pub async fn get_market_price_per_pgu(&self) -> Result<MarketPrice> {
+        match self.network_mode {
+            NetworkMode::Mainnet => {
+                self.with_retry(
+                    || async {
+                        let mut rpc = self.auction_prover_network_client().await?;
+                        let response = rpc
+                            .get_market_price_per_pgu(AuctionGetMarketPricePerPguRequest {})
+                            .await?
+                            .into_inner();
+                        let wei = response.price.parse::<u128>().with_context(|| {
+                            format!("invalid market_price_per_pgu wei: {:?}", response.price)
+                        })?;
+                        let as_of = u64::try_from(response.as_of).with_context(|| {
+                            format!("invalid market_price as_of: {}", response.as_of)
+                        })?;
+                        Ok(MarketPrice { wei, as_of })
+                    },
+                    "getting market price per PGU",
+                )
+                .await
+            }
+            NetworkMode::Reserved => {
+                Err(anyhow::anyhow!("get_market_price_per_pgu is not supported in Reserved mode"))
+            }
         }
     }
 
@@ -512,7 +598,7 @@ impl NetworkClient {
             }
         };
 
-        let status = FulfillmentStatus::try_from(res.fulfillment_status())?;
+        let status = parse_fulfillment_status(res.fulfillment_status(), request_id)?;
         let proof = match status {
             FulfillmentStatus::Fulfilled => {
                 let proof_uri =
@@ -532,23 +618,133 @@ impl NetworkClient {
         request_id: B256,
         timeout: Option<Duration>,
     ) -> Result<GetProofRequestDetailsResponse> {
-        let res = self
-            .with_retry_timeout(
-                || async {
-                    let mut rpc = self.prover_network_client().await?;
-                    Ok(rpc
-                        .get_proof_request_details(GetProofRequestDetailsRequest {
-                            request_id: request_id.to_vec(),
-                        })
-                        .await?
-                        .into_inner())
-                },
-                timeout.unwrap_or(DEFAULT_RETRY_TIMEOUT),
-                "getting proof request details",
-            )
-            .await?;
+        let res = match self.network_mode {
+            NetworkMode::Mainnet => {
+                self.with_retry_timeout(
+                    || async {
+                        let mut rpc = self.auction_prover_network_client().await?;
+                        Ok(rpc
+                            .get_proof_request_details(GetProofRequestDetailsRequest {
+                                request_id: request_id.to_vec(),
+                            })
+                            .await?
+                            .into_inner())
+                    },
+                    timeout.unwrap_or(DEFAULT_RETRY_TIMEOUT),
+                    "getting proof request details",
+                )
+                .await?
+            }
+            NetworkMode::Reserved => {
+                let response = self
+                    .with_retry_timeout(
+                        || async {
+                            let mut rpc = self.base_prover_network_client().await?;
+                            Ok(rpc
+                                .get_proof_request_details(BaseGetProofRequestDetailsRequest {
+                                    request_id: request_id.to_vec(),
+                                })
+                                .await?
+                                .into_inner())
+                        },
+                        timeout.unwrap_or(DEFAULT_RETRY_TIMEOUT),
+                        "getting proof request details",
+                    )
+                    .await?;
+                Self::convert_base_proof_request_details(response)
+            }
+        };
 
         Ok(res)
+    }
+
+    fn convert_base_proof_request_details(
+        response: BaseGetProofRequestDetailsResponse,
+    ) -> GetProofRequestDetailsResponse {
+        GetProofRequestDetailsResponse {
+            request: response.request.map(|request| {
+                let BaseProofRequest {
+                    request_id,
+                    vk_hash,
+                    version,
+                    mode,
+                    strategy,
+                    program_uri,
+                    stdin_uri,
+                    deadline,
+                    cycle_limit,
+                    gas_price,
+                    fulfillment_status,
+                    execution_status,
+                    requester,
+                    fulfiller,
+                    program_name,
+                    requester_name,
+                    fulfiller_name,
+                    created_at,
+                    updated_at,
+                    fulfilled_at,
+                    tx_hash,
+                    cycles,
+                    public_values_hash,
+                    deduction_amount,
+                    refund_amount,
+                    gas_limit,
+                    gas_used,
+                    execute_fail_cause,
+                    settlement_status,
+                    program_public_uri,
+                    stdin_public_uri,
+                    min_auction_period,
+                    whitelist,
+                    error,
+                    stdin_private,
+                } = request;
+
+                crate::network::proto::auction_types::ProofRequest {
+                    request_id,
+                    vk_hash,
+                    version,
+                    mode,
+                    strategy,
+                    program_uri,
+                    stdin_uri,
+                    deadline,
+                    cycle_limit,
+                    gas_price,
+                    fulfillment_status,
+                    execution_status,
+                    requester,
+                    fulfiller,
+                    program_name,
+                    requester_name,
+                    fulfiller_name,
+                    created_at,
+                    updated_at,
+                    fulfilled_at,
+                    tx_hash,
+                    cycles,
+                    public_values_hash,
+                    deduction_amount,
+                    refund_amount,
+                    gas_limit,
+                    gas_used,
+                    execute_fail_cause,
+                    settlement_status,
+                    program_public_uri,
+                    stdin_public_uri,
+                    min_auction_period,
+                    whitelist,
+                    base_fee: None,
+                    max_price_per_pgu: None,
+                    error,
+                    is_canceled: false,
+                    stdin_private,
+                    error_trace: None,
+                    floor_price_per_pgu: None,
+                }
+            }),
+        }
     }
 
     /// Creates a proof request with the given verifying key hash and stdin.
@@ -600,11 +796,9 @@ impl NetworkClient {
         let start = SystemTime::now();
         let since_the_epoch = start.duration_since(UNIX_EPOCH).expect("Invalid start time");
         let deadline = since_the_epoch.as_secs() + timeout_secs;
-        let mut store = self.artifact_store_client().await?;
 
         let stdin_uri = self
             .create_artifact_with_content(
-                &mut store,
                 if private_stdin { ArtifactType::PrivateStdin } else { ArtifactType::Stdin },
                 &stdin,
             )
@@ -710,66 +904,79 @@ impl NetworkClient {
         }
     }
 
-    // NetworkMode-aware generic client for shared operations (create_program,
-    // get_proof_request_details).
+    // Auction client for operations whose schemas are wire-compatible across network modes.
     pub(crate) async fn prover_network_client(
         &self,
-    ) -> Result<AuctionProverNetworkClient<Channel>> {
+    ) -> Result<AuctionProverNetworkClient<AuthenticatedChannel>> {
         // For shared operations, we use the auction client type as it provides the default types.
         // The actual network routing is handled by the RPC URL which is correctly set based on
         // network_mode.
         self.auction_prover_network_client().await
     }
 
+    /// Returns the shared gRPC channel, built at most once.
+    ///
+    /// `OnceCell` rather than `new()` since `new()` is infallible but `configure_endpoint` isn't.
+    /// `connect_lazy` reconnects transparently, so the connection is reused across polls and a
+    /// dropped one self-heals on next use.
+    async fn channel(&self) -> Result<Channel> {
+        self.channel
+            .get_or_try_init(|| async {
+                tracing::debug!(rpc_url = %self.rpc_url, "establishing gRPC channel");
+                Ok(grpc::configure_endpoint(&self.rpc_url, self.client_identity.clone())?
+                    .connect_lazy())
+            })
+            .await
+            .cloned()
+    }
+
     // Helper methods for runtime proto type selection.
     pub(crate) async fn auction_prover_network_client(
         &self,
-    ) -> Result<AuctionProverNetworkClient<Channel>> {
-        self.with_retry(
-            || async {
-                let channel = grpc::configure_endpoint(&self.rpc_url)?.connect().await?;
-                Ok(AuctionProverNetworkClient::new(channel))
-            },
-            "creating auction network client",
-        )
-        .await
+    ) -> Result<AuctionProverNetworkClient<AuthenticatedChannel>> {
+        Ok(AuctionProverNetworkClient::with_interceptor(
+            self.channel().await?,
+            BearerTokenInterceptor::new(self.bearer_token.as_ref()),
+        ))
     }
 
     pub(crate) async fn base_prover_network_client(
         &self,
-    ) -> Result<BaseProverNetworkClient<Channel>> {
-        self.with_retry(
-            || async {
-                let channel = grpc::configure_endpoint(&self.rpc_url)?.connect().await?;
-                Ok(BaseProverNetworkClient::new(channel))
-            },
-            "creating base network client",
-        )
-        .await
+    ) -> Result<BaseProverNetworkClient<AuthenticatedChannel>> {
+        Ok(BaseProverNetworkClient::with_interceptor(
+            self.channel().await?,
+            BearerTokenInterceptor::new(self.bearer_token.as_ref()),
+        ))
     }
 
-    pub(crate) async fn artifact_store_client(&self) -> Result<ArtifactStoreClient<Channel>> {
-        self.with_retry(
-            || async {
-                let channel = grpc::configure_endpoint(&self.rpc_url)?.connect().await?;
-                Ok(ArtifactStoreClient::new(channel))
-            },
-            "creating artifact client",
-        )
-        .await
+    pub(crate) async fn artifact_store_client(
+        &self,
+    ) -> Result<ArtifactStoreClient<AuthenticatedChannel>> {
+        Ok(ArtifactStoreClient::with_interceptor(
+            self.channel().await?,
+            BearerTokenInterceptor::new(self.bearer_token.as_ref()),
+        ))
     }
 
     pub(crate) async fn create_artifact_with_content<T: Serialize + Send + Sync>(
         &self,
-        store: &mut ArtifactStoreClient<Channel>,
         artifact_type: ArtifactType,
         item: &T,
     ) -> Result<String> {
-        let signature = sign_message("create_artifact".as_bytes(), &self.signer).await?;
-        let request = CreateArtifactRequest { artifact_type: artifact_type.into(), signature };
-
-        // Create the artifact.
-        let response = store.create_artifact(request).await?.into_inner();
+        // Acquire the store inside the retry so a transient channel-connect failure is retried.
+        let response = self
+            .with_retry(
+                || async {
+                    let mut store = self.artifact_store_client().await?;
+                    let signature =
+                        sign_message("create_artifact".as_bytes(), &self.signer).await?;
+                    let request =
+                        CreateArtifactRequest { artifact_type: artifact_type.into(), signature };
+                    Ok(store.create_artifact(request).await?.into_inner())
+                },
+                "creating artifact",
+            )
+            .await?;
 
         let presigned_url = response.artifact_presigned_url;
         let uri = response.artifact_uri;
@@ -857,12 +1064,149 @@ impl NetworkClient {
 
 #[cfg(test)]
 mod test {
-    use crate::network::{signer::NetworkSigner, NetworkMode, RESERVED_RPC_URL};
+    use std::{
+        convert::Infallible,
+        task::{Context, Poll},
+        time::Duration,
+    };
+
+    use alloy_primitives::B256;
+    use tonic::{
+        codegen::{http, Body, BoxFuture, Service, StdError},
+        server::{Grpc, NamedService, UnaryService},
+        transport::Server,
+        Request, Response, Status,
+    };
+
+    use crate::network::{proto::base_types, signer::NetworkSigner, NetworkMode, RESERVED_RPC_URL};
+
+    use super::parse_fulfillment_status;
+
+    #[derive(Clone)]
+    struct ReservedProofDetailsFixture(base_types::GetProofRequestDetailsResponse);
+
+    impl NamedService for ReservedProofDetailsFixture {
+        const NAME: &'static str = "network.ProverNetwork";
+    }
+
+    impl UnaryService<base_types::GetProofRequestDetailsRequest> for ReservedProofDetailsFixture {
+        type Response = base_types::GetProofRequestDetailsResponse;
+        type Future = BoxFuture<Response<Self::Response>, Status>;
+
+        fn call(
+            &mut self,
+            request: Request<base_types::GetProofRequestDetailsRequest>,
+        ) -> Self::Future {
+            assert_eq!(
+                request.into_inner().request_id,
+                self.0.request.as_ref().unwrap().request_id
+            );
+            let response = self.0.clone();
+            Box::pin(async move { Ok(Response::new(response)) })
+        }
+    }
+
+    impl<B> Service<http::Request<B>> for ReservedProofDetailsFixture
+    where
+        B: Body + Send + 'static,
+        B::Error: Into<StdError> + Send + 'static,
+    {
+        type Response = http::Response<tonic::body::BoxBody>;
+        type Error = Infallible;
+        type Future = BoxFuture<Self::Response, Self::Error>;
+
+        fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, request: http::Request<B>) -> Self::Future {
+            assert_eq!(request.uri().path(), "/network.ProverNetwork/GetProofRequestDetails");
+
+            let method = self.clone();
+            Box::pin(async move {
+                Ok(Grpc::new(tonic::codec::ProstCodec::default()).unary(method, request).await)
+            })
+        }
+    }
 
     #[test]
     fn test_can_create_network_client_with_0x_bytes() {
         let private_key = hex::encode(alloy_signer_local::PrivateKeySigner::random().to_bytes());
         let signer = NetworkSigner::local(&private_key).unwrap();
         let _ = super::NetworkClient::new(signer, RESERVED_RPC_URL, NetworkMode::Reserved);
+    }
+
+    #[test]
+    fn fulfillment_status_parser_handles_known_and_unknown_values() {
+        let request_id = B256::from([0xab; 32]);
+
+        for raw_status in 0..=6 {
+            let status = parse_fulfillment_status(raw_status, request_id).unwrap();
+            assert_eq!(status as i32, raw_status);
+        }
+
+        let error = parse_fulfillment_status(7, request_id).unwrap_err().to_string();
+        assert!(error.contains("unsupported fulfillment status 7"));
+        assert!(error.contains(&format!("0x{}", hex::encode(request_id))));
+    }
+
+    #[tokio::test]
+    async fn reserved_proof_request_details_uses_reserved_schema() {
+        let request_id = B256::repeat_byte(0x11);
+        let request = base_types::ProofRequest {
+            request_id: request_id.to_vec(),
+            vk_hash: vec![0x22; 32],
+            version: "sp1-v6.3.1".to_string(),
+            mode: base_types::ProofMode::Plonk.into(),
+            strategy: base_types::FulfillmentStrategy::Reserved.into(),
+            program_uri: "programs/test".to_string(),
+            stdin_uri: "stdins/test".to_string(),
+            deadline: 1_800_000_000,
+            cycle_limit: 1_000_000,
+            error: base_types::ProofRequestError::ExecutionFailure.into(),
+            stdin_private: true,
+            ..Default::default()
+        };
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let incoming = futures::stream::unfold(listener, |listener| async move {
+            let connection = listener.accept().await.map(|(stream, _)| stream);
+            Some((connection, listener))
+        });
+        let server = tokio::spawn(
+            Server::builder()
+                .add_service(ReservedProofDetailsFixture(
+                    base_types::GetProofRequestDetailsResponse { request: Some(request) },
+                ))
+                .serve_with_incoming(incoming),
+        );
+
+        let private_key = hex::encode(alloy_signer_local::PrivateKeySigner::random().to_bytes());
+        let signer = NetworkSigner::local(&private_key).unwrap();
+        let client =
+            super::NetworkClient::new(signer, format!("http://{address}"), NetworkMode::Reserved);
+
+        let response = client
+            .get_proof_request_details(request_id, Some(Duration::from_secs(1)))
+            .await
+            .unwrap();
+        server.abort();
+
+        let request = response.request.unwrap();
+        assert_eq!(request.request_id, request_id.as_slice());
+        assert_eq!(request.vk_hash, vec![0x22; 32]);
+        assert_eq!(request.version, "sp1-v6.3.1");
+        assert_eq!(request.mode, base_types::ProofMode::Plonk as i32);
+        assert_eq!(request.strategy, base_types::FulfillmentStrategy::Reserved as i32);
+        assert_eq!(request.program_uri, "programs/test");
+        assert_eq!(request.stdin_uri, "stdins/test");
+        assert_eq!(request.deadline, 1_800_000_000);
+        assert_eq!(request.cycle_limit, 1_000_000);
+        assert_eq!(request.error, base_types::ProofRequestError::ExecutionFailure as i32);
+        assert!(request.stdin_private);
+        assert_eq!(request.base_fee, None);
+        assert_eq!(request.max_price_per_pgu, None);
+        assert!(!request.is_canceled);
     }
 }
