@@ -48,6 +48,40 @@ class DuplexChallenger {
   public:
     static constexpr const size_t NUM_ELEMENTS = WIDTH + 2 * RATE;
 
+    // Number of kb31 words / size_t words needed by stage() / unstage().
+    static constexpr const int STAGE_ELEMENTS = 3 * WIDTH;
+
+    // Copy the (global-memory) challenger state into `sh` (STAGE_ELEMENTS words, e.g. shared
+    // memory) and return a challenger operating on that copy. A single thread doing a sequence of
+    // observe/sample calls otherwise pays a dependent global round trip per buffer access.
+    // The device buffers are WIDTH long (see challenger/src/duplex.rs). Call unstage() afterwards.
+    __device__ __forceinline__ DuplexChallenger stage(kb31_t* sh, size_t* sh_sizes) const {
+        for (int i = 0; i < WIDTH; i++) {
+            sh[i] = sponge_state[i];
+            sh[WIDTH + i] = input_buffer[i];
+            sh[2 * WIDTH + i] = output_buffer[i];
+        }
+        sh_sizes[0] = buffer_sizes[0];
+        sh_sizes[1] = buffer_sizes[1];
+        DuplexChallenger c;
+        c.sponge_state = sh;
+        c.input_buffer = sh + WIDTH;
+        c.output_buffer = sh + 2 * WIDTH;
+        c.buffer_sizes = sh_sizes;
+        return c;
+    }
+
+    // Write a staged copy (see stage()) back to this challenger's device buffers.
+    __device__ __forceinline__ void unstage(const kb31_t* sh, const size_t* sh_sizes) {
+        for (int i = 0; i < WIDTH; i++) {
+            sponge_state[i] = sh[i];
+            input_buffer[i] = sh[WIDTH + i];
+            output_buffer[i] = sh[2 * WIDTH + i];
+        }
+        buffer_sizes[0] = sh_sizes[0];
+        buffer_sizes[1] = sh_sizes[1];
+    }
+
     __device__ __forceinline__ kb31_t getVal(size_t idx) { return sponge_state[idx % 16]; }
 
     __device__ __forceinline__ DuplexChallenger load(kb31_t* shared, size_t* buffer_sizes) {

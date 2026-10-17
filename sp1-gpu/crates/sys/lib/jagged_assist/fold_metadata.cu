@@ -94,9 +94,15 @@ __global__ void jaggedFoldMetadata(
     // proceed.
     __shared__ uint32_t previous_sum;
     if (tid == 0) {
-        while (atomicAdd(&flags[bid], 0u) == 0u) {
+        // Block 0 has no predecessor: it neither waits nor reads scan_values[0] (callers may
+        // leave flags[0] / scan_values[0] zeroed).
+        if (bid > 0u) {
+            while (atomicAdd(&flags[bid], 0u) == 0u) {
+            }
+            previous_sum = scan_values[bid];
+        } else {
+            previous_sum = 0u;
         }
-        previous_sum = scan_values[bid];
         scan_values[bid + 1u] = aux[SECTION_SIZE - 1u] + previous_sum;
         __threadfence();
         atomicAdd(&flags[bid + 1u], 1u);

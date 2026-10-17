@@ -161,6 +161,196 @@ where
         (bp_results[0], Point::new(new_randomness))
     }
 
+    /// Runs all `num_rounds` rounds of the jagged-eval (branching program) sumcheck on the
+    /// device with no host round trip, using the cached suffix/prefix decomposition of
+    /// `bp_cached.cuh` (one layer of work per round instead of all layers). Produces exactly the
+    /// same `sum_values`, challenger state and point (newest challenge first) as the
+    /// round-by-round path. Returns the point.
+    #[allow(clippy::too_many_arguments)]
+    pub fn prove_all_rounds_cached<OnDeviceChallenger: AsMutRawChallenger>(
+        &self,
+        merged_prefix_sums: &Buffer<F, TaskScope>,
+        z_col_eq_vals: &Buffer<EF, TaskScope>,
+        intermediate_eq_full_evals: &mut Buffer<EF, TaskScope>,
+        sum_values: &mut Buffer<EF, TaskScope>,
+        challenger: &mut OnDeviceChallenger,
+        claim: EF,
+        num_rounds: usize,
+    ) -> Point<EF, TaskScope>
+    where
+        TaskScope: BranchingProgramKernel<F, EF, OnDeviceChallenger>,
+    {
+        #[repr(C)]
+        #[derive(Clone, Copy)]
+        struct BpDims {
+            p: i32,
+            l: i32,
+            n: i32,
+            zr_len: i32,
+            zi_len: i32,
+            c: u32,
+        }
+
+        let backend = self.z_row.backend().clone();
+        let p = self.prefix_sum_length;
+        let n = 2 * p;
+        assert_eq!(num_rounds, n, "cached jagged assist expects 2 * prefix_sum_length rounds");
+        let zr_len = self.z_row.dimension();
+        let zi_len = self.z_index.dimension();
+        let l = zr_len.max(zi_len) + 1;
+        let c = self.num_columns;
+        let dims = BpDims {
+            p: p as i32,
+            l: l as i32,
+            n: n as i32,
+            zr_len: zr_len as i32,
+            zi_len: zi_len as i32,
+            c: c as u32,
+        };
+
+        // v2 round kernel: one thread per (column, lambda), per-round matrices in shared memory.
+        // `SP1_GPU_BP_ROUND2=0` selects the v1 kernel (one thread per column).
+        static ROUND2: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let round2 = *ROUND2
+            .get_or_init(|| std::env::var("SP1_GPU_BP_ROUND2").map(|v| v != "0").unwrap_or(true));
+        let round_block: usize = if round2 { 128 } else { 256 };
+        const PRE_BLOCK: usize = 128;
+        let round_grid = c.div_ceil(round_block / if round2 { 2 } else { 1 }).clamp(1, 1024);
+        let pre_grid = c.div_ceil(PRE_BLOCK).max(1);
+
+        let mut rho: Buffer<EF, TaskScope> = Buffer::with_capacity_in(n, backend.clone());
+        let mut right: Buffer<EF, TaskScope> = Buffer::with_capacity_in(l * 4 * c, backend.clone());
+        let mut left: Buffer<EF, TaskScope> = Buffer::with_capacity_in(4 * c, backend.clone());
+        // Ping-pong copies of the per-column state for the v2 round kernel (two threads per
+        // column read the old state and one writes the new state to the other buffer).
+        let mut left2: Buffer<EF, TaskScope> = Buffer::with_capacity_in(4 * c, backend.clone());
+        let mut ieq2: Buffer<EF, TaskScope> = Buffer::with_capacity_in(c, backend.clone());
+        let mut partials: Buffer<EF, TaskScope> =
+            Buffer::with_capacity_in(2 * round_grid, backend.clone());
+        let claim_host: Buffer<EF> = vec![claim].into();
+        let mut claim_device = DeviceBuffer::from_host(&claim_host, &backend).unwrap().into_inner();
+
+        unsafe {
+            rho.assume_init();
+            right.assume_init();
+            left.assume_init();
+            left2.assume_init();
+            ieq2.assume_init();
+            partials.assume_init();
+            for r in 0..n {
+                let (mut update_left, mut update_eq) = (r > 0, r > 0);
+                // v2 ping-pong: round r reads buffer (r & 1) and writes the other one.
+                let odd = round2 && (r & 1) == 1;
+                let (left_in, left_out) = if odd {
+                    (left2.as_mut_ptr(), left.as_mut_ptr())
+                } else {
+                    (left.as_mut_ptr(), left2.as_mut_ptr())
+                };
+                let (ieq_in, ieq_out) = if odd {
+                    (ieq2.as_mut_ptr(), intermediate_eq_full_evals.as_mut_ptr())
+                } else {
+                    (intermediate_eq_full_evals.as_mut_ptr(), ieq2.as_mut_ptr())
+                };
+                if r == 0 || r == p {
+                    let phase2 = r == p;
+                    let args = args!(
+                        self.current_prefix_sums.as_ptr(),
+                        self.next_prefix_sums.as_ptr(),
+                        self.z_row.as_ptr(),
+                        self.z_index.as_ptr(),
+                        rho.as_ptr(),
+                        dims,
+                        phase2,
+                        right.as_mut_ptr(),
+                        left_in
+                    );
+                    backend
+                        .launch_kernel(
+                            <TaskScope as BranchingProgramKernel<F, EF, OnDeviceChallenger>>::cached_precompute_kernel(),
+                            pre_grid,
+                            PRE_BLOCK,
+                            &args,
+                            0,
+                        )
+                        .unwrap();
+                    update_left = false;
+                    update_eq = phase2;
+                }
+                let r_i32 = r as i32;
+                let round_kernel = if round2 {
+                    <TaskScope as BranchingProgramKernel<F, EF, OnDeviceChallenger>>::cached_round2_kernel()
+                } else {
+                    <TaskScope as BranchingProgramKernel<F, EF, OnDeviceChallenger>>::cached_round_kernel()
+                };
+                if round2 {
+                    let args = args!(
+                        self.current_prefix_sums.as_ptr(),
+                        self.next_prefix_sums.as_ptr(),
+                        merged_prefix_sums.as_ptr(),
+                        self.z_row.as_ptr(),
+                        self.z_index.as_ptr(),
+                        rho.as_ptr(),
+                        dims,
+                        r_i32,
+                        update_left,
+                        update_eq,
+                        self.lambdas.as_ptr(),
+                        z_col_eq_vals.as_ptr(),
+                        ieq_in,
+                        right.as_ptr(),
+                        left_in,
+                        partials.as_mut_ptr(),
+                        ieq_out,
+                        left_out
+                    );
+                    backend.launch_kernel(round_kernel, round_grid, round_block, &args, 0).unwrap();
+                } else {
+                    let args = args!(
+                        self.current_prefix_sums.as_ptr(),
+                        self.next_prefix_sums.as_ptr(),
+                        merged_prefix_sums.as_ptr(),
+                        self.z_row.as_ptr(),
+                        self.z_index.as_ptr(),
+                        rho.as_ptr(),
+                        dims,
+                        r_i32,
+                        update_left,
+                        update_eq,
+                        self.lambdas.as_ptr(),
+                        z_col_eq_vals.as_ptr(),
+                        intermediate_eq_full_evals.as_mut_ptr(),
+                        right.as_ptr(),
+                        left.as_mut_ptr(),
+                        partials.as_mut_ptr()
+                    );
+                    backend.launch_kernel(round_kernel, round_grid, round_block, &args, 0).unwrap();
+                }
+                let num_partials = round_grid as i32;
+                let args = args!(
+                    partials.as_ptr(),
+                    num_partials,
+                    challenger.as_mut_raw(),
+                    rho.as_mut_ptr(),
+                    dims,
+                    r_i32,
+                    sum_values.as_mut_ptr(),
+                    claim_device.as_mut_ptr()
+                );
+                backend
+                    .launch_kernel(
+                        <TaskScope as BranchingProgramKernel<F, EF, OnDeviceChallenger>>::cached_interpolate_kernel(),
+                        1usize,
+                        32usize,
+                        &args,
+                        0,
+                    )
+                    .unwrap();
+            }
+        }
+
+        Point::new(rho)
+    }
+
     pub fn fix_last_variable_kernel<OnDeviceChallenger>(
         merged_prefix_sums: &Buffer<F, TaskScope>,
         intermediate_eq_full_evals: &mut Buffer<EF, TaskScope>,

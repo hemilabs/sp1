@@ -598,6 +598,7 @@ async fn allocate_and_initialize_traces(
         col_index,
         start_indices,
         column_heights: column_heights_dev,
+        host_column_heights: None,
     })
 }
 
@@ -636,8 +637,9 @@ async fn copy_main_jagged_traces(
     global_dependencies_opt: bool,
 ) {
     // At this point, all traces are on device. Now we need to copy them into the Jagged MLE struct.
-    let JaggedMle { dense_data: trace_dense_data, col_index, start_indices, column_heights } =
-        &mut **jagged_traces;
+    let JaggedMle {
+        dense_data: trace_dense_data, col_index, start_indices, column_heights, ..
+    } = &mut **jagged_traces;
 
     let TraceDenseData {
         dense: dense_data,

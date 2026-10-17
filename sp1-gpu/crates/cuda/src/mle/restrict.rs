@@ -16,6 +16,12 @@ use crate::{args, DeviceCopy, DeviceTensor, TaskScope};
 
 use super::DeviceMle;
 
+/// `SP1_GPU_FILL_GRID=0` restores the original grid sizes (A/B switch).
+fn fill_grid_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("SP1_GPU_FILL_GRID").map(|v| v != "0").unwrap_or(true))
+}
+
 /// # Safety
 pub unsafe trait MleFixLastVariableKernel<F: Field, EF: ExtensionField<F>> {
     fn mle_fix_last_variable_kernel() -> KernelPtr;
@@ -44,7 +50,12 @@ impl<F: DeviceCopy + Field> DeviceMle<F> {
 
         const BLOCK_SIZE: usize = 256;
         const STRIDE: usize = 128;
-        let grid_size_x = output_height.div_ceil(BLOCK_SIZE * STRIDE);
+        // Grid-stride kernel: fill the GPU for mid-size MLEs instead of 128 iterations/thread.
+        let mut grid_size_x = output_height.div_ceil(BLOCK_SIZE * STRIDE);
+        if fill_grid_enabled() {
+            grid_size_x = grid_size_x
+                .max(output_height.div_ceil(BLOCK_SIZE).min(1024 / num_polynomials.max(1)).max(1));
+        }
         let grid_size_y = num_polynomials;
         let grid_size = (grid_size_x, grid_size_y, 1);
 
@@ -93,7 +104,12 @@ impl<F: DeviceCopy + Field> DeviceMle<F> {
 
         const BLOCK_SIZE: usize = 256;
         const STRIDE: usize = 128;
-        let grid_size_x = output_height.div_ceil(BLOCK_SIZE * STRIDE);
+        // Grid-stride kernel: fill the GPU for mid-size MLEs instead of 128 iterations/thread.
+        let mut grid_size_x = output_height.div_ceil(BLOCK_SIZE * STRIDE);
+        if fill_grid_enabled() {
+            grid_size_x = grid_size_x
+                .max(output_height.div_ceil(BLOCK_SIZE).min(1024 / num_polynomials.max(1)).max(1));
+        }
         let grid_size_y = num_polynomials;
         let grid_size = (grid_size_x, grid_size_y, 1);
 

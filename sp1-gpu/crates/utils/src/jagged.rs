@@ -16,6 +16,10 @@ pub struct JaggedMle<D: DenseData<A>, A: Backend> {
     /// directly on device to derive per-chip layouts without a host round-trip.
     pub column_heights: Buffer<u32, A>,
     pub dense_data: D,
+    /// Optional host mirror of `column_heights`. When present, folds compute the next
+    /// layer's heights and total height on the host instead of reading them back from the
+    /// device (which costs a blocking stream sync per fold).
+    pub host_column_heights: Option<std::sync::Arc<Vec<u32>>>,
 }
 
 pub struct VirtualTensor<T, B: Backend> {
@@ -102,7 +106,14 @@ impl<D: DenseData<A>, A: Backend> JaggedMle<D, A> {
         start_indices: Buffer<u32, A>,
         column_heights: Buffer<u32, A>,
     ) -> Self {
-        Self { dense_data, col_index, start_indices, column_heights }
+        Self { dense_data, col_index, start_indices, column_heights, host_column_heights: None }
+    }
+
+    /// Attach a host mirror of `column_heights` (see [`JaggedMle::host_column_heights`]).
+    pub fn with_host_column_heights(mut self, h: Option<std::sync::Arc<Vec<u32>>>) -> Self {
+        debug_assert!(h.as_ref().is_none_or(|h| h.len() == self.column_heights.len()));
+        self.host_column_heights = h;
+        self
     }
 
     pub fn column_heights(&self) -> &Buffer<u32, A> {
@@ -198,6 +209,17 @@ impl<D: DenseData<TaskScope>> JaggedMle<D, TaskScope> {
     ) -> (Buffer<u32, TaskScope>, Buffer<u32, TaskScope>, u32) {
         fold_jagged_metadata_dev(&self.column_heights)
     }
+
+    /// Like [`Self::next_start_indices_and_column_heights_dev`], but uses the host mirror of
+    /// the column heights (when present) to avoid the device readback, and returns the next
+    /// layer's host mirror.
+    #[allow(clippy::type_complexity)]
+    pub fn next_metadata_tracked(
+        &self,
+    ) -> (Buffer<u32, TaskScope>, Buffer<u32, TaskScope>, u32, Option<std::sync::Arc<Vec<u32>>>)
+    {
+        fold_jagged_metadata_dev_tracked(&self.column_heights, self.host_column_heights.as_ref())
+    }
 }
 
 /// Free-function core of [`JaggedMle::next_start_indices_and_column_heights_dev`]: runs the
@@ -207,6 +229,31 @@ impl<D: DenseData<TaskScope>> JaggedMle<D, TaskScope> {
 pub fn fold_jagged_metadata_dev(
     column_heights: &Buffer<u32, TaskScope>,
 ) -> (Buffer<u32, TaskScope>, Buffer<u32, TaskScope>, u32) {
+    let (a, b, h, _) = fold_jagged_metadata_dev_tracked(column_heights, None);
+    (a, b, h)
+}
+
+/// `SP1_GPU_FOLD_HOST=0` disables the host-tracked fold height (A/B switch);
+/// `SP1_GPU_FOLD_HOST=check` additionally reads the device result back and asserts equality.
+fn fold_host_mode() -> u8 {
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| match std::env::var("SP1_GPU_FOLD_HOST").as_deref() {
+        Ok("0") => 0,
+        Ok("check") => 2,
+        _ => 1,
+    })
+}
+
+/// Fold with an optional host mirror of the column heights. With a mirror, the next heights
+/// (`h.div_ceil(4) * 2`, the same transform as the kernel) and their total are computed on the
+/// host, so no device readback (stream sync) is needed. Returns the next mirror.
+#[allow(clippy::type_complexity)]
+pub fn fold_jagged_metadata_dev_tracked(
+    column_heights: &Buffer<u32, TaskScope>,
+    host_heights: Option<&std::sync::Arc<Vec<u32>>>,
+) -> (Buffer<u32, TaskScope>, Buffer<u32, TaskScope>, u32, Option<std::sync::Arc<Vec<u32>>>) {
+    let mode = fold_host_mode();
+    let host_heights = if mode == 0 { None } else { host_heights };
     let backend = column_heights.backend();
     let n_columns = column_heights.len();
     let section_size =
@@ -229,14 +276,15 @@ pub fn fold_jagged_metadata_dev(
     // `fold_metadata.cuh`: `block_counter[0] = 0`, `flags[0] = 1` so
     // the first block doesn't wait, `flags[1..]` and `scan_values[..]`
     // start at zero.
+    // One allocation + one memset for [block_counter | flags (n_blocks + 1) | scan (n_blocks + 1)];
+    // block 0 of the scan does not need flags[0] = 1 (see fold_metadata.cu).
     let u32_bytes = std::mem::size_of::<u32>();
-    let mut block_counter = Buffer::<u32, TaskScope>::with_capacity_in(1, backend.clone());
-    let mut flags = Buffer::<u32, TaskScope>::with_capacity_in(n_blocks + 1, backend.clone());
-    let mut scan_values = Buffer::<u32, TaskScope>::with_capacity_in(n_blocks + 1, backend.clone());
-    block_counter.write_bytes(0, u32_bytes).unwrap();
-    flags.write_bytes(1, u32_bytes).unwrap();
-    flags.write_bytes(0, n_blocks * u32_bytes).unwrap();
-    scan_values.write_bytes(0, (n_blocks + 1) * u32_bytes).unwrap();
+    let scratch_len = 1 + 2 * (n_blocks + 1);
+    let mut scratch = Buffer::<u32, TaskScope>::with_capacity_in(scratch_len, backend.clone());
+    scratch.write_bytes(0, scratch_len * u32_bytes).unwrap();
+    let scratch_ptr = scratch.as_mut_ptr();
+    let (block_counter_ptr, flags_ptr, scan_values_ptr) =
+        unsafe { (scratch_ptr, scratch_ptr.add(1), scratch_ptr.add(2 + n_blocks)) };
 
     // SAFETY: `args!` tuple matches `jagged_fold_metadata`'s C signature
     // in `sys/include/jagged_assist/fold_metadata.cuh`; every pointer
@@ -247,9 +295,9 @@ pub fn fold_jagged_metadata_dev(
             n_columns as u32,
             new_column_heights.as_mut_ptr(),
             new_start_indices.as_mut_ptr(),
-            block_counter.as_mut_ptr(),
-            flags.as_mut_ptr(),
-            scan_values.as_mut_ptr()
+            block_counter_ptr,
+            flags_ptr,
+            scan_values_ptr
         );
         backend
             .launch_kernel(
@@ -272,10 +320,28 @@ pub fn fold_jagged_metadata_dev(
     // recurrence the kernel runs, eliminating this final D2H.
     // SAFETY: kernel above fully wrote `new_start_indices`; the
     // download synchronizes on `backend`'s stream.
+    if let Some(h) = host_heights {
+        assert_eq!(h.len(), n_columns);
+        let next: Vec<u32> = h.iter().map(|&x| x.div_ceil(4) * 2).collect();
+        let output_height: u32 = next.iter().sum();
+        if mode == 2 {
+            let host_start_idx: Vec<u32> = unsafe { new_start_indices.copy_into_host_vec() };
+            assert_eq!(*host_start_idx.last().unwrap(), output_height, "fold host mirror mismatch");
+            let dev_heights: Vec<u32> = unsafe { new_column_heights.copy_into_host_vec() };
+            assert_eq!(dev_heights, next, "fold host mirror heights mismatch");
+        }
+        return (
+            new_start_indices,
+            new_column_heights,
+            output_height,
+            Some(std::sync::Arc::new(next)),
+        );
+    }
+
     let host_start_idx: Vec<u32> = unsafe { new_start_indices.copy_into_host_vec() };
     let output_height = *host_start_idx.last().unwrap();
 
-    (new_start_indices, new_column_heights, output_height)
+    (new_start_indices, new_column_heights, output_height, None)
 }
 
 impl<D: DenseData<A>, A: Backend> HasBackend for JaggedMle<D, A> {

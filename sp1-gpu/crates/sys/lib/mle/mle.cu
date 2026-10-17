@@ -193,3 +193,54 @@ extern "C" void* mle_fold_koala_bear_base_extension() {
 extern "C" void* mle_fold_koala_bear_ext_ext() {
     return (void*)foldMle<kb31_extension_t, kb31_extension_t>;
 }
+
+// Tiled partial Lagrange (eq) table for dimension >= PLAG_LB: out[i] = prod_k (bit_k(i) ? z_k : 1 - z_k)
+// with MSB-first bits. Split i = (hi << PLAG_LB) | lo; each block builds the 2^PLAG_LB low-variable
+// table once in shared memory and, per tile of 2^PLAG_LB `hi` rows, the high-variable products (one
+// thread per row), so each output costs one extension multiplication instead of `dimension`. Field
+// multiplication is exact, so the output is bit-identical to `partial_lagrange_naive`.
+#define PLAG_LB 8
+#define PLAG_T (1 << PLAG_LB)
+// Rows of the high table per tile: small tiles keep enough blocks in flight for mid-size tables.
+#define PLAG_ROWS 32
+
+template <typename F, typename EF>
+__global__ void partial_lagrange_tiled(EF* __restrict__ output, const EF* __restrict__ point, size_t n) {
+    __shared__ EF low[PLAG_T];
+    __shared__ EF high[PLAG_T];
+    const size_t nh = n - PLAG_LB;
+    {
+        size_t lo = threadIdx.x;
+        EF v = EF::one();
+        for (size_t k = nh; k < n; k++) {
+            bool bit = ((lo >> (n - 1 - k)) & 1) != 0;
+            EF z = EF::load(point, k);
+            v *= bit ? z : (EF::one() - z);
+        }
+        low[threadIdx.x] = v;
+    }
+    const size_t num_hi = (size_t)1 << nh;
+    for (size_t tile = (size_t)blockIdx.x * PLAG_ROWS; tile < num_hi; tile += (size_t)gridDim.x * PLAG_ROWS) {
+        __syncthreads();
+        size_t hi = tile + threadIdx.x;
+        if (threadIdx.x < PLAG_ROWS && hi < num_hi) {
+            EF v = EF::one();
+            for (size_t k = 0; k < nh; k++) {
+                bool bit = ((hi >> (nh - 1 - k)) & 1) != 0;
+                EF z = EF::load(point, k);
+                v *= bit ? z : (EF::one() - z);
+            }
+            high[threadIdx.x] = v;
+        }
+        __syncthreads();
+        size_t rows = num_hi - tile < PLAG_ROWS ? num_hi - tile : PLAG_ROWS;
+        EF lv = low[threadIdx.x];
+        for (size_t r = 0; r < rows; r++) {
+            EF::store(output, ((tile + r) << PLAG_LB) + threadIdx.x, high[r] * lv);
+        }
+    }
+}
+
+extern "C" void* partial_lagrange_tiled_koala_bear_extension() {
+    return (void*)partial_lagrange_tiled<kb31_t, kb31_extension_t>;
+}

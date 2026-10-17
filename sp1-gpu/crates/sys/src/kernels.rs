@@ -200,6 +200,10 @@ extern "C" {
     pub fn jagged_two_round_sum_as_poly() -> KernelPtr;
     pub fn jagged_two_round_fix_and_sum() -> KernelPtr;
     pub fn padded_hadamard_fix_and_sum() -> KernelPtr;
+    pub fn hadamard_fold1_grid1() -> KernelPtr;
+    pub fn hadamard_fold2_grid1() -> KernelPtr;
+    pub fn hadamard_fold1_grid2() -> KernelPtr;
+    pub fn hadamard_fold2_grid2() -> KernelPtr;
 
     // Populate restrict eq
     pub fn populate_restrict_eq_host(

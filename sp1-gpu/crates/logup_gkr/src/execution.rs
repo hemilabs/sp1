@@ -27,8 +27,12 @@ pub fn layer_transition(layer: &GkrLayer) -> GkrLayer {
     let backend = layer.jagged_mle.backend();
     let height = layer.jagged_mle.dense_data.height;
 
-    let (output_interaction_start_indices, output_interaction_row_counts, output_height_u32) =
-        layer.jagged_mle.next_start_indices_and_column_heights_dev();
+    let (
+        output_interaction_start_indices,
+        output_interaction_row_counts,
+        output_height_u32,
+        host_next,
+    ) = layer.jagged_mle.next_metadata_tracked();
     let output_height = output_height_u32 as usize;
 
     // Create a new layer
@@ -40,7 +44,8 @@ pub fn layer_transition(layer: &GkrLayer) -> GkrLayer {
     // populate the new layer
     const BLOCK_SIZE: usize = 256;
     const STRIDE: usize = 32;
-    let grid_size_x = height.div_ceil(BLOCK_SIZE * STRIDE);
+    let grid_size_x =
+        crate::sumcheck::fill_grid(height, BLOCK_SIZE, height.div_ceil(BLOCK_SIZE * STRIDE));
     let grid_size = (grid_size_x, 1, 1);
     let block_dim = BLOCK_SIZE;
 
@@ -50,7 +55,8 @@ pub fn layer_transition(layer: &GkrLayer) -> GkrLayer {
         output_col_index,
         output_interaction_start_indices,
         output_interaction_row_counts,
-    );
+    )
+    .with_host_column_heights(host_next);
 
     unsafe {
         output_jagged_mle.dense_data.assume_init();
@@ -75,8 +81,12 @@ pub fn first_layer_transition(layer: &FirstGkrLayer) -> GkrLayer {
 
     // If this is not the last layer, we need to fix the last variable and create a
     // new circuit layer.
-    let (output_interaction_start_indices, output_interaction_row_counts, output_height_u32) =
-        layer.jagged_mle.next_start_indices_and_column_heights_dev();
+    let (
+        output_interaction_start_indices,
+        output_interaction_row_counts,
+        output_height_u32,
+        host_next,
+    ) = layer.jagged_mle.next_metadata_tracked();
     let output_height = output_height_u32 as usize;
 
     // Create a new layer
@@ -90,12 +100,14 @@ pub fn first_layer_transition(layer: &FirstGkrLayer) -> GkrLayer {
         output_col_index,
         output_interaction_start_indices,
         output_interaction_row_counts,
-    );
+    )
+    .with_host_column_heights(host_next);
 
     // populate the new layer
     const BLOCK_SIZE: usize = 256;
     const STRIDE: usize = 32;
-    let grid_size_x = height.div_ceil(BLOCK_SIZE * STRIDE);
+    let grid_size_x =
+        crate::sumcheck::fill_grid(height, BLOCK_SIZE, height.div_ceil(BLOCK_SIZE * STRIDE));
     let grid_size = (grid_size_x, 1, 1);
     let block_dim = BLOCK_SIZE;
     unsafe {

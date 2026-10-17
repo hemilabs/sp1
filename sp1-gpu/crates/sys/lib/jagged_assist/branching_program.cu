@@ -512,3 +512,29 @@ extern "C" void *fixLastVariable_kernel()
 {
     return (void *)fixLastVariable<kb31_t, kb31_extension_t>;
 }
+
+// ---------------------------------------------------------------------------------------------
+// Cached branching-program sumcheck (see jagged_assist/bp_cached.cuh): O(1) layers per round and
+// no per-round host round trip.
+#include "sum_and_reduce/reduce.cuh"
+#include "jagged_assist/bp_cached.cuh"
+
+extern "C" void* bp_cached_precompute_kernel() {
+    return (void*)bpCachedPrecompute<kb31_t, kb31_extension_t>;
+}
+
+extern "C" void* bp_cached_round_kernel() {
+    return (void*)bpCachedRound<kb31_t, kb31_extension_t>;
+}
+
+extern "C" void* bp_cached_round2_kernel() {
+    return (void*)bpCachedRound2<kb31_t, kb31_extension_t>;
+}
+
+extern "C" void* bp_cached_interpolate_kernel_duplex() {
+    return (void*)bpCachedInterpolateAndObserve<kb31_t, kb31_extension_t, DuplexChallenger>;
+}
+
+extern "C" void* bp_cached_interpolate_kernel_multi_field_32() {
+    return (void*)bpCachedInterpolateAndObserve<kb31_t, kb31_extension_t, MultiField32Challenger>;
+}

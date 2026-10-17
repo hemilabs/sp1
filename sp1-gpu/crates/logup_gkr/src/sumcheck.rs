@@ -43,7 +43,44 @@ use crate::{
 };
 use rayon::prelude::*;
 use slop_sumcheck::partially_verify_sumcheck_proof;
-use sp1_gpu_utils::{fold_jagged_metadata_dev, DenseData, Ext, Felt, JaggedMle};
+use sp1_gpu_utils::{fold_jagged_metadata_dev_tracked, DenseData, Ext, Felt, JaggedMle};
+
+/// Raise an under-filled grid so small layers spread across the SMs instead of looping
+/// `STRIDE` times per thread on a handful of blocks. Never lowers the original grid, and
+/// caps the raise at 512 blocks so the per-block partial sums still reduce in a single
+/// `blockSum` launch. All kernels using it are grid-stride loops whose per-block partial
+/// sums are added in the field, so the result is identical for any grid size.
+#[inline]
+pub(crate) fn fill_grid(iters: usize, block: usize, old: usize) -> usize {
+    const GRID_CAP: usize = 512;
+    if !fill_grid_enabled() {
+        return old;
+    }
+    old.max(iters.div_ceil(block).min(GRID_CAP)).max(1)
+}
+
+/// `SP1_GPU_FILL_GRID=0` restores the original grid sizes (A/B switch).
+pub fn fill_grid_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("SP1_GPU_FILL_GRID").map(|v| v != "0").unwrap_or(true))
+}
+
+/// Sum the per-block partials over the last dimension and copy the result to the host. A
+/// single-block launch already produced the final sums, so skip the `sum_dim` reduction (a
+/// memset plus a `blockSum` launch) in that case. `SP1_GPU_SKIP_SUM1=0` disables (A/B switch).
+fn reduce_partials_to_host(partials: Tensor<Ext, TaskScope>) -> Tensor<Ext> {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let on =
+        *ON.get_or_init(|| std::env::var("SP1_GPU_SKIP_SUM1").map(|v| v != "0").unwrap_or(true));
+    let sizes = partials.sizes().to_vec();
+    if on && *sizes.last().unwrap() == 1 {
+        let mut t = DeviceTensor::from_raw(partials).to_host().unwrap();
+        t.reshape_in_place([sizes[0]]);
+        t
+    } else {
+        DeviceTensor::from_raw(partials).sum_dim(1).to_host().unwrap()
+    }
+}
 
 pub fn get_component_poly_evals(poly: &LogupRoundPolynomial) -> Vec<Ext> {
     match &poly.layer {
@@ -60,7 +97,7 @@ fn finalize_univariate(
     univariate_evals: Tensor<Ext, TaskScope>,
     claim: Ext,
 ) -> UnivariatePolynomial<Ext> {
-    let evals = DeviceTensor::from_raw(univariate_evals).sum_dim(1).to_host().unwrap();
+    let evals = reduce_partials_to_host(univariate_evals);
     let mut eval_zero: Ext = *evals[[0]];
     let mut eval_half: Ext = *evals[[1]];
     let eq_sum = *evals[[2]];
@@ -119,7 +156,7 @@ fn two_round_sum_as_poly<D: DenseData<TaskScope>>(
     const BLOCK_SIZE: usize = 256;
     const STRIDE: usize = 32;
     // Each iteration consumes one quad (two pairs).
-    let grid_dim = height.div_ceil(BLOCK_SIZE * STRIDE * 2);
+    let grid_dim = fill_grid(height >> 1, BLOCK_SIZE, height.div_ceil(BLOCK_SIZE * STRIDE * 2));
     let mut output = Tensor::<Ext, TaskScope>::with_sizes_in([10, grid_dim], scope.clone());
 
     let num_tiles = BLOCK_SIZE.checked_div(STRIDE).unwrap_or(1);
@@ -137,7 +174,7 @@ fn two_round_sum_as_poly<D: DenseData<TaskScope>>(
         scope.launch_kernel(kernel(), grid_dim, BLOCK_SIZE, &args, shared_mem).unwrap();
     }
 
-    let evals = DeviceTensor::from_raw(output).sum_dim(1).to_host().unwrap();
+    let evals = reduce_partials_to_host(output);
     evals.as_slice().try_into().unwrap()
 }
 
@@ -230,9 +267,16 @@ fn two_round_fix_and_sum<D: DenseData<TaskScope>>(
     let backend = jagged_mle.backend();
 
     // Advance the jagged metadata two folds; the intermediate layer is never materialized.
-    let (_, mid_column_heights, _) = fold_jagged_metadata_dev(jagged_mle.column_heights());
-    let (output_interaction_start_indices, output_interaction_row_counts, output_height_u32) =
-        fold_jagged_metadata_dev(&mid_column_heights);
+    let (_, mid_column_heights, _, mid_host) = fold_jagged_metadata_dev_tracked(
+        jagged_mle.column_heights(),
+        jagged_mle.host_column_heights.as_ref(),
+    );
+    let (
+        output_interaction_start_indices,
+        output_interaction_row_counts,
+        output_height_u32,
+        host_next,
+    ) = fold_jagged_metadata_dev_tracked(&mid_column_heights, mid_host.as_ref());
     let output_height = output_height_u32 as usize;
 
     // Create the doubly-folded layer.
@@ -247,12 +291,13 @@ fn two_round_fix_and_sum<D: DenseData<TaskScope>>(
         output_col_index,
         output_interaction_start_indices,
         output_interaction_row_counts,
-    );
+    )
+    .with_host_column_heights(host_next);
 
     // populate the new layer
     const BLOCK_SIZE: usize = 256;
     const STRIDE: usize = 32;
-    let grid_size_x = height.div_ceil(BLOCK_SIZE * STRIDE);
+    let grid_size_x = fill_grid(height >> 1, BLOCK_SIZE, height.div_ceil(BLOCK_SIZE * STRIDE));
     let grid_size = (grid_size_x, 1, 1);
 
     let mut univariate_evals =
@@ -403,7 +448,7 @@ fn sum_as_poly_first_layer(poly: &FirstLayerPolynomial, claim: Ext) -> Univariat
     const BLOCK_SIZE: usize = 256;
     const STRIDE: usize = 32;
 
-    let grid_dim = height.div_ceil(BLOCK_SIZE).div_ceil(STRIDE);
+    let grid_dim = fill_grid(height, BLOCK_SIZE, height.div_ceil(BLOCK_SIZE).div_ceil(STRIDE));
     let mut output = Tensor::<Ext, TaskScope>::with_sizes_in([3, grid_dim], scope.clone());
 
     let num_tiles = BLOCK_SIZE.checked_div(STRIDE).unwrap_or(1);
@@ -428,7 +473,7 @@ fn sum_as_poly_first_layer(poly: &FirstLayerPolynomial, claim: Ext) -> Univariat
             )
             .unwrap();
     }
-    let evals = DeviceTensor::from_raw(output).sum_dim(1).to_host().unwrap();
+    let evals = reduce_partials_to_host(output);
 
     let mut eval_zero: Ext = *evals[[0]];
     let mut eval_half: Ext = *evals[[1]];
@@ -483,7 +528,8 @@ fn fix_last_variable_materialized_round(
 
             const BLOCK_SIZE: usize = 256;
             const STRIDE: usize = 32;
-            let grid_size_x = height.div_ceil(BLOCK_SIZE * STRIDE);
+            let grid_size_x =
+                fill_grid(output_height, BLOCK_SIZE, height.div_ceil(BLOCK_SIZE * STRIDE));
             let grid_size = (grid_size_x, 1, 1);
 
             unsafe {
@@ -573,8 +619,12 @@ fn fix_and_sum_first_layer(
     let height = poly.layer.jagged_mle.dense_data.height >> 1;
 
     // Compute the next layer's start indices and column heights on device.
-    let (output_interaction_start_indices, output_interaction_row_counts, output_height_u32) =
-        poly.layer.jagged_mle.next_start_indices_and_column_heights_dev();
+    let (
+        output_interaction_start_indices,
+        output_interaction_row_counts,
+        output_height_u32,
+        host_next,
+    ) = poly.layer.jagged_mle.next_metadata_tracked();
     let output_height = output_height_u32 as usize;
 
     // Create a new layer
@@ -589,7 +639,8 @@ fn fix_and_sum_first_layer(
         output_col_index,
         output_interaction_start_indices,
         output_interaction_row_counts,
-    );
+    )
+    .with_host_column_heights(host_next);
 
     // Fix the eq_row variables
     let eq_row = poly.eq_row.fix_last_variable_constant_padding(alpha, Ext::zero());
@@ -597,7 +648,7 @@ fn fix_and_sum_first_layer(
     // populate the new layer
     const BLOCK_SIZE: usize = 256;
     const STRIDE: usize = 32;
-    let grid_size_x = height.div_ceil(BLOCK_SIZE * STRIDE);
+    let grid_size_x = fill_grid(height >> 1, BLOCK_SIZE, height.div_ceil(BLOCK_SIZE * STRIDE));
     let mut univariate_evals =
         Tensor::<Ext, TaskScope>::with_sizes_in([3, grid_size_x], backend.clone());
     let grid_size = (grid_size_x, 1, 1);
@@ -660,7 +711,8 @@ fn sum_as_poly_materialized_round(
 
             const BLOCK_SIZE: usize = 256;
             const STRIDE: usize = 32;
-            let grid_dim = height.div_ceil(BLOCK_SIZE).div_ceil(STRIDE);
+            let grid_dim =
+                fill_grid(height, BLOCK_SIZE, height.div_ceil(BLOCK_SIZE).div_ceil(STRIDE));
             let mut output = Tensor::<Ext, TaskScope>::with_sizes_in([3, grid_dim], scope.clone());
             let num_tiles = BLOCK_SIZE.checked_div(STRIDE).unwrap_or(1);
             let shared_mem = num_tiles * std::mem::size_of::<Ext>();
@@ -714,7 +766,11 @@ fn fix_and_sum_materialized_round(
 
             const BLOCK_SIZE: usize = 256;
             const STRIDE: usize = 32;
-            let grid_size_x = height.div_ceil(BLOCK_SIZE).div_ceil(STRIDE);
+            let grid_size_x = fill_grid(
+                output_height.div_ceil(2),
+                BLOCK_SIZE,
+                height.div_ceil(BLOCK_SIZE).div_ceil(STRIDE),
+            );
             let grid_size = (grid_size_x, 1, 1);
             let mut univariate_evals =
                 Tensor::<Ext, TaskScope>::with_sizes_in([3, grid_size_x], backend.clone());
@@ -773,7 +829,11 @@ fn fix_and_sum_materialized_round(
 
                 const BLOCK_SIZE: usize = 256;
                 const STRIDE: usize = 32;
-                let grid_size_x = height.div_ceil(BLOCK_SIZE).div_ceil(STRIDE);
+                let grid_size_x = fill_grid(
+                    height.div_ceil(2),
+                    BLOCK_SIZE,
+                    height.div_ceil(BLOCK_SIZE).div_ceil(STRIDE),
+                );
                 let grid_size = (grid_size_x, 1, 1);
                 let mut univariate_evals =
                     Tensor::<Ext, TaskScope>::with_sizes_in([3, grid_size_x], backend.clone());
@@ -819,7 +879,8 @@ fn fix_and_sum_materialized_round(
                     output_interaction_start_indices,
                     output_interaction_row_counts,
                     output_height_u32,
-                ) = circuit.jagged_mle.next_start_indices_and_column_heights_dev();
+                    host_next,
+                ) = circuit.jagged_mle.next_metadata_tracked();
                 let output_height = output_height_u32 as usize;
 
                 // Create a new layer
@@ -834,12 +895,17 @@ fn fix_and_sum_materialized_round(
                     output_col_index,
                     output_interaction_start_indices,
                     output_interaction_row_counts,
-                );
+                )
+                .with_host_column_heights(host_next);
 
                 // populate the new layer
                 const BLOCK_SIZE: usize = 256;
                 const STRIDE: usize = 32;
-                let grid_size_x = height.div_ceil(BLOCK_SIZE).div_ceil(STRIDE);
+                let grid_size_x = fill_grid(
+                    height >> 1,
+                    BLOCK_SIZE,
+                    height.div_ceil(BLOCK_SIZE).div_ceil(STRIDE),
+                );
                 let grid_size = (grid_size_x, 1, 1);
                 let block_dim = BLOCK_SIZE;
 

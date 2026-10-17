@@ -3,6 +3,7 @@ use crate::runtime::KernelPtr;
 extern "C" {
     pub fn partial_lagrange_koala_bear() -> KernelPtr;
     pub fn partial_lagrange_koala_bear_extension() -> KernelPtr;
+    pub fn partial_lagrange_tiled_koala_bear_extension() -> KernelPtr;
 
     pub fn mle_fold_koala_bear_base_base() -> KernelPtr;
     pub fn mle_fold_koala_bear_base_extension() -> KernelPtr;
