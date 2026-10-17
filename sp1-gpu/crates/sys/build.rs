@@ -499,6 +499,11 @@ fn main() {
 
             // HIP device runtime for relocatable device code (GPU linking)
             println!("cargo:rustc-link-lib=hiprtc");
+
+            // The caching allocator's VRAM budget query (lib/runtime/stream.cu).
+            if msvc {
+                println!("cargo:rustc-link-lib=dxgi");
+            }
         }
         GpuBackend::Cuda if msvc => {
             // A Windows toolkit keeps its libraries in lib\x64. The runtime is linked
