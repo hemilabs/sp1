@@ -76,6 +76,41 @@ impl RegisterAllocator {
     }
 }
 
+/// Panics if a base-field register is read before this program writes it.
+///
+/// The GPU interpreter (`jaggedConstraintPolyEval`, sys/lib/zerocheck/zerocheck_eval.cu) runs only
+/// the base-field opcodes and relies on this: it does not clear its registers between rows, so a
+/// register read before being written would hold the previous row's value.
+fn assert_f_registers_written_before_read(program: &[Instruction32]) {
+    let mut written = vec![false; 2048];
+    for (i, instr) in program.iter().enumerate() {
+        let opcode = Opcode::from(instr.opcode);
+        let mut reads = Vec::with_capacity(3);
+        if opcode.is_f_arg1() {
+            reads.push(instr.b);
+        }
+        if opcode.is_f_arg2() {
+            reads.push(instr.c);
+        }
+        let read_modify_write = matches!(
+            opcode,
+            Opcode::FAddAssignE | Opcode::FSubAssignE | Opcode::FMulAssignE | Opcode::FAssertZero
+        );
+        if read_modify_write {
+            reads.push(instr.a);
+        }
+        for r in reads {
+            assert!(
+                written[r as usize],
+                "constraint program instruction {i} ({opcode:?}) reads register {r} before writing it"
+            );
+        }
+        if opcode.is_f_assign() && !matches!(opcode, Opcode::FAssertZero) {
+            written[instr.a as usize] = true;
+        }
+    }
+}
+
 pub fn optimize(instructions: Vec<Instruction32>) -> (Vec<Instruction16>, usize, usize) {
     let mut f_first_time_vreg_used: HashMap<u32, u32> = HashMap::new();
     let mut f_last_time_vreg_used: HashMap<u32, u32> = HashMap::new();
@@ -180,6 +215,8 @@ pub fn optimize(instructions: Vec<Instruction32>) -> (Vec<Instruction16>, usize,
             allocator.ef_free(instr.c);
         }
     }
+
+    assert_f_registers_written_before_read(&optimized_instructions);
 
     (
         optimized_instructions

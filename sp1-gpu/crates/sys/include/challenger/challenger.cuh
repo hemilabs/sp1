@@ -111,6 +111,18 @@ class DuplexChallenger {
         return sample_bits(bits) == 0;
     }
 
+    // Whether another thread has found a witness. On SYCL an atomic load: Intel's per-core L1 caches
+    // are not coherent, so a plain (even volatile) load can keep returning the stale `false` and
+    // leave every other work-group grinding long after the hit. The flag is a 4-byte allocation
+    // (see grinding_challenger.rs), set with a 4-byte atomicExch.
+    static __device__ __forceinline__ bool grind_found(volatile bool* found_flag) {
+#ifdef SP1_SYCL
+        return ::sp1sycl::device_atomic<int>(*(int*)found_flag).load() != 0;
+#else
+        return *found_flag;
+#endif
+    }
+
     __device__ __forceinline__ void
     grind(size_t bits, kb31_t* result, volatile bool* found_flag, size_t n) {
         size_t idx = threadIdx.x + blockIdx.x * blockDim.x;
@@ -160,7 +172,7 @@ class DuplexChallenger {
         static constexpr const size_t LOCAL_ELEMENTS = WIDTH + RATE + WIDTH;
         kb31_t local_state[LOCAL_ELEMENTS];
         size_t buffer_sizes[2];
-        for (size_t i = idx; i < n && !*found_flag; i += blockDim.x * gridDim.x) {
+        for (size_t i = idx; i < n && !grind_found(found_flag); i += blockDim.x * gridDim.x) {
             buffer_sizes[0] = original_buffer_size;
             buffer_sizes[1] = original_output_buffer_size;
             // Reset the local state to the shared state.
