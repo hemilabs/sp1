@@ -57,7 +57,7 @@ if(USE_HIP)
 
     # Release optimization. -Wno-c++11-narrowing for sppark's variadic constructors.
     # NDEBUG: device asserts cost a load or more each in hot kernels, and on Windows, which has no
-    # HIP trap handler, a failing one cannot report anyway.
+    # HIP trap handler, a failing one cannot report anyway. (Not for sppark's NTT: see lib/ntt.)
     set(CMAKE_HIP_FLAGS_RELEASE "-O3 -DNDEBUG -Wno-c++11-narrowing")
     set(CMAKE_HIP_FLAGS_DEBUG "-O3 -Wno-c++11-narrowing")
 

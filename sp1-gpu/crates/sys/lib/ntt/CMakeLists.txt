@@ -29,6 +29,9 @@ if(USE_HIP)
     # The portable KoalaBear coset DFT (kb_ntt.cu), which batch_coset_dft uses on HIP.
     target_sources(ntt_objs PRIVATE kb_ntt.cu)
     set_source_files_properties(sppark.cu kb_ntt.cu PROPERTIES LANGUAGE HIP)
+    # sppark's cuda2hip.hpp #undefs assert at its end under NDEBUG, and its NTT code uses assert
+    # after it.
+    set_source_files_properties(sppark.cu PROPERTIES COMPILE_OPTIONS "-UNDEBUG")
 endif()
 
 # BN254 NTT: separate compilation unit with FEATURE_BN254.
@@ -46,5 +49,5 @@ add_library(ntt_bn254_objs OBJECT
 target_link_libraries(ntt_bn254_objs PRIVATE sp1_gpu_bn254)
 
 if(USE_HIP)
-    set_source_files_properties(sppark_bn254.cu PROPERTIES LANGUAGE HIP)
+    set_source_files_properties(sppark_bn254.cu PROPERTIES LANGUAGE HIP COMPILE_OPTIONS "-UNDEBUG")
 endif()
