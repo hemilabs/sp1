@@ -1,3 +1,4 @@
+#include "runtime/gpu_backend.cuh"
 #include <stdio.h>
 #include "poseidon2/poseidon2_kb31_16.cuh"
 #include "poseidon2/poseidon2.cuh"
@@ -22,15 +23,14 @@ __global__ __launch_bounds__(256, 2) void leafHash(
 }
 
 extern "C" void* leaf_hash_merkle_tree_koala_bear_16_kernel() {
-    return (void*)leafHash<
+    return SP1_KERNEL_PTR(leafHash<
         poseidon2::KoalaBearHasher,
         poseidon2_kb31_16::KoalaBear,
-        poseidon2::KoalaBearHasherState>;
+        poseidon2::KoalaBearHasherState>);
 }
 
 extern "C" void* leaf_hash_merkle_tree_bn254_kernel() {
-    return (void*)
-        leafHash<poseidon2::Bn254Hasher, poseidon2_bn254_3::Bn254, poseidon2::Bn254HasherState>;
+    return SP1_KERNEL_PTR(leafHash<poseidon2::Bn254Hasher, poseidon2_bn254_3::Bn254, poseidon2::Bn254HasherState>);
 }
 
 template <typename Hasher_t, typename HashParams, typename HasherState_t>
@@ -49,15 +49,14 @@ __global__ __launch_bounds__(128, 2) void compress(
 }
 
 extern "C" void* compress_merkle_tree_koala_bear_16_kernel() {
-    return (void*)compress<
+    return SP1_KERNEL_PTR(compress<
         poseidon2::KoalaBearHasher,
         poseidon2_kb31_16::KoalaBear,
-        poseidon2::KoalaBearHasherState>;
+        poseidon2::KoalaBearHasherState>);
 }
 
 extern "C" void* compress_merkle_tree_bn254_kernel() {
-    return (void*)
-        compress<poseidon2::Bn254Hasher, poseidon2_bn254_3::Bn254, poseidon2::Bn254HasherState>;
+    return SP1_KERNEL_PTR(compress<poseidon2::Bn254Hasher, poseidon2_bn254_3::Bn254, poseidon2::Bn254HasherState>);
 }
 
 // Batched compress: process multiple small tree layers in a single kernel launch.
@@ -82,15 +81,15 @@ __global__ __launch_bounds__(128, 2) void compressBatched(
 }
 
 extern "C" void* compress_batched_merkle_tree_koala_bear_16_kernel() {
-    return (void*)compressBatched<
+    return SP1_KERNEL_PTR(compressBatched<
         poseidon2::KoalaBearHasher,
         poseidon2_kb31_16::KoalaBear,
-        poseidon2::KoalaBearHasherState>;
+        poseidon2::KoalaBearHasherState>);
 }
 
 extern "C" void* compress_batched_merkle_tree_bn254_kernel() {
-    return (void*)compressBatched<
-        poseidon2::Bn254Hasher, poseidon2_bn254_3::Bn254, poseidon2::Bn254HasherState>;
+    return SP1_KERNEL_PTR(compressBatched<
+        poseidon2::Bn254Hasher, poseidon2_bn254_3::Bn254, poseidon2::Bn254HasherState>);
 }
 
 
@@ -120,15 +119,14 @@ __global__ void computePaths(
 
 
 extern "C" void* compute_paths_merkle_tree_koala_bear_16_kernel() {
-    return (void*)computePaths<
+    return SP1_KERNEL_PTR(computePaths<
         poseidon2::KoalaBearHasher,
         poseidon2_kb31_16::KoalaBear,
-        poseidon2::KoalaBearHasherState>;
+        poseidon2::KoalaBearHasherState>);
 }
 
 extern "C" void* compute_paths_merkle_tree_bn254_kernel() {
-    return (void*)
-        computePaths<poseidon2::Bn254Hasher, poseidon2_bn254_3::Bn254, poseidon2::Bn254HasherState>;
+    return SP1_KERNEL_PTR(computePaths<poseidon2::Bn254Hasher, poseidon2_bn254_3::Bn254, poseidon2::Bn254HasherState>);
 }
 
 
@@ -160,15 +158,15 @@ __global__ void computeOpenings(
 }
 
 extern "C" void* compute_openings_merkle_tree_koala_bear_16_kernel() {
-    return (void*)computeOpenings<
+    return SP1_KERNEL_PTR(computeOpenings<
         poseidon2::KoalaBearHasher,
         poseidon2_kb31_16::KoalaBear,
-        poseidon2::KoalaBearHasherState>;
+        poseidon2::KoalaBearHasherState>);
 }
 
 extern "C" void* compute_openings_merkle_tree_bn254_kernel() {
-    return (void*)computeOpenings<
+    return SP1_KERNEL_PTR(computeOpenings<
         poseidon2::Bn254Hasher,
         poseidon2_bn254_3::Bn254,
-        poseidon2::Bn254HasherState>;
+        poseidon2::Bn254HasherState>);
 }

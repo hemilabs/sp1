@@ -1,3 +1,4 @@
+#include "runtime/gpu_backend.cuh"
 #include <type_traits>
 
 #include "zerocheck/jagged_mle.cuh"
@@ -303,7 +304,7 @@ SP1_KERNEL void jaggedConstraintPolyEval(
         }
     }
 
-    extern __shared__ unsigned char memory[];
+    SP1_EXTERN_SHARED(unsigned char, memory);
     ext_t* shared = reinterpret_cast<ext_t*>(memory);
 
     auto block = cg::this_thread_block();
@@ -316,49 +317,49 @@ SP1_KERNEL void jaggedConstraintPolyEval(
 }
 
 extern "C" void* jagged_constraint_poly_eval_32_koala_bear_kernel() {
-    return (void*)jaggedConstraintPolyEval<kb31_t, 32>;
+    return SP1_KERNEL_PTR(jaggedConstraintPolyEval<kb31_t, 32>);
 }
 
 extern "C" void* jagged_constraint_poly_eval_64_koala_bear_kernel() {
-    return (void*)jaggedConstraintPolyEval<kb31_t, 64>;
+    return SP1_KERNEL_PTR(jaggedConstraintPolyEval<kb31_t, 64>);
 }
 
 extern "C" void* jagged_constraint_poly_eval_128_koala_bear_kernel() {
-    return (void*)jaggedConstraintPolyEval<kb31_t, 128>;
+    return SP1_KERNEL_PTR(jaggedConstraintPolyEval<kb31_t, 128>);
 }
 
 extern "C" void* jagged_constraint_poly_eval_256_koala_bear_kernel() {
-    return (void*)jaggedConstraintPolyEval<kb31_t, 256>;
+    return SP1_KERNEL_PTR(jaggedConstraintPolyEval<kb31_t, 256>);
 }
 
 extern "C" void* jagged_constraint_poly_eval_512_koala_bear_kernel() {
-    return (void*)jaggedConstraintPolyEval<kb31_t, 512>;
+    return SP1_KERNEL_PTR(jaggedConstraintPolyEval<kb31_t, 512>);
 }
 
 extern "C" void* jagged_constraint_poly_eval_1024_koala_bear_kernel() {
-    return (void*)jaggedConstraintPolyEval<kb31_t, 1024>;
+    return SP1_KERNEL_PTR(jaggedConstraintPolyEval<kb31_t, 1024>);
 }
 
 extern "C" void* jagged_constraint_poly_eval_32_koala_bear_extension_kernel() {
-    return (void*)jaggedConstraintPolyEval<ext_t, 32>;
+    return SP1_KERNEL_PTR(jaggedConstraintPolyEval<ext_t, 32>);
 }
 
 extern "C" void* jagged_constraint_poly_eval_64_koala_bear_extension_kernel() {
-    return (void*)jaggedConstraintPolyEval<ext_t, 64>;
+    return SP1_KERNEL_PTR(jaggedConstraintPolyEval<ext_t, 64>);
 }
 
 extern "C" void* jagged_constraint_poly_eval_128_koala_bear_extension_kernel() {
-    return (void*)jaggedConstraintPolyEval<ext_t, 128>;
+    return SP1_KERNEL_PTR(jaggedConstraintPolyEval<ext_t, 128>);
 }
 
 extern "C" void* jagged_constraint_poly_eval_256_koala_bear_extension_kernel() {
-    return (void*)jaggedConstraintPolyEval<ext_t, 256>;
+    return SP1_KERNEL_PTR(jaggedConstraintPolyEval<ext_t, 256>);
 }
 
 extern "C" void* jagged_constraint_poly_eval_512_koala_bear_extension_kernel() {
-    return (void*)jaggedConstraintPolyEval<ext_t, 512>;
+    return SP1_KERNEL_PTR(jaggedConstraintPolyEval<ext_t, 512>);
 }
 
 extern "C" void* jagged_constraint_poly_eval_1024_koala_bear_extension_kernel() {
-    return (void*)jaggedConstraintPolyEval<ext_t, 1024>;
+    return SP1_KERNEL_PTR(jaggedConstraintPolyEval<ext_t, 1024>);
 }

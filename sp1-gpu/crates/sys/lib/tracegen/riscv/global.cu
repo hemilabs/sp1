@@ -1,3 +1,4 @@
+#include "runtime/gpu_backend.cuh"
 #include "sp1-gpu-cbindgen.hpp"
 
 #include "fields/kb31_t.cuh"
@@ -244,9 +245,9 @@ __global__ void riscv_global_generate_trace_finalize_kernel(
 
 namespace sp1_gpu_sys {
 extern KernelPtr riscv_global_generate_trace_decompress_kernel() {
-    return (KernelPtr)::riscv_global_generate_trace_decompress_kernel;
+    return (KernelPtr)SP1_KERNEL_PTR(::riscv_global_generate_trace_decompress_kernel);
 }
 extern KernelPtr riscv_global_generate_trace_finalize_kernel() {
-    return (KernelPtr)::riscv_global_generate_trace_finalize_kernel;
+    return (KernelPtr)SP1_KERNEL_PTR(::riscv_global_generate_trace_finalize_kernel);
 }
 } // namespace sp1_gpu_sys

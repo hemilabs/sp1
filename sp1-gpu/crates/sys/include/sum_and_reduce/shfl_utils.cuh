@@ -1,5 +1,7 @@
 #pragma once
 
+#include "runtime/gpu_backend.cuh"
+
 // Shuffle-down helper: reinterprets any type as an array of uint32_t and
 // shuffles each 32-bit word independently. This works for kb31_t (1 word)
 // and kb31_extension_t (4 words) without requiring type-specific overloads.
@@ -11,7 +13,7 @@ __device__ __forceinline__ F shfl_down_field(F val, unsigned int offset) {
     uint32_t* words = reinterpret_cast<uint32_t*>(&val);
 #pragma unroll
     for (int i = 0; i < N; i++) {
-#ifdef __HIPCC__
+#ifdef SP1_PORTABLE
         words[i] = __shfl_down(words[i], offset);
 #else
         words[i] = __shfl_down_sync(0xFFFFFFFF, words[i], offset);
@@ -29,7 +31,7 @@ __device__ __forceinline__ F shfl_field(F val, int srcLane, int width = 0) {
     uint32_t* words = reinterpret_cast<uint32_t*>(&val);
 #pragma unroll
     for (int i = 0; i < N; i++) {
-#ifdef __HIPCC__
+#ifdef SP1_PORTABLE
         if (width > 0)
             words[i] = __shfl(words[i], srcLane, width);
         else

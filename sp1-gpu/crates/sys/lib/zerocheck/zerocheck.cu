@@ -1,3 +1,4 @@
+#include "runtime/gpu_backend.cuh"
 #include "config.cuh"
 #include "sum_and_reduce/reduce.cuh"
 #include "zerocheck/zerocheck.cuh"
@@ -87,7 +88,7 @@ SP1_KERNEL void zerocheckFixLastVariableAndSumAsPoly(
     // __syncthreads();
 
     // Allocate shared memory
-    extern __shared__ unsigned char memory[];
+    SP1_EXTERN_SHARED(unsigned char, memory);
     EF* shared = reinterpret_cast<EF*>(memory);
 
     auto reduce_tile = cg::tiled_partition<32>(block);
@@ -151,7 +152,7 @@ SP1_KERNEL void zerocheckSumAsPoly(
     }
 
     // Allocate shared memory
-    extern __shared__ unsigned char memory[];
+    SP1_EXTERN_SHARED(unsigned char, memory);
     EF* shared = reinterpret_cast<EF*>(memory);
 
     auto block = cg::this_thread_block();
@@ -175,17 +176,17 @@ SP1_KERNEL void zerocheckSumAsPoly(
 }
 
 extern "C" void* zerocheck_sum_as_poly_base_ext_kernel() {
-    return (void*)zerocheckSumAsPoly<felt_t, ext_t>;
+    return SP1_KERNEL_PTR(zerocheckSumAsPoly<felt_t, ext_t>);
 }
 
 extern "C" void* zerocheck_sum_as_poly_ext_ext_kernel() {
-    return (void*)zerocheckSumAsPoly<ext_t, ext_t>;
+    return SP1_KERNEL_PTR(zerocheckSumAsPoly<ext_t, ext_t>);
 }
 
 extern "C" void* zerocheck_fix_last_variable_and_sum_as_poly_base_ext_kernel() {
-    return (void*)zerocheckFixLastVariableAndSumAsPoly<felt_t, ext_t>;
+    return SP1_KERNEL_PTR(zerocheckFixLastVariableAndSumAsPoly<felt_t, ext_t>);
 }
 
 extern "C" void* zerocheck_fix_last_variable_and_sum_as_poly_ext_ext_kernel() {
-    return (void*)zerocheckFixLastVariableAndSumAsPoly<ext_t, ext_t>;
+    return SP1_KERNEL_PTR(zerocheckFixLastVariableAndSumAsPoly<ext_t, ext_t>);
 }

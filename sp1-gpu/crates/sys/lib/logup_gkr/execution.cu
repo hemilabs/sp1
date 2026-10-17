@@ -1,3 +1,4 @@
+#include "runtime/gpu_backend.cuh"
 #include <stdint.h>
 
 #include "logup_gkr/execution.cuh"
@@ -67,7 +68,7 @@ __global__ void extractOutput(
 }
 
 extern "C" void* logup_gkr_circuit_transition() {
-    return (void*)logUpCircuitTransition;
+    return SP1_KERNEL_PTR(logUpCircuitTransition);
 }
 
-extern "C" void* logup_gkr_extract_output() { return (void*)extractOutput; }
+extern "C" void* logup_gkr_extract_output() { return SP1_KERNEL_PTR(extractOutput); }

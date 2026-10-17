@@ -1,3 +1,4 @@
+#include "runtime/gpu_backend.cuh"
 // Copyright Supranational LLC
 // Licensed under the Apache License, Version 2.0, see LICENSE for details.
 // SPDX-License-Identifier: Apache-2.0
@@ -86,11 +87,11 @@ static __device__ __constant__ const uint32_t ALT_BN128_m0 = 0xefffffff;
 
 } // namespace device
 
-#ifndef __HIPCC__
+#ifndef SP1_PORTABLE
 #include "mont_t.cuh"
 #endif
 
-#ifndef __HIPCC__
+#ifndef SP1_PORTABLE
 typedef mont_t<
     254,
     (254 + 31) / 32,
@@ -110,5 +111,5 @@ typedef mont_t<
     device::ALT_BN128_rone,
     device::ALT_BN128_rx4>
     fr_mont;
-#endif // !__HIPCC__
+#endif // !SP1_PORTABLE
 #endif // __SPPARK_FF_ALT_BN128_HPP__

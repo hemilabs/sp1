@@ -12,6 +12,15 @@
 #include <hip/hip_runtime.h>
 #endif
 
+#include "runtime/gpu_backend.cuh"
+
+// The high 64 bits of a 64x64-bit product: SYCL device code has no 128-bit integers.
+#ifdef SP1_SYCL
+#define SP1_MULHI_U64(a, b) sycl::mul_hi((uint64_t)(a), (uint64_t)(b))
+#else
+#define SP1_MULHI_U64(a, b) ((uint64_t)(__uint128_t(a) * (b) >> 64))
+#endif
+
 // Pack two uint32_t into a uint64_t (low, high)
 __device__ __forceinline__ void pack(uint64_t& d, uint32_t a0, uint32_t a1) {
     d = (uint64_t)a0 | ((uint64_t)a1 << 32);
@@ -52,7 +61,7 @@ __device__ __forceinline__ void mul_hi(uint32_t& d, uint32_t a, uint32_t b) {
     d = (uint32_t)(((uint64_t)a * b) >> 32);
 }
 __device__ __forceinline__ void mul_hi(uint64_t& d, uint64_t a, uint64_t b) {
-    d = (uint64_t)(__uint128_t(a) * b >> 64);
+    d = SP1_MULHI_U64(a, b);
 }
 
 // Mul wide: uint32 x uint32 -> uint64
@@ -73,7 +82,7 @@ __device__ __forceinline__ void mad_hi(uint32_t& d, uint32_t a, uint32_t b, uint
     d = (uint32_t)(((uint64_t)a * b) >> 32) + c;
 }
 __device__ __forceinline__ void mad_hi(uint64_t& d, uint64_t a, uint64_t b, uint64_t c) {
-    d = (uint64_t)(__uint128_t(a) * b >> 64) + c;
+    d = SP1_MULHI_U64(a, b) + c;
 }
 
 // Mad wide: uint32 x uint32 + uint64 -> uint64
@@ -115,7 +124,7 @@ __device__ __forceinline__ void mad_hi_cc(uint32_t& d, uint32_t a, uint32_t b, u
     d = (uint32_t)(((uint64_t)a * b) >> 32) + c;
 }
 __device__ __forceinline__ void mad_hi_cc(uint64_t& d, uint64_t a, uint64_t b, uint64_t c) {
-    d = (uint64_t)(__uint128_t(a) * b >> 64) + c;
+    d = SP1_MULHI_U64(a, b) + c;
 }
 
 // madc.lo / madc.hi — multiply-add with carry in
@@ -129,7 +138,7 @@ __device__ __forceinline__ void madc_hi(uint32_t& d, uint32_t a, uint32_t b, uin
     d = (uint32_t)(((uint64_t)a * b) >> 32) + c;
 }
 __device__ __forceinline__ void madc_hi(uint64_t& d, uint64_t a, uint64_t b, uint64_t c) {
-    d = (uint64_t)(__uint128_t(a) * b >> 64) + c;
+    d = SP1_MULHI_U64(a, b) + c;
 }
 
 // madc.lo.cc / madc.hi.cc
@@ -143,7 +152,7 @@ __device__ __forceinline__ void madc_hi_cc(uint32_t& d, uint32_t a, uint32_t b, 
     d = (uint32_t)(((uint64_t)a * b) >> 32) + c;
 }
 __device__ __forceinline__ void madc_hi_cc(uint64_t& d, uint64_t a, uint64_t b, uint64_t c) {
-    d = (uint64_t)(__uint128_t(a) * b >> 64) + c;
+    d = SP1_MULHI_U64(a, b) + c;
 }
 
 // Wide mad.cc / madc.cc / madc — these are 2-instruction sequences on NVIDIA

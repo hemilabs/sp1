@@ -1,3 +1,4 @@
+#include "runtime/gpu_backend.cuh"
 #pragma once
 #include "fields/kb31_t.cuh"
 #include "poseidon2/poseidon2_kb31_16.cuh"
@@ -116,7 +117,7 @@ class DuplexChallenger {
 
         size_t original_buffer_size = buffer_sizes[0];
         size_t original_output_buffer_size = buffer_sizes[1];
-        __shared__ kb31_t challenger_state[NUM_ELEMENTS];
+        SP1_SHARED_ARRAY(kb31_t, challenger_state, [NUM_ELEMENTS]);
 
         if (threadIdx.x == 0) {
             for (size_t j = 0; j < WIDTH; j++) {

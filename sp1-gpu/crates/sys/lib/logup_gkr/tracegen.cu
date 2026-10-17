@@ -1,3 +1,4 @@
+#include "runtime/gpu_backend.cuh"
 #include "logup_gkr/execution.cuh"
 #include "logup_gkr/first_layer.cuh"
 #include "logup_gkr/tracegen.cuh"
@@ -147,5 +148,5 @@ __global__ void populateLastCircuitLayer(
 }
 
 extern "C" void* logup_gkr_populate_last_circuit_layer() {
-    return (void*)populateLastCircuitLayer;
+    return SP1_KERNEL_PTR(populateLastCircuitLayer);
 }

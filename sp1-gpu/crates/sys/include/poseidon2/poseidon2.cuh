@@ -1,5 +1,7 @@
 #pragma once
 
+#include "runtime/gpu_backend.cuh"
+
 #include "poseidon2/poseidon2_kb31_16.cuh"
 #include "poseidon2/poseidon2_bn254_3.cuh"
 
@@ -259,7 +261,7 @@ struct MultiFieldHasherState : public HasherState<Params, Hasher_t> {
 };
 
 using KoalaBearHasher = StaticHasher<poseidon2_kb31_16::KoalaBear>;
-#ifndef __HIPCC__
+#ifndef SP1_PORTABLE
 using Bn254Hasher = StaticHasher<poseidon2_bn254_3::Bn254>;
 #else
 // HIP: StaticHasher's `static constexpr` pointer-to-__constant__ pattern fails without

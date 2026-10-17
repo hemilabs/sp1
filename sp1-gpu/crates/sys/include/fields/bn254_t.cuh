@@ -1,13 +1,17 @@
 #pragma once
 
-#ifdef __HIPCC__
+#include "runtime/gpu_backend.cuh"
+
+#ifdef SP1_PORTABLE
 // Full BN254 scalar field (Fr) Montgomery arithmetic for HIP/AMD.
 // Uses portable 32-bit CIOS (same algorithm as bn254_fq_t but with scalar field modulus r).
 //
 // Fr modulus r = 21888242871839275222246405745257275088548364400416034343698204186575808495617
 // M0 = -r^{-1} mod 2^32 = 0xefffffff
 #include <cstdint>
+#ifdef __HIPCC__
 #include <hip/hip_runtime.h>
+#endif
 #include "fields/alt_bn128.hpp"
 
 struct bn254_t {

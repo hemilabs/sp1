@@ -21,7 +21,11 @@ partialBlockReduce(const TyBlock& block, const TyTile& tile, F val, F* shared) {
     // This replaces log2(numWarps) tree-reduction steps (each with a __syncthreads)
     // with a single warp-level shuffle reduction — saving 2-3 barrier syncs.
     if (block.thread_rank() < tile.size()) {
-        F warpVal = (block.thread_rank() < numWarps) ? shared[block.thread_rank()] : F::zero();
+        // A loop for blocks of more warps than a warp has lanes (narrow SYCL sub-groups).
+        F warpVal = F::zero();
+        for (int i = block.thread_rank(); i < numWarps; i += tile.size()) {
+            warpVal += shared[i];
+        }
         warpVal = cg::reduce(tile, warpVal, cg::plus<F>());
         if (block.thread_rank() == 0) {
             shared[0] = warpVal;

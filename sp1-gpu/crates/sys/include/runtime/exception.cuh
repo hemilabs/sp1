@@ -1,5 +1,7 @@
 #pragma once
 
+#include "runtime/gpu_backend.cuh"
+
 #ifdef __HIPCC__
 #include <hip/hip_runtime.h>
 using cudaError_t = hipError_t;
@@ -41,7 +43,7 @@ extern "C" const rustCudaError_t CUDA_OUT_OF_MEMORY;
 
 extern "C" const rustCudaError_t CUDA_ERROR_NOT_READY_SLOP;
 
-#ifndef __HIPCC__
+#ifndef SP1_PORTABLE
 #define CUDA_UNWRAP(expr)                                                                          \
     do {                                                                                           \
         cudaError_t code = expr;                                                                   \
