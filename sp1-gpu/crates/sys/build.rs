@@ -686,6 +686,7 @@ const SYCL_KERNEL_SOURCES: &[&str] = &[
     "lib/zerocheck/layout_check.cu",
     "lib/zerocheck/pad_adj.cu",
     "lib/zerocheck/sequential.cu",
+    "lib/ntt/kb_ntt.cu",
     "lib/sycl/runtime.cpp",
     "lib/sycl/ntt.cpp",
 ];

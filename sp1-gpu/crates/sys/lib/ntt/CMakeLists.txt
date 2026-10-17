@@ -26,7 +26,9 @@ if(NVIDIA_NTT)
 endif()
 
 if(USE_HIP)
-    set_source_files_properties(sppark.cu PROPERTIES LANGUAGE HIP)
+    # The portable KoalaBear coset DFT (kb_ntt.cu), which batch_coset_dft uses on HIP.
+    target_sources(ntt_objs PRIVATE kb_ntt.cu)
+    set_source_files_properties(sppark.cu kb_ntt.cu PROPERTIES LANGUAGE HIP)
 endif()
 
 # BN254 NTT: separate compilation unit with FEATURE_BN254.
