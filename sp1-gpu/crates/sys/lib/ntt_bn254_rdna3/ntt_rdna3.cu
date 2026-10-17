@@ -1,3 +1,4 @@
+#include "runtime/gpu_backend.cuh"
 // RDNA3-optimized BN254 NTT: four-step decomposition with LDS-resident sub-NTTs.
 //
 // Replaces sppark's NTT on the HIP path. Implements the same extern "C" FFI
@@ -90,7 +91,7 @@ __global__ void bn254_small_ntt_kernel(
 
     if (group_id >= num_groups) return;
 
-    extern __shared__ uint32_t lds_small[];
+    SP1_EXTERN_SHARED(uint32_t, lds_small);
     uint32_t group_in_block = threadIdx.x / half_n;
     uint32_t* my_lds = lds_small + group_in_block * small_n * 8;
 

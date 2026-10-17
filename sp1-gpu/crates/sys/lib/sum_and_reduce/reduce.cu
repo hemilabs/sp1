@@ -1,3 +1,4 @@
+#include "runtime/gpu_backend.cuh"
 #include "config.cuh"
 #include "sum_and_reduce/reduce.cuh"
 #include "runtime/gpu_compat.cuh"
@@ -18,7 +19,7 @@ __global__ void reduceKernel(F* input, F* output, size_t width, size_t height) {
     auto tile = cg::tiled_partition<32>(block);
 
     // Allocate shared memory
-    extern __shared__ unsigned char memory[];
+    SP1_EXTERN_SHARED(unsigned char, memory);
     F* shared = reinterpret_cast<F*>(memory);
 
     // Stride loop on columns
@@ -42,9 +43,9 @@ __global__ void reduceKernel(F* input, F* output, size_t width, size_t height) {
     }
 }
 
-extern "C" void* reduce_kernel_felt() { return reinterpret_cast<void*>(reduceKernel<felt_t>); }
+extern "C" void* reduce_kernel_felt() { return SP1_KERNEL_PTR(reduceKernel<felt_t>); }
 
-extern "C" void* reduce_kernel_ext() { return reinterpret_cast<void*>(reduceKernel<ext_t>); }
+extern "C" void* reduce_kernel_ext() { return SP1_KERNEL_PTR(reduceKernel<ext_t>); }
 
 // Test-only kernel: launched as a single block with `len` threads (where
 // `len <= blockDim.x`). Each thread loads `input[threadIdx.x]` (or zero if out
@@ -56,7 +57,7 @@ __global__ void partialBlockReduceTestKernel(const felt_t* input, felt_t* output
     auto block = cg::this_thread_block();
     auto tile = cg::tiled_partition<32>(block);
 
-    extern __shared__ unsigned char memory[];
+    SP1_EXTERN_SHARED(unsigned char, memory);
     felt_t* shared = reinterpret_cast<felt_t*>(memory);
 
     felt_t val = (threadIdx.x < len) ? input[threadIdx.x] : felt_t::zero();
@@ -68,5 +69,5 @@ __global__ void partialBlockReduceTestKernel(const felt_t* input, felt_t* output
 }
 
 extern "C" void* partial_block_reduce_test_kernel_felt() {
-    return reinterpret_cast<void*>(partialBlockReduceTestKernel);
+    return SP1_KERNEL_PTR(partialBlockReduceTestKernel);
 }

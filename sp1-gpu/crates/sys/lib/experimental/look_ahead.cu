@@ -1,3 +1,4 @@
+#include "runtime/gpu_backend.cuh"
 #include "experimental/look_ahead.cuh"
 
 #include "config.cuh"
@@ -114,7 +115,7 @@ __global__ void roundKernel(
 
     const size_t block_tile = blockDim.x * TILES_PER_WARP;
 
-    extern __shared__ __align__(16) uint8_t smem[];
+    SP1_EXTERN_SHARED(uint8_t, smem);
     // Assign shared memory pointers for `p` and `q`
     ext_t* p_smem = reinterpret_cast<ext_t*>(smem);
     ext_t* q_smem =
@@ -242,71 +243,71 @@ __global__ void roundKernel(
     }
 }
 
-extern "C" void* round_kernel_1_32_2_2_false() { return (void*)roundKernel<1, 32, 2, 2, false>; }
+extern "C" void* round_kernel_1_32_2_2_false() { return SP1_KERNEL_PTR(roundKernel<1, 32, 2, 2, false>); }
 
 
-extern "C" void* round_kernel_2_32_2_2_true() { return (void*)roundKernel<2, 32, 2, 2, true>; }
+extern "C" void* round_kernel_2_32_2_2_true() { return SP1_KERNEL_PTR(roundKernel<2, 32, 2, 2, true>); }
 
-extern "C" void* round_kernel_2_32_2_2_false() { return (void*)roundKernel<2, 32, 2, 2, false>; }
+extern "C" void* round_kernel_2_32_2_2_false() { return SP1_KERNEL_PTR(roundKernel<2, 32, 2, 2, false>); }
 
-extern "C" void* round_kernel_4_32_2_2_true() { return (void*)roundKernel<4, 32, 2, 2, true>; }
+extern "C" void* round_kernel_4_32_2_2_true() { return SP1_KERNEL_PTR(roundKernel<4, 32, 2, 2, true>); }
 
-extern "C" void* round_kernel_4_32_2_2_false() { return (void*)roundKernel<4, 32, 2, 2, false>; }
+extern "C" void* round_kernel_4_32_2_2_false() { return SP1_KERNEL_PTR(roundKernel<4, 32, 2, 2, false>); }
 
-extern "C" void* round_kernel_8_32_2_2_true() { return (void*)roundKernel<8, 32, 2, 2, true>; }
+extern "C" void* round_kernel_8_32_2_2_true() { return SP1_KERNEL_PTR(roundKernel<8, 32, 2, 2, true>); }
 
-extern "C" void* round_kernel_8_32_2_2_false() { return (void*)roundKernel<8, 32, 2, 2, false>; }
+extern "C" void* round_kernel_8_32_2_2_false() { return SP1_KERNEL_PTR(roundKernel<8, 32, 2, 2, false>); }
 
 // FIX_TILE=64 variants
-extern "C" void* round_kernel_1_64_2_2_false() { return (void*)roundKernel<1, 64, 2, 2, false>; }
+extern "C" void* round_kernel_1_64_2_2_false() { return SP1_KERNEL_PTR(roundKernel<1, 64, 2, 2, false>); }
 
-extern "C" void* round_kernel_2_64_2_2_true() { return (void*)roundKernel<2, 64, 2, 2, true>; }
+extern "C" void* round_kernel_2_64_2_2_true() { return SP1_KERNEL_PTR(roundKernel<2, 64, 2, 2, true>); }
 
-extern "C" void* round_kernel_2_64_2_2_false() { return (void*)roundKernel<2, 64, 2, 2, false>; }
+extern "C" void* round_kernel_2_64_2_2_false() { return SP1_KERNEL_PTR(roundKernel<2, 64, 2, 2, false>); }
 
-extern "C" void* round_kernel_4_64_2_2_true() { return (void*)roundKernel<4, 64, 2, 2, true>; }
+extern "C" void* round_kernel_4_64_2_2_true() { return SP1_KERNEL_PTR(roundKernel<4, 64, 2, 2, true>); }
 
-extern "C" void* round_kernel_4_64_2_2_false() { return (void*)roundKernel<4, 64, 2, 2, false>; }
+extern "C" void* round_kernel_4_64_2_2_false() { return SP1_KERNEL_PTR(roundKernel<4, 64, 2, 2, false>); }
 
-extern "C" void* round_kernel_8_64_2_2_true() { return (void*)roundKernel<8, 64, 2, 2, true>; }
+extern "C" void* round_kernel_8_64_2_2_true() { return SP1_KERNEL_PTR(roundKernel<8, 64, 2, 2, true>); }
 
-extern "C" void* round_kernel_8_64_2_2_false() { return (void*)roundKernel<8, 64, 2, 2, false>; }
+extern "C" void* round_kernel_8_64_2_2_false() { return SP1_KERNEL_PTR(roundKernel<8, 64, 2, 2, false>); }
 
 // NUM_POINTS=3 variants with FIX_TILE=32
-extern "C" void* round_kernel_1_32_2_3_false() { return (void*)roundKernel<1, 32, 2, 3, false>; }
+extern "C" void* round_kernel_1_32_2_3_false() { return SP1_KERNEL_PTR(roundKernel<1, 32, 2, 3, false>); }
 
-extern "C" void* round_kernel_2_32_2_3_true() { return (void*)roundKernel<2, 32, 2, 3, true>; }
+extern "C" void* round_kernel_2_32_2_3_true() { return SP1_KERNEL_PTR(roundKernel<2, 32, 2, 3, true>); }
 
-extern "C" void* round_kernel_2_32_2_3_false() { return (void*)roundKernel<2, 32, 2, 3, false>; }
+extern "C" void* round_kernel_2_32_2_3_false() { return SP1_KERNEL_PTR(roundKernel<2, 32, 2, 3, false>); }
 
-extern "C" void* round_kernel_4_32_2_3_true() { return (void*)roundKernel<4, 32, 2, 3, true>; }
+extern "C" void* round_kernel_4_32_2_3_true() { return SP1_KERNEL_PTR(roundKernel<4, 32, 2, 3, true>); }
 
-extern "C" void* round_kernel_4_32_2_3_false() { return (void*)roundKernel<4, 32, 2, 3, false>; }
+extern "C" void* round_kernel_4_32_2_3_false() { return SP1_KERNEL_PTR(roundKernel<4, 32, 2, 3, false>); }
 
-extern "C" void* round_kernel_8_32_2_3_true() { return (void*)roundKernel<8, 32, 2, 3, true>; }
+extern "C" void* round_kernel_8_32_2_3_true() { return SP1_KERNEL_PTR(roundKernel<8, 32, 2, 3, true>); }
 
-extern "C" void* round_kernel_8_32_2_3_false() { return (void*)roundKernel<8, 32, 2, 3, false>; }
+extern "C" void* round_kernel_8_32_2_3_false() { return SP1_KERNEL_PTR(roundKernel<8, 32, 2, 3, false>); }
 
 // NUM_POINTS=3 variants with FIX_TILE=64
-extern "C" void* round_kernel_1_64_2_3_false() { return (void*)roundKernel<1, 64, 2, 3, false>; }
+extern "C" void* round_kernel_1_64_2_3_false() { return SP1_KERNEL_PTR(roundKernel<1, 64, 2, 3, false>); }
 
-extern "C" void* round_kernel_1_64_4_8_false() { return (void*)roundKernel<1, 64, 4, 8, false>; }
+extern "C" void* round_kernel_1_64_4_8_false() { return SP1_KERNEL_PTR(roundKernel<1, 64, 4, 8, false>); }
 
-extern "C" void* round_kernel_2_64_2_3_true() { return (void*)roundKernel<2, 64, 2, 3, true>; }
+extern "C" void* round_kernel_2_64_2_3_true() { return SP1_KERNEL_PTR(roundKernel<2, 64, 2, 3, true>); }
 
-extern "C" void* round_kernel_2_64_2_3_false() { return (void*)roundKernel<2, 64, 2, 3, false>; }
+extern "C" void* round_kernel_2_64_2_3_false() { return SP1_KERNEL_PTR(roundKernel<2, 64, 2, 3, false>); }
 
-extern "C" void* round_kernel_4_64_2_3_true() { return (void*)roundKernel<4, 64, 2, 3, true>; }
+extern "C" void* round_kernel_4_64_2_3_true() { return SP1_KERNEL_PTR(roundKernel<4, 64, 2, 3, true>); }
 
-extern "C" void* round_kernel_4_64_2_3_false() { return (void*)roundKernel<4, 64, 2, 3, false>; }
+extern "C" void* round_kernel_4_64_2_3_false() { return SP1_KERNEL_PTR(roundKernel<4, 64, 2, 3, false>); }
 
-extern "C" void* round_kernel_4_64_4_8_true() { return (void*)roundKernel<4, 64, 4, 8, true>; }
+extern "C" void* round_kernel_4_64_4_8_true() { return SP1_KERNEL_PTR(roundKernel<4, 64, 4, 8, true>); }
 
-extern "C" void* round_kernel_4_64_4_8_false() { return (void*)roundKernel<4, 64, 4, 8, false>; }
+extern "C" void* round_kernel_4_64_4_8_false() { return SP1_KERNEL_PTR(roundKernel<4, 64, 4, 8, false>); }
 
-extern "C" void* round_kernel_8_64_2_3_true() { return (void*)roundKernel<8, 64, 2, 3, true>; }
+extern "C" void* round_kernel_8_64_2_3_true() { return SP1_KERNEL_PTR(roundKernel<8, 64, 2, 3, true>); }
 
-extern "C" void* round_kernel_8_64_2_3_false() { return (void*)roundKernel<8, 64, 2, 3, false>; }
+extern "C" void* round_kernel_8_64_2_3_false() { return SP1_KERNEL_PTR(roundKernel<8, 64, 2, 3, false>); }
 
 
-extern "C" void* round_kernel_1_128_4_8_false() { return (void*)roundKernel<1, 128, 4, 8, false>; }
+extern "C" void* round_kernel_1_128_4_8_false() { return SP1_KERNEL_PTR(roundKernel<1, 128, 4, 8, false>); }

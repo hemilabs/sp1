@@ -1,3 +1,4 @@
+#include "runtime/gpu_backend.cuh"
 // Two-round lookahead kernels for the LogUp GKR sumchecks.
 //
 // Both kernels iterate over QUADS: four consecutive dense elements 4q .. 4q+3 of a layer,
@@ -112,7 +113,7 @@ __global__ void logupGkrTwoRoundSumLayer(
     }
 
     // Allocate shared memory
-    extern __shared__ unsigned char memory[];
+    SP1_EXTERN_SHARED(unsigned char, memory);
     ext_t* shared = reinterpret_cast<ext_t*>(memory);
 
     auto block = cg::this_thread_block();
@@ -229,7 +230,7 @@ __global__ void logupGkrTwoRoundFixAndSumLayer(
     }
 
     // Allocate shared memory
-    extern __shared__ unsigned char memory[];
+    SP1_EXTERN_SHARED(unsigned char, memory);
     ext_t* shared = reinterpret_cast<ext_t*>(memory);
 
     auto block = cg::this_thread_block();
@@ -246,17 +247,17 @@ __global__ void logupGkrTwoRoundFixAndSumLayer(
 }
 
 extern "C" void* logup_gkr_two_round_sum_circuit_layer() {
-    return (void*)logupGkrTwoRoundSumLayer<JaggedGkrLayer>;
+    return SP1_KERNEL_PTR(logupGkrTwoRoundSumLayer<JaggedGkrLayer>);
 }
 
 extern "C" void* logup_gkr_two_round_sum_first_layer() {
-    return (void*)logupGkrTwoRoundSumLayer<JaggedFirstGkrLayer>;
+    return SP1_KERNEL_PTR(logupGkrTwoRoundSumLayer<JaggedFirstGkrLayer>);
 }
 
 extern "C" void* logup_gkr_two_round_fix_and_sum_circuit_layer() {
-    return (void*)logupGkrTwoRoundFixAndSumLayer<JaggedGkrLayer>;
+    return SP1_KERNEL_PTR(logupGkrTwoRoundFixAndSumLayer<JaggedGkrLayer>);
 }
 
 extern "C" void* logup_gkr_two_round_fix_and_sum_first_layer() {
-    return (void*)logupGkrTwoRoundFixAndSumLayer<JaggedFirstGkrLayer>;
+    return SP1_KERNEL_PTR(logupGkrTwoRoundFixAndSumLayer<JaggedFirstGkrLayer>);
 }

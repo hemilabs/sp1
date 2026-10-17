@@ -1,5 +1,7 @@
 #pragma once
 
+#include "runtime/gpu_backend.cuh"
+
 #include "runtime/exception.cuh"
 
 #ifdef __HIPCC__
@@ -37,7 +39,7 @@ extern "C" rustCudaError_t cuda_event_elapsed_time(float* ms, cudaEvent_t start,
 
 // Cuda streams.
 
-#ifdef __HIPCC__
+#ifdef SP1_PORTABLE
 extern "C" const cudaStream_t DEFAULT_STREAM;
 #else
 extern "C" const cudaStream_t DEFAULT_STREAM = cudaStreamDefault;

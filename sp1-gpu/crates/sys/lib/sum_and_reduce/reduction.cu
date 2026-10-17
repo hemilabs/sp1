@@ -1,3 +1,4 @@
+#include "runtime/gpu_backend.cuh"
 #include "sum_and_reduce/reduction.cuh"
 #include "runtime/gpu_compat.cuh"
 
@@ -23,7 +24,7 @@ __global__ void partialBlockReduceKernel(F* partial, F* A, size_t width, size_t 
     }
 
     // Allocate shared memory
-    extern __shared__ unsigned char memory[];
+    SP1_EXTERN_SHARED(unsigned char, memory);
     F* shared = reinterpret_cast<F*>(memory);
 
     // // Warp-level reduction within tiles
@@ -79,7 +80,7 @@ __global__ void partialBlockSumKernel(F* partial, F* A, size_t width, size_t hei
     }
 
     // Allocate shared memory
-    extern __shared__ unsigned char memory[];
+    SP1_EXTERN_SHARED(unsigned char, memory);
     F* shared = reinterpret_cast<F*>(memory);
 
     // // Warp-level reduction within tiles
@@ -114,16 +115,16 @@ __global__ void blockSum(F* A, F* result, size_t width, size_t height) {
     block.sync();
 }
 
-extern "C" void* koala_bear_sum_block_reduce_kernel() { return (void*)blockSum<kb31_t>; }
+extern "C" void* koala_bear_sum_block_reduce_kernel() { return SP1_KERNEL_PTR(blockSum<kb31_t>); }
 
 extern "C" void* koala_bear_sum_partial_block_reduce_kernel() {
-    return (void*)partialBlockSumKernel<kb31_t>;
+    return SP1_KERNEL_PTR(partialBlockSumKernel<kb31_t>);
 }
 
 extern "C" void* koala_bear_extension_sum_block_reduce_kernel() {
-    return (void*)blockSum<kb31_extension_t>;
+    return SP1_KERNEL_PTR(blockSum<kb31_extension_t>);
 }
 
 extern "C" void* koala_bear_extension_sum_partial_block_reduce_kernel() {
-    return (void*)partialBlockSumKernel<kb31_extension_t>;
+    return SP1_KERNEL_PTR(partialBlockSumKernel<kb31_extension_t>);
 }

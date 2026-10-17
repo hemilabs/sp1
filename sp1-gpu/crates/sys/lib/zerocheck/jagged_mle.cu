@@ -1,3 +1,4 @@
+#include "runtime/gpu_backend.cuh"
 #include "config.cuh"
 #include "tracegen/jagged_tracegen/jagged.cuh"
 #include "zerocheck/jagged_mle.cuh"
@@ -69,14 +70,14 @@ __global__ void jaggedEvalChunked(
     inputJaggedMle.evaluate(row_coefficient, col_coefficient, L, num_cols, output_evals);
 }
 
-extern "C" void* initialize_jagged_info() { return (void*)initializeJaggedInfo; }
+extern "C" void* initialize_jagged_info() { return SP1_KERNEL_PTR(initializeJaggedInfo); }
 
-extern "C" void* fix_last_variable_jagged_felt() { return (void*)fixLastVariableJagged<felt_t>; }
-extern "C" void* fix_last_variable_jagged_ext() { return (void*)fixLastVariableJagged<ext_t>; }
+extern "C" void* fix_last_variable_jagged_felt() { return SP1_KERNEL_PTR(fixLastVariableJagged<felt_t>); }
+extern "C" void* fix_last_variable_jagged_ext() { return SP1_KERNEL_PTR(fixLastVariableJagged<ext_t>); }
 extern "C" void* fix_last_two_variables_jagged_felt() {
-    return (void*)fixLastTwoVariablesJagged<felt_t>;
+    return SP1_KERNEL_PTR(fixLastTwoVariablesJagged<felt_t>);
 }
-extern "C" void* fix_last_variable_jagged_info() { return (void*)fixLastVariableJaggedInfo; }
+extern "C" void* fix_last_variable_jagged_info() { return SP1_KERNEL_PTR(fixLastVariableJaggedInfo); }
 
-extern "C" void* jagged_eval_kernel_chunked_felt() { return (void*)jaggedEvalChunked<felt_t>; }
-extern "C" void* jagged_eval_kernel_chunked_ext() { return (void*)jaggedEvalChunked<ext_t>; }
+extern "C" void* jagged_eval_kernel_chunked_felt() { return SP1_KERNEL_PTR(jaggedEvalChunked<felt_t>); }
+extern "C" void* jagged_eval_kernel_chunked_ext() { return SP1_KERNEL_PTR(jaggedEvalChunked<ext_t>); }

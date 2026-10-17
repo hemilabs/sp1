@@ -1,3 +1,4 @@
+#include "runtime/gpu_backend.cuh"
 #include "sp1-gpu-cbindgen.hpp"
 
 #include "fields/kb31_t.cuh"
@@ -58,9 +59,9 @@ __global__ void recursion_poseidon2_wide_generate_trace_koala_bear_kernel(
 
 namespace sp1_gpu_sys {
 extern KernelPtr recursion_poseidon2_wide_generate_preprocessed_trace_koala_bear_kernel() {
-    return (KernelPtr)::recursion_poseidon2_wide_generate_preprocessed_trace_kernel<kb31_t>;
+    return (KernelPtr)SP1_KERNEL_PTR(::recursion_poseidon2_wide_generate_preprocessed_trace_kernel<kb31_t>);
 }
 extern KernelPtr recursion_poseidon2_wide_generate_trace_koala_bear_kernel() {
-    return (KernelPtr)::recursion_poseidon2_wide_generate_trace_koala_bear_kernel;
+    return (KernelPtr)SP1_KERNEL_PTR(::recursion_poseidon2_wide_generate_trace_koala_bear_kernel);
 }
 } // namespace sp1_gpu_sys

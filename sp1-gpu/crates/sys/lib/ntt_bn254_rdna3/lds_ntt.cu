@@ -1,3 +1,4 @@
+#include "runtime/gpu_backend.cuh"
 // BN254 NTT-1024 LDS kernel for RDNA3.
 //
 // Performs a complete 1024-point DIF (Gentleman-Sande) NTT entirely in LDS.
@@ -39,7 +40,7 @@ __global__ void bn254_dit_ntt_1024_kernel(
 ) {
     if (blockIdx.x >= num_sub_ntts) return;
 
-    __shared__ uint32_t lds[8192]; // 1024 × 8 words = 32 KB
+    SP1_SHARED_ARRAY(uint32_t, lds, [8192]); // 1024 × 8 words = 32 KB
 
     const uint32_t tid = threadIdx.x;
     const uint32_t block_offset = blockIdx.x * 1024;

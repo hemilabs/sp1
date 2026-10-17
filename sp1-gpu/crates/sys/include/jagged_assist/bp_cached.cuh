@@ -222,7 +222,7 @@ __global__ void bpCachedRound(
     }
 
     // Block reduction of acc0 / acc1.
-    __shared__ EF sh[32];
+    SP1_SHARED_ARRAY(EF, sh, [32]);
     auto block = cg::this_thread_block();
     auto tile = cg::tiled_partition<32>(block);
     EF t0 = partialBlockReduce(block, tile, acc0, sh);
@@ -260,7 +260,7 @@ __global__ void bpCachedRound2(
     // Ping-pong state: reads `left` / `intermediate_eq_full_evals`, writes the (possibly updated)
     // values to `left_out` / `ieq_out`, so the two threads of a column never race.
     // mats[v][bit]: v = 0 update (alpha_{r-1}), 1 lambda_0, 2 lambda_1.
-    __shared__ EF mats[3][2][BP_S][BP_S];
+    SP1_SHARED_ARRAY(EF, mats, [3][2][BP_S][BP_S]);
     const bool phase2 = r >= d.P;
     const int s = phase2 ? r - d.P : r;
     const int rp = r - 1;
@@ -354,7 +354,7 @@ __global__ void bpCachedRound2(
         if (li == 0) acc0 += out; else acc1 += out;
     }
 
-    __shared__ EF sh[32];
+    SP1_SHARED_ARRAY(EF, sh, [32]);
     auto block = cg::this_thread_block();
     auto tile = cg::tiled_partition<32>(block);
     EF t0 = partialBlockReduce(block, tile, acc0, sh);
@@ -378,14 +378,14 @@ __global__ void bpCachedInterpolateAndObserve(
     int round_num,
     EF* sum_values,
     EF* claim) {
-#ifndef __HIPCC__
+#ifndef SP1_PORTABLE
     if constexpr (std::is_same<Challenger, DuplexChallenger>::value &&
                   std::is_same<EF, kb31_extension_t>::value) {
         // Warp path (launched with 32 threads): lane-parallel partial sums, closed-form
         // interpolation on the fixed nodes {0, 1/2, 1} (no field inversion), and the
         // warp-cooperative Poseidon2 challenger. Bit-identical results.
-        __shared__ kb31_t sh[48];
-        __shared__ size_t shs[2];
+        SP1_SHARED_ARRAY(kb31_t, sh, [48]);
+        SP1_SHARED_ARRAY(size_t, shs, [2]);
         if (blockIdx.x != 0 || threadIdx.x >= 32) return;
         EF y_0 = EF::zero();
         EF y_half = EF::zero();
@@ -448,8 +448,8 @@ __global__ void bpCachedInterpolateAndObserve(
     if constexpr (std::is_same<Challenger, DuplexChallenger>::value) {
         // Run the sponge on a shared-memory copy of the state (one global round trip in/out
         // instead of one per buffer access).
-        __shared__ kb31_t sh[DuplexChallenger::STAGE_ELEMENTS];
-        __shared__ size_t sh_sizes[2];
+        SP1_SHARED_ARRAY(kb31_t, sh, [DuplexChallenger::STAGE_ELEMENTS]);
+        SP1_SHARED_ARRAY(size_t, sh_sizes, [2]);
         DuplexChallenger local = challenger.stage(sh, sh_sizes);
         local.observe_ext(&coefficients[0]);
         local.observe_ext(&coefficients[1]);

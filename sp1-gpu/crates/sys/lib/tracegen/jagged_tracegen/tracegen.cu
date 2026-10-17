@@ -1,3 +1,4 @@
+#include "runtime/gpu_backend.cuh"
 #include "tracegen/jagged_tracegen/tracegen.cuh"
 #include "config.cuh"
 
@@ -43,7 +44,7 @@ __global__ void countAndAddKernel(
     constexpr int NUM_BINS = 320;
     constexpr int THREADS_PER_BLOCK = 16;
 
-    __shared__ unsigned int s_hist[THREADS_PER_BLOCK][NUM_BINS];
+    SP1_SHARED_ARRAY(unsigned int, s_hist, [THREADS_PER_BLOCK][NUM_BINS]);
 
     const int tid = threadIdx.x;
 
@@ -108,8 +109,8 @@ __global__ void sumToTraceKernel(
 }
 
 
-extern "C" void* generate_col_index() { return (void*)generateColIndex; }
-extern "C" void* generate_start_indices() { return (void*)generateStartIndices; }
-extern "C" void* fill_buffer() { return (void*)fillBuffer; }
-extern "C" void* count_and_add_kernel() { return (void*)countAndAddKernel; }
-extern "C" void* sum_to_trace_kernel() { return (void*)sumToTraceKernel; }
+extern "C" void* generate_col_index() { return SP1_KERNEL_PTR(generateColIndex); }
+extern "C" void* generate_start_indices() { return SP1_KERNEL_PTR(generateStartIndices); }
+extern "C" void* fill_buffer() { return SP1_KERNEL_PTR(fillBuffer); }
+extern "C" void* count_and_add_kernel() { return SP1_KERNEL_PTR(countAndAddKernel); }
+extern "C" void* sum_to_trace_kernel() { return SP1_KERNEL_PTR(sumToTraceKernel); }

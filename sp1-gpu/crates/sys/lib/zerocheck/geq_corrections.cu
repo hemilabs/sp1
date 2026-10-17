@@ -1,3 +1,4 @@
+#include "runtime/gpu_backend.cuh"
 // Per-chip geq correction + per-round VirtualGeq state update.
 //
 // See `geq_corrections.cuh` for the full algorithm description. The math is
@@ -108,7 +109,7 @@ __global__ void zerocheck_geq_corrections(
         }
     }
 
-    extern __shared__ unsigned char smem[];
+    SP1_EXTERN_SHARED(unsigned char, smem);
     ext_t* shared = reinterpret_cast<ext_t*>(smem);
     auto block = cg::this_thread_block();
     auto tile = cg::tiled_partition<32>(block);
@@ -202,7 +203,7 @@ __global__ void zerocheck_geq_corrections_bivariate(
         }
     }
 
-    extern __shared__ unsigned char smem[];
+    SP1_EXTERN_SHARED(unsigned char, smem);
     ext_t* shared = reinterpret_cast<ext_t*>(smem);
     auto block = cg::this_thread_block();
     auto tile = cg::tiled_partition<32>(block);
@@ -233,13 +234,13 @@ __global__ void zerocheck_geq_corrections_bivariate(
 }  // namespace
 
 extern "C" void* zerocheck_fix_geq_state_kernel() {
-    return (void*)zerocheck_fix_geq_state;
+    return SP1_KERNEL_PTR(zerocheck_fix_geq_state);
 }
 
 extern "C" void* zerocheck_geq_corrections_kernel() {
-    return (void*)zerocheck_geq_corrections;
+    return SP1_KERNEL_PTR(zerocheck_geq_corrections);
 }
 
 extern "C" void* zerocheck_geq_corrections_bivariate_kernel() {
-    return (void*)zerocheck_geq_corrections_bivariate;
+    return SP1_KERNEL_PTR(zerocheck_geq_corrections_bivariate);
 }

@@ -1,9 +1,11 @@
 #pragma once
 
+#include "runtime/gpu_backend.cuh"
+
 #include "fields/kb31_t.cuh"
 // #include <cstdio>
 
-#if defined(__CUDA_ARCH__) || defined(__HIPCC__)
+#if defined(__CUDA_ARCH__) || defined(SP1_PORTABLE)
 #define FUN __host__ __device__
 #else
 #define FUN inline

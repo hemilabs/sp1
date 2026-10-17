@@ -1,3 +1,4 @@
+#include "runtime/gpu_backend.cuh"
 #pragma once
 #include "config.cuh"
 #include <stdint.h>
@@ -255,8 +256,8 @@ struct JaggedMle {
         // ext_t `nwarps` (for ext_t reduction)
         // uint32_t `MAX_COLS_SH + 1` (for loading startIndices)
         // ext_t `MAX_COLS_SH` (for loading col_coefficient)
-        extern __shared__ __align__(16) unsigned char smem_raw[];
-        const int nwarps = blockDim.x / 32;
+        SP1_EXTERN_SHARED(unsigned char, smem_raw);
+        const int nwarps = blockDim.x / SP1_WARP_SIZE;
         ext_t* sh_reduce = reinterpret_cast<ext_t*>(smem_raw);
         uint32_t* sh_start = reinterpret_cast<uint32_t*>(sh_reduce + nwarps);
         ext_t* sh_zcol = reinterpret_cast<ext_t*>(sh_start + (MAX_COLS_SH + 1));

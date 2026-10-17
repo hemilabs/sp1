@@ -1,3 +1,4 @@
+#include "runtime/gpu_backend.cuh"
 // BN254 global transpose + twiddle multiply kernel for RDNA3.
 //
 // Part of the four-step NTT: after sub-NTTs in LDS, this kernel
@@ -27,7 +28,7 @@ __global__ void bn254_transpose_twiddle_kernel(
     uint32_t twiddle_stride              // multiply twiddle index by this (1 for standard)
 ) {
     // 32x32 tile = 1024 elements x 8 words = 32 KB
-    __shared__ uint32_t lds[TILE_DIM * TILE_DIM * 8];
+    SP1_SHARED_ARRAY(uint32_t, lds, [TILE_DIM * TILE_DIM * 8]);
 
     const uint32_t tile_col = blockIdx.x * TILE_DIM;
     const uint32_t tile_row = blockIdx.y * TILE_DIM;

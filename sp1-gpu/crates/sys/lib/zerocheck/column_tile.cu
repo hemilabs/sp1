@@ -1,3 +1,4 @@
+#include "runtime/gpu_backend.cuh"
 // v2 ColumnTile lowering.
 //
 // Each thread = one `(term, row)` pair. Per thread:
@@ -118,7 +119,7 @@ __global__ void zerocheck_column_tile(
         }
     }
 
-    extern __shared__ unsigned char smem[];
+    SP1_EXTERN_SHARED(unsigned char, smem);
     ext_t* shared = reinterpret_cast<ext_t*>(smem);
 
     auto block = cg::this_thread_block();
@@ -136,9 +137,9 @@ __global__ void zerocheck_column_tile(
 }  // namespace
 
 extern "C" void* zerocheck_column_tile_kb_kernel() {
-    return (void*)zerocheck_column_tile<felt_t>;
+    return SP1_KERNEL_PTR(zerocheck_column_tile<felt_t>);
 }
 
 extern "C" void* zerocheck_column_tile_ext_kernel() {
-    return (void*)zerocheck_column_tile<ext_t>;
+    return SP1_KERNEL_PTR(zerocheck_column_tile<ext_t>);
 }

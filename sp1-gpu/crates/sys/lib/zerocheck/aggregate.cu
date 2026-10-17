@@ -1,3 +1,4 @@
+#include "runtime/gpu_backend.cuh"
 // Device-side aggregation of per-block (per-eval-point) partials.
 // See `aggregate.cuh` for the contract.
 
@@ -26,7 +27,7 @@ __global__ void zerocheck_aggregate_partials(
         acc2 += ext_t::load(partials, b * 3u + 2u);
     }
 
-    extern __shared__ unsigned char smem[];
+    SP1_EXTERN_SHARED(unsigned char, smem);
     ext_t* shared = reinterpret_cast<ext_t*>(smem);
     auto block = cg::this_thread_block();
     auto tile = cg::tiled_partition<32>(block);
@@ -61,7 +62,7 @@ __global__ void zerocheck_aggregate_partials_strided(
         acc += ext_t::load(partials, b * stride + e);
     }
 
-    extern __shared__ unsigned char smem[];
+    SP1_EXTERN_SHARED(unsigned char, smem);
     ext_t* shared = reinterpret_cast<ext_t*>(smem);
     auto block = cg::this_thread_block();
     auto tile = cg::tiled_partition<32>(block);
@@ -75,9 +76,9 @@ __global__ void zerocheck_aggregate_partials_strided(
 }  // namespace
 
 extern "C" void* zerocheck_aggregate_partials_kernel() {
-    return (void*)zerocheck_aggregate_partials;
+    return SP1_KERNEL_PTR(zerocheck_aggregate_partials);
 }
 
 extern "C" void* zerocheck_aggregate_partials_strided_kernel() {
-    return (void*)zerocheck_aggregate_partials_strided;
+    return SP1_KERNEL_PTR(zerocheck_aggregate_partials_strided);
 }

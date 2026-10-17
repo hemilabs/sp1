@@ -1,3 +1,4 @@
+#include "runtime/gpu_backend.cuh"
 #pragma once
 #include "fields/kb31_t.cuh"
 #include "poseidon2/poseidon2_kb31_16.cuh"
@@ -159,7 +160,7 @@ class DuplexChallenger {
 
         size_t original_buffer_size = buffer_sizes[0];
         size_t original_output_buffer_size = buffer_sizes[1];
-        __shared__ kb31_t challenger_state[NUM_ELEMENTS];
+        SP1_SHARED_ARRAY(kb31_t, challenger_state, [NUM_ELEMENTS]);
 
         if (threadIdx.x == 0) {
             for (size_t j = 0; j < WIDTH; j++) {
@@ -362,6 +363,15 @@ class MultiField32Challenger {
             original_buffer_sizes[j] = buffer_sizes[j];
         }
 
+#ifdef SP1_SYCL
+        // Work-group memory of 32-bit words (bn254_t's default constructor is not trivial).
+        SP1_SHARED_ARRAY(uint32_t, shared_sponge_state_words, [sizeof(bn254_t) / 4 * WIDTH]);
+        SP1_SHARED_ARRAY(kb31_t, shared_input_buffer_storage, [INPUT_BUFFER_SIZE]);
+        SP1_SHARED_ARRAY(kb31_t, shared_output_buffer_storage, [OUTPUT_BUFFER_SIZE]);
+        bn254_t* shared_sponge_state = reinterpret_cast<bn254_t*>(shared_sponge_state_words);
+        kb31_t* shared_input_buffer = shared_input_buffer_storage;
+        kb31_t* shared_output_buffer = shared_output_buffer_storage;
+#else
         // HIP/clang disallows __shared__ initialization of types with
         // non-trivial constructors. Use raw byte storage + reinterpret_cast.
         __shared__ __align__(alignof(bn254_t))
@@ -373,6 +383,7 @@ class MultiField32Challenger {
         bn254_t* shared_sponge_state = reinterpret_cast<bn254_t*>(shared_sponge_state_raw);
         kb31_t* shared_input_buffer = reinterpret_cast<kb31_t*>(shared_input_buffer_raw);
         kb31_t* shared_output_buffer = reinterpret_cast<kb31_t*>(shared_output_buffer_raw);
+#endif
 
         if (threadIdx.x == 0) {
             for (size_t j = 0; j < WIDTH; j++) {

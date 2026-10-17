@@ -209,7 +209,7 @@ extern "C" rustCudaError_t batch_coset_dft(
             return CUDA_SUCCESS_CSL;
         }
 #endif
-#if !defined(NVIDIA_NTT) && !defined(__HIPCC__)
+#if !defined(NVIDIA_NTT) && !defined(SP1_PORTABLE)
         // Fused LDE + NTT (2 passes, no copy/memset) for the basefold encoder's shapes; the
         // output is bit-identical to the generic path below.
         if (!perform_shift && bit_rev_output && lde_fused::supported(lg_domain_size, lg_blowup)) {

@@ -1,3 +1,4 @@
+#include "runtime/gpu_backend.cuh"
 #include "mle/fixlastvariable.cuh"
 #include "config.cuh"
 #include "mle/fixlastvariable.cuh"
@@ -34,10 +35,10 @@ __global__ void fixLastVariable(
 }
 
 extern "C" void* fix_last_variable_felt_ext_kernel() {
-    return (void*)fixLastVariable<felt_t, ext_t>;
+    return SP1_KERNEL_PTR(fixLastVariable<felt_t, ext_t>);
 }
 
-extern "C" void* fix_last_variable_ext_ext_kernel() { return (void*)fixLastVariable<ext_t, ext_t>; }
+extern "C" void* fix_last_variable_ext_ext_kernel() { return SP1_KERNEL_PTR(fixLastVariable<ext_t, ext_t>); }
 
 
 
@@ -105,13 +106,13 @@ __global__ void fixLastVariableZeroPadding(
 
 
 extern "C" void* mle_fix_last_variable_koala_bear_base_extension_constant_padding() {
-    return (void*)fixLastVariableConstantPadding<kb31_t, kb31_extension_t>;
+    return SP1_KERNEL_PTR(fixLastVariableConstantPadding<kb31_t, kb31_extension_t>);
 }
 
 extern "C" void* mle_fix_last_variable_koala_bear_ext_ext_constant_padding() {
-    return (void*)fixLastVariableConstantPadding<kb31_extension_t, kb31_extension_t>;
+    return SP1_KERNEL_PTR(fixLastVariableConstantPadding<kb31_extension_t, kb31_extension_t>);
 }
 
 extern "C" void* mle_fix_last_variable_koala_bear_ext_ext_zero_padding() {
-    return (void*)fixLastVariableZeroPadding<kb31_extension_t, kb31_extension_t>;
+    return SP1_KERNEL_PTR(fixLastVariableZeroPadding<kb31_extension_t, kb31_extension_t>);
 }

@@ -1,3 +1,4 @@
+#include "runtime/gpu_backend.cuh"
 #include "sum_and_reduce/reduce.cuh"
 #include "tracegen/jagged_tracegen/jagged.cuh"
 #include "logup_gkr/round.cuh"
@@ -73,7 +74,7 @@ SP1_KERNEL void sumAsPolyCircuitLayer(
     }
 
     // Allocate shared memory
-    extern __shared__ unsigned char memory[];
+    SP1_EXTERN_SHARED(unsigned char, memory);
     ext_t* shared = reinterpret_cast<ext_t*>(memory);
 
     auto block = cg::this_thread_block();
@@ -150,7 +151,7 @@ SP1_KERNEL void firstSumAsPolyCircuitLayer(
     }
 
     // Allocate shared memory
-    extern __shared__ unsigned char memory[];
+    SP1_EXTERN_SHARED(unsigned char, memory);
     ext_t* shared = reinterpret_cast<ext_t*>(memory);
 
     auto block = cg::this_thread_block();
@@ -208,7 +209,7 @@ SP1_KERNEL void sumAsPolyInteractionsLayer(
     }
 
     // Allocate shared memory
-    extern __shared__ unsigned char memory[];
+    SP1_EXTERN_SHARED(unsigned char, memory);
     ext_t* shared = reinterpret_cast<ext_t*>(memory);
 
     auto block = cg::this_thread_block();
@@ -287,7 +288,7 @@ SP1_KERNEL void fixAndSumCircuitLayer(
     }
 
     // Allocate shared memory
-    extern __shared__ unsigned char memory[];
+    SP1_EXTERN_SHARED(unsigned char, memory);
     ext_t* shared = reinterpret_cast<ext_t*>(memory);
 
     auto block = cg::this_thread_block();
@@ -377,7 +378,7 @@ SP1_KERNEL void fixAndSumLastCircuitLayer(
     }
 
     // Allocate shared memory
-    extern __shared__ unsigned char memory[];
+    SP1_EXTERN_SHARED(unsigned char, memory);
     ext_t* shared = reinterpret_cast<ext_t*>(memory);
 
     auto block = cg::this_thread_block();
@@ -437,7 +438,7 @@ SP1_KERNEL void fixAndSumInteractionsLayer(
     }
 
     // Allocate shared memory
-    extern __shared__ unsigned char memory[];
+    SP1_EXTERN_SHARED(unsigned char, memory);
     ext_t* shared = reinterpret_cast<ext_t*>(memory);
 
     auto block = cg::this_thread_block();
@@ -454,35 +455,35 @@ SP1_KERNEL void fixAndSumInteractionsLayer(
 }
 
 extern "C" void* logup_gkr_sum_as_poly_circuit_layer() {
-    return (void*)sumAsPolyCircuitLayer;
+    return SP1_KERNEL_PTR(sumAsPolyCircuitLayer);
 }
 
 extern "C" void* logup_gkr_first_sum_as_poly_circuit_layer() {
-    return (void*)firstSumAsPolyCircuitLayer;
+    return SP1_KERNEL_PTR(firstSumAsPolyCircuitLayer);
 }
 
 extern "C" void* logup_gkr_fix_last_variable_circuit_layer() {
-    return (void*)fixLastVariableCircuitLayer;
+    return SP1_KERNEL_PTR(fixLastVariableCircuitLayer);
 }
 
 extern "C" void* logup_gkr_fix_last_variable_last_circuit_layer() {
-    return (void*)fixLastVariableLastCircuitLayer;
+    return SP1_KERNEL_PTR(fixLastVariableLastCircuitLayer);
 }
 
 extern "C" void* logup_gkr_sum_as_poly_interactions_layer() {
-    return (void*)sumAsPolyInteractionsLayer;
+    return SP1_KERNEL_PTR(sumAsPolyInteractionsLayer);
 }
 
 extern "C" void* logup_gkr_fix_last_variable_interactions_layer() {
-    return (void*)fixLastVariableInteractionsLayer;
+    return SP1_KERNEL_PTR(fixLastVariableInteractionsLayer);
 }
 
-extern "C" void* logup_gkr_fix_and_sum_circuit_layer() { return (void*)fixAndSumCircuitLayer; }
+extern "C" void* logup_gkr_fix_and_sum_circuit_layer() { return SP1_KERNEL_PTR(fixAndSumCircuitLayer); }
 
 extern "C" void* logup_gkr_fix_and_sum_last_circuit_layer() {
-    return (void*)fixAndSumLastCircuitLayer;
+    return SP1_KERNEL_PTR(fixAndSumLastCircuitLayer);
 }
 
 extern "C" void* logup_gkr_fix_and_sum_interactions_layer() {
-    return (void*)fixAndSumInteractionsLayer;
+    return SP1_KERNEL_PTR(fixAndSumInteractionsLayer);
 }

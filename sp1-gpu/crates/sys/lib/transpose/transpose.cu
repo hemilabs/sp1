@@ -1,3 +1,4 @@
+#include "runtime/gpu_backend.cuh"
 #include "transpose/transpose.cuh"
 #include "fields/kb31_t.cuh"
 #include "fields/kb31_extension_t.cuh"
@@ -37,7 +38,7 @@ __global__ void __launch_bounds__(256) transpose_kernel_tiled(
     size_t dimX,
     size_t dimY,
     size_t dimZ) {
-    __shared__ T tile[32][33];
+    SP1_SHARED_ARRAY(T, tile, [32][33]);
     const size_t z = blockIdx.z;
     if (z >= dimZ) return;
     in += z * dimX * dimY;
@@ -84,20 +85,20 @@ __global__ void transpose_array_kernel(
     }
 }
 
-extern "C" void* transpose_kernel_koala_bear() { return (void*)transpose_kernel_tiled<kb31_t>; }
+extern "C" void* transpose_kernel_koala_bear() { return SP1_KERNEL_PTR(transpose_kernel_tiled<kb31_t>); }
 
 extern "C" void* transpose_kernel_koala_bear_digest() {
-    return (void*)transpose_array_kernel<kb31_t, 8>;
+    return SP1_KERNEL_PTR(transpose_array_kernel<kb31_t, 8>);
 }
 
-extern "C" void* transpose_kernel_u32() { return (void*)transpose_kernel_tiled<uint32_t>; }
+extern "C" void* transpose_kernel_u32() { return SP1_KERNEL_PTR(transpose_kernel_tiled<uint32_t>); }
 
 extern "C" void* transpose_kernel_u32_digest() {
-    return (void*)transpose_array_kernel<uint32_t, 8>;
+    return SP1_KERNEL_PTR(transpose_array_kernel<uint32_t, 8>);
 }
 
 extern "C" void* transpose_kernel_koala_bear_extension() {
-    return (void*)transpose_kernel_tiled<kb31_extension_t>;
+    return SP1_KERNEL_PTR(transpose_kernel_tiled<kb31_extension_t>);
 }
 
 // #define TILE_DIM 32
@@ -150,7 +151,7 @@ extern "C" void* transpose_kernel_koala_bear_extension() {
 
 //     extern "C" void *transpose_kernel_tiled_koala_bear()
 //     {
-//         return (void *)transpose_kernel_tiled<kb31_t>;
+//         return SP1_KERNEL_PTR(transpose_kernel_tiled<kb31_t>);
 //     }
 
 } // namespace transpose

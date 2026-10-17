@@ -13,7 +13,7 @@
 //   latency-bound work, small Merkle layers and the warp-cooperative device challenger
 //   (challenger/warp_duplex.cuh): 3.1 us per permutation vs 6.7 us for permute() on one thread.
 #pragma once
-#ifndef __HIPCC__
+#ifndef SP1_PORTABLE
 #include <cstdint>
 #include "poseidon2/poseidon2_kb31_16.cuh"
 
@@ -263,4 +263,4 @@ __device__ __forceinline__ void permute(uint32_t (&x)[4], const QCtx& C) {
 
 }  // namespace quad
 }  // namespace poseidon2_kb31_16_fast
-#endif  // __HIPCC__
+#endif  // SP1_PORTABLE

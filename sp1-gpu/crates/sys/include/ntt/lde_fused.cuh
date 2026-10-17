@@ -17,7 +17,7 @@
 // Pass 2 (one warp per contiguous row of 2^C): DIF DFT_{2^C} with bit-reversed output, in place.
 #pragma once
 
-#if !defined(__HIPCC__)
+#if !defined(SP1_PORTABLE)
 
 #include <cstdint>
 #include <map>
@@ -72,7 +72,7 @@ __global__ void __launch_bounds__(256) lde_pass1(const kb31_t* __restrict__ in, 
                                                  const kb31_t* __restrict__ tw4096,
                                                  const kb31_t* __restrict__ tlo,
                                                  const kb31_t* __restrict__ thi) {
-    extern __shared__ kb31_t p1_smem[];
+    SP1_EXTERN_SHARED(kb31_t, p1_smem);
     kb31_t* s_tw = p1_smem;         // w_4096^e
     kb31_t* xchg = p1_smem + 4096;  // [k_a][r][z], k_a stride 264 (bank-conflict padding)
     const unsigned tid = threadIdx.x;
@@ -133,7 +133,7 @@ __global__ void __launch_bounds__(128) lde_pass2(kb31_t* __restrict__ data, size
     constexpr int NV = 1 << S1;      // 32 or 64
     constexpr int KA_PER = NV / 32;  // k_a values per thread in step 2
     constexpr int ROW = 1 << C;
-    __shared__ kb31_t xs[RB][ROW + ROW / 32];
+    SP1_SHARED_ARRAY(kb31_t, xs, [RB][ROW + ROW / 32]);
     const unsigned rl = threadIdx.x >> 5, r = threadIdx.x & 31;
     kb31_t* row = data + (size_t)blockIdx.y * stride + ((size_t)(blockIdx.x * RB + rl) << C);
 
@@ -295,4 +295,4 @@ inline cudaError_t batch_lde(kb31_t* d_out, const kb31_t* d_in, uint32_t lg_n, u
 
 }  // namespace lde_fused
 
-#endif  // !__HIPCC__
+#endif  // !SP1_PORTABLE
