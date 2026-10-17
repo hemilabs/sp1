@@ -23,33 +23,112 @@ use crate::{
     SP1CudaProverComponents,
 };
 
+/// The card's memory as the tiers below see it: `ceil(total GiB) + 4`, so a 16 GB card reports 20
+/// and a 24 GB card 28.
+fn gpu_memory_gb() -> usize {
+    let gb = 1024.0 * 1024.0 * 1024.0;
+    (((cuda_memory_info().unwrap().1 as f64) / gb).ceil() as usize) + 4
+}
+
+/// Pinned host trace buffers per prover. One shard proves at a time (`ProverSemaphore(1)`), so
+/// two still double-buffer tracegen of shard N+1 against proving of shard N. Cards of 30 GB or
+/// less use two, as `max/optimizations_and_amd` did before it was rebased onto upstream: four
+/// pin ~6 GB of host memory across the four provers, which leaves too little beside the Groth16
+/// prover on a 28 GB host.
+fn trace_buffer_count() -> usize {
+    if gpu_memory_gb() <= 30 {
+        2
+    } else {
+        4
+    }
+}
+
 pub fn local_gpu_opts() -> SP1CoreOpts {
     let mut opts = SP1CoreOpts::default();
 
     let log2_shard_size = 24;
     opts.shard_size = 1 << log2_shard_size;
 
-    let gb = 1024.0 * 1024.0 * 1024.0;
+    let gpu_memory_gb = gpu_memory_gb();
 
-    // Get the amount of memory on the GPU.
-    let gpu_memory_gb: usize = (((cuda_memory_info().unwrap().1 as f64) / gb).ceil() as usize) + 4;
-
-    if gpu_memory_gb < 24 {
-        panic!("Unsupported GPU memory: {gpu_memory_gb}, must be at least 24GB");
+    if gpu_memory_gb < 16 {
+        panic!("Unsupported GPU memory: {gpu_memory_gb}, must be at least 16GB");
     }
 
-    let shard_threshold = if !opts.full_size_shards && gpu_memory_gb <= 30 {
+    // Shard threshold tiers based on GPU memory. `gpu_memory_gb` = ceil(actual GiB) + 4, so a 16 GB
+    // card reports 20 and a 24 GB card 28.
+    let tier_threshold = if gpu_memory_gb <= 20 {
+        // 16 GB cards (e.g. RTX 5080, RX 9070 XT): ~134M elements per shard to fit in VRAM.
+        ELEMENT_THRESHOLD - (1 << 28)
+    } else if !opts.full_size_shards && gpu_memory_gb <= 30 {
         ELEMENT_THRESHOLD - (1 << 26) - (1 << 25) - (1 << 24)
     } else {
         ELEMENT_THRESHOLD
+    };
+
+    // `SP1_GPU_ELEMENT_THRESHOLD` caps the tier's choice; it never replaces it.
+    //
+    // `SP1CoreOpts::default()` already reads `ELEMENT_THRESHOLD` from the environment, but the tier
+    // above overwrites it, so without this there is no supported way to tune the core trace budget.
+    // It is the main host-RAM dial: the threshold sizes each worker's PINNED host trace buffer, so
+    // lowering it saves non-swappable host memory at the cost of more shards.
+    //
+    // A cap, because the caller usually derives it from HOST memory, which says nothing about the
+    // card: as a replacement it raised a 16 GB card's 134,217,728 to 268,435,456 and ran the card out
+    // of VRAM mid-proof. Raising it above `ELEMENT_THRESHOLD` would also produce recursion shapes the
+    // circuit does not accept. Taking the minimum respects both the tier and the caller.
+    let shard_threshold = match std::env::var("SP1_GPU_ELEMENT_THRESHOLD")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+    {
+        Some(requested) => {
+            let capped = requested.min(tier_threshold);
+            if capped != requested {
+                tracing::info!(
+                    "SP1_GPU_ELEMENT_THRESHOLD={requested} is above what this card's VRAM tier \
+                     allows ({tier_threshold}); using the tier's value."
+                );
+            } else if capped != tier_threshold {
+                tracing::info!(
+                    "element threshold capped to {capped} by SP1_GPU_ELEMENT_THRESHOLD (tier would \
+                     have used {tier_threshold})"
+                );
+            }
+            capped
+        }
+        None => tier_threshold,
     };
 
     tracing::debug!("Shard threshold: {shard_threshold}");
     opts.sharding_threshold.element_threshold = shard_threshold;
 
     opts.global_dependencies_opt = true;
-    opts.recompute_gkr_trace = false;
-    opts.drop_ldes = opts.full_size_shards && gpu_memory_gb <= 30;
+    // Dropping the LDEs after the trace commit and re-encoding them in basefold trades time for
+    // ~6 GiB at a 100K shard. Upstream drops them only for full-size shards on 24 GB-class cards;
+    // the 16 GB tier always drops them, as the v6.0.0 fork did. Override with
+    // `SP1_GPU_DROP_LDES={0,1}`.
+    opts.drop_ldes = std::env::var("SP1_GPU_DROP_LDES")
+        .ok()
+        .and_then(|s| match s.as_str() {
+            "0" | "false" => Some(false),
+            "1" | "true" => Some(true),
+            _ => None,
+        })
+        .unwrap_or(gpu_memory_gb <= 20 || (opts.full_size_shards && gpu_memory_gb <= 30));
+
+    // Recomputing the first GKR layer instead of keeping it resident saves ~2.8 GiB at a 100K
+    // shard. Upstream turned it off once look-ahead sumchecks and truncated Merkle trees (#2917,
+    // #2925) cut the footprint, but upstream supports only 24 GB and larger cards. Keep it on for
+    // the 16 GB tier, where the margin is thinnest. Override with
+    // `SP1_GPU_RECOMPUTE_FIRST_LAYER={0,1}`.
+    opts.recompute_gkr_trace = std::env::var("SP1_GPU_RECOMPUTE_FIRST_LAYER")
+        .ok()
+        .and_then(|s| match s.as_str() {
+            "0" | "false" => Some(false),
+            "1" | "true" => Some(true),
+            _ => None,
+        })
+        .unwrap_or(gpu_memory_gb <= 20);
 
     opts
 }
@@ -74,7 +153,7 @@ pub async fn core_prover_and_verifier(
         new_cuda_prover(
             &core_verifier,
             num_elts,
-            4,
+            trace_buffer_count(),
             opts.recompute_gkr_trace,
             opts.drop_ldes,
             scope,
@@ -90,10 +169,18 @@ pub async fn recursion_prover_and_verifier(
     CudaShardProver<SP1GlobalContext, CudaProverRecursionComponents>,
     MachineVerifier<SP1GlobalContext, InnerSC<CompressAir<SP1Field>>>,
 ) {
+    let opts = local_gpu_opts();
     let recursion_verifier = SP1CudaProverComponents::compress_verifier();
     (
-        new_cuda_prover(&recursion_verifier, RECURSION_TRACE_ALLOCATION, 4, false, false, scope)
-            .await,
+        new_cuda_prover(
+            &recursion_verifier,
+            RECURSION_TRACE_ALLOCATION,
+            trace_buffer_count(),
+            opts.recompute_gkr_trace,
+            opts.drop_ldes,
+            scope,
+        )
+        .await,
         recursion_verifier,
     )
 }
@@ -103,31 +190,93 @@ pub async fn cuda_worker_builder_with_machine(
     scope: TaskScope,
     machine: Machine<SP1Field, RiscvAir<SP1Field>>,
 ) -> SP1WorkerBuilder<SP1CudaProverComponents> {
-    // Create a prover permits, assuming a single proof happens at a time.
-    let prover_permits = ProverSemaphore::new(1);
+    // #3: permit count = max in-flight shards. Default 1 = single-shard
+    // (today's behaviour); env `SP1_PROVE_OVERLAP_TRACEGEN` ≥ 1 raises it
+    // in lockstep with the per-PK trace-buffer pool size (see
+    // shard_prover::setup) so shard N+1's tracegen can start while shard N
+    // still holds its buffer + permit.
+    //
+    // WARNING: empirically N=2 OOMs on a 32 GiB RTX 5090 (per-shard prove
+    // allocates ~3-6 GiB single allocations; two concurrent shards exceed
+    // VRAM). N>1 currently requires either a bigger GPU (e.g. 80 GiB H100)
+    // or prove-side VRAM reduction work first — see #3 in
+    // sp1-gpu/docs/5090_optimization_plan.md. Default 1 is always safe.
+    let pool_size = std::env::var("SP1_PROVE_OVERLAP_TRACEGEN")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(1)
+        .max(1);
+    if pool_size > 1 {
+        tracing::warn!(
+            target: "sp1_gpu_prover",
+            pool_size,
+            "SP1_PROVE_OVERLAP_TRACEGEN > 1 — N concurrent shards each hold \
+             a ~2 GiB trace buffer plus 5-10 GiB of prove-side allocations; \
+             empirically OOMs on a 32 GiB RTX 5090 at N=2. Use only on \
+             GPUs with substantial VRAM headroom."
+        );
+    }
+    let prover_permits = ProverSemaphore::new(pool_size);
 
     // Get the core options.
     let opts = local_gpu_opts();
 
     let core_prover = Arc::new(core_prover_and_verifier(scope.clone(), machine.clone()).await.0);
 
+    // The memory-saving flags apply to all four provers, not just core.
+    //
+    // Upstream passes them to core and a literal `false` to recursion, shrink and wrap, so those
+    // phases keep their LDE codewords and their materialized LogUp-GKR first layer. The tier only
+    // shrinks the core threshold; the retained codewords in recursion (~2 GiB), shrink (~1 GiB) and
+    // wrap (~2.5 GiB) are tier-blind, and the wrap's peak is what blocks a 16 GB card from finishing a
+    // Groth16 proof. On larger cards both flags default off, so nothing changes there.
+    //
+    // Correctness: `drop_ldes` only decides whether a codeword is kept or recomputed. The commitment
+    // is taken before the drop (`FriCudaProver::encode_and_commit`), the recompute re-runs the same
+    // `encode_batch`, and openings are checked against the committed tree, so a divergence would give
+    // an invalid proof, not a different valid one. Setup is unaffected: `commit_multilinears` never
+    // drops preprocessed traces.
     // TODO: tune this more precisely and make it a constant.
     let recursion_prover = Arc::new(recursion_prover_and_verifier(scope.clone()).await.0);
 
     let shrink_verifier = SP1CudaProverComponents::shrink_verifier();
     let shrink_prover = Arc::new(
-        new_cuda_prover(&shrink_verifier, SHRINK_TRACE_ALLOCATION, 4, false, false, scope.clone())
-            .await,
+        new_cuda_prover(
+            &shrink_verifier,
+            SHRINK_TRACE_ALLOCATION,
+            trace_buffer_count(),
+            opts.recompute_gkr_trace,
+            opts.drop_ldes,
+            scope.clone(),
+        )
+        .await,
     );
 
     let wrap_verifier = SP1CudaProverComponents::wrap_verifier();
     let wrap_prover = Arc::new(
-        new_cuda_prover(&wrap_verifier, WRAP_TRACE_ALLOCATION, 4, false, false, scope.clone())
-            .await,
+        new_cuda_prover(
+            &wrap_verifier,
+            WRAP_TRACE_ALLOCATION,
+            trace_buffer_count(),
+            opts.recompute_gkr_trace,
+            opts.drop_ldes,
+            scope.clone(),
+        )
+        .await,
     );
+
+    // The GPU Groth16 prover is for cards above the 16 GB tier; 16 GB cards use gnark's CPU
+    // prover, as the v6.0.0 fork always did. Before each proof the recursion prover also checks
+    // that the card has the GPU memory free for the GPU prover's helper (beside this prover's own
+    // state, that rules out cards below 48 GB unless SP1_GPU_RESET_BEFORE_WRAP is set) and the host
+    // has the memory, and uses the CPU prover if not.
+    let groth16_gpu = gpu_memory_gb() > 20;
 
     let base_builder = SP1WorkerBuilder::new_with_machine(machine)
         .with_core_opts(opts)
+        .with_config(|config| {
+            config.prover_config.recursion_prover_config.groth16_gpu = groth16_gpu;
+        })
         .with_core_air_prover(core_prover, prover_permits.clone())
         .with_compress_air_prover(recursion_prover, prover_permits.clone())
         .with_shrink_air_prover(shrink_prover, prover_permits.clone())

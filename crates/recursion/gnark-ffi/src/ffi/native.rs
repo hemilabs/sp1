@@ -5,12 +5,8 @@
 //! Although we cast to *mut c_char because the Go signatures can't be immutable, the Go functions
 //! should not modify the strings.
 
-use crate::{Groth16Bn254Proof, PlonkBn254Proof, SP1_CIRCUIT_VERSION};
-use cfg_if::cfg_if;
-use std::{
-    ffi::{c_char, CStr, CString},
-    mem::forget,
-};
+use crate::{Groth16Bn254Proof, PlonkBn254Proof};
+use std::ffi::{c_char, CStr, CString};
 
 #[allow(warnings, clippy::all)]
 mod bind {
@@ -198,10 +194,144 @@ pub fn build_groth16_bn254(data_dir: &str) {
     build(ProofSystem::Groth16, data_dir)
 }
 
+/// Export Groth16 proving key as flat binary files for GPU prover.
+pub fn export_groth16_gpu_data(data_dir: &str, output_dir: &str) {
+    let data_dir_cstring = CString::new(data_dir).expect("CString::new failed");
+    let output_dir_cstring = CString::new(output_dir).expect("CString::new failed");
+    unsafe {
+        let err = bind::ExportGroth16GpuData(
+            data_dir_cstring.as_ptr() as *mut c_char,
+            output_dir_cstring.as_ptr() as *mut c_char,
+        );
+        if !err.is_null() {
+            let msg = ptr_to_string_freed(err);
+            panic!("ExportGroth16GpuData failed: {msg}");
+        }
+    }
+}
+
+/// Solve Groth16 R1CS and export witness data for GPU prover. `pk_dir` is the directory
+/// `export_groth16_gpu_data` wrote, and is only read. `output_dir` must belong to this proof
+/// alone: provers share `pk_dir`, so per-proof files written there would clobber each other.
+pub fn export_groth16_gpu_witness(
+    data_dir: &str,
+    witness_path: &str,
+    pk_dir: &str,
+    output_dir: &str,
+) {
+    let data_dir_cstring = CString::new(data_dir).expect("CString::new failed");
+    let witness_path_cstring = CString::new(witness_path).expect("CString::new failed");
+    let pk_dir_cstring = CString::new(pk_dir).expect("CString::new failed");
+    let output_dir_cstring = CString::new(output_dir).expect("CString::new failed");
+    unsafe {
+        let err = bind::ExportGroth16GpuWitness(
+            data_dir_cstring.as_ptr() as *mut c_char,
+            witness_path_cstring.as_ptr() as *mut c_char,
+            pk_dir_cstring.as_ptr() as *mut c_char,
+            output_dir_cstring.as_ptr() as *mut c_char,
+        );
+        if !err.is_null() {
+            let msg = ptr_to_string_freed(err);
+            panic!("ExportGroth16GpuWitness failed: {msg}");
+        }
+    }
+}
+
+/// Export PLONK proving data (SRS, selectors, permutation polys) as flat
+/// binary files for the GPU PLONK prover. Mirrors `ExportPlonkData` (Go).
+pub fn export_plonk_gpu_data(data_dir: &str, output_dir: &str) {
+    let data_dir_cstring = CString::new(data_dir).expect("CString::new failed");
+    let output_dir_cstring = CString::new(output_dir).expect("CString::new failed");
+    unsafe {
+        let err = bind::ExportPlonkGpuData(
+            data_dir_cstring.as_ptr() as *mut c_char,
+            output_dir_cstring.as_ptr() as *mut c_char,
+        );
+        if !err.is_null() {
+            let msg = ptr_to_string_freed(err);
+            panic!("ExportPlonkGpuData failed: {msg}");
+        }
+    }
+}
+
+/// Solve the PLONK SCS and export per-proof witness data (L/R/O wires +
+/// BSB22 polys + commitments) for the GPU PLONK prover. Mirrors
+/// `ExportSolvedWitness` (Go).
+pub fn export_plonk_gpu_witness(data_dir: &str, witness_path: &str, output_dir: &str) {
+    let data_dir_cstring = CString::new(data_dir).expect("CString::new failed");
+    let witness_path_cstring = CString::new(witness_path).expect("CString::new failed");
+    let output_dir_cstring = CString::new(output_dir).expect("CString::new failed");
+    unsafe {
+        let err = bind::ExportPlonkGpuWitness(
+            data_dir_cstring.as_ptr() as *mut c_char,
+            witness_path_cstring.as_ptr() as *mut c_char,
+            output_dir_cstring.as_ptr() as *mut c_char,
+        );
+        if !err.is_null() {
+            let msg = ptr_to_string_freed(err);
+            panic!("ExportPlonkGpuWitness failed: {msg}");
+        }
+    }
+}
+
 pub fn prove_groth16_bn254(data_dir: &str, witness_path: &str) -> Groth16Bn254Proof {
     match prove(ProofSystem::Groth16, data_dir, witness_path) {
         ProofResult::Groth16(proof) => unsafe { groth16_bn254_proof_from_raw(proof) },
         _ => unreachable!(),
+    }
+}
+
+/// Proves with the R1CS at `r1cs_path` (typically the stripped circuit) and keeps nothing in the Go
+/// runtime afterwards, unlike [`prove_groth16_bn254`], which caches the R1CS and proving key for
+/// the life of the process. For a short-lived process such as `groth16_cpu_helper`.
+///
+/// `Err` only when the R1CS cannot be read, so the caller can try another; any other failure
+/// panics in Go, which ends the process.
+pub fn prove_groth16_bn254_with_r1cs(
+    data_dir: &str,
+    r1cs_path: &str,
+    witness_path: &str,
+) -> Result<Groth16Bn254Proof, String> {
+    let data_dir = CString::new(data_dir).expect("CString::new failed");
+    let r1cs_path = CString::new(r1cs_path).expect("CString::new failed");
+    let witness_path = CString::new(witness_path).expect("CString::new failed");
+    unsafe {
+        let mut r1cs_err: *mut c_char = std::ptr::null_mut();
+        let proof = bind::ProveGroth16Bn254WithR1cs(
+            data_dir.as_ptr() as *mut c_char,
+            r1cs_path.as_ptr() as *mut c_char,
+            witness_path.as_ptr() as *mut c_char,
+            &mut r1cs_err,
+        );
+        if !r1cs_err.is_null() {
+            return Err(ptr_to_string_freed(r1cs_err));
+        }
+        assert!(!proof.is_null(), "ProveGroth16Bn254WithR1cs returned no proof");
+        Ok(groth16_bn254_proof_from_raw(proof))
+    }
+}
+
+/// Drops the circuit and proving key that [`prove_groth16_bn254`] and
+/// [`export_groth16_gpu_witness`] keep in Go globals (~12 GB on the v6.1.0 circuit), and returns
+/// the memory to the host. The next call reloads them.
+pub fn release_groth16_caches() {
+    unsafe { bind::ReleaseGroth16Caches() }
+}
+
+/// Writes the Groth16 R1CS in `data_dir` to `output_path` without its debug information, which
+/// the prover does not use and which makes up about a third of the file.
+pub fn export_groth16_stripped_r1cs(data_dir: &str, output_path: &str) {
+    let data_dir_cstring = CString::new(data_dir).expect("CString::new failed");
+    let output_path_cstring = CString::new(output_path).expect("CString::new failed");
+    unsafe {
+        let err = bind::ExportGroth16StrippedR1cs(
+            data_dir_cstring.as_ptr() as *mut c_char,
+            output_path_cstring.as_ptr() as *mut c_char,
+        );
+        if !err.is_null() {
+            let msg = ptr_to_string_freed(err);
+            panic!("ExportGroth16StrippedR1cs failed: {msg}");
+        }
     }
 }
 

@@ -5,7 +5,7 @@ use std::{
 
 use crate::{CudaError, TaskScope};
 use slop_alloc::{mem::CopyError, CopyIntoBackend, CopyToBackend, CpuBackend};
-use sp1_gpu_sys::runtime::{cuda_get_device_name, cuda_mem_get_info};
+use sp1_gpu_sys::runtime::{cuda_get_device_name, cuda_mem_get_info, cuda_sm_count};
 
 pub trait DeviceCopy: Copy + 'static + Sized {}
 
@@ -41,6 +41,22 @@ pub fn cuda_device_name() -> Result<&'static str, CudaError> {
         .unwrap_or_default();
 
     Ok(DEVICE_NAME.get_or_init(|| name))
+}
+
+/// Number of streaming multiprocessors on the active device, queried once and cached.
+///
+/// Used to size kernel grids relative to the actual hardware (e.g. 128 on an
+/// RTX 4090, 170 on an RTX 5090) instead of hardcoded 128-SM-era constants, so
+/// grids fill larger GPUs. Falls back to 128 if the query fails.
+pub fn cuda_sm_count_cached() -> usize {
+    static SM_COUNT: OnceLock<usize> = OnceLock::new();
+    *SM_COUNT.get_or_init(|| {
+        let mut count: i32 = 0;
+        match CudaError::result_from_ffi(unsafe { cuda_sm_count(&mut count) }) {
+            Ok(()) if count > 0 => count as usize,
+            _ => 128,
+        }
+    })
 }
 
 pub trait IntoDevice: CopyIntoBackend<TaskScope, CpuBackend> + Sized {

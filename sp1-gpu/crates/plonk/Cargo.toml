@@ -1,0 +1,34 @@
+[package]
+name = "sp1-gpu-plonk"
+description = "GPU-accelerated BN254 PLONK prover for SP1"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[features]
+cuda = ["sp1-gpu-sys"]
+
+[dependencies]
+sha2 = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+rayon = { workspace = true }
+sp1-gpu-sys = { workspace = true, optional = true }
+hex = "0.4"
+# Phase 1 ZK blinding (gnark Option A parity). `rand` is the workspace pin used
+# by every other Rust crate in SP1 that needs OS entropy; the helper here is a
+# trivial `OsRng.fill_bytes` call.
+rand = { workspace = true }
+
+[dev-dependencies]
+num-bigint = { workspace = true }
+sp1-verifier = { workspace = true }
+dirs = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+
+[lints]
+workspace = true

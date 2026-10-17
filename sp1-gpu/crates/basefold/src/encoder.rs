@@ -125,7 +125,12 @@ impl CudaB31Kernels {
 
 impl Default for CudaB31Kernels {
     fn default() -> Self {
-        CudaError::result_from_ffi(unsafe { dft_init_default_stream() }).unwrap();
+        // Once per process: the init is not cheap, and `Default` runs for every encoder.
+        use std::sync::Once;
+        static DFT_INIT: Once = Once::new();
+        DFT_INIT.call_once(|| {
+            CudaError::result_from_ffi(unsafe { dft_init_default_stream() }).unwrap();
+        });
         Self
     }
 }

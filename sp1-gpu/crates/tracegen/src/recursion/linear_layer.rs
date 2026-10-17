@@ -46,7 +46,7 @@ impl CudaTracegenAir<F> for Poseidon2LinearLayerChip {
         let mut trace = Tensor::<F, TaskScope>::zeros_in([width, height], scope.clone());
 
         unsafe {
-            const BLOCK_DIM: usize = 64;
+            const BLOCK_DIM: usize = 256;
             let grid_dim = height.div_ceil(BLOCK_DIM);
             // args:
             // T *trace,
@@ -94,7 +94,7 @@ impl CudaTracegenAir<F> for Poseidon2LinearLayerChip {
         let mut trace = Tensor::<F, TaskScope>::zeros_in([width, height], scope.clone());
 
         unsafe {
-            const BLOCK_DIM: usize = 64;
+            const BLOCK_DIM: usize = 256;
             let grid_dim = height.div_ceil(BLOCK_DIM);
             // args:
             // T *trace,

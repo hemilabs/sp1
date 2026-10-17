@@ -1,10 +1,9 @@
 #include "jagged_sumcheck/jagged_sumcheck.cuh"
 #include "sum_and_reduce/reduce.cuh"
 #include "tracegen/jagged_tracegen/jagged.cuh"
+#include "runtime/gpu_compat.cuh"
 
 
-#include <cooperative_groups.h>
-#include <cooperative_groups/reduce.h>
 
 
 // Computes the two-round polynomial h(X, Y) = sum_i p(i, X, Y) * q(i, X, Y) on the grid
@@ -16,7 +15,7 @@
 // order: h(0,0), h(0,1), h(0,1/2), h(1,0), h(1,1/2), h(1/2,0), h(1/2,1), h(1/2,1/2).
 // Midpoint accumulators carry the unscaled pair sums: entries 2, 4, 5, 6 hold 4*h and
 // entry 7 holds 16*h; the host descales.
-__global__ void jaggedTwoRoundSumAsPoly(
+SP1_KERNEL void jaggedTwoRoundSumAsPoly(
     ext_t* evaluations,
     const JaggedMle<JaggedSumcheckData> inputJaggedMle) {
 
@@ -83,7 +82,7 @@ __global__ void jaggedTwoRoundSumAsPoly(
 // Folds the first two sumcheck challenges in one pass, materializing the (p, q) pair at a
 // quarter of the dense size (instead of half after one fold), and accumulates the round-3
 // univariate evaluations from the folded values while they are still in registers.
-__global__ void jaggedTwoRoundFixAndSum(
+SP1_KERNEL void jaggedTwoRoundFixAndSum(
     ext_t* evaluations,
     const JaggedMle<JaggedSumcheckData> inputJaggedMle,
     ext_t* output_p,
@@ -148,13 +147,13 @@ __global__ void jaggedTwoRoundFixAndSum(
     }
 }
 
-__global__ void paddedHadamardFixAndSum(
-    const ext_t* base_input,
-    const ext_t* ext_input,
-    ext_t* __restrict base_output,
-    ext_t* __restrict ext_output,
+SP1_KERNEL void paddedHadamardFixAndSum(
+    const ext_t* __restrict__ base_input,
+    const ext_t* __restrict__ ext_input,
+    ext_t* __restrict__ base_output,
+    ext_t* __restrict__ ext_output,
     ext_t alpha,
-    ext_t* univariate_result,
+    ext_t* __restrict__ univariate_result,
     size_t inputHeight) {
 
     size_t outputHeight = (inputHeight + 1) >> 1;
@@ -180,15 +179,31 @@ __global__ void paddedHadamardFixAndSum(
 
         // Todo: instead of checking padding conditions twice here ad in sumAsPoly, we should do it
         // once.
+        // GUARD THE STORES, not just the computation.
+        //
+        // The bounds test below used to cover only `fixLastVariableInner`, while the two stores at
+        // `secondIdx` ran unconditionally. `secondIdx = 2i + 1` with `i < halfOutputHeight =
+        // ceil(outputHeight / 2)`, so whenever `outputHeight` is ODD the final thread lands exactly one
+        // element past the end of both output buffers. (`firstIdx = 2i` is always in range, so only
+        // this one overflows.)
+        //
+        // Observed: outputHeight 3, thread 1, a 16-byte write at offset 48 of a 48-byte allocation —
+        // `Invalid __global__ write of size 16 bytes ... 1 bytes after the nearest allocation` in
+        // compute-sanitizer. It survives wherever the allocator leaves slack after a small block, which
+        // is why it went unnoticed on sm_89, and faults on sm_120 where the pool is tight.
+        //
+        // This is a real out-of-bounds write on every architecture, not a Blackwell quirk: on another
+        // allocation layout it would silently corrupt whatever sits next to the output buffer rather
+        // than fault. Writing a zero there was never the intent either — the padded element only needs
+        // to contribute zero to `evalHalf`, which the zero-valued `pair2` below still does.
         Pair pair2;
         if (secondIdx < outputHeight) {
             pair2 = fixLastVariableInner(base_input, ext_input, alpha, inputHeight, secondIdx);
+            ext_t::store(base_output, secondIdx, pair2.p);
+            ext_t::store(ext_output, secondIdx, pair2.q);
         } else {
             pair2 = Pair{ext_t::zero(), ext_t::zero()};
         }
-
-        ext_t::store(base_output, secondIdx, pair2.p);
-        ext_t::store(ext_output, secondIdx, pair2.q);
 
         evalZero += pair1.p * pair1.q;
         evalHalf += (pair1.p + pair2.p) * (pair1.q + pair2.q);

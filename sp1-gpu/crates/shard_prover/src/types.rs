@@ -1,7 +1,9 @@
 use std::{collections::BTreeSet, sync::Arc};
 
 use slop_challenger::IopCtx;
-use sp1_gpu_utils::{Ext, Felt};
+use slop_futures::queue::Worker;
+use sp1_gpu_cudart::TaskScope;
+use sp1_gpu_utils::{Ext, Felt, JaggedTraceMle};
 use sp1_hypercube::{
     prover::{AirProver, ProverPermit, ProvingKey},
     Chip, ShardContext, ShardContextImpl,
@@ -33,4 +35,8 @@ pub struct MainTraceData<
     pub shard_chips: BTreeSet<Chip<GC::F, SC::Air>>,
     /// A permit for a prover resource.
     pub permit: ProverPermit,
+    /// Owned handle to the per-shard trace MLE buffer popped from the
+    /// PK's pool by `main_tracegen`. Held through `prove_shard_with_data`;
+    /// `Drop` returns the buffer to the pool when prove completes. #3.
+    pub trace_buffer: Worker<JaggedTraceMle<Felt, TaskScope>>,
 }

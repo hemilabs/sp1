@@ -15,7 +15,10 @@ use std::{
     ops::Deref,
     pin::Pin,
     ptr::{self, NonNull},
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex,
+    },
     task::{Context, Poll, Waker},
     time::Duration,
 };
@@ -317,6 +320,77 @@ impl IntoFuture for CudaStream {
     }
 }
 
+/// Process-wide tally of `cuda_malloc_async`/`cuda_free_async` traffic, used to
+/// size the prove-side VRAM working set for #3 (per-shard concurrency on the
+/// 5090 OOMs because two concurrent shards exceed the 32 GiB budget; we need
+/// to know the high-water mark + the biggest live allocations to reduce it).
+///
+/// Cheap atomic counters — `Relaxed` ordering is fine since `cudaMalloc` is
+/// already a serialisation point and we only need ballpark numbers.
+#[derive(Default)]
+pub struct VramStats {
+    /// Bytes currently live (sum of allocate − deallocate).
+    pub current: AtomicU64,
+    /// High-water mark of `current` since the last `vram_reset_peak()`.
+    pub peak: AtomicU64,
+    /// Total `cuda_malloc_async` calls.
+    pub alloc_count: AtomicU64,
+    /// Total bytes allocated (cumulative; sum of all `alloc.size()`).
+    pub alloc_bytes_total: AtomicU64,
+    /// Threshold in bytes for emitting a per-alloc `tracing::debug!` log.
+    /// 0 = disabled. Set via `SP1_GPU_LARGE_ALLOC_LOG_MIB` env (read once).
+    pub large_alloc_log_threshold: AtomicU64,
+}
+
+pub static VRAM_STATS: VramStats = VramStats {
+    current: AtomicU64::new(0),
+    peak: AtomicU64::new(0),
+    alloc_count: AtomicU64::new(0),
+    alloc_bytes_total: AtomicU64::new(0),
+    large_alloc_log_threshold: AtomicU64::new(u64::MAX),
+};
+
+/// Current live device-allocated bytes (across all `CudaStream`s).
+pub fn vram_current_bytes() -> u64 {
+    VRAM_STATS.current.load(Ordering::Relaxed)
+}
+
+/// High-water mark of `vram_current_bytes()` since the last `vram_reset_peak()`.
+pub fn vram_peak_bytes() -> u64 {
+    VRAM_STATS.peak.load(Ordering::Relaxed)
+}
+
+/// Snapshot `(current, peak)` in MiB.
+pub fn vram_snapshot_mib() -> (u64, u64) {
+    const MIB: u64 = 1024 * 1024;
+    (vram_current_bytes() / MIB, vram_peak_bytes() / MIB)
+}
+
+/// Reset the peak counter to the current live bytes. Call before a phase you
+/// want to bound (e.g. `prove_shard_with_data`) then read `vram_peak_bytes()`
+/// after to get that phase's high-water mark.
+pub fn vram_reset_peak() {
+    let cur = VRAM_STATS.current.load(Ordering::Relaxed);
+    VRAM_STATS.peak.store(cur, Ordering::Relaxed);
+}
+
+/// Read the per-alloc log threshold once from `SP1_GPU_LARGE_ALLOC_LOG_MIB`.
+fn vram_log_threshold() -> u64 {
+    use std::sync::OnceLock;
+    static T: OnceLock<u64> = OnceLock::new();
+    *T.get_or_init(|| {
+        let mib = std::env::var("SP1_GPU_LARGE_ALLOC_LOG_MIB")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(0); // disabled by default
+        if mib == 0 {
+            u64::MAX
+        } else {
+            mib * 1024 * 1024
+        }
+    })
+}
+
 unsafe impl Allocator for CudaStream {
     #[inline]
     unsafe fn allocate(&self, layout: Layout) -> Result<ptr::NonNull<[u8]>, AllocError> {
@@ -329,6 +403,19 @@ unsafe impl Allocator for CudaStream {
             ))
             .map_err(|_| AllocError)?;
         };
+        let size = layout.size() as u64;
+        let new_cur = VRAM_STATS.current.fetch_add(size, Ordering::Relaxed) + size;
+        VRAM_STATS.peak.fetch_max(new_cur, Ordering::Relaxed);
+        VRAM_STATS.alloc_count.fetch_add(1, Ordering::Relaxed);
+        VRAM_STATS.alloc_bytes_total.fetch_add(size, Ordering::Relaxed);
+        if size >= vram_log_threshold() {
+            tracing::debug!(
+                target: "sp1_gpu_alloc",
+                size_mib = size / (1024 * 1024),
+                live_mib = new_cur / (1024 * 1024),
+                "large device alloc"
+            );
+        }
         let ptr = ptr as *mut u8;
         Ok(NonNull::slice_from_raw_parts(NonNull::new_unchecked(ptr), layout.size()))
     }
@@ -339,6 +426,7 @@ unsafe impl Allocator for CudaStream {
             CudaError::result_from_ffi(cuda_free_async(ptr.as_ptr() as *mut c_void, self.0))
                 .unwrap()
         }
+        VRAM_STATS.current.fetch_sub(_layout.size() as u64, Ordering::Relaxed);
     }
 }
 
