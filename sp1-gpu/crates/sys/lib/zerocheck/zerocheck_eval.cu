@@ -57,13 +57,10 @@ SP1_KERNEL void jaggedConstraintPolyEval(
     ext_t* __restrict__ constraintValues,
     uint32_t rest_point_dim
 ) {
-    // The programs write every register before reading it (checked where they are built, in
-    // sp1-gpu-air's optimizer), so the registers are cleared once per thread, not per row: per row
-    // that was up to MEMORY_SIZE stores (2 KiB for extension elements) of private memory each.
+    // Not cleared: the programs write every register before reading it (checked where they are
+    // built, in sp1-gpu-air's optimizer). Clearing them cost up to MEMORY_SIZE stores (2 KiB for
+    // extension elements) of private memory per row, and later per thread.
     K expr_f[MEMORY_SIZE];
-    for (size_t i = 0; i < MEMORY_SIZE; i++) {
-        expr_f[i] = K::zero();
-    }
     JaggedConstraintFolder<K> folder = JaggedConstraintFolder<K>();
 
     ext_t thread_sum = ext_t::zero();

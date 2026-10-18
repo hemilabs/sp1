@@ -391,8 +391,11 @@ impl JaggedConstraintPolyEvalKernel<Ext> for TaskScope {
 
 /// Returns the MEMORY_SIZE bucket for a given f_ctr value.
 /// Must match the kernel template instantiation sizes.
+/// The register-file size (the interpreter kernel's MEMORY_SIZE) for a program whose highest
+/// register index is `f_ctr`: the optimizer reports the highest index used, not a count, so a
+/// program using register 32 needs 33 registers.
 fn memory_size_bucket(f_ctr: u32) -> usize {
-    match f_ctr {
+    match f_ctr + 1 {
         0..=32 => 32,
         33..=64 => 64,
         65..=128 => 128,
@@ -414,7 +417,10 @@ where
     const NUM_EVAL_POINT: usize = 3;
 
     let n_chunks = input.total_len.div_ceil(1 << 12);
-    let grid_size_x = n_chunks.max(256);
+    // At least 256 blocks for parallelism, but no more than one row per thread: late rounds have
+    // few rows, and every thread costs its register file's setup.
+    let rows = input.total_len / 2;
+    let grid_size_x = n_chunks.max(256).min(rows.div_ceil(BLOCK_SIZE).max(1));
     let grid_size = (grid_size_x, 1, NUM_EVAL_POINT);
 
     let num_tiles = BLOCK_SIZE.div_ceil(32);
@@ -528,7 +534,10 @@ where
     const NUM_EVAL_POINT: usize = 3;
 
     let n_chunks = input.total_len.div_ceil(1 << 12);
-    let grid_size_x = n_chunks.max(256);
+    // At least 256 blocks for parallelism, but no more than one row per thread: late rounds have
+    // few rows, and every thread costs its register file's setup.
+    let rows = input.total_len / 2;
+    let grid_size_x = n_chunks.max(256).min(rows.div_ceil(BLOCK_SIZE).max(1));
     let grid_size = (grid_size_x, 1, NUM_EVAL_POINT);
 
     let num_tiles = BLOCK_SIZE.div_ceil(32);
