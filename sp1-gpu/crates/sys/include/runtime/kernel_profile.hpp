@@ -84,6 +84,19 @@ class Totals {
             std::lock_guard<std::mutex> lock(m_);
             iv = intervals_;
         }
+        // SP1_GPU_PROFILE_WINDOW_MS=<n>: the busy time and gaps of the last n ms only (e.g. the
+        // proof, without the setup before it).
+        if (const char* w = std::getenv("SP1_GPU_PROFILE_WINDOW_MS"); w && !iv.empty()) {
+            const double window = std::atof(w);
+            double last_end = 0;
+            for (auto& v : iv) last_end = v.end > last_end ? v.end : last_end;
+            std::vector<Interval> kept;
+            for (auto& v : iv) {
+                if (v.start >= last_end - window) kept.push_back(v);
+            }
+            iv.swap(kept);
+            std::fprintf(f, "# (busy time and gaps over the last %.0f ms only)\n", window);
+        }
         if (!iv.empty()) {
             std::sort(iv.begin(), iv.end(), [](const Interval& a, const Interval& b) {
                 return a.start < b.start;
