@@ -12,7 +12,7 @@ use crate::{
         CommonProverInput, DeferredInputs, ProverMetrics, RangeProofs, RawTaskRequest, TaskContext,
         TaskError, TaskMetadata, WrapAirProverInit,
     },
-    RecursionSC, SP1CircuitWitness, SP1ProverComponents,
+    RecursionSC, SP1CircuitWitness, SP1ProverComponents, WrapSC,
 };
 use core::sync::atomic::AtomicBool;
 use slop_algebra::PrimeField32;
@@ -1354,11 +1354,20 @@ impl<C: SP1ProverComponents> ShrinkProver<C> {
     }
 }
 
+/// The wrap program's proving key.
+type WrapProvingKey<C> =
+    ProvingKey<SP1OuterGlobalContext, WrapSC, <C as SP1ProverComponents>::WrapProver>;
+
 pub struct WrapProver<C: SP1ProverComponents> {
     prover: Arc<C::WrapProver>,
     permits: ProverSemaphore,
     program: Arc<RecursionProgram<SP1Field>>,
     pub verifying_key: MachineVerifyingKey<SP1OuterGlobalContext>,
+    /// The proving key from the setup, kept to prove with: the setup commits the program's
+    /// preprocessed traces, which takes seconds (3.6 s on an Arc Pro B70), and the wrap program is
+    /// the same for every proof. None with SP1_WRAP_PERSISTENT_PK=0, which keeps the key's memory
+    /// free between proofs and sets the program up again for each.
+    proving_key: Option<Arc<WrapProvingKey<C>>>,
     prover_data: Arc<RecursionProverData<C>>,
 }
 
@@ -1387,7 +1396,7 @@ impl<C: SP1ProverComponents> WrapProver<C> {
             config.vk_verification,
             &wrap_input,
         ));
-        let (_, verifying_key) = {
+        let (preprocessed, verifying_key) = {
             let (prover, program, permits) = (prover.clone(), program.clone(), permits.clone());
             let (tx, rx) = oneshot::channel();
             tokio::task::spawn(async move {
@@ -1395,8 +1404,11 @@ impl<C: SP1ProverComponents> WrapProver<C> {
             });
             rx.blocking_recv().unwrap()
         };
+        let keep = std::env::var("SP1_WRAP_PERSISTENT_PK").map(|v| v != "0").unwrap_or(true);
+        // The setup's permit is released here, as when the key was dropped: proving takes its own.
+        let proving_key = keep.then(|| unsafe { preprocessed.into_inner() });
 
-        Self { prover, permits, program, verifying_key, prover_data }
+        Self { prover, permits, program, verifying_key, proving_key, prover_data }
     }
 
     pub async fn prove(
@@ -1420,15 +1432,25 @@ impl<C: SP1ProverComponents> WrapProver<C> {
             runtime.record
         };
 
-        let (_, proof, permit) = self
-            .prover
-            .setup_and_prove_shard(
-                self.program.clone(),
-                execution_record,
-                Some(self.verifying_key.clone()),
-                self.permits.clone(),
-            )
-            .await;
+        let (proof, permit) = match &self.proving_key {
+            Some(pk) => {
+                self.prover
+                    .prove_shard_with_pk(pk.clone(), execution_record, self.permits.clone())
+                    .await
+            }
+            None => {
+                let (_, proof, permit) = self
+                    .prover
+                    .setup_and_prove_shard(
+                        self.program.clone(),
+                        execution_record,
+                        Some(self.verifying_key.clone()),
+                        self.permits.clone(),
+                    )
+                    .await;
+                (proof, permit)
+            }
+        };
         let duration = permit.release();
         metrics.increment_permit_time(duration);
 
