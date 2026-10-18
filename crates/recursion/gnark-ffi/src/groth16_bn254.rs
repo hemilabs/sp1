@@ -911,6 +911,19 @@ impl Groth16Bn254Prover {
         // In the proof's own directory, so a crash leaves nothing behind that is not swept.
         let out_path = prepared.witness_dir.path().join("proof.json");
 
+        // A helper prestarted for this circuit has its key loaded (and maybe uploaded) already;
+        // it reads the witness files gnark's solve wrote, so not with the GPU R1CS solver.
+        if prepared.gpu_r1cs.is_none() {
+            if let Some(proof) = crate::prestart::prove_with_prestarted_gpu(
+                &prepared.pk.dir,
+                prepared.witness_dir.path(),
+                &prepared.witness_json,
+                &out_path,
+            ) {
+                return proof;
+            }
+        }
+
         // The helper needs ~15 GB of GPU memory, which a prover keeping its shard-prover state on
         // a 24 GB card does not have free. Only a process that exits after this proof may reset
         // its GPU to make room; see `gpu_device`.

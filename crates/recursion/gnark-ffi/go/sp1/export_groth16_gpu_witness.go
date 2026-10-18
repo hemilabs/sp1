@@ -107,6 +107,14 @@ func hasGroth16Commitments(r constraint.ConstraintSystem) bool {
 	return len(r.(*cs.R1CS).CommitmentInfo.(constraint.Groth16Commitments)) > 0
 }
 
+// PrefetchGroth16GpuWitnessCircuit reads the circuit that ExportGroth16GpuWitness solves into its
+// cache ahead of the proof, so that the solve does not wait ~2 s for it. Reading the circuit needs
+// none of the environment variables the solve sets, so this runs without touching the environment
+// (other threads read it concurrently).
+func PrefetchGroth16GpuWitnessCircuit(dataDir string, pkDir string) {
+	gpuWitnessCircuit(dataDir, pkDir)
+}
+
 // ExportGroth16GpuWitness solves the Groth16 R1CS and exports the solved
 // witness vectors (W, A, B, C) plus BSB22 Pedersen commitments as flat
 // binary files for the Rust GPU prover.

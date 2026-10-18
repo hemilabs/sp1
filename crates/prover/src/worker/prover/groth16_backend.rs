@@ -99,6 +99,72 @@ pub(crate) fn use_gpu(inputs: &Groth16Inputs<'_>) -> (bool, String) {
     }
 }
 
+/// Least total GPU memory for prestarting the GPU helper: above the 30 GB tier, where the pool trim
+/// leaves the helper room beside the resident shard prover (25.5 GB free on a 32 GB card).
+pub(crate) const PRESTART_MIN_VRAM_BYTES: u64 = 30 << 30;
+
+/// Host memory a proof must have available to prestart the GPU helper: it holds the GPU-format key
+/// (~13 GB) and the R1CS (~3 GB) from the start of the proof, beside the solve's own 13 GB later.
+pub(crate) const PRESTART_MIN_AVAILABLE_BYTES: u64 = 32 << 30;
+
+/// What prestarting the GPU helper depends on; see [`should_prestart`].
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PrestartInputs<'a> {
+    /// `SP1_GROTH16_PRESTART`: `0`/`false` turns prestarting off.
+    pub prestart_env: Option<&'a str>,
+    /// `SP1_GROTH16_GPU`: forcing the CPU prover rules out the helper.
+    pub override_env: Option<&'a str>,
+    pub helper_available: bool,
+    /// Whether this process resets its GPU before the wrap, which would kill a prestarted helper's
+    /// uploaded key along with everything else.
+    pub gpu_reset: bool,
+    /// Total memory of this process's GPU, if it has one.
+    pub vram_total: Option<u64>,
+    pub mem_available: Option<u64>,
+    /// Whether the circuit artifacts are installed (in release mode, at the default location).
+    pub circuit_installed: bool,
+}
+
+/// Whether to prestart the GPU helper as a Groth16 proof starts: only where the GPU prover will
+/// probably be chosen, and the host has the memory to hold the helper all through the proof.
+pub(crate) fn should_prestart(inputs: &PrestartInputs<'_>) -> bool {
+    !matches!(inputs.prestart_env, Some("0" | "false"))
+        && !matches!(inputs.override_env, Some("0" | "false"))
+        && inputs.helper_available
+        && !inputs.gpu_reset
+        && inputs.circuit_installed
+        && inputs.vram_total.is_some_and(|total| total >= PRESTART_MIN_VRAM_BYTES)
+        && inputs.mem_available.is_some_and(|available| available >= PRESTART_MIN_AVAILABLE_BYTES)
+}
+
+/// Prestarts the GPU helper for a Groth16 proof (see `sp1_recursion_gnark_ffi::prestart`) if
+/// [`should_prestart`]. Dropping the result when the proof ends gives back whatever it did not use.
+#[cfg(feature = "native-gnark")]
+pub(crate) fn prestart_gpu_helper() -> Option<sp1_recursion_gnark_ffi::prestart::Prestart> {
+    use sp1_recursion_gnark_ffi::Groth16Bn254Prover;
+    let build_dir =
+        (!crate::build::use_development_mode()).then(crate::build::groth16_circuit_artifacts_dir);
+    let build_dir = build_dir.and_then(Result::ok);
+    let prestart_env = std::env::var("SP1_GROTH16_PRESTART").ok();
+    let override_env = std::env::var("SP1_GROTH16_GPU").ok();
+    let inputs = PrestartInputs {
+        prestart_env: prestart_env.as_deref(),
+        override_env: override_env.as_deref(),
+        helper_available: Groth16Bn254Prover::gpu_helper_available(),
+        gpu_reset: sp1_recursion_gnark_ffi::gpu_reset_requested(),
+        vram_total: sp1_recursion_gnark_ffi::gpu_total_memory(),
+        mem_available: sp1_recursion_gnark_ffi::host_memory::available(),
+        circuit_installed: build_dir
+            .as_deref()
+            .is_some_and(crate::build::circuit_artifacts_installed),
+    };
+    if !should_prestart(&inputs) {
+        tracing::debug!("Groth16: not prestarting the GPU helper: {inputs:?}");
+        return None;
+    }
+    sp1_recursion_gnark_ffi::prestart::prestart_groth16_gpu(&build_dir?)
+}
+
 /// Proves with the GPU prover when `use_gpu`, and with the CPU prover otherwise or if the GPU prover
 /// fails, so that a GPU failure costs time rather than the proof. `gpu` may fail by returning an
 /// error or by panicking, which is how its helper reports failure.
@@ -232,5 +298,38 @@ mod tests {
         assert_eq!(prove_preferring_gpu("test", false, untried, cpu).unwrap(), "cpu");
         let cpu_failed = || -> anyhow::Result<&str> { Err(anyhow::anyhow!("helper failed")) };
         assert!(prove_preferring_gpu("test", true, failed, cpu_failed).is_err());
+    }
+
+    fn prestart_inputs() -> PrestartInputs<'static> {
+        PrestartInputs {
+            prestart_env: None,
+            override_env: None,
+            helper_available: true,
+            gpu_reset: false,
+            vram_total: Some(32 * GIB),
+            mem_available: Some(64 * GIB),
+            circuit_installed: true,
+        }
+    }
+
+    #[test]
+    fn prestarts_only_where_the_gpu_prover_is_likely_and_the_host_has_room() {
+        let base = prestart_inputs();
+        assert!(should_prestart(&base));
+        for off in ["0", "false"] {
+            assert!(!should_prestart(&PrestartInputs { prestart_env: Some(off), ..base }));
+            assert!(!should_prestart(&PrestartInputs { override_env: Some(off), ..base }));
+        }
+        assert!(should_prestart(&PrestartInputs { override_env: Some("1"), ..base }));
+        assert!(!should_prestart(&PrestartInputs { helper_available: false, ..base }));
+        assert!(!should_prestart(&PrestartInputs { gpu_reset: true, ..base }));
+        assert!(!should_prestart(&PrestartInputs { circuit_installed: false, ..base }));
+        assert!(!should_prestart(&PrestartInputs { vram_total: Some(24 * GIB), ..base }));
+        assert!(!should_prestart(&PrestartInputs { vram_total: None, ..base }));
+        assert!(!should_prestart(&PrestartInputs {
+            mem_available: Some(PRESTART_MIN_AVAILABLE_BYTES - 1),
+            ..base
+        }));
+        assert!(!should_prestart(&PrestartInputs { mem_available: None, ..base }));
     }
 }

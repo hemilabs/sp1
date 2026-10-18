@@ -18,6 +18,8 @@ pub mod plonk_bn254;
 pub mod plonk_helper_server;
 #[cfg(feature = "native")]
 pub mod plonk_witness_worker;
+#[cfg(feature = "native")]
+pub mod prestart;
 pub mod proof;
 pub mod retry;
 #[cfg(feature = "native")]

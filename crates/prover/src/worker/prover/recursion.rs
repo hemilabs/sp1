@@ -845,6 +845,13 @@ impl<A: ArtifactClient, C: SP1ProverComponents> SP1RecursionProver<A, C> {
                     "Groth16 prover: {} ({reason})",
                     if gpu { "GPU" } else { "gnark CPU" }
                 );
+                // A prestarted GPU helper uploads its key while this thread solves; with the CPU
+                // prover it is not needed, and gives its memory back.
+                if gpu {
+                    sp1_recursion_gnark_ffi::prestart::let_prestarted_gpu_helper_upload();
+                } else {
+                    sp1_recursion_gnark_ffi::prestart::cancel();
+                }
                 gpu
             };
 

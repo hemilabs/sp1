@@ -254,6 +254,13 @@ where
 
         // However the proof ends, the workers' cached core proving key for it goes away with it.
         let _release_core_pk = ReleaseCoreProvingKeysOnDrop(elf.clone());
+        // A Groth16 proof starts the GPU prover's helper now, so that it has its key loaded by the
+        // time the wrap is done; whatever the proof does not use goes when it ends. This helps
+        // when this process also runs the Groth16 task, as a local node or GPU server does.
+        #[cfg(feature = "native-gnark")]
+        let _groth16_prestart = (mode == ProofMode::Groth16)
+            .then(crate::worker::prover::groth16_backend::prestart_gpu_helper)
+            .flatten();
 
         let stdin_download_handle = self
             .artifact_client
