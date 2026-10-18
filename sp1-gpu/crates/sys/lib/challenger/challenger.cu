@@ -10,11 +10,17 @@
 
 
 __global__ __launch_bounds__(256, 1) void
-grindKernel(DuplexChallenger challenger, kb31_t* result, size_t bits, size_t n, bool* found_flag) {
+grindKernel(
+    DuplexChallenger challenger,
+    kb31_t* result,
+    size_t bits,
+    size_t start,
+    size_t end,
+    bool* found_flag) {
     // found_flag is initialized to false by the host before launch.
     // Do NOT set it here — late-starting blocks would overwrite true→false,
     // causing the search to miss early successes and run far too long.
-    challenger.grind(bits, result, found_flag, n);
+    challenger.grind_fast(bits, result, found_flag, start, end);
 }
 
 extern "C" void* grind_koala_bear() { return SP1_KERNEL_PTR(grindKernel); }
