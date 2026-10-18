@@ -42,7 +42,10 @@ use tracing::Instrument;
 
 use crate::{
     verify::SP1Verifier,
-    worker::{MessageReceiver, RawTaskRequest, TaskContext, TaskError, TaskId, WorkerClient},
+    worker::{
+        release_core_proving_keys, MessageReceiver, RawTaskRequest, TaskContext, TaskError, TaskId,
+        WorkerClient,
+    },
     SP1_CIRCUIT_VERSION,
 };
 
@@ -73,7 +76,9 @@ pub struct SP1ControllerConfig {
 
 pub struct SP1Controller<A, W> {
     config: SP1ControllerConfig,
-    setup_cache: Arc<Mutex<LruCache<Artifact, SP1VerifyingKey>>>,
+    // Keyed by the SHA-256 of the ELF bytes: the ELF artifact id is fresh for every proof, so an
+    // artifact-keyed cache never hit and every proof re-ran SetupVkey before starting execution.
+    setup_cache: Arc<Mutex<LruCache<[u8; 32], SP1VerifyingKey>>>,
     pub(crate) artifact_client: A,
     pub(crate) worker_client: W,
     pub(crate) verifier: SP1Verifier,
@@ -247,6 +252,9 @@ where
         let ControllerInputs { elf, stdin_artifact, mode, cycle_limit, proof_nonce, metadata } =
             ControllerInputs::try_from(inputs.as_slice())?;
 
+        // However the proof ends, the workers' cached core proving key for it goes away with it.
+        let _release_core_pk = ReleaseCoreProvingKeysOnDrop(elf.clone());
+
         let stdin_download_handle = self
             .artifact_client
             .download_with_type::<SP1Stdin>(&stdin_artifact, metadata.stdin_artifact_type());
@@ -263,8 +271,13 @@ where
             let setup_cache = self.setup_cache.clone();
             let context = context.clone();
             async move {
+                let elf_digest: [u8; 32] = {
+                    use sha2::{Digest, Sha256};
+                    let elf_bytes = artifact_client_clone.download_program(&elf_clone).await?;
+                    Sha256::digest(&elf_bytes).into()
+                };
                 let mut lock = setup_cache.lock().await;
-                let vkey = lock.get(&elf_clone).cloned();
+                let vkey = lock.get(&elf_digest).cloned();
                 drop(lock);
                 let vk = if let Some(vkey) = vkey {
                     tracing::debug!("setup cache hit");
@@ -294,7 +307,7 @@ where
                     tracing::debug!("setup task succeeded");
                     let vk =
                         artifact_client_clone.download::<SP1VerifyingKey>(&vk_artifact).await?;
-                    setup_cache.lock().await.put(elf_clone, vk.clone());
+                    setup_cache.lock().await.put(elf_digest, vk.clone());
                     // The vk is now memory-cached for the lifetime of this worker;
                     let _ = artifact_client_clone
                         .try_delete(&vk_artifact, ArtifactType::UnspecifiedArtifactType)
@@ -373,6 +386,7 @@ where
             let artifact_client = self.artifact_client.clone();
             let worker_client = self.worker_client.clone();
             let context = context.clone();
+            let elf = elf.clone();
             compress_proof_artifact = Some(self.artifact_client.create_artifact()?);
             let compress_proof_artifact = compress_proof_artifact.clone().unwrap();
             join_set.spawn(
@@ -385,6 +399,9 @@ where
                         &worker_client,
                     )
                     .await?;
+                    // Every core shard is proven: free the core proving key before shrink, wrap
+                    // and the final SNARK need the device memory.
+                    release_core_proving_keys(&elf);
                     compress_complete_tx.send(()).unwrap();
                     Ok(())
                 }
@@ -551,6 +568,16 @@ where
 /// after every shard proof has been streamed — so its presence means re-executing
 /// would stream a second set. A failed lookup re-executes rather than failing the
 /// task: duplicates are recoverable, a lost proof is not.
+/// Releases the cached core proving key of a proof when dropped (see
+/// [`release_core_proving_keys`]).
+struct ReleaseCoreProvingKeysOnDrop(Artifact);
+
+impl Drop for ReleaseCoreProvingKeysOnDrop {
+    fn drop(&mut self) {
+        release_core_proving_keys(&self.0);
+    }
+}
+
 async fn recorded_execution_output<A: ArtifactClient>(
     artifact_client: &A,
     task_id: &TaskId,
