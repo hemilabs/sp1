@@ -360,6 +360,13 @@ rustCudaError_t cached_free(void* p, sycl::queue* q) {
 
 }  // namespace
 
+// Frees the allocator's cached blocks (after waiting for the device), for work that needs the
+// memory back, such as the Groth16 prover (lib/groth16) after a proof's SP1 stages.
+extern "C" void cuda_release_cached_memory() {
+    std::lock_guard<std::mutex> lock(g_alloc_mutex);
+    release_cached_blocks();
+}
+
 // For the other SYCL sources (lib/sycl/ntt.cpp): times a submission if the kernel timing is on.
 void sp1_sycl_profile_event(const char* name, const sycl::event& e) {
     if (sp1prof::enabled()) GpuProfiler::get().add(name, e);

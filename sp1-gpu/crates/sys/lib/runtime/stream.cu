@@ -301,6 +301,15 @@ static hipError_t cachedHipFree(void* p, hipStream_t stream) {
 #define cudaFreeAsync cachedHipFree
 #endif // __HIPCC__
 
+// Frees the allocator's cached blocks (after waiting for the device), for work that needs the
+// memory back, such as the Groth16 prover (lib/groth16) after a proof's SP1 stages.
+extern "C" void cuda_release_cached_memory() {
+#ifdef __HIPCC__
+    std::lock_guard<std::mutex> lock(g_alloc_mutex);
+    releaseCachedBlocks();
+#endif
+}
+
 // ---------------------------------------------------------------------------------------------
 // Optional per-kernel GPU timing (runtime/kernel_profile.hpp): a pair of timing events around
 // each launch, copy or profiled scope, resolved in batches off the launch path.

@@ -40,6 +40,7 @@
 #ifdef SP1_SYCL
 
 #include <sycl/sycl.hpp>
+#include <sycl/ext/intel/experimental/grf_size_properties.hpp>
 
 #include <algorithm>
 #include <cstddef>
@@ -301,6 +302,12 @@ using launch_fn = sycl::event (*)(
 // (jagged_assist's fix_last_variable test, reproduced outside SP1; correct with optimizations
 // disabled). Large GRF mode avoided that case but miscompiled the LogUp-GKR round kernels. Every
 // kernel test passes at SIMD16.
+// Kernels that keep many wide values per work item get Intel's large register file (256 GRF,
+// at half the threads per core) instead of spilling: SP1_SYCL_LARGE_GRF(kernel), at namespace
+// scope after the kernel.
+template <auto& F>
+inline constexpr bool large_grf = false;
+
 template <auto& F, typename Tuple>
 struct KernelFunctor {
     Tuple captured;
@@ -310,8 +317,14 @@ struct KernelFunctor {
     }
 
     auto get(sycl::ext::oneapi::experimental::properties_tag) const {
-        return sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::sub_group_size<SP1_SYCL_SUB_GROUP>};
+        if constexpr (large_grf<F>) {
+            return sycl::ext::oneapi::experimental::properties{
+                sycl::ext::oneapi::experimental::sub_group_size<SP1_SYCL_SUB_GROUP>,
+                sycl::ext::intel::experimental::grf_size<256>};
+        } else {
+            return sycl::ext::oneapi::experimental::properties{
+                sycl::ext::oneapi::experimental::sub_group_size<SP1_SYCL_SUB_GROUP>};
+        }
     }
 };
 
@@ -389,7 +402,9 @@ launch_thunk(void* queue, dim3 grid, dim3 block, void** args, size_t shared_mem,
 extern "C" void* sp1_kernel_named(void* kernel, const char* name);
 #ifdef SP1_SYCL
 #define SP1_KERNEL_PTR(...) sp1_kernel_named((void*)&::sp1sycl::launch_thunk<__VA_ARGS__>, #__VA_ARGS__)
+#define SP1_SYCL_LARGE_GRF(...)                                                                        template <>                                                                                        inline constexpr bool ::sp1sycl::large_grf<__VA_ARGS__> = true;
 #else
+#define SP1_SYCL_LARGE_GRF(...)
 #define SP1_KERNEL_PTR(...) sp1_kernel_named((void*)(__VA_ARGS__), #__VA_ARGS__)
 #endif
 

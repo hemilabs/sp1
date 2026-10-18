@@ -226,6 +226,12 @@ pub async fn cuda_worker_builder_with_machine(
     scope: TaskScope,
     machine: Machine<SP1Field, RiscvAir<SP1Field>>,
 ) -> SP1WorkerBuilder<SP1CudaProverComponents> {
+    // gnark's Groth16 prover runs its quotient polynomial and MSMs on this GPU where the build has
+    // them (HIP and SYCL; SP1_GROTH16_GPU=0 keeps them on the CPU).
+    if let Some((compute_h, msm_g1, msm_g2)) = sp1_gpu_cudart::sys::groth16_entry_points() {
+        sp1_recursion_gnark_ffi::ffi::set_groth16_gpu_hooks(compute_h, msm_g1, msm_g2);
+    }
+
     // #3: permit count = max in-flight shards. Default 1 = single-shard
     // (today's behaviour); env `SP1_PROVE_OVERLAP_TRACEGEN` ≥ 1 raises it
     // in lockstep with the per-PK trace-buffer pool size (see
