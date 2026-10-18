@@ -151,7 +151,12 @@ __global__ void interpolateAndObserve(
     EF *sum_values,
     const EF *claim_ptr
 ){
-    if (blockIdx.x == 0 && threadIdx.x == 0 && blockIdx.y == 0 && threadIdx.y == 0) {
+    // A DuplexChallenger runs on 16 lanes, which compute the same values (permuteCoop); lane 0
+    // writes them.
+    constexpr unsigned LANES = Challenger::COOPERATIVE ? 16 : 1;
+    if (blockIdx.x != 0 || blockIdx.y != 0 || threadIdx.y != 0 || threadIdx.x >= LANES) return;
+    const bool writer = threadIdx.x == 0;
+    auto ch = challenger.localize_coop();
 
     // The round's claim, from the previous round's results[0] on the device (no host round trip).
     EF claim = *claim_ptr;
@@ -159,28 +164,31 @@ __global__ void interpolateAndObserve(
     EF y_0 = results[0];
     EF y_half = results[1];
     EF y_1 = claim - y_0;
-    F x_0 = F::zero();
-    F x_one = F::one();
-    F x_half = F::one() / F::two();
 
-    sum_values[3*round_num + 0] = y_0;
-    sum_values[3*round_num + 1] = y_half;
-    sum_values[3*round_num + 2] = y_1;
+    if (writer) {
+        sum_values[3*round_num + 0] = y_0;
+        sum_values[3*round_num + 1] = y_half;
+        sum_values[3*round_num + 2] = y_1;
+    }
 
-
-
+    // The quadratic through (0, y_0), (1/2, y_half) and (1, y_1), the points being fixed:
+    // c0 = y_0, c1 = 4 y_half - 3 y_0 - y_1, c2 = 2 (y_0 + y_1 - 2 y_half).
+    EF two_half = y_half + y_half;
     EF coefficients[3];
-    interpolateQuadratic<F, EF>(x_0, x_half, x_one, y_0, y_half, y_1, coefficients);
+    coefficients[0] = y_0;
+    coefficients[1] = two_half + two_half - (y_0 + y_0 + y_0) - y_1;
+    EF c2 = y_0 + y_1 - two_half;
+    coefficients[2] = c2 + c2;
 
-    challenger.observe_ext(&coefficients[0]);
-    challenger.observe_ext(&coefficients[1]);
-    challenger.observe_ext(&coefficients[2]);
+    ch.observe_ext(&coefficients[0]);
+    ch.observe_ext(&coefficients[1]);
+    ch.observe_ext(&coefficients[2]);
 
-    EF alpha = challenger.sample_ext();
+    EF alpha = ch.sample_ext();
+    if (!writer) return;
+    challenger.store_coop(ch);
 
     sampled_value[0] = alpha;
-
-    // results[0] = coefficients[0] + coefficients[1] * alpha + coefficients[2] * alpha * alpha;
 
     EF t(coefficients[2]);
     t *= alpha;
@@ -188,75 +196,8 @@ __global__ void interpolateAndObserve(
     t *= alpha;
     t += coefficients[0];
     results[0] = t;
-    }
 }
 
-template<typename F, typename EF>
-__device__ void interpolateQuadratic(
-    F x_0,
-    F x_1,
-    F x_2,
-    EF y_0,
-    EF y_1,
-    EF y_2,
-    EF coefficients[3])
-{
-    /* Compute the coefficients of the quadratic polynomial.
-
-    EF coeff_0 = y_0/((x_0-x_1)*(x_0-x_2));
-    EF coeff_1 = y_1/((x_1-x_0)*(x_1-x_2));
-    EF coeff_2 = y_2/((x_2-x_0)*(x_2-x_1));
-    */
-
-    F x0102 = (x_0-x_1)*(x_0-x_2);
-    F x1012 = (x_1-x_0)*(x_1-x_2);
-    F x2021 = (x_2-x_0)*(x_2-x_1);
-    F x0102x1012 = x0102 * x1012;
-    F denom = x0102x1012 * x2021;
-    F inv = denom.reciprocal();
-
-    EF coeff_0 = y_0 * inv * x1012 * x2021;
-    EF coeff_1 = y_1 * inv * x0102 * x2021;
-    EF coeff_2 = y_2 * inv * x0102x1012;
-
-    /* Compute the value of the polynomial at x.
-
-    // 3 F+F
-    // 4 EF+EF
-    // 9 EF*F
-    coefficients[2] =coeff_0+ coeff_1 + coeff_2;
-    coefficients[1] = -(coeff_0 * (x_1 + x_2) + coeff_1 * (x_0 + x_2) + coeff_2 * (x_0 + x_1));
-    coefficients[0] = coeff_0 * x_1 * x_2 + coeff_1 * x_0 * x_2 + coeff_2 * x_0 * x_1;
-    */
-
-    // 2 F+F
-    // 6 EF+EF
-    // 7 EF*F
-    EF
-        t0, t1, t2,
-        c0c1 = coeff_0 + coeff_1,       // EF+EF
-        c0x1 = coeff_0 * x_1,           // EF*F
-        c1x0 = coeff_1 * x_0,           // EF*F
-        c2x0 = coeff_2 * x_0,           // EF*F
-        c0c1x2 = c0c1 * x_2;            // EF*F
-
-    F x0x1 = x_0 + x_1;                 // F+F
-
-    t2 = c0c1 + coeff_2;                // F+F
-
-    t1  = coeff_2 * x0x1;               // EF*F
-    t1 += c0x1;                         // EF+EF
-    t1 += c1x0;                         // EF+EF
-    t1 += c0c1x2;                       // EF+EF
-
-    t0 = c0x1 + c1x0;                   // EF+EF
-    t0 *= x_2;                          // EF*F
-    t0 += c2x0 * x_1;                   // EF + EF*F
-
-    coefficients[2] = t2;
-    coefficients[1] = -t1;
-    coefficients[0] = t0;
-}
 
 
 template<typename F, typename EF>

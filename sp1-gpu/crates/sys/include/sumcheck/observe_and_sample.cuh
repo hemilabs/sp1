@@ -355,6 +355,16 @@ __global__ __launch_bounds__(256) void sumcheckObserveAndSampleCubic(
 ///   point_last    - [in]     the last coordinate of the round's point
 ///   switch_to_eq  - [in]     the next fold is the last circuit layer's: afterwards
 ///                            eq_adjustment = padding_adjustment and padding_adjustment = 1
+/// The round polynomial's coefficients as a linear map of (eval_zero, eval_one, eval_half):
+/// coefficient k = m[3k] eval_zero + m[3k + 1] eval_one + m[3k + 2] eval_half. The interpolation
+/// through (0, eval_zero), (1, eval_one), (1/2, eval_half / 8) and (b, 0), b = (1 - point_last) /
+/// (1 - 2 point_last), depends on the point alone, and the host computes it (cubic_basis in
+/// sp1-gpu-logup-gkr): a lone GPU thread would spend most of the round on its inversions.
+template <typename EF>
+struct CubicBasis {
+    EF m[12];
+};
+
 template <typename F, typename EF, typename Challenger>
 __global__ __launch_bounds__(256) void sumcheckObserveAndSampleCubicDevice(
     const EF* __restrict__ evals,
@@ -363,8 +373,14 @@ __global__ __launch_bounds__(256) void sumcheckObserveAndSampleCubicDevice(
     EF* __restrict__ alpha_out,
     EF* __restrict__ coeffs_out,
     EF point_last,
-    int switch_to_eq) {
-    if (blockIdx.x != 0 || threadIdx.x != 0) return;
+    int switch_to_eq,
+    CubicBasis<EF> basis) {
+    // A DuplexChallenger runs on 16 lanes (permuteCoop); the launch gives the kernel 16 threads,
+    // which compute the same values, and lane 0 writes them.
+    constexpr unsigned LANES = Challenger::COOPERATIVE ? 16 : 1;
+    if (blockIdx.x != 0 || threadIdx.x >= LANES) return;
+    const bool writer = threadIdx.x == 0;
+    auto ch = challenger.localize_coop();
 
     const EF claim = state[0];
     const EF padding_adjustment = state[1];
@@ -378,31 +394,23 @@ __global__ __launch_bounds__(256) void sumcheckObserveAndSampleCubicDevice(
     eval_zero += eq_correction_term * (one - point_last);
     EF four = EF(F(4));
     eval_half += eq_correction_term * four;
-    EF inv8 = EF(F(8)).reciprocal();
-    eval_half = eval_half * inv8;
     eval_zero = eval_zero * eq_adjustment;
     eval_half = eval_half * eq_adjustment;
     EF eval_one = claim - eval_zero;
-    EF two = EF(F(2));
-    EF b_const = (one - point_last) * (one - two * point_last).reciprocal();
 
     EF coefficients[4];
-    interpolateCubicSumcheck<F, EF>(
-        EF::zero(),
-        one,
-        two.reciprocal(),
-        b_const,
-        eval_zero,
-        eval_one,
-        eval_half,
-        EF::zero(),
-        coefficients);
+    for (int k = 0; k < 4; k++) {
+        coefficients[k] = basis.m[3 * k] * eval_zero + basis.m[3 * k + 1] * eval_one +
+                          basis.m[3 * k + 2] * eval_half;
+    }
 
-    challenger.observe_ext(&coefficients[0]);
-    challenger.observe_ext(&coefficients[1]);
-    challenger.observe_ext(&coefficients[2]);
-    challenger.observe_ext(&coefficients[3]);
-    EF alpha = challenger.sample_ext();
+    ch.observe_ext(&coefficients[0]);
+    ch.observe_ext(&coefficients[1]);
+    ch.observe_ext(&coefficients[2]);
+    ch.observe_ext(&coefficients[3]);
+    EF alpha = ch.sample_ext();
+    if (!writer) return;
+    challenger.store_coop(ch);
     alpha_out[0] = alpha;
     for (int i = 0; i < 4; i++) coeffs_out[i] = coefficients[i];
 

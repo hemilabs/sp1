@@ -123,6 +123,32 @@ mod tests {
     use slop_challenger::{CanObserve, CanSample, GrindingChallenger};
     use sp1_hypercube::inner_perm;
 
+    /// The 16-lane cooperative permutation (permuteCoop) agrees with the single-thread one.
+    #[test]
+    fn test_cooperative_permutation() {
+        use sp1_gpu_cudart::{args, DeviceBuffer};
+        sp1_gpu_cudart::run_sync_in_place(|t| {
+            let mut out = DeviceBuffer::<u32>::with_capacity_in(1, t.clone());
+            for seed in [1u32, 7, 12345] {
+                unsafe {
+                    out.set_len(1);
+                    let rounds = 50i32;
+                    let args = args!(seed, rounds, out.as_mut_ptr());
+                    t.launch_kernel(
+                        sp1_gpu_cudart::sys::challenger::coop_permutation_check_kernel(),
+                        1usize,
+                        16usize,
+                        &args,
+                        0,
+                    )
+                    .unwrap();
+                }
+                assert_eq!(out.to_host().unwrap()[0], 0, "seed {seed}");
+            }
+        })
+        .unwrap();
+    }
+
     #[test]
     fn test_grinding() {
         sp1_gpu_cudart::run_sync_in_place(|t| {

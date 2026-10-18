@@ -10,6 +10,112 @@
 extern "C" void* grind_koala_bear();
 
 
+// The KoalaBear Poseidon2 permutation on 16 cooperating lanes (a 16-wide group of a warp or
+// sub-group): lane l holds state[l], the S-boxes run in parallel and the linear layers exchange
+// values by shuffles. Every lane passes the same `in` and gets the whole `out`. The same
+// permutation as Hasher<KoalaBear>::permute: on one GPU thread that is a ~17 us chain of
+// dependent operations (Radeon RX 9070 XT), for the single-thread challenger kernels a few
+// microseconds here.
+namespace poseidon2_kb31_16 {
+
+__device__ __forceinline__ kb31_t coopShfl(kb31_t v, int src) {
+    kb31_t r;
+    r.val = __shfl((int)v.val, src, 16);
+    return r;
+}
+
+__device__ __forceinline__ kb31_t coopShflXor(kb31_t v, int mask) {
+    kb31_t r;
+    r.val = __shfl_xor((int)v.val, mask, 16);
+    return r;
+}
+
+// table[base + lane], selected with constant indices only: SYCL device code reads a constant table
+// at a run-time index as garbage (the single-thread permutation's indices are all constants).
+__device__ __forceinline__ kb31_t laneConst(const kb31_t* table, int base, int lane) {
+    kb31_t c = table[base];
+#pragma unroll
+    for (int i = 1; i < 16; i++)
+        if (lane == i) c = table[base + i];
+    return c;
+}
+
+// KoalaBear::externalLinearLayer for this lane's element.
+__device__ __forceinline__ kb31_t coopExternal(kb31_t v, int lane) {
+    const int base = lane & ~3, j = lane & 3;
+    kb31_t s0 = coopShfl(v, base), s1 = coopShfl(v, base + 1);
+    kb31_t s2 = coopShfl(v, base + 2), s3 = coopShfl(v, base + 3);
+    kb31_t t01 = s0 + s1;
+    kb31_t t23 = s2 + s3;
+    kb31_t t0123 = t01 + t23;
+    kb31_t t01123 = t0123 + s1;
+    kb31_t t01233 = t0123 + s3;
+    kb31_t m;
+    if (j == 0)
+        m = t01123 + t01;
+    else if (j == 1)
+        m = t01123 + operator<<(s2, 1);
+    else if (j == 2)
+        m = t01233 + t23;
+    else
+        m = t01233 + operator<<(s0, 1);
+    // Plus the sum of the same position over the four 4x4 blocks.
+    kb31_t sum = m + coopShflXor(m, 4);
+    sum += coopShflXor(sum, 8);
+    return m + sum;
+}
+
+// KoalaBear::internalLinearLayer for this lane's element. Its sum term is what that function
+// computes on each backend (checked lane by lane against it, sp1-gpu-challenger's
+// test_cooperative_permutation): on SYCL, its formula on the raw representations (the sum mod p,
+// made an element and scaled by MONTY_INVERSE); on CUDA and HIP, the field sum of the state.
+__device__ __forceinline__ kb31_t coopInternal(kb31_t v, int lane) {
+#ifdef SP1_SYCL
+    uint32_t raw = v.val;
+#pragma unroll
+    for (int mask = 1; mask < 16; mask <<= 1) {
+        raw += (uint32_t)__shfl_xor((int)raw, mask, 16);
+        if (raw >= kb31_t::MOD) raw -= kb31_t::MOD;
+    }
+    const kb31_t sum = kb31_t(raw) * constants::MONTY_INVERSE;
+#else
+    kb31_t sum = v + coopShflXor(v, 1);
+    sum += coopShflXor(sum, 2);
+    sum += coopShflXor(sum, 4);
+    sum += coopShflXor(sum, 8);
+#endif
+    return v * laneConst(constants::MAT_INTERNAL_DIAG_M1, 0, lane) + sum;
+}
+
+__device__ __forceinline__ void permuteCoop(const kb31_t in[16], kb31_t out[16]) {
+    const int lane = threadIdx.x & 15;
+    kb31_t v = in[lane];
+    v = coopExternal(v, lane);
+#pragma unroll
+    for (int r = 0; r < constants::ROUNDS_F / 2; r++) {
+        v += laneConst(constants::EXTERNAL_ROUND_CONSTANTS, r * 16, lane);
+        v ^= constants::D;
+        v = coopExternal(v, lane);
+    }
+#pragma unroll
+    for (int r = 0; r < constants::ROUNDS_P; r++) {
+        if (lane == 0) {
+            v += constants::INTERNAL_ROUND_CONSTANTS[r];
+            v ^= constants::D;
+        }
+        v = coopInternal(v, lane);
+    }
+#pragma unroll
+    for (int r = constants::ROUNDS_F / 2; r < constants::ROUNDS_F; r++) {
+        v += laneConst(constants::EXTERNAL_ROUND_CONSTANTS, r * 16, lane);
+        v ^= constants::D;
+        v = coopExternal(v, lane);
+    }
+    for (int i = 0; i < 16; i++) out[i] = coopShfl(v, i);
+}
+
+}  // namespace poseidon2_kb31_16
+
 class DuplexChallenger {
     static constexpr const int WIDTH = poseidon2_kb31_16::KoalaBear::WIDTH;
     static constexpr const int RATE = poseidon2_kb31_16::constants::RATE;
@@ -47,6 +153,16 @@ class DuplexChallenger {
 
   public:
     static constexpr const size_t NUM_ELEMENTS = WIDTH + 2 * RATE;
+
+    // Observed and sampled by the 16 lanes of a group together (permuteCoop).
+    static constexpr bool COOPERATIVE = true;
+
+    // The state for the 16 lanes of a group to observe and sample together (CoopDuplexChallenger),
+    // copied out of global memory: in place, every observation and sample of a lone thread is a
+    // chain of dependent global accesses. Each lane calls it, and one writes the result back with
+    // store_coop.
+    __device__ __forceinline__ class CoopDuplexChallenger localize_coop() const;
+    __device__ __forceinline__ void store_coop(const class CoopDuplexChallenger& c);
 
     __device__ __forceinline__ kb31_t getVal(size_t idx) { return sponge_state[idx % 16]; }
 
@@ -235,6 +351,73 @@ class DuplexChallenger {
     }
 };
 
+// A DuplexChallenger's state copied into registers, observed and sampled by the 16 lanes of a
+// group together: every lane runs the same operations on its own identical copy, and the
+// permutation is cooperative (permuteCoop). From DuplexChallenger::localize_coop; written back
+// with DuplexChallenger::store_coop.
+class CoopDuplexChallenger {
+  public:
+    static constexpr int WIDTH = poseidon2_kb31_16::constants::WIDTH;
+    static constexpr int RATE = poseidon2_kb31_16::constants::RATE;
+    kb31_t sponge[WIDTH];
+    kb31_t input[RATE];
+    kb31_t output[WIDTH];
+    size_t in_size;
+    size_t out_size;
+
+    __device__ void duplexing() {
+        for (size_t i = 0; i < in_size; i++) sponge[i] = input[i];
+        in_size = 0;
+        poseidon2_kb31_16::permuteCoop(sponge, output);
+        out_size = RATE;
+        for (int i = 0; i < WIDTH; i++) {
+            sponge[i] = output[i];
+            if (i >= RATE) output[i] = kb31_t::zero();
+        }
+    }
+
+    __device__ __forceinline__ void observe(kb31_t* value) {
+        out_size = 0;
+        input[in_size++] = *value;
+        if (in_size == RATE) duplexing();
+    }
+
+    __device__ __forceinline__ void observe_ext(kb31_extension_t* value) {
+#pragma unroll
+        for (size_t i = 0; i < kb31_extension_t::D; i++) observe(&value->value[i]);
+    }
+
+    __device__ __forceinline__ kb31_t sample() {
+        if (in_size != 0 || out_size == 0) duplexing();
+        return output[--out_size];
+    }
+
+    __device__ __forceinline__ kb31_extension_t sample_ext() {
+        kb31_extension_t result;
+        for (size_t i = 0; i < kb31_extension_t::D; i++) result.value[i] = sample();
+        return result;
+    }
+};
+
+__device__ __forceinline__ CoopDuplexChallenger DuplexChallenger::localize_coop() const {
+    CoopDuplexChallenger c;
+    for (int i = 0; i < WIDTH; i++) c.sponge[i] = sponge_state[i];
+    for (int i = 0; i < RATE; i++) c.input[i] = input_buffer[i];
+    for (int i = 0; i < RATE; i++) c.output[i] = output_buffer[i];
+    for (int i = RATE; i < WIDTH; i++) c.output[i] = kb31_t::zero();
+    c.in_size = buffer_sizes[0];
+    c.out_size = buffer_sizes[1];
+    return c;
+}
+
+__device__ __forceinline__ void DuplexChallenger::store_coop(const CoopDuplexChallenger& c) {
+    for (int i = 0; i < WIDTH; i++) sponge_state[i] = c.sponge[i];
+    for (int i = 0; i < RATE; i++) input_buffer[i] = c.input[i];
+    for (int i = 0; i < RATE; i++) output_buffer[i] = c.output[i];
+    buffer_sizes[0] = c.in_size;
+    buffer_sizes[1] = c.out_size;
+}
+
 class MultiField32Challenger {
     static constexpr const int WIDTH = poseidon2_bn254_3::Bn254::WIDTH;
     static constexpr const int RATE = poseidon2_bn254_3::constants::RATE;
@@ -297,6 +480,11 @@ class MultiField32Challenger {
     }
 
   public:
+    // Its permutation is not cooperative: one thread uses it in place.
+    static constexpr bool COOPERATIVE = false;
+    __device__ __forceinline__ MultiField32Challenger localize_coop() const { return *this; }
+    __device__ __forceinline__ void store_coop(const MultiField32Challenger&) {}
+
     __device__ __forceinline__ void observe(kb31_t* value) {
         // Clear the output buffer.
         buffer_sizes[1] = 0;

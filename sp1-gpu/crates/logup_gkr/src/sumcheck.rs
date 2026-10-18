@@ -1394,6 +1394,46 @@ where
     )
 }
 
+/// The cubic round polynomial's coefficients as a linear map of the round's (eval_zero, eval_one,
+/// eval_half) (CubicBasis in observe_and_sample.cuh): coefficient k is m[3k] eval_zero +
+/// m[3k + 1] eval_one + m[3k + 2] eval_half, from the Lagrange interpolation through
+/// (0, eval_zero), (1, eval_one), (1/2, eval_half / 8) and (b, 0), b = (1 - point_last) /
+/// (1 - 2 point_last), as finalize_univariate interpolates them.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct CubicBasis([Ext; 12]);
+
+fn cubic_basis(point_last: Ext) -> CubicBasis {
+    let half = Ext::two().inverse();
+    let b = (Ext::one() - point_last) / (Ext::one() - point_last.double());
+    let xs = [Ext::zero(), Ext::one(), half, b];
+    // eval_half enters as eval_half / 8.
+    let scale = [Ext::one(), Ext::one(), Ext::from_canonical_u32(8).inverse()];
+    let mut m = [Ext::zero(); 12];
+    for i in 0..3 {
+        // L_i(X) = prod_{j != i} (X - x_j) / (x_i - x_j), as coefficients, lowest first.
+        let mut poly = vec![Ext::one()];
+        let mut denom = Ext::one();
+        for (j, &xj) in xs.iter().enumerate() {
+            if j == i {
+                continue;
+            }
+            let mut next = vec![Ext::zero(); poly.len() + 1];
+            for (k, &c) in poly.iter().enumerate() {
+                next[k + 1] += c;
+                next[k] -= c * xj;
+            }
+            poly = next;
+            denom *= xs[i] - xj;
+        }
+        let w = scale[i] / denom;
+        for k in 0..4 {
+            m[3 * k + i] = poly[k] * w;
+        }
+    }
+    CubicBasis(m)
+}
+
 /// A LogUp-GKR layer's sumcheck with its rounds on the device: the same proof as
 /// [`materialized_round_sumcheck`], without a host round trip per round.
 ///
@@ -1448,6 +1488,7 @@ where
             &poly.layer,
             PolynomialLayer::CircuitLayer(circuit) if circuit.num_row_variables == 1
         ));
+        let basis = cubic_basis(point_last);
         let state = unsafe { base.add(state_offset) };
         let alpha_out = unsafe { base.add(round) };
         let coeffs_out = unsafe { base.add(coeffs_offset + 4 * round) };
@@ -1460,13 +1501,15 @@ where
                 alpha_out,
                 coeffs_out,
                 point_last,
-                switch_to_eq
+                switch_to_eq,
+                basis
             );
+            // 16 threads: a DuplexChallenger permutes on 16 lanes (the kernel uses one otherwise).
             backend
                 .launch_kernel(
                     DC::observe_and_sample_cubic_device_kernel(),
                     1usize,
-                    1usize,
+                    16usize,
                     &args,
                     0,
                 )
