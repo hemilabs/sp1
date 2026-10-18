@@ -110,6 +110,18 @@ pub async fn cuda_worker_builder(scope: TaskScope) -> SP1WorkerBuilder<SP1CudaPr
         sp1_recursion_gnark_ffi::ffi::set_groth16_gpu_hooks(compute_h, msm_g1, msm_g2);
     }
 
+    // The wrap prover keeps its proving key between Groth16/PLONK proofs (sp1-prover's WrapProver)
+    // where the card has the memory for it: on a 32 GB Arc Pro B70 that saves ~3 s a proof, while
+    // on a 16 GB Radeon RX 9070 XT the key's memory slowed the rest of each proof by more (19 s ->
+    // 25 s). SP1_WRAP_PERSISTENT_PK set by the user decides either way.
+    if std::env::var_os("SP1_WRAP_PERSISTENT_PK").is_none() {
+        if let Ok((_, total)) = sp1_gpu_cudart::cuda_memory_info() {
+            if total < 24 << 30 {
+                std::env::set_var("SP1_WRAP_PERSISTENT_PK", "0");
+            }
+        }
+    }
+
     // Create a prover permits, assuming a single proof happens at a time.
     let prover_permits = ProverSemaphore::new(1);
 
