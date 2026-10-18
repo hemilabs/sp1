@@ -34,10 +34,42 @@ use sp1_hypercube::{SP1PcsProof, ShardContextImpl};
 use std::collections::{BTreeMap, BTreeSet};
 use std::iter::once;
 use std::vec;
-use std::{marker::PhantomData, sync::Arc};
+use std::{
+    marker::PhantomData,
+    sync::{Arc, OnceLock},
+};
 use thiserror::Error;
 use tokio::sync::Mutex;
 use tracing::Instrument;
+
+/// Runs host work done while holding the prover permit on its own rayon pool.
+///
+/// The GPU waits on this work, but in the global pool its `par_iter`s queue behind the host
+/// tracegen and dependency generation of the shards waiting for the permit: a sub-millisecond
+/// one (the LogUp-GKR first layer's chip scan) took up to 0.4 s under load. The results do not
+/// depend on the pool. `SP1_GPU_PERMIT_POOL_THREADS` sets the pool size (default: a quarter of
+/// the cores, at least 4); `0` keeps the global pool.
+fn under_permit<R: Send>(f: impl FnOnce() -> R + Send) -> R {
+    static POOL: OnceLock<Option<rayon::ThreadPool>> = OnceLock::new();
+    let pool = POOL.get_or_init(|| {
+        let default = std::thread::available_parallelism().map_or(4, |n| (n.get() / 4).max(4));
+        let threads = std::env::var("SP1_GPU_PERMIT_POOL_THREADS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(default);
+        (threads > 0).then(|| {
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .thread_name(|i| format!("sp1-gpu-permit-{i}"))
+                .build()
+                .expect("failed to build the permit thread pool")
+        })
+    });
+    match pool {
+        Some(pool) => pool.install(f),
+        None => f(),
+    }
+}
 
 pub trait CudaShardProverComponents<GC: IopCtx>: Send + Sync + 'static {
     type P: CudaTcsProver<GC>;
@@ -271,13 +303,15 @@ where
         let (pk, vk) = tokio::task::spawn_blocking({
             let span = tracing::debug_span!("setup_from_preprocessed_data_and_traces");
             move || {
-                let _guard = span.enter();
-                inner.setup_from_preprocessed_data_and_traces(
-                    pc_start,
-                    initial_global_cumulative_sum,
-                    trace_data,
-                    untrusted_config,
-                )
+                under_permit(|| {
+                    let _guard = span.enter();
+                    inner.setup_from_preprocessed_data_and_traces(
+                        pc_start,
+                        initial_global_cumulative_sum,
+                        trace_data,
+                        untrusted_config,
+                    )
+                })
             }
         })
         .await
@@ -318,8 +352,10 @@ where
         let (shard_proof, permit) = tokio::task::spawn_blocking({
             let span = tracing::debug_span!("prove_shard_with_data");
             move || {
-                let _guard = span.enter();
-                inner.prove_shard_with_data(shard_data, challenger)
+                under_permit(|| {
+                    let _guard = span.enter();
+                    inner.prove_shard_with_data(shard_data, challenger)
+                })
             }
         })
         .await
@@ -375,8 +411,10 @@ where
         let (shard_proof, permit) = tokio::task::spawn_blocking({
             let span = tracing::debug_span!("prove_shard_with_data");
             move || {
-                let _guard = span.enter();
-                inner.prove_shard_with_data(shard_data, challenger)
+                under_permit(|| {
+                    let _guard = span.enter();
+                    inner.prove_shard_with_data(shard_data, challenger)
+                })
             }
         })
         .await

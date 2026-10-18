@@ -255,7 +255,11 @@ impl TaskPoolBuilder {
             let aux_stream =
                 CudaStream::create().map_err(TaskPoolBuildError::StreamCreationFailed)?;
             let end_event = CudaEvent::create().map_err(TaskPoolBuildError::EventCreationFailed)?;
-            tasks.push(Task { owner_id: id, id: i, stream, aux_stream, end_event });
+            let aux_events = std::sync::Mutex::new([
+                CudaEvent::create().map_err(TaskPoolBuildError::EventCreationFailed)?,
+                CudaEvent::create().map_err(TaskPoolBuildError::EventCreationFailed)?,
+            ]);
+            tasks.push(Task { owner_id: id, id: i, stream, aux_stream, end_event, aux_events });
         }
         let inner = Arc::new(WorkerQueue::new(tasks));
 
@@ -515,9 +519,11 @@ impl TaskScope {
             cuda_event_record, cuda_mem_copy_host_to_device_async, cuda_stream_wait_event,
         };
 
+        let events = self.aux_events.lock().unwrap_or_else(|e| e.into_inner());
+        let [alloc_done, copy_done] = &*events;
+
         // 1. Record a sync point on the primary stream so the aux stream
         //    can wait for any pending allocations / prior work on `dst`.
-        let alloc_done = CudaEvent::create()?;
         CudaError::result_from_ffi(cuda_event_record(alloc_done.0, self.stream.0))?;
         CudaError::result_from_ffi(cuda_stream_wait_event(self.aux_stream.0, alloc_done.0))?;
 
@@ -531,7 +537,6 @@ impl TaskScope {
 
         // 3. Record a sync point on the aux stream so any subsequent kernel
         //    on the primary stream sees the H2D's writes happen-before.
-        let copy_done = CudaEvent::create()?;
         CudaError::result_from_ffi(cuda_event_record(copy_done.0, self.aux_stream.0))?;
         CudaError::result_from_ffi(cuda_stream_wait_event(self.stream.0, copy_done.0))?;
         Ok(())
@@ -675,6 +680,12 @@ pub struct Task {
     /// 2026-06-18 nsys profile).
     pub(crate) aux_stream: CudaStream,
     end_event: CudaEvent,
+    /// The two events `TaskScope::copy_host_to_device_aux_async` orders its copy with, reused
+    /// for every copy: creating and destroying two events per copy cost 1.4 s of host time per
+    /// rsp proof, mostly blocked behind other threads' synchronous copies in the driver. A
+    /// stream wait uses the event's state when it is enqueued, so re-recording it afterwards is
+    /// safe; the lock keeps each record/wait pair together.
+    aux_events: std::sync::Mutex<[CudaEvent; 2]>,
 }
 
 impl PartialEq for Task {
