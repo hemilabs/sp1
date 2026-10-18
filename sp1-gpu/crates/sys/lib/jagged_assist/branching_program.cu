@@ -149,10 +149,12 @@ __global__ void interpolateAndObserve(
     EF *sampled_value,
     int8_t round_num,
     EF *sum_values,
-    EF claim
+    const EF *claim_ptr
 ){
     if (blockIdx.x == 0 && threadIdx.x == 0 && blockIdx.y == 0 && threadIdx.y == 0) {
 
+    // The round's claim, from the previous round's results[0] on the device (no host round trip).
+    EF claim = *claim_ptr;
 
     EF y_0 = results[0];
     EF y_half = results[1];

@@ -179,16 +179,22 @@ where
         return finish_jagged_eval_sumcheck(&poly.rho, sum_values, claim);
     }
 
+    // Each round reads its claim on the device, from the previous round's results (the first from
+    // this upload), so no round waits for the host.
+    let initial_claim =
+        DeviceBuffer::from_host(&Buffer::from(vec![claim]), poly.rho.backend()).unwrap();
+
     // First round of sumcheck - sync call
-    let (mut round_claim, new_point) = poly.bp_batch_eval.sum_as_poly_and_sample_into_point(
-        poly.round_num,
-        &poly.z_col_eq_vals,
-        &poly.intermediate_eq_full_evals,
-        sum_values,
-        challenger,
-        claim,
-        poly.rho.clone(),
-    );
+    let (mut round_results, new_point) =
+        poly.bp_batch_eval.sum_as_poly_and_sample_into_point_device(
+            poly.round_num,
+            &poly.z_col_eq_vals,
+            &poly.intermediate_eq_full_evals,
+            sum_values,
+            challenger,
+            initial_claim.as_ptr(),
+            poly.rho.clone(),
+        );
     poly.rho = new_point;
 
     // Fix last variable - sync call
@@ -204,16 +210,16 @@ where
     poly.round_num += 1;
 
     for _ in t..num_variables as usize {
-        let (new_claim, new_point) = poly.bp_batch_eval.sum_as_poly_and_sample_into_point(
+        let (new_results, new_point) = poly.bp_batch_eval.sum_as_poly_and_sample_into_point_device(
             poly.round_num,
             &poly.z_col_eq_vals,
             &poly.intermediate_eq_full_evals,
             sum_values,
             challenger,
-            round_claim,
+            round_results.as_ptr(),
             poly.rho.clone(),
         );
-        round_claim = new_claim;
+        round_results = new_results;
         poly.rho = new_point;
 
         JaggedAssistSumAsPolyGPUImpl::<F, EF, DeviceChallenger>::fix_last_variable_kernel::<
