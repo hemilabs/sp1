@@ -1,9 +1,6 @@
-#[cfg(not(target_env = "msvc"))]
-use tikv_jemallocator::Jemalloc;
-
-#[cfg(not(target_env = "msvc"))]
+// mimalloc with large OS pages on hosts with enough RAM; see `sp1_gpu_host_alloc`.
 #[global_allocator]
-static GLOBAL: Jemalloc = Jemalloc;
+static GLOBAL: sp1_gpu_host_alloc::HostAlloc = sp1_gpu_host_alloc::HostAlloc;
 
 use clap::Parser;
 use server::Server;
@@ -35,6 +32,8 @@ async fn serve() {
         println!("{}", sp1_primitives::SP1_CRATE_VERSION);
         return;
     }
+
+    tracing::info!("host allocator: {}", sp1_gpu_host_alloc::host_allocator_name());
 
     let cuda_device_id = std::env::var("CUDA_VISIBLE_DEVICES")
         .expect("CUDA_VISIBLE_DEVICES must be set")

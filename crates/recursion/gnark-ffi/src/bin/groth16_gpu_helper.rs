@@ -79,6 +79,11 @@ struct GnarkPubInputs {
     proof_nonce: String,
 }
 
+// mimalloc with large OS pages on hosts with enough RAM: loading and converting the proving key
+// is allocation-heavy (9.1 -> 7.3 s for a standalone proof on an RTX 5090 host).
+#[global_allocator]
+static GLOBAL: sp1_gpu_host_alloc::OneShotHostAlloc = sp1_gpu_host_alloc::OneShotHostAlloc;
+
 fn main() {
     let args = Args::parse();
     let gpu_dir_str = args.gpu_dir.to_str().expect("--gpu-dir is not valid UTF-8");
