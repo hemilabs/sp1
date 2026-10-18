@@ -103,6 +103,36 @@ where
     where
         TaskScope: BranchingProgramKernel<F, EF, OnDeviceChallenger>,
     {
+        let claim = DeviceBuffer::from_host(&Buffer::from(vec![claim]), rhos.backend()).unwrap();
+        let (results, point) = self.sum_as_poly_and_sample_into_point_device(
+            round_num,
+            z_col_eq_vals,
+            intermediate_eq_full_evals,
+            sum_values,
+            challenger,
+            claim.as_ptr(),
+            rhos,
+        );
+        let results: Vec<EF> = DeviceBuffer::from_raw(results.storage).to_host().unwrap();
+        (results[0], point)
+    }
+
+    /// One round, with the claim read on the device from `claim` (the previous round's results)
+    /// and the next claim left there, at index 0 of the returned results: no host round trip.
+    #[allow(clippy::too_many_arguments)]
+    pub fn sum_as_poly_and_sample_into_point_device<OnDeviceChallenger: AsMutRawChallenger>(
+        &self,
+        round_num: usize,
+        z_col_eq_vals: &Buffer<EF, TaskScope>,
+        intermediate_eq_full_evals: &Buffer<EF, TaskScope>,
+        sum_values: &mut Buffer<EF, TaskScope>,
+        challenger: &mut OnDeviceChallenger,
+        claim: *const EF,
+        rhos: Point<EF, TaskScope>,
+    ) -> (Tensor<EF, TaskScope>, Point<EF, TaskScope>)
+    where
+        TaskScope: BranchingProgramKernel<F, EF, OnDeviceChallenger>,
+    {
         let (current_prefix_sum_rho_point, next_prefix_sum_rho_point): (
             Point<EF, TaskScope>,
             Point<EF, TaskScope>,
@@ -153,12 +183,7 @@ where
             claim,
         );
 
-        let bp_results_device: Vec<EF> =
-            DeviceBuffer::from_raw(bp_results_device.storage).to_host().unwrap();
-
-        let bp_results = bp_results_device;
-
-        (bp_results[0], Point::new(new_randomness))
+        (bp_results_device, Point::new(new_randomness))
     }
 
     pub fn fix_last_variable_kernel<OnDeviceChallenger>(

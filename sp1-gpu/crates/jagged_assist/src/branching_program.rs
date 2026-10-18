@@ -106,7 +106,7 @@ pub fn branching_program_and_sample<
     challenger: &mut Challenger,
     randomness_point: &Point<EF, TaskScope>,
     sum_values: &mut Buffer<EF, TaskScope>,
-    claim: EF,
+    claim: *const EF,
 ) -> (Tensor<EF, TaskScope>, Buffer<EF, TaskScope>)
 where
     TaskScope: BranchingProgramKernel<F, EF, Challenger> + DeviceSumKernel<EF>,
@@ -718,6 +718,7 @@ mod tests {
 
                 let time = std::time::Instant::now();
                 let _span = tracing::info_span!("branching_program", round_num).entered();
+                let claim_device = DeviceBuffer::from_host(&Buffer::from(vec![claim]), &t).unwrap();
                 let bp_results_device = branching_program_and_sample(
                     &curr_prefix_sums_device,
                     &next_prefix_sums_device,
@@ -734,7 +735,7 @@ mod tests {
                     &mut challenger_device,
                     &Point::new(randomness_point_device.clone()),
                     &mut sum_values_device,
-                    claim,
+                    claim_device.as_ptr(),
                 );
 
                 tracing::info!("branching program time: {:?}", time.elapsed());
