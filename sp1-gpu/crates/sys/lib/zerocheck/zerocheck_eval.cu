@@ -63,8 +63,10 @@ SP1_KERNEL void jaggedConstraintPolyEval(
     K3<K> expr_f[MEMORY_SIZE];
     JaggedConstraintFolder<K> folder = JaggedConstraintFolder<K>();
 
-    // The three evaluation points 0, 2 and 4, together (K3).
-    ext_t thread_sum[3] = {ext_t::zero(), ext_t::zero(), ext_t::zero()};
+    // The thread's ZC_POINTS evaluation points (K3): this block's z-slice's.
+    const uint32_t pointBase = blockIdx.z * ZC_POINTS;
+    ext_t thread_sum[ZC_POINTS];
+    for (int e = 0; e < ZC_POINTS; e++) thread_sum[e] = ext_t::zero();
 
     for (size_t idx = blockDim.x * blockIdx.x + threadIdx.x; idx < totalLen; idx += blockDim.x * gridDim.x) {
         uint32_t packed_info = inputJaggedInfo.denseData.data[idx << 1];
@@ -97,7 +99,9 @@ SP1_KERNEL void jaggedConstraintPolyEval(
         folder.powersOfAlpha = powersOfAlpha;
         folder.constraintIndex = constraint_offset;
         folder.rowIdx = rowIdx;
-        ext_t acc[3] = {ext_t::zero(), ext_t::zero(), ext_t::zero()};
+        folder.pointBase = pointBase;
+        ext_t acc[ZC_POINTS];
+        for (int e = 0; e < ZC_POINTS; e++) acc[e] = ext_t::zero();
 
         for (size_t i = program_start_idx; i < program_end_idx; i++) {
             Instruction instr = evalProgram[i];
@@ -273,30 +277,31 @@ SP1_KERNEL void jaggedConstraintPolyEval(
                 DEBUG("FAssertZero: %d\n", instr.a);
                 {
                     const ext_t alpha = folder.powersOfAlpha[folder.constraintIndex];
-                    for (int e = 0; e < 3; e++) acc[e] += alpha * expr_f[instr.a].v[e];
+                    for (int e = 0; e < ZC_POINTS; e++) acc[e] += alpha * expr_f[instr.a].v[e];
                 }
                 folder.constraintIndex++;
                 break;
             }
         }
 
-        ext_t gkr_correction[3] = {ext_t::zero(), ext_t::zero(), ext_t::zero()};
-        ext_t geq_correction[3] = {ext_t::zero(), ext_t::zero(), ext_t::zero()};
+        ext_t gkr_correction[ZC_POINTS];
+        ext_t geq_correction[ZC_POINTS];
+        for (int e = 0; e < ZC_POINTS; e++) gkr_correction[e] = geq_correction[e] = ext_t::zero();
 
         if (is_first_air_block) {
             for (size_t i = 0; i < num_main_columns; i++) {
                 const K3<K> v = folder.var_f3(4, i);
-                for (int e = 0; e < 3; e++) gkr_correction[e] += batchingPowers[i] * v.v[e];
+                for (int e = 0; e < ZC_POINTS; e++) gkr_correction[e] += batchingPowers[i] * v.v[e];
             }
             for (size_t i = 0; i < num_preprocessed_columns ; i++) {
                 const K3<K> v = folder.var_f3(2, i);
-                for (int e = 0; e < 3; e++)
+                for (int e = 0; e < ZC_POINTS; e++)
                     gkr_correction[e] += batchingPowers[num_main_columns + i] * v.v[e];
             }
             ext_t zeroVal = geq_eval(rowIdx << 1, geq_thresholds[chip_idx], eq_coefficients[chip_idx]);
             ext_t oneVal = geq_eval(rowIdx << 1 | 1, geq_thresholds[chip_idx], eq_coefficients[chip_idx]);
-            for (int e = 0; e < 3; e++) {
-                geq_correction[e] = (zeroVal + get_input_point(e) * (oneVal - zeroVal)) *
+            for (int e = 0; e < ZC_POINTS; e++) {
+                geq_correction[e] = (zeroVal + get_input_point(pointBase + e) * (oneVal - zeroVal)) *
                                     paddedRowAdjustment[chip_idx];
             }
         }
@@ -304,7 +309,7 @@ SP1_KERNEL void jaggedConstraintPolyEval(
         if (rowIdx < (1 << rest_point_dim)) {
             ext_t eq = ext_t::load(partialLagrange, rowIdx);
             const ext_t weight = eq * powersOfLambda[chip_idx];
-            for (int e = 0; e < 3; e++)
+            for (int e = 0; e < ZC_POINTS; e++)
                 thread_sum[e] += (acc[e] + gkr_correction[e] - geq_correction[e]) * weight;
         }
     }
@@ -314,10 +319,10 @@ SP1_KERNEL void jaggedConstraintPolyEval(
 
     auto block = cg::this_thread_block();
     auto tile = cg::tiled_partition<32>(block);
-    for (int e = 0; e < 3; e++) {
+    for (int e = 0; e < ZC_POINTS; e++) {
         ext_t thread_block_sum = partialBlockReduce(block, tile, thread_sum[e], shared);
         if (threadIdx.x == 0 && threadIdx.y == 0 && threadIdx.z == 0) {
-            ext_t::store(constraintValues, e * gridDim.x + blockIdx.x, thread_block_sum);
+            ext_t::store(constraintValues, (pointBase + e) * gridDim.x + blockIdx.x, thread_block_sum);
         }
         // `shared` is reused by the next point's reduction.
         block.sync();
@@ -371,3 +376,6 @@ extern "C" void* jagged_constraint_poly_eval_512_koala_bear_extension_kernel() {
 extern "C" void* jagged_constraint_poly_eval_1024_koala_bear_extension_kernel() {
     return SP1_KERNEL_PTR(jaggedConstraintPolyEval<ext_t, 1024>);
 }
+
+// The evaluation points a thread computes (ZC_POINTS): the launch's z-dimension is 3 / this.
+extern "C" uint32_t zerocheck_points_per_thread() { return ZC_POINTS; }

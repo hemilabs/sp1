@@ -421,8 +421,9 @@ where
     // few rows, and every thread costs its register file's setup.
     let rows = input.total_len / 2;
     let grid_size_x = n_chunks.max(256).min(rows.div_ceil(BLOCK_SIZE).max(1));
-    // Each thread evaluates its row at all NUM_EVAL_POINT points (the kernel's K3).
-    let grid_size = (grid_size_x, 1, 1);
+    // Each thread evaluates its row at zerocheck_points_per_thread() of the points (the kernel's K3).
+    let points = unsafe { sp1_gpu_cudart::sys::zerocheck::zerocheck_points_per_thread() } as usize;
+    let grid_size = (grid_size_x, 1, NUM_EVAL_POINT / points);
 
     let num_tiles = BLOCK_SIZE.div_ceil(32);
     let shared_mem = num_tiles * std::mem::size_of::<Ext>();
@@ -539,8 +540,9 @@ where
     // few rows, and every thread costs its register file's setup.
     let rows = input.total_len / 2;
     let grid_size_x = n_chunks.max(256).min(rows.div_ceil(BLOCK_SIZE).max(1));
-    // Each thread evaluates its row at all NUM_EVAL_POINT points (the kernel's K3).
-    let grid_size = (grid_size_x, 1, 1);
+    // Each thread evaluates its row at zerocheck_points_per_thread() of the points (the kernel's K3).
+    let points = unsafe { sp1_gpu_cudart::sys::zerocheck::zerocheck_points_per_thread() } as usize;
+    let grid_size = (grid_size_x, 1, NUM_EVAL_POINT / points);
 
     let num_tiles = BLOCK_SIZE.div_ceil(32);
     let shared_mem = num_tiles * std::mem::size_of::<Ext>();
