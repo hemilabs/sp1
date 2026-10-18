@@ -537,3 +537,136 @@ mod tests {
         assert_eq!(bc.asserts[2].0, bc.asserts[3].0);
     }
 }
+
+/// Level schedule of a chunk for the cooperative small-round kernel
+/// `zerocheck_fused_sequential_coop`, where several lanes evaluate one row.
+///
+/// Instructions are grouped by dependency level (ASAP for operations, ALAP
+/// for loads/constants so they do not stay live longer than needed) and,
+/// within a level, sorted by opcode class so neighbouring lanes mostly take
+/// the same switch arm. Values live in `n_phys` slots allocated by liveness
+/// over the level order: a slot is reused only at a level strictly after the
+/// last level reading it, so the lanes of one level never race. Every value
+/// is computed by the same operation on the same operands as in `instrs`,
+/// and the assert accumulation is an exact field sum, so the result is
+/// bit-identical to the sequential interpreter.
+#[derive(Debug, Default, Clone)]
+pub struct LevelSchedule {
+    /// One entry per instruction: `[op | a << 16, b | out << 16]`. For
+    /// `AddF`/`SubF`/`MulF` `a`/`b` are slots; for `NegF` `a` is a slot; for
+    /// `MulConst` `a` is a slot and `b` a const-pool index; for loads `a` is
+    /// the leaf/const/public index as in `instrs`. `out` is the result slot.
+    pub code: Vec<[u32; 2]>,
+    /// `levels + 1` start offsets into `code`.
+    pub level_starts: Vec<u16>,
+    /// Slot of each assertion root, parallel to `ChunkBytecode::asserts`.
+    pub assert_slots: Vec<u16>,
+    /// Number of value slots one row needs.
+    pub n_phys: u16,
+}
+
+pub fn level_schedule(bc: &ChunkBytecode) -> LevelSchedule {
+    let n = bc.instrs.len();
+    assert!(n < u16::MAX as usize, "chunk too large for a u16 level schedule");
+    let is_bin =
+        |op: u8| op == BcOp::AddF as u8 || op == BcOp::SubF as u8 || op == BcOp::MulF as u8;
+    let is_un = |op: u8| op == BcOp::NegF as u8 || op == BcOp::MulConst as u8;
+    let mut writer = vec![usize::MAX; bc.max_reg as usize + 1];
+    let mut src: Vec<[usize; 2]> = vec![[usize::MAX; 2]; n];
+    let mut users: Vec<Vec<usize>> = vec![Vec::new(); n];
+    let mut level = vec![0usize; n];
+    for (i, ins) in bc.instrs.iter().enumerate() {
+        if is_bin(ins.opcode) {
+            let (a, b) = (writer[ins.a as usize], writer[ins.b as usize]);
+            src[i] = [a, b];
+            users[a].push(i);
+            if b != a {
+                users[b].push(i);
+            }
+            level[i] = 1 + level[a].max(level[b]);
+        } else if is_un(ins.opcode) {
+            let a = writer[ins.a as usize];
+            src[i][0] = a;
+            users[a].push(i);
+            level[i] = 1 + level[a];
+        }
+        writer[ins.out as usize] = i;
+    }
+    let mut is_root = vec![false; n];
+    for &(r, _) in &bc.asserts {
+        is_root[writer[r as usize]] = true;
+    }
+    // ALAP for operand-free instructions (loads, constants): one level
+    // before their first consumer.
+    for i in 0..n {
+        if src[i][0] == usize::MAX && !users[i].is_empty() {
+            level[i] = users[i].iter().map(|&u| level[u]).min().unwrap() - 1;
+        }
+    }
+    let last_use: Vec<usize> = (0..n)
+        .map(|i| {
+            if is_root[i] {
+                usize::MAX
+            } else {
+                users[i].iter().map(|&u| level[u]).max().unwrap_or(level[i])
+            }
+        })
+        .collect();
+    let class = |op: u8| -> u8 {
+        match op {
+            x if x == BcOp::LoadLeaf as u8 => 0,
+            x if x == BcOp::MulF as u8 => 1,
+            x if x == BcOp::MulConst as u8 => 2,
+            x if x == BcOp::AddF as u8 => 3,
+            x if x == BcOp::SubF as u8 => 4,
+            x if x == BcOp::NegF as u8 => 5,
+            x if x == BcOp::LoadConst as u8 => 6,
+            _ => 7,
+        }
+    };
+    let mut order: Vec<usize> = (0..n).collect();
+    order.sort_by_key(|&i| (level[i], class(bc.instrs[i].opcode), i));
+    let n_levels = level.iter().map(|&l| l + 1).max().unwrap_or(0);
+    let mut expire: Vec<Vec<usize>> = vec![Vec::new(); n_levels + 1];
+    let mut phys = vec![u16::MAX; n];
+    let mut free: Vec<u16> = Vec::new();
+    let mut n_phys: u16 = 0;
+    let mut level_starts = vec![0u16; n_levels + 1];
+    let mut code = Vec::with_capacity(n);
+    let mut j = 0usize;
+    for l in 0..n_levels {
+        if l > 0 {
+            // Values whose last read was at level l - 1 are dead from level l on.
+            for &x in &expire[l - 1] {
+                free.push(phys[x]);
+            }
+        }
+        level_starts[l] = j as u16;
+        while j < n && level[order[j]] == l {
+            let i = order[j];
+            let p = free.pop().unwrap_or_else(|| {
+                n_phys += 1;
+                n_phys - 1
+            });
+            phys[i] = p;
+            if last_use[i] != usize::MAX {
+                expire[last_use[i]].push(i);
+            }
+            let ins = bc.instrs[i];
+            let (a, b) = if is_bin(ins.opcode) {
+                (phys[src[i][0]] as u32, phys[src[i][1]] as u32)
+            } else if ins.opcode == BcOp::NegF as u8 {
+                (phys[src[i][0]] as u32, 0)
+            } else if ins.opcode == BcOp::MulConst as u8 {
+                (phys[src[i][0]] as u32, ins.b as u32)
+            } else {
+                (ins.a as u32, 0)
+            };
+            code.push([ins.opcode as u32 | (a << 16), b | ((p as u32) << 16)]);
+            j += 1;
+        }
+    }
+    level_starts[n_levels] = j as u16;
+    let assert_slots = bc.asserts.iter().map(|&(r, _)| phys[writer[r as usize]]).collect();
+    LevelSchedule { code, level_starts, assert_slots, n_phys }
+}

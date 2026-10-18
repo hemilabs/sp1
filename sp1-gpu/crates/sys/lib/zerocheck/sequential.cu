@@ -460,8 +460,340 @@ __global__ void zerocheck_fused_sequential_bivariate_vec(
     }
 }
 
+
+
+// ============================================================================
+// All-eval-points variant ("e3") for large rounds.
+//
+// The univariate kernel above runs each row three times — once per eval point
+// on blockIdx.z — re-decoding the bytecode, re-reading the row pair from
+// DRAM and keeping three independent per-thread register files alive. For
+// rounds with many rows that kernel is bound by DRAM traffic (the per-thread
+// `regs[]` local memory does not fit in L2 at full occupancy, plus 2.5x trace
+// re-reads). Here one thread evaluates all three eval points of a row: the
+// pair is loaded once, the bytecode is decoded once, and every register holds
+// the three values. Per eval point the arithmetic and its order are unchanged
+// (same forwarding flags), so the partials are bit-identical.
+//
+// Launch: grid (n_dispatch, 1, 1); writes partials[block * 3 + e] for e = 0..2.
+// ============================================================================
+template <typename K>
+struct E3Val {
+    K v[3];
+};
+template <typename K, int MAX_REGS>
+__global__ void zerocheck_fused_sequential_e3(
+    const BlockDispatch* __restrict__ dispatch,
+    const ChunkStatic* __restrict__ chunk_static,
+    const ChipLayout* __restrict__ chip_layouts,
+    const K* __restrict__ trace_data,
+    const felt_t* __restrict__ public_values,
+    const ext_t* __restrict__ powers_of_alpha,
+    const ext_t* __restrict__ partial_lagrange,
+    const ext_t* __restrict__ powers_of_lambda,
+    const ext_t* __restrict__ gkr_powers,
+    uint32_t rest_point_dim,
+    ext_t* __restrict__ partials
+) {
+    BlockDispatch disp = dispatch[blockIdx.x];
+    ChunkStatic stc = chunk_static[disp.chunk_id];
+    ChipLayout lay = chip_layouts[stc.chip_idx];
+    const felt_t* consts = reinterpret_cast<const felt_t*>(stc.consts);
+
+    // Row pair -> values at the univariate nodes {0, 2, 4}, with the same
+    // diff-doubling as `interp_load_pair`.
+    auto load3 = [&](size_t base, uint32_t col, uint32_t row_idx) {
+        const size_t off = base + (size_t)col * (size_t)lay.height + ((size_t)row_idx << 1);
+        K z = K::load(trace_data, off);
+        K o = K::load(trace_data, off + 1);
+        K diff = o - z;
+        K d2 = diff + diff;
+        E3Val<K> r;
+        r.v[0] = z;
+        r.v[1] = z + d2;
+        r.v[2] = z + d2 + d2;
+        return r;
+    };
+
+    E3Val<K> regs[MAX_REGS];
+    ext_t tacc[3] = {ext_t::zero(), ext_t::zero(), ext_t::zero()};
+    const uint32_t row_limit = 1u << rest_point_dim;
+    const uint32_t row_end = disp.row_offset + disp.n_rows;
+    for (uint32_t row_idx = disp.row_offset + threadIdx.x; row_idx < row_end;
+         row_idx += blockDim.x)
+    {
+        E3Val<K> prev;
+#pragma unroll
+        for (int k = 0; k < 3; k++) prev.v[k] = K::zero();
+        for (uint32_t i = 0; i < stc.n_instrs; i++) {
+            DagInstr instr = stc.instrs[i];
+            const uint32_t f = instr._pad;
+            E3Val<K> x;
+            switch (instr.opcode) {
+            case BC_LOAD_LEAF: {
+                LeafRef leaf = stc.leaves[instr.a];
+                size_t base = (leaf.source == LEAF_SOURCE_MAIN_LOCAL) ? lay.main_ptr
+                                                                     : lay.preprocessed_ptr;
+                x = load3(base, leaf.col, row_idx);
+                break;
+            }
+            case BC_LOAD_CONST: {
+                K c = K(consts[instr.a]);
+#pragma unroll
+                for (int k = 0; k < 3; k++) x.v[k] = c;
+                break;
+            }
+            case BC_LOAD_PUBLIC: {
+                K c = K(felt_t::load(public_values, stc.publics[instr.a]));
+#pragma unroll
+                for (int k = 0; k < 3; k++) x.v[k] = c;
+                break;
+            }
+            case BC_ADD_F:
+            case BC_SUB_F:
+            case BC_MUL_F: {
+                E3Val<K> va, vb;
+                if (f & DAG_FLAG_A_PREV) va = prev; else va = regs[instr.a];
+                if (f & DAG_FLAG_B_PREV) vb = prev; else vb = regs[instr.b];
+#pragma unroll
+                for (int k = 0; k < 3; k++) {
+                    x.v[k] = (instr.opcode == BC_ADD_F)   ? va.v[k] + vb.v[k]
+                             : (instr.opcode == BC_SUB_F) ? va.v[k] - vb.v[k]
+                                                          : va.v[k] * vb.v[k];
+                }
+                break;
+            }
+            case BC_MUL_CONST: {
+                E3Val<K> va;
+                if (f & DAG_FLAG_A_PREV) va = prev; else va = regs[instr.a];
+                const felt_t c = consts[instr.b];
+#pragma unroll
+                for (int k = 0; k < 3; k++) x.v[k] = va.v[k] * c;
+                break;
+            }
+            case BC_NEG_F: {
+                E3Val<K> va;
+                if (f & DAG_FLAG_A_PREV) va = prev; else va = regs[instr.a];
+#pragma unroll
+                for (int k = 0; k < 3; k++) x.v[k] = K::zero() - va.v[k];
+                break;
+            }
+            default:
+                __trap();
+            }
+            if (!(f & DAG_FLAG_NO_STORE)) regs[instr.out] = x;
+            prev = x;
+        }
+
+        ext_t acc[3] = {ext_t::zero(), ext_t::zero(), ext_t::zero()};
+        for (uint32_t i = 0; i < stc.n_asserts; i++) {
+            uint32_t alpha_idx = stc.chip_alpha_offset + stc.assert_alphas[i];
+            ext_t alpha = ext_t::load(powers_of_alpha, alpha_idx);
+            const E3Val<K> r = regs[stc.assert_regs[i]];
+#pragma unroll
+            for (int k = 0; k < 3; k++) acc[k] += alpha * r.v[k];
+        }
+        if (stc.gkr_main_width != 0 || stc.gkr_prep_width != 0) {
+            for (uint32_t i = 0; i < stc.gkr_main_width; i++) {
+                E3Val<K> v = load3(lay.main_ptr, i, row_idx);
+                ext_t pw = ext_t::load(gkr_powers, i);
+#pragma unroll
+                for (int k = 0; k < 3; k++) acc[k] += pw * v.v[k];
+            }
+            for (uint32_t i = 0; i < stc.gkr_prep_width; i++) {
+                E3Val<K> v = load3(lay.preprocessed_ptr, i, row_idx);
+                ext_t pw = ext_t::load(gkr_powers, stc.gkr_main_width + i);
+#pragma unroll
+                for (int k = 0; k < 3; k++) acc[k] += pw * v.v[k];
+            }
+        }
+        if (row_idx < row_limit) {
+            ext_t eq = ext_t::load(partial_lagrange, row_idx);
+#pragma unroll
+            for (int k = 0; k < 3; k++) tacc[k] += acc[k] * eq;
+        }
+    }
+
+    extern __shared__ unsigned char smem[];
+    ext_t* shared = reinterpret_cast<ext_t*>(smem);
+    auto block = cg::this_thread_block();
+    auto tile_warp = cg::tiled_partition<32>(block);
+    const ext_t lambda = ext_t::load(powers_of_lambda, stc.chip_idx);
+    for (int k = 0; k < 3; k++) {
+        ext_t block_sum = partialBlockReduce(block, tile_warp, tacc[k], shared);
+        if (threadIdx.x == 0) {
+            ext_t::store(partials, blockIdx.x * 3 + (uint32_t)k, block_sum * lambda);
+        }
+        block.sync();
+    }
+}
+
+// ============================================================================
+// Cooperative small-round variant.
+//
+// For a chunk with few rows the thread-per-row interpreter above is bound by
+// one thread walking the whole bytecode (~0.4 ms for the 1565-instruction
+// Poseidon2 chunk, whatever the row count). Here ZC_COOP_LANES lanes evaluate
+// one row together, following the host-built level schedule
+// (`ChunkStatic::coop_*`, see `level_schedule` in bytecode.rs): within a
+// level the lanes split the instructions, values live in shared-memory slots,
+// and the block synchronises between levels. Each value is computed by the
+// same operation on the same operands as in the sequential order, and the
+// assert sum is an exact field sum, so the partials are bit-identical.
+//
+// Launch: grid (n_dispatch, 1, 3), block ZC_COOP_THREADS; dispatch tiles of
+// ZC_COOP_ROWS rows. Dynamic smem: zerocheck_coop_smem_bytes().
+// ============================================================================
+template <typename K>
+__global__ void zerocheck_fused_sequential_coop(
+    const BlockDispatch* __restrict__ dispatch,
+    const ChunkStatic* __restrict__ chunk_static,
+    const ChipLayout* __restrict__ chip_layouts,
+    const K* __restrict__ trace_data,
+    const felt_t* __restrict__ public_values,
+    const ext_t* __restrict__ powers_of_alpha,
+    const ext_t* __restrict__ partial_lagrange,
+    const ext_t* __restrict__ powers_of_lambda,
+    const ext_t* __restrict__ gkr_powers,
+    uint32_t rest_point_dim,
+    ext_t* __restrict__ partials,
+    uint32_t max_instrs,
+    uint32_t max_levels,
+    uint32_t max_phys
+) {
+    constexpr uint32_t G = ZC_COOP_LANES;
+    BlockDispatch disp = dispatch[blockIdx.x];
+    ChunkStatic stc = chunk_static[disp.chunk_id];
+    ChipLayout lay = chip_layouts[stc.chip_idx];
+    const felt_t* consts = reinterpret_cast<const felt_t*>(stc.consts);
+    const int e = blockIdx.z;
+    const uint32_t grp = threadIdx.x / G, gl = threadIdx.x % G;
+    const uint32_t rows_per_pass = blockDim.x / G;
+
+    extern __shared__ unsigned char smem[];
+    ext_t* red = reinterpret_cast<ext_t*>(smem);
+    uint2* code = reinterpret_cast<uint2*>(smem + 32 * sizeof(ext_t));
+    uint16_t* lvl = reinterpret_cast<uint16_t*>(code + max_instrs);
+    K* slots = reinterpret_cast<K*>(
+                   smem + 32 * sizeof(ext_t) + (size_t)max_instrs * sizeof(uint2)
+                   + (((size_t)(max_levels + 1) * sizeof(uint16_t) + 15) & ~(size_t)15))
+               + (size_t)grp * max_phys;
+    for (uint32_t i = threadIdx.x; i < stc.n_instrs; i += blockDim.x) code[i] = stc.coop_code[i];
+    for (uint32_t i = threadIdx.x; i <= stc.coop_n_levels; i += blockDim.x) {
+        lvl[i] = stc.coop_level_starts[i];
+    }
+    __syncthreads();
+
+    const uint32_t row_limit = 1u << rest_point_dim;
+    const uint32_t row_end = disp.row_offset + disp.n_rows;
+    ext_t lane_acc = ext_t::zero();
+    for (uint32_t rbase = disp.row_offset; rbase < row_end; rbase += rows_per_pass) {
+        const uint32_t row_idx = rbase + grp;
+        const bool active = row_idx < row_end;
+        uint32_t lo = lvl[0];
+        for (uint32_t l = 0; l < stc.coop_n_levels; l++) {
+            const uint32_t hi = lvl[l + 1];
+            if (active) {
+                for (uint32_t s = lo + gl; s < hi; s += G) {
+                    const uint2 c = code[s];
+                    const uint32_t op = c.x & 0xffu, a = c.x >> 16;
+                    const uint32_t b = c.y & 0xffffu, out = c.y >> 16;
+                    K x;
+                    switch (op) {
+                    case BC_LOAD_LEAF: {
+                        LeafRef leaf = stc.leaves[a];
+                        size_t base = (leaf.source == LEAF_SOURCE_MAIN_LOCAL)
+                                          ? lay.main_ptr
+                                          : lay.preprocessed_ptr;
+                        x = interp_load_pair(trace_data, base, leaf.col, lay.height, row_idx, e);
+                        break;
+                    }
+                    case BC_LOAD_CONST: x = K(consts[a]); break;
+                    case BC_LOAD_PUBLIC: x = K(felt_t::load(public_values, stc.publics[a])); break;
+                    case BC_ADD_F: x = slots[a] + slots[b]; break;
+                    case BC_SUB_F: x = slots[a] - slots[b]; break;
+                    case BC_MUL_F: x = slots[a] * slots[b]; break;
+                    case BC_MUL_CONST: x = slots[a] * consts[b]; break;
+                    case BC_NEG_F: x = K::zero() - slots[a]; break;
+                    default: __trap();
+                    }
+                    slots[out] = x;
+                }
+            }
+            lo = hi;
+            __syncthreads();
+        }
+        if (active) {
+            ext_t acc = ext_t::zero();
+            for (uint32_t i = gl; i < stc.n_asserts; i += G) {
+                uint32_t alpha_idx = stc.chip_alpha_offset + stc.assert_alphas[i];
+                acc += ext_t::load(powers_of_alpha, alpha_idx) * slots[stc.coop_assert_slots[i]];
+            }
+            for (uint32_t i = gl; i < stc.gkr_main_width; i += G) {
+                K v = interp_load_pair(trace_data, lay.main_ptr, i, lay.height, row_idx, e);
+                acc += ext_t::load(gkr_powers, i) * v;
+            }
+            for (uint32_t i = gl; i < stc.gkr_prep_width; i += G) {
+                K v = interp_load_pair(trace_data, lay.preprocessed_ptr, i, lay.height, row_idx, e);
+                acc += ext_t::load(gkr_powers, stc.gkr_main_width + i) * v;
+            }
+            if (row_idx < row_limit) {
+                lane_acc += acc * ext_t::load(partial_lagrange, row_idx);
+            }
+        }
+        __syncthreads();  // the next pass overwrites the slots
+    }
+
+    auto block = cg::this_thread_block();
+    auto tile_warp = cg::tiled_partition<32>(block);
+    ext_t block_sum = partialBlockReduce(block, tile_warp, lane_acc, red);
+    if (threadIdx.x == 0) {
+        ext_t lambda = ext_t::load(powers_of_lambda, stc.chip_idx);
+        ext_t::store(partials, blockIdx.x * 3 + (uint32_t)e, block_sum * lambda);
+    }
+}
+
 } // namespace
 
+extern "C" void* zerocheck_fused_sequential_e3_kb_128_kernel() {
+    return (void*)zerocheck_fused_sequential_e3<felt_t, 128>;
+}
+extern "C" void* zerocheck_fused_sequential_e3_ext_128_kernel() {
+    return (void*)zerocheck_fused_sequential_e3<ext_t, 128>;
+}
+// The cooperative kernel may need more than the default 48 KB of dynamic
+// shared memory; raise its limit once when the launcher first asks for it.
+extern "C" uint32_t zerocheck_coop_smem_cap() {
+#ifdef __HIPCC__
+    return 64 * 1024;  // LDS per workgroup on AMD
+#else
+    return 96 * 1024;
+#endif
+}
+
+template <typename K>
+static void* coop_kernel_with_smem_limit() {
+    static const bool once = [] {
+#ifdef __HIPCC__
+        hipFuncSetAttribute((const void*)zerocheck_fused_sequential_coop<K>,
+                            hipFuncAttributeMaxDynamicSharedMemorySize,
+                            (int)zerocheck_coop_smem_cap());
+#else
+        cudaFuncSetAttribute(zerocheck_fused_sequential_coop<K>,
+                             cudaFuncAttributeMaxDynamicSharedMemorySize,
+                             (int)zerocheck_coop_smem_cap());
+#endif
+        return true;
+    }();
+    (void)once;
+    return (void*)zerocheck_fused_sequential_coop<K>;
+}
+extern "C" void* zerocheck_fused_sequential_coop_kb_kernel() {
+    return coop_kernel_with_smem_limit<felt_t>();
+}
+extern "C" void* zerocheck_fused_sequential_coop_ext_kernel() {
+    return coop_kernel_with_smem_limit<ext_t>();
+}
 
 // Fused dispatch entry points, tiered by MAX_REGS so the per-thread local
 // memory footprint matches the largest chunk in the tier. The launcher

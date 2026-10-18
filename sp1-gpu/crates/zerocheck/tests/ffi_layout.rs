@@ -103,6 +103,11 @@ fn chunk_static_layout_matches() {
         "gkr_main_width" => std::mem::offset_of!(ChunkStaticC, gkr_main_width),
         "gkr_prep_width" => std::mem::offset_of!(ChunkStaticC, gkr_prep_width),
         "chip_alpha_offset" => std::mem::offset_of!(ChunkStaticC, chip_alpha_offset),
+        "coop_code" => std::mem::offset_of!(ChunkStaticC, coop_code),
+        "coop_level_starts" => std::mem::offset_of!(ChunkStaticC, coop_level_starts),
+        "coop_assert_slots" => std::mem::offset_of!(ChunkStaticC, coop_assert_slots),
+        "coop_n_levels" => std::mem::offset_of!(ChunkStaticC, coop_n_levels),
+        "coop_n_phys" => std::mem::offset_of!(ChunkStaticC, coop_n_phys),
     );
 }
 

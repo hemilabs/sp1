@@ -22,12 +22,13 @@ use slop_sumcheck::PartialSumcheckProof;
 use slop_tensor::Tensor;
 
 use sp1_gpu_air::ir::{
-    analyze_constraints, build_dag, chunk_dag, enumerate_lowerings, lower_column_tile,
-    lower_sequential, ChunkBudget, ChunkBytecode, ColumnTileBytecode, DagBuilder, Lowering,
+    analyze_constraints, build_dag, chunk_dag, enumerate_lowerings, level_schedule,
+    lower_column_tile, lower_sequential, ChunkBudget, ChunkBytecode, ColumnTileBytecode,
+    DagBuilder, Lowering,
 };
 use sp1_gpu_cudart::sys::kernels::{
     zerocheck_aggregate_partials_kernel, zerocheck_aggregate_partials_strided_kernel,
-    zerocheck_column_tile_ext_kernel, zerocheck_column_tile_kb_kernel,
+    zerocheck_column_tile_ext_kernel, zerocheck_column_tile_kb_kernel, zerocheck_coop_smem_cap,
     zerocheck_fix_geq_state_kernel, zerocheck_fused_sequential_bivariate_kb_1024_kernel,
     zerocheck_fused_sequential_bivariate_kb_128_kernel,
     zerocheck_fused_sequential_bivariate_kb_256_kernel,
@@ -37,6 +38,8 @@ use sp1_gpu_cudart::sys::kernels::{
     zerocheck_fused_sequential_bivariate_vec12_kb_128_kernel,
     zerocheck_fused_sequential_bivariate_vec2_kb_128_kernel,
     zerocheck_fused_sequential_bivariate_vec4_kb_128_kernel,
+    zerocheck_fused_sequential_coop_ext_kernel, zerocheck_fused_sequential_coop_kb_kernel,
+    zerocheck_fused_sequential_e3_ext_128_kernel, zerocheck_fused_sequential_e3_kb_128_kernel,
     zerocheck_fused_sequential_ext_1024_kernel, zerocheck_fused_sequential_ext_128_kernel,
     zerocheck_fused_sequential_ext_256_kernel, zerocheck_fused_sequential_ext_32_kernel,
     zerocheck_fused_sequential_ext_512_kernel, zerocheck_fused_sequential_ext_64_kernel,
@@ -47,7 +50,7 @@ use sp1_gpu_cudart::sys::kernels::{
     zerocheck_gkr_corner_sweep_kb_kernel, zerocheck_gkr_sweep_ext_kernel,
     zerocheck_gkr_sweep_kb_kernel, zerocheck_pad_adj_1024_kernel, zerocheck_pad_adj_128_kernel,
     zerocheck_pad_adj_256_kernel, zerocheck_pad_adj_32_kernel, zerocheck_pad_adj_512_kernel,
-    zerocheck_pad_adj_64_kernel,
+    zerocheck_pad_adj_64_kernel, zerocheck_pad_adj_coop_kernel,
 };
 use sp1_gpu_cudart::sys::runtime::KernelPtr;
 use sp1_gpu_cudart::{args, DeviceBuffer, DeviceCopy, DevicePoint, TaskScope};
@@ -192,10 +195,19 @@ where
         // `gkr_active_chips` in `initialize_zerocheck_poly`.
         let main_width = air.width() as u32;
         let prep_width = air.preprocessed_width() as u32;
-        if let Some(carrier_bc) = compiled_chunks.iter_mut().find_map(|c| match c {
-            CompiledChunk::Sequential(bc) => Some(bc),
-            _ => None,
-        }) {
+        // The carrier is the chip's SHORTEST Sequential chunk: the inline sweep
+        // adds a serial per-row loop over every column, and putting it on the
+        // longest chunk (often the first) lengthens the critical path of the
+        // small, latency-bound rounds. Which chunk carries it does not change
+        // the round sums.
+        if let Some(carrier_bc) = compiled_chunks
+            .iter_mut()
+            .filter_map(|c| match c {
+                CompiledChunk::Sequential(bc) => Some(bc),
+                _ => None,
+            })
+            .min_by_key(|bc| bc.instrs.len())
+        {
             carrier_bc.gkr_main_width = main_width;
             carrier_bc.gkr_prep_width = prep_width;
         }
@@ -247,6 +259,13 @@ pub struct ChunkStaticC {
     /// Cluster-dependent shift added to every chip-relative alpha index in
     /// this chunk's bytecode before indexing `powers_of_alpha`.
     pub chip_alpha_offset: u32,
+    /// Level schedule for the cooperative small-round kernel; see
+    /// `sp1_gpu_air::ir::level_schedule`. `coop_code` has `n_instrs` entries.
+    pub coop_code: *const [u32; 2],
+    pub coop_level_starts: *const u16,
+    pub coop_assert_slots: *const u16,
+    pub coop_n_levels: u32,
+    pub coop_n_phys: u32,
 }
 
 /// Per-chip GKR widths held on device. Indexed by `chip_idx`; shard-static
@@ -447,6 +466,12 @@ pub(crate) struct ChunkDeviceBufs {
     // ColumnTile-only (dummy-but-valid pointer + zero count for Sequential)
     pub terms: *const sp1_gpu_air::ir::ColumnTermEntry,
     pub n_terms: u32,
+    // Sequential-only level schedule for the cooperative small-round kernel.
+    pub coop_code: *const [u32; 2],
+    pub coop_level_starts: *const u16,
+    pub coop_assert_slots: *const u16,
+    pub coop_n_levels: u32,
+    pub coop_n_phys: u32,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -482,6 +507,8 @@ pub struct MachineBytecode {
     _flat_assert_regs: Buffer<u16, TaskScope>,
     _flat_assert_alphas: Buffer<u32, TaskScope>,
     _flat_terms: Buffer<sp1_gpu_air::ir::ColumnTermEntry, TaskScope>,
+    _flat_coop_code: Buffer<[u32; 2], TaskScope>,
+    _flat_coop_u16: Buffer<u16, TaskScope>,
     /// One entry per machine chip, in machine chip order.
     pub(crate) chips: Vec<CompiledChipDevice>,
     /// Chip name → index into `chips`, for per-shard subset selection.
@@ -524,6 +551,9 @@ pub(crate) fn upload_compiled_bytecode(
     let mut flat_assert_regs: Vec<u16> = Vec::new();
     let mut flat_assert_alphas: Vec<u32> = Vec::new();
     let mut flat_terms: Vec<sp1_gpu_air::ir::ColumnTermEntry> = Vec::new();
+    let mut flat_coop_code: Vec<[u32; 2]> = Vec::new();
+    // Level starts and assert slots share one u16 buffer.
+    let mut flat_coop_u16: Vec<u16> = Vec::new();
 
     // Per-chunk (offset, len) into each flat vec, recorded in pass 1 and
     // resolved to pointers in pass 2 (after the flat buffers are uploaded).
@@ -539,6 +569,10 @@ pub(crate) fn upload_compiled_bytecode(
         max_reg: u16,
         gkr_main_width: u32,
         gkr_prep_width: u32,
+        coop_code: usize,
+        coop_level_starts: (usize, usize),
+        coop_assert_slots: usize,
+        coop_n_phys: u32,
     }
     let mut chip_offsets: Vec<Vec<ChunkOffsets>> = Vec::with_capacity(compiled.len());
 
@@ -556,7 +590,12 @@ pub(crate) fn upload_compiled_bytecode(
                 CompiledChunk::Sequential(bc) => {
                     let regs: Vec<u16> = bc.asserts.iter().map(|&(r, _)| r).collect();
                     let alphas: Vec<u32> = bc.asserts.iter().map(|&(_, a)| a).collect();
+                    let sched = level_schedule(bc);
                     ChunkOffsets {
+                        coop_code: extend_flat(&mut flat_coop_code, &sched.code).0,
+                        coop_level_starts: extend_flat(&mut flat_coop_u16, &sched.level_starts),
+                        coop_assert_slots: extend_flat(&mut flat_coop_u16, &sched.assert_slots).0,
+                        coop_n_phys: sched.n_phys as u32,
                         kind: ChunkKind::Sequential,
                         leaves: extend_flat(&mut flat_leaves, &bc.leaves),
                         consts: extend_flat(&mut flat_consts, &bc.consts),
@@ -582,6 +621,10 @@ pub(crate) fn upload_compiled_bytecode(
                     max_reg: 0,
                     gkr_main_width: 0,
                     gkr_prep_width: 0,
+                    coop_code: flat_coop_code.len(),
+                    coop_level_starts: (flat_coop_u16.len(), 0),
+                    coop_assert_slots: flat_coop_u16.len(),
+                    coop_n_phys: 0,
                 },
             });
         }
@@ -621,6 +664,8 @@ pub(crate) fn upload_compiled_bytecode(
     let flat_assert_regs_buf = upload_flat(&mut flat_assert_regs, scope);
     let flat_assert_alphas_buf = upload_flat(&mut flat_assert_alphas, scope);
     let flat_terms_buf = upload_flat(&mut flat_terms, scope);
+    let flat_coop_code_buf = upload_flat(&mut flat_coop_code, scope);
+    let flat_coop_u16_buf = upload_flat(&mut flat_coop_u16, scope);
 
     // ---- Pass 2: resolve offsets to device pointers. ----
     let instrs_base = flat_instrs_buf.as_ptr();
@@ -630,6 +675,8 @@ pub(crate) fn upload_compiled_bytecode(
     let assert_regs_base = flat_assert_regs_buf.as_ptr();
     let assert_alphas_base = flat_assert_alphas_buf.as_ptr();
     let terms_base = flat_terms_buf.as_ptr();
+    let coop_code_base = flat_coop_code_buf.as_ptr();
+    let coop_u16_base = flat_coop_u16_buf.as_ptr();
 
     let mut device_chips = Vec::with_capacity(compiled.len());
     let mut chip_index = BTreeMap::new();
@@ -658,6 +705,11 @@ pub(crate) fn upload_compiled_bytecode(
                 gkr_main_width: o.gkr_main_width,
                 gkr_prep_width: o.gkr_prep_width,
                 n_terms: o.terms.1 as u32,
+                coop_code: unsafe { coop_code_base.add(o.coop_code) },
+                coop_level_starts: unsafe { coop_u16_base.add(o.coop_level_starts.0) },
+                coop_assert_slots: unsafe { coop_u16_base.add(o.coop_assert_slots) },
+                coop_n_levels: o.coop_level_starts.1.saturating_sub(1) as u32,
+                coop_n_phys: o.coop_n_phys,
             })
             .collect();
         chip_index.insert(chip.name.clone(), device_chips.len());
@@ -677,6 +729,8 @@ pub(crate) fn upload_compiled_bytecode(
         _flat_assert_regs: flat_assert_regs_buf,
         _flat_assert_alphas: flat_assert_alphas_buf,
         _flat_terms: flat_terms_buf,
+        _flat_coop_code: flat_coop_code_buf,
+        _flat_coop_u16: flat_coop_u16_buf,
         chips: device_chips,
         chip_index,
     }
@@ -789,6 +843,11 @@ pub(crate) struct SeqTierStatic {
     /// Worst-case `max_reg` across all chunks in this tier — drives the
     /// kernel template choice at launch.
     pub max_reg: u16,
+    /// Worst-case level-schedule sizes over the tier's cooperative-eligible
+    /// chunks (`coop_fits`); size the cooperative kernel's shared memory.
+    pub coop_max_instrs: u32,
+    pub coop_max_levels: u32,
+    pub coop_max_phys: u32,
     /// Device buffer holding `static_host`; uploaded once per shard, reused
     /// every round.
     pub static_buf: Option<Buffer<ChunkStaticC, TaskScope>>,
@@ -806,6 +865,10 @@ pub(crate) trait EvalKernels<K: Field> {
     /// Per-chip GKR column sweep — one block per (chip, row-tile), warp-
     /// per-row with lane-strided column reduction so wide chips scale.
     fn gkr_sweep_kernel() -> KernelPtr;
+    /// All-eval-points interpreter for large rounds (MAX_REGS = 128).
+    fn e3_kernel_128() -> KernelPtr;
+    /// Cooperative level-scheduled interpreter for small chunks.
+    fn coop_kernel() -> KernelPtr;
 }
 
 impl EvalKernels<Felt> for TaskScope {
@@ -832,6 +895,12 @@ impl EvalKernels<Felt> for TaskScope {
     fn gkr_sweep_kernel() -> KernelPtr {
         unsafe { zerocheck_gkr_sweep_kb_kernel() }
     }
+    fn e3_kernel_128() -> KernelPtr {
+        unsafe { zerocheck_fused_sequential_e3_kb_128_kernel() }
+    }
+    fn coop_kernel() -> KernelPtr {
+        unsafe { zerocheck_fused_sequential_coop_kb_kernel() }
+    }
 }
 
 impl EvalKernels<Ext> for TaskScope {
@@ -857,6 +926,12 @@ impl EvalKernels<Ext> for TaskScope {
     }
     fn gkr_sweep_kernel() -> KernelPtr {
         unsafe { zerocheck_gkr_sweep_ext_kernel() }
+    }
+    fn e3_kernel_128() -> KernelPtr {
+        unsafe { zerocheck_fused_sequential_e3_ext_128_kernel() }
+    }
+    fn coop_kernel() -> KernelPtr {
+        unsafe { zerocheck_fused_sequential_coop_ext_kernel() }
     }
 }
 
@@ -946,11 +1021,10 @@ where
     let gkr_active_chips: Vec<u32> = compiled_chips_dev
         .iter()
         .filter(|chip| chip.main_width + chip.prep_width > 0)
-        .filter(|chip| {
-            let has_seq_carrier =
-                chip.chunks.iter().any(|c| matches!(c.kind, ChunkKind::Sequential));
-            chip_uses_decoupled_gkr(chip.main_width, chip.prep_width) || !has_seq_carrier
-        })
+        // Narrow chips without a Sequential carrier get a zero-instruction
+        // carrier chunk in the fused kernel instead (`gkr_pseudo_chunk`), so
+        // only the wide chips need the separate sweep launch each round.
+        .filter(|chip| chip_uses_decoupled_gkr(chip.main_width, chip.prep_width))
         .map(|chip| chip.chip_idx)
         .collect();
 
@@ -1091,6 +1165,91 @@ fn chip_uses_decoupled_gkr(main_width: u32, prep_width: u32) -> bool {
     main_width + prep_width > WIDE_GKR_THRESHOLD
 }
 
+// ---- Small-round / large-round kernel selection (ext rounds) ----
+//
+// Rows per thread of the thread-per-row interpreter. One row per thread: the
+// small rounds are bound by one thread's serial walk over the bytecode, so
+// fewer rows per thread cut their latency, and the large rounds lose nothing.
+const ROWS_PER_THREAD_SEQ: u32 = 1;
+/// A tier whose thread-per-row dispatch has at least this many blocks runs
+/// the all-eval-points (`e3`) kernel instead (MAX_REGS <= 128 tiers only).
+const E3_MIN_BLOCKS: u32 = 900;
+/// Least total GPU memory for the `e3` kernel by default. Its per-thread register file covers all
+/// three eval points (a 6 KB stack), and the driver reserves local memory for every resident thread
+/// at the largest stack a launched kernel needs: ~1.6 GB on a 170-SM card, ~1 GB more than the
+/// one-point kernel. On a 32 GB card with the compress prover on its own stream that pushed
+/// fibonacci-compressed out of memory.
+const E3_MIN_VRAM: usize = 40 << 30;
+
+/// Whether large rounds use the `e3` kernel: `SP1_GPU_ZEROCHECK_E3=0|1`, else cards with at least
+/// [`E3_MIN_VRAM`].
+fn e3_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| match std::env::var("SP1_GPU_ZEROCHECK_E3").as_deref() {
+        Ok("0") | Ok("false") => false,
+        Ok("1") | Ok("true") => true,
+        _ => sp1_gpu_cudart::cuda_memory_info().is_ok_and(|(_, total)| total >= E3_MIN_VRAM),
+    })
+}
+/// Cooperative kernel eligibility: chunks with at most this many rows ...
+const COOP_MAX_ROWS: u32 = 1024;
+/// ... whose serial cost (instructions + 3 per inline GKR column) is at least
+/// this ...
+const COOP_MIN_COST: u32 = 300;
+/// ... (or have at most this many rows, so that the tiny tail rounds run in a
+/// single cooperative launch) ...
+const COOP_SMALL_ROWS: u32 = 32;
+/// ... take the cooperative kernel, costliest first, up to this many rows per
+/// round (beyond that the thread-per-row kernel has enough parallelism).
+const COOP_ROW_BUDGET: u32 = 8192;
+/// Per-chunk limits for the cooperative kernel. Its shared memory is sized
+/// from the tier-wide maxima of the three components, so each component is
+/// capped separately to keep the sum within `zerocheck_coop_smem_cap()`.
+const COOP_MAX_INSTRS: u32 = 4096;
+const COOP_MAX_LEVELS: u32 = 2048;
+fn coop_max_phys() -> u32 {
+    static CAP: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *CAP.get_or_init(|| {
+        let cap = unsafe { zerocheck_coop_smem_cap() } as usize;
+        let fixed = coop_smem_bytes(COOP_MAX_INSTRS, COOP_MAX_LEVELS, 0);
+        (cap.saturating_sub(fixed) / (COOP_ROWS as usize * std::mem::size_of::<Ext>())) as u32
+    })
+}
+
+fn coop_smem_bytes(max_instrs: u32, max_levels: u32, max_phys: u32) -> usize {
+    32 * std::mem::size_of::<Ext>()
+        + max_instrs as usize * 8
+        + ((2 * (max_levels as usize + 1) + 15) & !15)
+        + COOP_ROWS as usize * max_phys as usize * std::mem::size_of::<Ext>()
+}
+
+/// Must match `ZC_COOP_THREADS` / `ZC_COOP_ROWS` in sequential.cuh.
+const COOP_THREADS: u32 = 64;
+const COOP_ROWS: u32 = 8;
+
+fn coop_fits(c: &ChunkStaticC) -> bool {
+    c.n_instrs > 0
+        && c.n_instrs <= COOP_MAX_INSTRS
+        && c.coop_n_levels <= COOP_MAX_LEVELS
+        && c.coop_n_phys <= coop_max_phys()
+}
+
+fn env_u32(name: &str, default: u32) -> u32 {
+    std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+}
+
+/// True iff the chip's GKR column sweep rides on a zero-instruction carrier
+/// chunk in the fused sequential kernel: a narrow chip (see
+/// `chip_uses_decoupled_gkr`) with no Sequential chunk of its own. Saves one
+/// `zerocheck_gkr_sweep` launch per round for the shard's ColumnTile-only /
+/// constraint-free chips (Program, Byte, Range, ...). The bivariate kernels
+/// skip inline GKR, so there the chunk evaluates to exactly zero.
+fn gkr_pseudo_chunk(chip: &CompiledChipDevice) -> bool {
+    chip.main_width + chip.prep_width > 0
+        && !chip_uses_decoupled_gkr(chip.main_width, chip.prep_width)
+        && !chip.chunks.iter().any(|c| matches!(c.kind, ChunkKind::Sequential))
+}
+
 fn build_seq_tiers(
     compiled: &[CompiledChipDevice],
     chip_alpha_offset: &[u32],
@@ -1116,6 +1275,9 @@ fn build_seq_tiers(
         static_host: Vec::new(),
         chip_indices: Vec::new(),
         max_reg: 0,
+        coop_max_instrs: 0,
+        coop_max_levels: 0,
+        coop_max_phys: 0,
         static_buf: None,
     });
 
@@ -1146,11 +1308,45 @@ fn build_seq_tiers(
                 gkr_main_width: if decoupled { 0 } else { chunk.gkr_main_width },
                 gkr_prep_width: if decoupled { 0 } else { chunk.gkr_prep_width },
                 chip_alpha_offset: chip_alpha_offset[chip_idx as usize],
+                coop_code: chunk.coop_code,
+                coop_level_starts: chunk.coop_level_starts,
+                coop_assert_slots: chunk.coop_assert_slots,
+                coop_n_levels: chunk.coop_n_levels,
+                coop_n_phys: chunk.coop_n_phys,
             });
         }
     }
 
+    for chip in compiled.iter().filter(|chip| gkr_pseudo_chunk(chip)) {
+        // Never dereferenced: `n_instrs == n_asserts == 0`.
+        tiers[0].chip_indices.push(chip.chip_idx);
+        tiers[0].static_host.push(ChunkStaticC {
+            instrs: std::ptr::null(),
+            leaves: std::ptr::null(),
+            consts: std::ptr::null(),
+            publics: std::ptr::null(),
+            assert_regs: std::ptr::null(),
+            assert_alphas: std::ptr::null(),
+            n_instrs: 0,
+            n_asserts: 0,
+            chip_idx: chip.chip_idx,
+            gkr_main_width: chip.main_width,
+            gkr_prep_width: chip.prep_width,
+            chip_alpha_offset: chip_alpha_offset[chip.chip_idx as usize],
+            coop_code: std::ptr::null(),
+            coop_level_starts: std::ptr::null(),
+            coop_assert_slots: std::ptr::null(),
+            coop_n_levels: 0,
+            coop_n_phys: 0,
+        });
+    }
+
     for tier in tiers.iter_mut() {
+        for c in tier.static_host.iter().filter(|c| coop_fits(c)) {
+            tier.coop_max_instrs = tier.coop_max_instrs.max(c.n_instrs);
+            tier.coop_max_levels = tier.coop_max_levels.max(c.coop_n_levels);
+            tier.coop_max_phys = tier.coop_max_phys.max(c.coop_n_phys);
+        }
         if !tier.static_host.is_empty() {
             tier.static_buf =
                 Some(DeviceBuffer::from_host_slice(&tier.static_host, scope).unwrap().into_inner());
@@ -1232,6 +1428,36 @@ fn compute_padded_row_adjustment(
         // `output`; we promise to read no slot the kernel hasn't written.
         unsafe {
             output.assume_init();
+        }
+        // Cooperative path (one 32-thread block per chunk over its level
+        // schedule) unless disabled; every Sequential chunk has a schedule and
+        // the zero-instruction GKR carriers contribute zero either way.
+        let use_coop = std::env::var("SP1_GPU_ZEROCHECK_PAD_ADJ_LEGACY").is_err();
+        let max_phys = tier.static_host.iter().map(|c| c.coop_n_phys).max().unwrap_or(0);
+        if use_coop {
+            unsafe {
+                let args = args!(
+                    static_buf.as_ptr(),
+                    (n_chunks as u32),
+                    public_values.as_ptr(),
+                    powers_of_alpha.as_ptr(),
+                    output.as_mut_ptr()
+                );
+                scope
+                    .launch_kernel(
+                        zerocheck_pad_adj_coop_kernel(),
+                        (n_chunks as u32, 1u32, 1u32),
+                        (32u32, 1u32, 1u32),
+                        &args,
+                        (max_phys as usize).max(1) * std::mem::size_of::<Felt>(),
+                    )
+                    .unwrap();
+            }
+            let per_chunk: Vec<Ext> = unsafe { output.into_buffer().copy_into_host_vec() };
+            for (i, &chip_idx) in tier.chip_indices.iter().enumerate() {
+                padded_row_adjustment[chip_idx as usize] += per_chunk[i];
+            }
+            continue;
         }
         let n_blocks = (n_chunks as u32).div_ceil(PAD_ADJ_BLOCK_SIZE);
         // SAFETY: the `args!` tuple matches `zerocheck_pad_adj_*`'s C
@@ -1524,21 +1750,62 @@ where
     // BlockDispatch entries. The kernel reads one entry per block and
     // strides through `n_rows` rows of `chunk_id`.
     let mut dispatch_tiers: [Vec<BlockDispatchC>; NUM_SEQ_TIERS] = Default::default();
+    // Per tier: does the main launch use the all-eval-points kernel, and the
+    // dispatch of the chunks that take the cooperative kernel instead.
+    let mut e3_tiers: [bool; NUM_SEQ_TIERS] = [false; NUM_SEQ_TIERS];
+    let mut coop_tiers: [Vec<BlockDispatchC>; NUM_SEQ_TIERS] = Default::default();
+    let rows_per_thread = env_u32("SP1_GPU_ZEROCHECK_RPT", ROWS_PER_THREAD_SEQ).max(1);
+    let e3_min_blocks = env_u32("SP1_GPU_ZEROCHECK_E3_MIN_BLOCKS", E3_MIN_BLOCKS);
+    let coop_budget = env_u32("SP1_GPU_ZEROCHECK_COOP_ROWS", COOP_ROW_BUDGET);
     for (t, tier) in poly.seq_tiers.iter().enumerate() {
-        let tile = block_size_for(t) * ROWS_PER_THREAD;
+        let bs = block_size_for(t);
+        let rows_of =
+            |chip_idx: u32| poly.layout_tracker.chip_height_elements(chip_idx as usize) / 2;
+        let n_blocks_1: u32 = tier.chip_indices.iter().map(|&c| rows_of(c).div_ceil(bs)).sum();
+        e3_tiers[t] = e3_enabled() && tier.max_reg <= 128 && n_blocks_1 >= e3_min_blocks;
+        // Cooperative candidates: small row count, long serial walk, costliest
+        // first within the per-round row budget. Never mixed with e3.
+        let mut is_coop = vec![false; tier.chip_indices.len()];
+        if !e3_tiers[t] && coop_budget > 0 {
+            let mut cand: Vec<(u32, usize)> = Vec::new();
+            for (i, (&chip_idx, c)) in
+                tier.chip_indices.iter().zip(tier.static_host.iter()).enumerate()
+            {
+                let rows = rows_of(chip_idx);
+                let cost = c.n_instrs + 3 * (c.gkr_main_width + c.gkr_prep_width);
+                if rows > 0
+                    && rows <= COOP_MAX_ROWS
+                    && (cost >= COOP_MIN_COST || rows <= COOP_SMALL_ROWS)
+                    && coop_fits(c)
+                {
+                    cand.push((cost, i));
+                }
+            }
+            cand.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+            let mut used = 0u32;
+            for (_, i) in cand {
+                let rows = rows_of(tier.chip_indices[i]);
+                if used + rows <= coop_budget {
+                    used += rows;
+                    is_coop[i] = true;
+                }
+            }
+        }
+        let tile = if e3_tiers[t] { bs } else { bs * rows_per_thread };
         for (chunk_idx_in_tier, &chip_idx) in tier.chip_indices.iter().enumerate() {
-            let row_count = poly.layout_tracker.chip_height_elements(chip_idx as usize) / 2;
+            let row_count = rows_of(chip_idx);
             if row_count == 0 {
                 continue;
             }
+            let (out, tile) = if is_coop[chunk_idx_in_tier] {
+                (&mut coop_tiers[t], COOP_ROWS)
+            } else {
+                (&mut dispatch_tiers[t], tile)
+            };
             let mut row_offset = 0u32;
             while row_offset < row_count {
                 let n_rows = (row_count - row_offset).min(tile);
-                dispatch_tiers[t].push(BlockDispatchC {
-                    chunk_id: chunk_idx_in_tier as u32,
-                    row_offset,
-                    n_rows,
-                });
+                out.push(BlockDispatchC { chunk_id: chunk_idx_in_tier as u32, row_offset, n_rows });
                 row_offset += tile;
             }
         }
@@ -1552,7 +1819,18 @@ where
     // Block size for GKR is fixed (256, 8 warps); tile = block_size *
     // ROWS_PER_THREAD matches the sequential pattern.
     const GKR_BLOCK_SIZE: u32 = 256;
-    let gkr_tile: u32 = GKR_BLOCK_SIZE * ROWS_PER_THREAD;
+    // Only wide (decoupled) chips reach this kernel now (narrow ones ride on a
+    // zero-instruction carrier chunk), and its wide path is warp-per-row: a
+    // 1024-row tile leaves each warp 128 rows in series and a handful of
+    // blocks for the whole GPU. Small tiles: 64 rows (8 per warp) while the
+    // round is large, 8 rows (one per warp) once it is small.
+    let gkr_rows: u32 = poly
+        .gkr_active_chips
+        .iter()
+        .map(|&c| poly.layout_tracker.chip_height_elements(c as usize) / 2)
+        .sum();
+    let gkr_tile: u32 = if gkr_rows >= 4096 { 64 } else { 8 };
+    let _ = ROWS_PER_THREAD;
     let mut gkr_dispatch: Vec<BlockDispatchC> = Vec::new();
     for &chip_idx in poly.gkr_active_chips.iter() {
         let row_count = poly.layout_tracker.chip_height_elements(chip_idx as usize) / 2;
@@ -1569,10 +1847,13 @@ where
 
     // ---- Slot allocation in the shared output ----
     let mut tier_slot: [usize; NUM_SEQ_TIERS] = [0; NUM_SEQ_TIERS];
+    let mut coop_slot: [usize; NUM_SEQ_TIERS] = [0; NUM_SEQ_TIERS];
     let mut total_slots: usize = 0;
     for t in 0..NUM_SEQ_TIERS {
         tier_slot[t] = total_slots;
         total_slots += dispatch_tiers[t].len() * NUM_EVAL_POINT;
+        coop_slot[t] = total_slots;
+        total_slots += coop_tiers[t].len() * NUM_EVAL_POINT;
     }
     let mut ct_slots: Vec<(usize, u32)> = Vec::with_capacity(ct_launches.len());
     let ct_block_size: u32 = 128; // unchanged for ColumnTile fallback
@@ -1602,44 +1883,89 @@ where
     }
     let shared_output_ptr = shared_output.as_mut_ptr();
 
-    // ---- Launch one fused kernel per non-empty tier ----
+    // ---- Launch the fused kernels per non-empty tier ----
     //
     // Per-tier dispatch buffers are pooled in `poly.cached_seq_dispatch`
-    // (grow-only) so we don't pay a CUDA malloc per round per tier.
+    // (grow-only) so we don't pay a CUDA malloc per round per tier. The
+    // cooperative dispatch is appended after the main one in the same buffer.
     for t in 0..NUM_SEQ_TIERS {
-        if dispatch_tiers[t].is_empty() {
+        let n_main = dispatch_tiers[t].len();
+        let n_coop = coop_tiers[t].len();
+        if n_main + n_coop == 0 {
             continue;
         }
         let bs = block_size_for(t);
-        let dispatch_ptr =
-            refill_buffer(&mut poly.cached_seq_dispatch[t], &dispatch_tiers[t], backend).as_ptr();
+        let mut all = std::mem::take(&mut dispatch_tiers[t]);
+        all.extend_from_slice(&coop_tiers[t]);
+        let dispatch_ptr = refill_buffer(&mut poly.cached_seq_dispatch[t], &all, backend).as_ptr();
         let static_ptr = poly.seq_tiers[t].static_buf.as_ref().unwrap().as_ptr();
         let max_reg = poly.seq_tiers[t].max_reg;
-        let out_ptr = unsafe { shared_output_ptr.add(tier_slot[t]) };
-        let shmem_bytes = (bs as usize / 32).max(1) * std::mem::size_of::<Ext>();
-        unsafe {
-            let args = args!(
-                dispatch_ptr,
-                static_ptr,
-                chip_layouts_ptr,
-                trace_ptr,
-                poly.public_values.as_ptr(),
-                poly.powers_of_alpha.as_ptr(),
-                partial_lagrange.as_ptr(),
-                poly.powers_of_lambda.as_ptr(),
-                poly.gkr_powers.as_ptr(),
-                rest_point_dim,
-                out_ptr
-            );
-            backend
-                .launch_kernel(
-                    <TaskScope as EvalKernels<K>>::fused_sequential_kernel_for(max_reg),
-                    (dispatch_tiers[t].len() as u32, 1, 3),
-                    (bs, 1, 1),
-                    &args,
-                    shmem_bytes,
-                )
-                .unwrap();
+        if n_main > 0 {
+            let out_ptr = unsafe { shared_output_ptr.add(tier_slot[t]) };
+            let shmem_bytes = (bs as usize / 32).max(1) * std::mem::size_of::<Ext>();
+            let (kernel, grid_z) = if e3_tiers[t] {
+                (<TaskScope as EvalKernels<K>>::e3_kernel_128(), 1u32)
+            } else {
+                (<TaskScope as EvalKernels<K>>::fused_sequential_kernel_for(max_reg), 3u32)
+            };
+            unsafe {
+                let args = args!(
+                    dispatch_ptr,
+                    static_ptr,
+                    chip_layouts_ptr,
+                    trace_ptr,
+                    poly.public_values.as_ptr(),
+                    poly.powers_of_alpha.as_ptr(),
+                    partial_lagrange.as_ptr(),
+                    poly.powers_of_lambda.as_ptr(),
+                    poly.gkr_powers.as_ptr(),
+                    rest_point_dim,
+                    out_ptr
+                );
+                backend
+                    .launch_kernel(
+                        kernel,
+                        (n_main as u32, 1, grid_z),
+                        (bs, 1, 1),
+                        &args,
+                        shmem_bytes,
+                    )
+                    .unwrap();
+            }
+        }
+        if n_coop > 0 {
+            let tier = &poly.seq_tiers[t];
+            let coop_dispatch_ptr = unsafe { dispatch_ptr.add(n_main) };
+            let out_ptr = unsafe { shared_output_ptr.add(coop_slot[t]) };
+            let shmem_bytes =
+                coop_smem_bytes(tier.coop_max_instrs, tier.coop_max_levels, tier.coop_max_phys);
+            unsafe {
+                let args = args!(
+                    coop_dispatch_ptr,
+                    static_ptr,
+                    chip_layouts_ptr,
+                    trace_ptr,
+                    poly.public_values.as_ptr(),
+                    poly.powers_of_alpha.as_ptr(),
+                    partial_lagrange.as_ptr(),
+                    poly.powers_of_lambda.as_ptr(),
+                    poly.gkr_powers.as_ptr(),
+                    rest_point_dim,
+                    out_ptr,
+                    tier.coop_max_instrs,
+                    tier.coop_max_levels,
+                    tier.coop_max_phys
+                );
+                backend
+                    .launch_kernel(
+                        <TaskScope as EvalKernels<K>>::coop_kernel(),
+                        (n_coop as u32, 1, 3),
+                        (COOP_THREADS, 1, 1),
+                        &args,
+                        shmem_bytes,
+                    )
+                    .unwrap();
+            }
         }
     }
 
@@ -1891,7 +2217,9 @@ fn bivariate_nodes_per_pass() -> u32 {
             .ok()
             .and_then(|v| v.parse().ok())
             .filter(|g| [1, 2, 4, 12].contains(g))
-            .unwrap_or(2)
+            // G = 4 measured 0.97x / 0.76x / 0.85x of G = 2 on rsp core /
+            // keccak / recursion shards (kr/zerocheck harness).
+            .unwrap_or(4)
     })
 }
 

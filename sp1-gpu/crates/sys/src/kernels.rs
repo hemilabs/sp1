@@ -50,6 +50,14 @@ extern "C" {
     pub fn zerocheck_fused_sequential_ext_256_kernel() -> KernelPtr;
     pub fn zerocheck_fused_sequential_ext_512_kernel() -> KernelPtr;
     pub fn zerocheck_fused_sequential_ext_1024_kernel() -> KernelPtr;
+    // All-eval-points variant for large rounds (grid z = 1) and the
+    // cooperative level-scheduled variant for small chunks.
+    pub fn zerocheck_fused_sequential_e3_kb_128_kernel() -> KernelPtr;
+    pub fn zerocheck_fused_sequential_e3_ext_128_kernel() -> KernelPtr;
+    pub fn zerocheck_fused_sequential_coop_kb_kernel() -> KernelPtr;
+    pub fn zerocheck_fused_sequential_coop_ext_kernel() -> KernelPtr;
+    pub fn zerocheck_pad_adj_coop_kernel() -> KernelPtr;
+    pub fn zerocheck_coop_smem_cap() -> u32;
 
     // zerocheck (DAG-native): bivariate variants for the fused
     // first-two-rounds evaluation. Eval nodes on blockIdx.z (12 non-boolean

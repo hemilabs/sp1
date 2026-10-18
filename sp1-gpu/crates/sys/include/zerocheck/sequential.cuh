@@ -77,6 +77,14 @@ struct ChunkStatic {
     uint32_t gkr_main_width;           // 4
     uint32_t gkr_prep_width;           // 4
     uint32_t chip_alpha_offset;        // 4 — added to chip-relative alpha idx
+    /// Level schedule for the cooperative small-round kernel
+    /// (`zerocheck_fused_sequential_coop`); see `level_schedule` in
+    /// sp1-gpu-air/src/ir/bytecode.rs. `coop_code` has `n_instrs` entries.
+    const uint2* coop_code;            // 8
+    const uint16_t* coop_level_starts; // 8 — coop_n_levels + 1 entries
+    const uint16_t* coop_assert_slots; // 8 — n_asserts entries
+    uint32_t coop_n_levels;            // 4
+    uint32_t coop_n_phys;              // 4 — value slots per row
 };
 
 // Per-round per-chip trace pointers + height. Must match `ChipLayoutC` in
@@ -145,6 +153,25 @@ extern "C" void* zerocheck_fused_sequential_ext_128_kernel();
 extern "C" void* zerocheck_fused_sequential_ext_256_kernel();
 extern "C" void* zerocheck_fused_sequential_ext_512_kernel();
 extern "C" void* zerocheck_fused_sequential_ext_1024_kernel();
+
+// Cooperative small-round kernel: ZC_COOP_LANES lanes per row, ZC_COOP_ROWS
+// rows per block (ZC_COOP_THREADS threads), lanes split each level of the
+// chunk's level schedule, values in dynamic shared memory. Used for chunks
+// with few rows and long bytecode, where the thread-per-row interpreter is
+// bound by one thread's serial latency. Grid (n_dispatch, 1, 3).
+// Dynamic smem bytes = 32 * 16 + max_instrs * 8
+//   + align16(2 * (max_levels + 1)) + ZC_COOP_ROWS * max_phys * sizeof(K).
+constexpr uint32_t ZC_COOP_LANES = 8;
+constexpr uint32_t ZC_COOP_THREADS = 64;
+constexpr uint32_t ZC_COOP_ROWS = ZC_COOP_THREADS / ZC_COOP_LANES;
+// All-eval-points variant for large rounds: grid (n_dispatch, 1, 1), one
+// thread evaluates the three eval points of a row (MAX_REGS = 128 tier only).
+extern "C" void* zerocheck_fused_sequential_e3_kb_128_kernel();
+extern "C" void* zerocheck_fused_sequential_e3_ext_128_kernel();
+// Dynamic shared memory the cooperative kernel may use (bytes).
+extern "C" uint32_t zerocheck_coop_smem_cap();
+extern "C" void* zerocheck_fused_sequential_coop_kb_kernel();
+extern "C" void* zerocheck_fused_sequential_coop_ext_kernel();
 
 // Bivariate (fused first-two-rounds) variants: eval nodes on blockIdx.z
 // (12 nodes), quadruple row consumption, output stride 12. Round 0 only —
