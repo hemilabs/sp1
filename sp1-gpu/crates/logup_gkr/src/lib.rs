@@ -141,12 +141,9 @@ where
         point: eval_point.clone(),
     };
 
-    // Produce the sumcheck proof using GPU challenger.
-    let (sumcheck_proof, openings) = sumcheck::materialized_round_sumcheck_gpu_challenger::<C, DC>(
-        sumcheck_poly,
-        challenger,
-        claim,
-    );
+    // Produce the sumcheck proof with its rounds on the device.
+    let (sumcheck_proof, openings) =
+        sumcheck::materialized_round_sumcheck_device::<C, DC>(sumcheck_poly, challenger, claim);
     let [numerator_0, numerator_1, denominator_0, denominator_1] = openings.try_into().unwrap();
 
     LogupGkrRoundProof { numerator_0, numerator_1, denominator_0, denominator_1, sumcheck_proof }
@@ -296,6 +293,12 @@ where
     (eval_point, round_proofs)
 }
 
+fn device_rounds() -> bool {
+    static DEVICE_ROUNDS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *DEVICE_ROUNDS
+        .get_or_init(|| std::env::var("SP1_LOGUP_DEVICE_ROUNDS").map(|v| v == "1").unwrap_or(false))
+}
+
 /// End-to-end proves lookups for a given trace.
 pub fn prove_logup_gkr<GC: IopCtx<F = Felt, EF = Ext>, A: MachineAir<Felt>, DC>(
     chips: &BTreeSet<Chip<Felt, A>>,
@@ -369,14 +372,29 @@ where
     let first_numerator_eval = numerator.eval_at_eq(&first_point_eq).to_host_vec().unwrap()[0];
     let first_denominator_eval = denominator.eval_at_eq(&first_point_eq).to_host_vec().unwrap()[0];
 
-    let (eval_point, round_proofs) = prove_gkr_circuit(
-        first_numerator_eval,
-        first_denominator_eval,
-        first_eval_point,
-        circuit,
-        challenger,
-        recompute_first_layer,
-    );
+    // SP1_LOGUP_DEVICE_ROUNDS=1 runs the materialized layers' rounds on the device
+    // (sumcheck::materialized_round_sumcheck_device): no host round trip per round, but a
+    // single-thread challenger kernel instead, which on a Radeon RX 9070 XT takes longer (~110 us
+    // a round) than the round trip it saves.
+    let (eval_point, round_proofs) = if device_rounds() {
+        prove_gkr_circuit_gpu_challenger::<GC::Challenger, DC>(
+            first_numerator_eval,
+            first_denominator_eval,
+            first_eval_point,
+            circuit,
+            challenger,
+            recompute_first_layer,
+        )
+    } else {
+        prove_gkr_circuit(
+            first_numerator_eval,
+            first_denominator_eval,
+            first_eval_point,
+            circuit,
+            challenger,
+            recompute_first_layer,
+        )
+    };
 
     // Get the evaluations for each chip at the evaluation point of the last round.
     // We accomplish this by doing jagged fix last variable on the evaluation point.

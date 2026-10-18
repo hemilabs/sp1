@@ -24,6 +24,17 @@ extern "C" void* sumcheck_observe_and_sample_cubic_multi_field_32() {
     return SP1_KERNEL_PTR(sumcheckObserveAndSampleCubic<kb31_t, kb31_extension_t, MultiField32Challenger>);
 }
 
+// The cubic round with its state on the device (LogUp-GKR rounds without host round trips).
+
+extern "C" void* sumcheck_observe_and_sample_cubic_device_duplex() {
+    return SP1_KERNEL_PTR(sumcheckObserveAndSampleCubicDevice<kb31_t, kb31_extension_t, DuplexChallenger>);
+}
+
+extern "C" void* sumcheck_observe_and_sample_cubic_device_multi_field_32() {
+    return SP1_KERNEL_PTR(
+        sumcheckObserveAndSampleCubicDevice<kb31_t, kb31_extension_t, MultiField32Challenger>);
+}
+
 // Export kernel function pointers for the quartic observe-and-sample kernel (zerocheck).
 // These handle degree-4 polynomials with eq-correction and 5-point interpolation.
 

@@ -344,6 +344,90 @@ __global__ __launch_bounds__(256) void sumcheckObserveAndSampleCubic(
     next_claim_out[0] = result;
 }
 
+/// The cubic round with its state kept on the device, so that a LogUp-GKR layer's rounds run with
+/// no host round trip (the rounds that follow read `alpha_out` through a pointer).
+///
+///   evals         - [in]     the round's reduced evaluations [eval_zero, eval_half, eq_sum]
+///   state         - [in/out] [claim, padding_adjustment, eq_adjustment]: as the host-side round
+///                            functions would carry them; after the round, the next round's
+///   alpha_out     - [out]    the sampled alpha
+///   coeffs_out    - [out]    the round polynomial's 4 coefficients (for the proof)
+///   point_last    - [in]     the last coordinate of the round's point
+///   switch_to_eq  - [in]     the next fold is the last circuit layer's: afterwards
+///                            eq_adjustment = padding_adjustment and padding_adjustment = 1
+template <typename F, typename EF, typename Challenger>
+__global__ __launch_bounds__(256) void sumcheckObserveAndSampleCubicDevice(
+    const EF* __restrict__ evals,
+    Challenger challenger,
+    EF* __restrict__ state,
+    EF* __restrict__ alpha_out,
+    EF* __restrict__ coeffs_out,
+    EF point_last,
+    int switch_to_eq) {
+    if (blockIdx.x != 0 || threadIdx.x != 0) return;
+
+    const EF claim = state[0];
+    const EF padding_adjustment = state[1];
+    const EF eq_adjustment = state[2];
+
+    EF eval_zero = evals[0];
+    EF eval_half = evals[1];
+    EF eq_sum = evals[2];
+    EF eq_correction_term = padding_adjustment - eq_sum;
+    EF one = EF::one();
+    eval_zero += eq_correction_term * (one - point_last);
+    EF four = EF(F(4));
+    eval_half += eq_correction_term * four;
+    EF inv8 = EF(F(8)).reciprocal();
+    eval_half = eval_half * inv8;
+    eval_zero = eval_zero * eq_adjustment;
+    eval_half = eval_half * eq_adjustment;
+    EF eval_one = claim - eval_zero;
+    EF two = EF(F(2));
+    EF b_const = (one - point_last) * (one - two * point_last).reciprocal();
+
+    EF coefficients[4];
+    interpolateCubicSumcheck<F, EF>(
+        EF::zero(),
+        one,
+        two.reciprocal(),
+        b_const,
+        eval_zero,
+        eval_one,
+        eval_half,
+        EF::zero(),
+        coefficients);
+
+    challenger.observe_ext(&coefficients[0]);
+    challenger.observe_ext(&coefficients[1]);
+    challenger.observe_ext(&coefficients[2]);
+    challenger.observe_ext(&coefficients[3]);
+    EF alpha = challenger.sample_ext();
+    alpha_out[0] = alpha;
+    for (int i = 0; i < 4; i++) coeffs_out[i] = coefficients[i];
+
+    EF next_claim(coefficients[3]);
+    next_claim *= alpha;
+    next_claim += coefficients[2];
+    next_claim *= alpha;
+    next_claim += coefficients[1];
+    next_claim *= alpha;
+    next_claim += coefficients[0];
+
+    // The next fold removes this round's last coordinate and scales the padding adjustment by
+    // eq(point_last, alpha), as fix_and_sum_materialized_round_raw does on the host.
+    EF next_padding =
+        padding_adjustment * (point_last * alpha + (one - point_last) * (one - alpha));
+    EF next_eq = eq_adjustment;
+    if (switch_to_eq) {
+        next_eq = next_padding;
+        next_padding = one;
+    }
+    state[0] = next_claim;
+    state[1] = next_padding;
+    state[2] = next_eq;
+}
+
 /// Lagrange interpolation through 5 points to get degree-4 polynomial coefficients.
 /// Explicit (non-loop) implementation matching the pattern of interpolateCubicSumcheck.
 template <typename F, typename EF>
