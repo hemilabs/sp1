@@ -336,6 +336,31 @@ impl Groth16Prover {
                 p
             } else {
                 eprintln!("[groth16] Skipping persistent G2 MSM on CUDA (sppark gpu_t conflict)");
+                // SP1 perf: the one-shot G2 MSM uploads all G2 bases (1.95 GB for SP1's circuit) on
+                // every prove. From pageable memory that runs at ~13.6 GB/s (143 ms in nsys); pinning
+                // the host copy once here (off the critical path: the helper is prestarted) makes it a
+                // DMA at PCIe speed. Measured with the production sppark one-shot path and the real
+                // PK + witness: G2 MSM 480 -> 390 ms. Non-fatal on failure. The helper exits after
+                // the proof, so the registration is not undone.
+                let g2_bytes = data.pk_g2_b.len() * std::mem::size_of::<crate::g2::G2Affine>();
+                let t = std::time::Instant::now();
+                let err = unsafe {
+                    sp1_gpu_sys::runtime::cuda_host_register(
+                        data.pk_g2_b.as_ptr() as *const std::ffi::c_void,
+                        g2_bytes,
+                    )
+                };
+                if err != unsafe { sp1_gpu_sys::runtime::CUDA_SUCCESS_CSL } {
+                    eprintln!(
+                        "[groth16] WARN: pinning the G2 bases failed; G2 upload stays pageable"
+                    );
+                } else {
+                    eprintln!(
+                        "[groth16] Pinned G2 bases ({} MB): {:?}",
+                        g2_bytes >> 20,
+                        t.elapsed()
+                    );
+                }
                 None
             }
         };
