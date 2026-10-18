@@ -8,12 +8,57 @@ use slop_jagged::{JaggedAssistSumAsPoly, JaggedEvalSumcheckPoly};
 use slop_multilinear::Point;
 use slop_tensor::Tensor;
 use sp1_gpu_cudart::reduce::DeviceSumKernel;
+use sp1_gpu_cudart::sys::jagged::{
+    branching_program_advance_kernel, branching_program_round_kernel,
+    branching_program_suffix_kernel,
+};
 use sp1_gpu_cudart::transpose::DeviceTransposeKernel;
 use sp1_gpu_cudart::{args, DeviceBuffer, DeviceTensor, TaskScope};
 
-use crate::branching_program_and_sample;
+use crate::branching_program::branching_program_results;
+use crate::branching_program::reduce_and_sample;
 use crate::AsMutRawChallenger;
 use crate::BranchingProgramKernel;
+
+/// The incremental branching program's state across a sumcheck's rounds (see bpSuffix in
+/// branching_program.cu): the suffix vectors of the current phase, the running prefix vector, and
+/// in the second phase the first phase's alphas.
+struct BpState<EF> {
+    phase: i32,
+    next_round: usize,
+    w: Buffer<EF, TaskScope>,
+    u: Buffer<EF, TaskScope>,
+    next_rho: Option<Point<EF, TaskScope>>,
+}
+
+/// Holds a [`BpState`]. A clone starts without one (it recomputes at its next phase start).
+pub struct BpCache<EF>(std::sync::Mutex<Option<BpState<EF>>>);
+
+impl<EF> Default for BpCache<EF> {
+    fn default() -> Self {
+        Self(std::sync::Mutex::new(None))
+    }
+}
+
+impl<EF> Clone for BpCache<EF> {
+    fn clone(&self) -> Self {
+        Self::default()
+    }
+}
+
+impl<EF> std::fmt::Debug for BpCache<EF> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("BpCache")
+    }
+}
+
+/// SP1_LEGACY_BRANCHING_PROGRAM=1 evaluates the whole branching program every round.
+fn legacy_branching_program() -> bool {
+    static LEGACY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *LEGACY.get_or_init(|| {
+        std::env::var("SP1_LEGACY_BRANCHING_PROGRAM").map(|v| v == "1").unwrap_or(false)
+    })
+}
 
 #[derive(Debug, Clone)]
 pub struct JaggedAssistSumAsPolyGPUImpl<F: Field, EF: ExtensionField<F>, Challenger> {
@@ -24,6 +69,7 @@ pub struct JaggedAssistSumAsPolyGPUImpl<F: Field, EF: ExtensionField<F>, Challen
     prefix_sum_length: usize,
     num_columns: usize,
     lambdas: Tensor<EF, TaskScope>,
+    incremental: BpCache<EF>,
     _marker: PhantomData<Challenger>,
 }
 
@@ -85,6 +131,7 @@ where
             prefix_sum_length,
             num_columns,
             lambdas: lambdas_device,
+            incremental: BpCache::default(),
             _marker: PhantomData,
         }
     }
@@ -117,22 +164,15 @@ where
         (results[0], point)
     }
 
-    /// One round, with the claim read on the device from `claim` (the previous round's results)
-    /// and the next claim left there, at index 0 of the returned results: no host round trip.
-    #[allow(clippy::too_many_arguments)]
-    pub fn sum_as_poly_and_sample_into_point_device<OnDeviceChallenger: AsMutRawChallenger>(
+    /// The round's per-column results with the whole program evaluated for each column (the
+    /// rounds' points split between the current and next prefix sums by phase).
+    fn full_program_round(
         &self,
         round_num: usize,
         z_col_eq_vals: &Buffer<EF, TaskScope>,
         intermediate_eq_full_evals: &Buffer<EF, TaskScope>,
-        sum_values: &mut Buffer<EF, TaskScope>,
-        challenger: &mut OnDeviceChallenger,
-        claim: *const EF,
-        rhos: Point<EF, TaskScope>,
-    ) -> (Tensor<EF, TaskScope>, Point<EF, TaskScope>)
-    where
-        TaskScope: BranchingProgramKernel<F, EF, OnDeviceChallenger>,
-    {
+        rhos: &Point<EF, TaskScope>,
+    ) -> Tensor<EF, TaskScope> {
         let (current_prefix_sum_rho_point, next_prefix_sum_rho_point): (
             Point<EF, TaskScope>,
             Point<EF, TaskScope>,
@@ -164,7 +204,7 @@ where
             (Point::new(current_prefix_sum_rho_point), Point::new(next_prefix_sum_rho_point))
         };
 
-        let (bp_results_device, new_randomness) = branching_program_and_sample(
+        branching_program_results(
             &self.current_prefix_sums,
             &self.next_prefix_sums,
             self.prefix_sum_length,
@@ -177,12 +217,179 @@ where
             &self.lambdas,
             z_col_eq_vals,
             intermediate_eq_full_evals,
+        )
+    }
+
+    /// The round's per-column branching program results, computed incrementally (see bpSuffix),
+    /// or None where the rounds do not run in the order the incremental state expects (the caller
+    /// then evaluates the whole program).
+    fn incremental_round(
+        &self,
+        round_num: usize,
+        z_col_eq_vals: &Buffer<EF, TaskScope>,
+        intermediate_eq_full_evals: &Buffer<EF, TaskScope>,
+        rhos: &Point<EF, TaskScope>,
+    ) -> Option<Tensor<EF, TaskScope>> {
+        if legacy_branching_program() {
+            return None;
+        }
+        let psl = self.prefix_sum_length;
+        let num_layers = self.z_row.dimension().max(self.z_index.dimension()) + 1;
+        if round_num >= 2 * psl || rhos.dimension() != round_num || psl > num_layers {
+            return None;
+        }
+        let backend = rhos.backend().clone();
+        let num_columns = self.num_columns;
+        const BLOCK_SIZE: usize = 256;
+        let grid_x = num_columns.div_ceil(BLOCK_SIZE);
+        let mut guard = self.incremental.0.lock().unwrap();
+
+        if round_num == 0 || round_num == psl {
+            // A phase starts: its suffix vectors, and the prefix vector back at e_init.
+            let phase = i32::from(round_num == psl);
+            let next_rho = (phase == 1).then(|| rhos.clone());
+            let (mut w, mut u) = match guard.take() {
+                Some(state) => (state.w, state.u),
+                None => (
+                    Buffer::with_capacity_in((num_layers + 1) * 4 * num_columns, backend.clone()),
+                    Buffer::with_capacity_in(4 * num_columns, backend.clone()),
+                ),
+            };
+            let (next_rho_ptr, next_rho_len) = match &next_rho {
+                Some(rho) => (rho.as_ptr(), rho.dimension()),
+                None => (std::ptr::null(), 0usize),
+            };
+            unsafe {
+                w.assume_init();
+                u.assume_init();
+                let args = args!(
+                    self.current_prefix_sums.as_ptr(),
+                    self.next_prefix_sums.as_ptr(),
+                    psl,
+                    self.z_row.as_ptr(),
+                    self.z_row.dimension(),
+                    self.z_index.as_ptr(),
+                    self.z_index.dimension(),
+                    next_rho_ptr,
+                    next_rho_len,
+                    phase,
+                    num_columns,
+                    w.as_mut_ptr(),
+                    u.as_mut_ptr()
+                );
+                backend
+                    .launch_kernel(branching_program_suffix_kernel(), grid_x, BLOCK_SIZE, &args, 0)
+                    .unwrap();
+            }
+            *guard = Some(BpState { phase, next_round: round_num, w, u, next_rho });
+        } else {
+            let state = guard.as_mut()?;
+            if state.next_round != round_num {
+                *guard = None;
+                return None;
+            }
+            // Advance the prefix vector past the previous round's layer, at the alpha it sampled
+            // (the first coordinate of `rhos`, on the device).
+            let s_prev = (round_num - 1 - state.phase as usize * psl) as i32;
+            let (next_rho_ptr, next_rho_len) = match &state.next_rho {
+                Some(rho) => (rho.as_ptr(), rho.dimension()),
+                None => (std::ptr::null(), 0usize),
+            };
+            unsafe {
+                let args = args!(
+                    self.current_prefix_sums.as_ptr(),
+                    psl,
+                    self.z_row.as_ptr(),
+                    self.z_row.dimension(),
+                    self.z_index.as_ptr(),
+                    self.z_index.dimension(),
+                    next_rho_ptr,
+                    next_rho_len,
+                    state.phase,
+                    s_prev,
+                    num_columns,
+                    rhos.as_ptr(),
+                    state.u.as_mut_ptr()
+                );
+                backend
+                    .launch_kernel(branching_program_advance_kernel(), grid_x, BLOCK_SIZE, &args, 0)
+                    .unwrap();
+            }
+        }
+
+        let state = guard.as_mut().unwrap();
+        let s = (round_num - state.phase as usize * psl) as i32;
+        let (next_rho_ptr, next_rho_len) = match &state.next_rho {
+            Some(rho) => (rho.as_ptr(), rho.dimension()),
+            None => (std::ptr::null(), 0usize),
+        };
+        let mut bp_results: Tensor<EF, TaskScope> =
+            Tensor::with_sizes_in([2, num_columns], backend.clone());
+        unsafe {
+            bp_results.assume_init();
+            let args = args!(
+                self.current_prefix_sums.as_ptr(),
+                self.next_prefix_sums.as_ptr(),
+                psl,
+                self.z_row.as_ptr(),
+                self.z_row.dimension(),
+                self.z_index.as_ptr(),
+                self.z_index.dimension(),
+                next_rho_ptr,
+                next_rho_len,
+                state.phase,
+                s,
+                num_columns,
+                self.lambdas.as_ptr(),
+                z_col_eq_vals.as_ptr(),
+                intermediate_eq_full_evals.as_ptr(),
+                state.w.as_ptr(),
+                state.u.as_ptr(),
+                bp_results.as_mut_ptr()
+            );
+            backend
+                .launch_kernel(
+                    branching_program_round_kernel(),
+                    (grid_x, 2, 1),
+                    (BLOCK_SIZE, 1, 1),
+                    &args,
+                    0,
+                )
+                .unwrap();
+        }
+        state.next_round = round_num + 1;
+        Some(bp_results)
+    }
+
+    /// One round, with the claim read on the device from `claim` (the previous round's results)
+    /// and the next claim left there, at index 0 of the returned results: no host round trip.
+    #[allow(clippy::too_many_arguments)]
+    pub fn sum_as_poly_and_sample_into_point_device<OnDeviceChallenger: AsMutRawChallenger>(
+        &self,
+        round_num: usize,
+        z_col_eq_vals: &Buffer<EF, TaskScope>,
+        intermediate_eq_full_evals: &Buffer<EF, TaskScope>,
+        sum_values: &mut Buffer<EF, TaskScope>,
+        challenger: &mut OnDeviceChallenger,
+        claim: *const EF,
+        rhos: Point<EF, TaskScope>,
+    ) -> (Tensor<EF, TaskScope>, Point<EF, TaskScope>)
+    where
+        TaskScope: BranchingProgramKernel<F, EF, OnDeviceChallenger>,
+    {
+        let bp_results = self
+            .incremental_round(round_num, z_col_eq_vals, intermediate_eq_full_evals, &rhos)
+            .unwrap_or_else(|| {
+                self.full_program_round(round_num, z_col_eq_vals, intermediate_eq_full_evals, &rhos)
+            });
+        let (bp_results_device, new_randomness) = reduce_and_sample::<F, EF, OnDeviceChallenger>(
+            bp_results,
             challenger,
             &rhos,
             sum_values,
             claim,
+            round_num.try_into().unwrap(),
         );
-
         (bp_results_device, Point::new(new_randomness))
     }
 
@@ -308,6 +515,54 @@ mod tests {
 
     type F = SP1Field;
     type EF = BinomialExtensionField<F, 4>;
+
+    /// The incremental rounds give the whole program's per-column results, through both phases.
+    #[test]
+    fn test_incremental_branching_program() {
+        use slop_algebra::AbstractField;
+        let mut rng = rand::thread_rng();
+        let (num_columns, prefix_sum_length, z_row_len, z_index_len) = (300, 22, 21, 5);
+        let z_row: Point<EF> = (0..z_row_len).map(|_| rng.gen::<EF>()).collect();
+        let z_index: Point<EF> = (0..z_index_len).map(|_| rng.gen::<EF>()).collect();
+        let merged: Vec<Point<F>> = (0..num_columns)
+            .map(|_| {
+                (0..2 * prefix_sum_length)
+                    .map(|_| F::from_canonical_u32(rng.gen_range(0..2)))
+                    .collect()
+            })
+            .collect();
+        let z_col: Vec<EF> = (0..num_columns).map(|_| rng.gen::<EF>()).collect();
+        let eq: Vec<EF> = (0..num_columns).map(|_| rng.gen::<EF>()).collect();
+        sp1_gpu_cudart::run_sync_in_place(|t| {
+            let bp = JaggedAssistSumAsPolyGPUImpl::<F, EF, DuplexChallenger<F, TaskScope>>::new(
+                z_row.clone(),
+                z_index.clone(),
+                &merged,
+                &z_col,
+                &t,
+            );
+            let z_col_device =
+                DeviceBuffer::from_host(&Buffer::from(z_col.clone()), &t).unwrap().into_inner();
+            let eq_device =
+                DeviceBuffer::from_host(&Buffer::from(eq.clone()), &t).unwrap().into_inner();
+            let mut rhos: Vec<EF> = vec![];
+            for round in 0..2 * prefix_sum_length {
+                let rho_device: Point<EF, TaskScope> = Point::new(
+                    DeviceBuffer::from_host(&Buffer::from(rhos.clone()), &t).unwrap().into_inner(),
+                );
+                let full = bp.full_program_round(round, &z_col_device, &eq_device, &rho_device);
+                let incremental = bp
+                    .incremental_round(round, &z_col_device, &eq_device, &rho_device)
+                    .expect("the incremental rounds apply");
+                let full = DeviceBuffer::from_raw(full.storage).to_host().unwrap();
+                let incremental = DeviceBuffer::from_raw(incremental.storage).to_host().unwrap();
+                assert_eq!(full, incremental, "round {round}");
+                // The next round's point, the newest alpha first.
+                rhos.insert(0, rng.gen::<EF>());
+            }
+        })
+        .unwrap();
+    }
 
     #[test]
     fn test_fix_last_variable() {
