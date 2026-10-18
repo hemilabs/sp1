@@ -15,7 +15,7 @@ use tracing::{instrument, Instrument};
 
 use futures::stream::FuturesUnordered;
 use futures::StreamExt;
-use rayon::iter::{IntoParallelIterator, ParallelIterator};
+use rayon::iter::{IntoParallelIterator, IntoParallelRefIterator, ParallelIterator};
 use slop_air::BaseAir;
 use slop_alloc::{Backend, Buffer, HasBackend, Slice};
 use slop_challenger::IopCtx;
@@ -26,7 +26,7 @@ use sp1_gpu_cudart::sys::kernels::{
     sum_to_trace_kernel,
 };
 use sp1_gpu_cudart::{args, DeviceBuffer, DeviceTensor, PinnedBuffer, TaskScope};
-use sp1_gpu_tracegen::CudaTracegenAir;
+use sp1_gpu_tracegen::{CudaTracegenAir, PreprocessedPrep};
 use sp1_hypercube::prover::{ProverPermit, ProverSemaphore};
 
 use sp1_core_executor::ELEMENT_THRESHOLD;
@@ -49,6 +49,9 @@ pub struct HostPhaseTracegen<A> {
     pub device_airs: Vec<Arc<A>>,
     /// The real traces generated in the host phase.
     pub host_traces: futures::channel::mpsc::UnboundedReceiver<(String, usize, usize, usize)>,
+    /// Host-side preparation for each of `device_airs` (preprocessed phase only; empty for main),
+    /// computed before the prover permit is taken.
+    pub device_preps: Vec<Option<PreprocessedPrep>>,
 }
 
 /// Information about the traces generated in the host phase.
@@ -405,58 +408,73 @@ async fn host_preprocessed_tracegen<A: CudaTracegenAir<Felt>>(
     let chips: Vec<_> = machine.chips().iter().map(|chip| chip.air.clone()).collect();
 
     // Move ALL CPU-intensive work into spawn_blocking to avoid blocking the async runtime.
-    let (device_airs, host_traces, total_size) = tokio::task::spawn_blocking(move || {
-        // Split chips based on where we will generate their traces.
-        let (device_airs, host_airs): (Vec<_>, Vec<_>) =
-            chips.into_iter().partition(|air| air.supports_device_preprocessed_tracegen());
+    let (device_airs, device_preps, host_traces, total_size) =
+        tokio::task::spawn_blocking(move || {
+            // Split chips based on where we will generate their traces.
+            let (device_airs, host_airs): (Vec<_>, Vec<_>) =
+                chips.into_iter().partition(|air| air.supports_device_preprocessed_tracegen());
 
-        let mut total_size = 0;
-        let mut jobs = Vec::new();
-        for air in host_airs.iter() {
-            let height = air.preprocessed_num_rows(&program);
-            let width = air.preprocessed_width();
-            jobs.push((air.clone(), total_size, height, width));
-            if let Some(height) = height {
-                total_size += height * width;
+            // Scan the program for each device chip now, in parallel and before the prover permit is
+            // taken, instead of serially inside `device_preprocessed_tracegen` while holding it.
+            // `SP1_GPU_PREP_UNDER_PERMIT=1` restores the old behaviour (A/B switch).
+            let prep_outside =
+                std::env::var("SP1_GPU_PREP_UNDER_PERMIT").map(|v| v != "1").unwrap_or(true);
+            let device_preps: Vec<Option<PreprocessedPrep>> = if prep_outside {
+                device_airs
+                    .par_iter()
+                    .map(|air| air.prepare_preprocessed_device(&program))
+                    .collect()
+            } else {
+                device_airs.iter().map(|_| None).collect()
+            };
+
+            let mut total_size = 0;
+            let mut jobs = Vec::new();
+            for air in host_airs.iter() {
+                let height = air.preprocessed_num_rows(&program);
+                let width = air.preprocessed_width();
+                jobs.push((air.clone(), total_size, height, width));
+                if let Some(height) = height {
+                    total_size += height * width;
+                }
             }
-        }
 
-        // Spawn a rayon task to generate the traces on the CPU.
-        // `traces` is a futures Stream that will immediately begin buffering traces.
-        let (host_traces_tx, host_traces) = futures::channel::mpsc::unbounded();
-        rayon::spawn(move || {
-            jobs.into_par_iter().for_each_with(
-                host_traces_tx,
-                |tx, (air, offset, height, width)| {
-                    let base_ptr = buffer_ptr as *mut MaybeUninit<Felt>;
-                    if let Some(height) = height {
-                        let trace_len = height * width;
-                        let slice: &mut [MaybeUninit<Felt>] = unsafe {
-                            std::slice::from_raw_parts_mut(base_ptr.add(offset), trace_len)
-                        };
-                        air.generate_preprocessed_trace_into(&program, slice);
-                        let start_pointer = unsafe { base_ptr.add(offset) as usize };
-                        // Since it's unbounded, it will only error if the receiver is disconnected.
-                        // If the receiver dropped (task cancelled), exit gracefully instead of panicking.
-                        let _ = tx.unbounded_send((
-                            air.name().to_string(),
-                            start_pointer,
-                            height,
-                            width,
-                        ));
-                    }
-                },
-            );
-            // Make this explicit.
-            // If we are the last users of the program, this will expensively drop it.
-            drop(program);
-        });
-        (device_airs, host_traces, total_size)
-    })
-    .await
-    .unwrap();
+            // Spawn a rayon task to generate the traces on the CPU.
+            // `traces` is a futures Stream that will immediately begin buffering traces.
+            let (host_traces_tx, host_traces) = futures::channel::mpsc::unbounded();
+            rayon::spawn(move || {
+                jobs.into_par_iter().for_each_with(
+                    host_traces_tx,
+                    |tx, (air, offset, height, width)| {
+                        let base_ptr = buffer_ptr as *mut MaybeUninit<Felt>;
+                        if let Some(height) = height {
+                            let trace_len = height * width;
+                            let slice: &mut [MaybeUninit<Felt>] = unsafe {
+                                std::slice::from_raw_parts_mut(base_ptr.add(offset), trace_len)
+                            };
+                            air.generate_preprocessed_trace_into(&program, slice);
+                            let start_pointer = unsafe { base_ptr.add(offset) as usize };
+                            // Since it's unbounded, it will only error if the receiver is disconnected.
+                            // If the receiver dropped (task cancelled), exit gracefully instead of panicking.
+                            let _ = tx.unbounded_send((
+                                air.name().to_string(),
+                                start_pointer,
+                                height,
+                                width,
+                            ));
+                        }
+                    },
+                );
+                // Make this explicit.
+                // If we are the last users of the program, this will expensively drop it.
+                drop(program);
+            });
+            (device_airs, device_preps, host_traces, total_size)
+        })
+        .await
+        .unwrap();
 
-    (HostPhaseTracegen { device_airs, host_traces }, total_size)
+    (HostPhaseTracegen { device_airs, host_traces, device_preps }, total_size)
 }
 
 #[instrument(skip_all, level = "debug")]
@@ -465,7 +483,8 @@ async fn device_preprocessed_tracegen<A: CudaTracegenAir<Felt>>(
     host_phase_tracegen: HostPhaseTracegen<A>,
     backend: &TaskScope,
 ) -> BTreeMap<String, Trace<TaskScope>> {
-    let HostPhaseTracegen { device_airs, host_traces } = host_phase_tracegen;
+    let HostPhaseTracegen { device_airs, host_traces, device_preps } = host_phase_tracegen;
+    let mut device_preps = device_preps.into_iter();
 
     // Stream that, when polled, copies the host traces to the device.
     let copied_host_traces =
@@ -504,9 +523,12 @@ async fn device_preprocessed_tracegen<A: CudaTracegenAir<Felt>>(
         .map(|air| {
             // We want to borrow the program and move the air.
             let program = program.as_ref();
+            let prep = device_preps.next().flatten();
             async move {
-                let maybe_trace =
-                    air.generate_preprocessed_trace_device(program, backend).await.unwrap();
+                let maybe_trace = air
+                    .generate_preprocessed_trace_device_prepared(program, prep, backend)
+                    .await
+                    .unwrap();
                 (air, maybe_trace)
             }
         })
@@ -848,7 +870,8 @@ where
 
     let host_phase_shape_info = HostPhaseShapeInfo { traces_by_name: initial_traces, chip_set };
 
-    let host_phase_tracegen = HostPhaseTracegen { device_airs, host_traces };
+    let host_phase_tracegen =
+        HostPhaseTracegen { device_airs, host_traces, device_preps: Vec::new() };
 
     (host_phase_tracegen, host_phase_shape_info)
 }
@@ -861,7 +884,7 @@ async fn device_main_tracegen<A: CudaTracegenAir<Felt>>(
     initial_traces: BTreeMap<String, Trace>,
     backend: &TaskScope,
 ) -> (BTreeMap<String, Trace>, Vec<Felt>) {
-    let HostPhaseTracegen { device_airs, host_traces } = host_phase_tracegen;
+    let HostPhaseTracegen { device_airs, host_traces, .. } = host_phase_tracegen;
 
     let outer_span = tracing::Span::current();
     // Stream that, when polled, copies the host traces to the device.

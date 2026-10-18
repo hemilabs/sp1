@@ -11,7 +11,7 @@ use slop_alloc::mem::CopyError;
 use sp1_gpu_cudart::{DeviceMle, TaskScope};
 use sp1_recursion_machine::RecursionAir;
 
-use crate::{CudaTracegenAir, F};
+use crate::{CudaTracegenAir, PreprocessedPrep, F};
 
 impl<const DEGREE: usize, const VAR_EVENTS_PER_ROW: usize> CudaTracegenAir<F>
     for RecursionAir<F, DEGREE, VAR_EVENTS_PER_ROW>
@@ -59,6 +59,51 @@ impl<const DEGREE: usize, const VAR_EVENTS_PER_ROW: usize> CudaTracegenAir<F>
             Self::PublicValues(_) => unimplemented!(),
             // Other chips don't have `CudaTracegenAir` implemented yet.
             _ => unimplemented!(),
+        }
+    }
+
+    fn prepare_preprocessed_device(&self, program: &Self::Program) -> Option<PreprocessedPrep> {
+        match self {
+            Self::BaseAlu(chip) => chip.prepare_preprocessed_device(program),
+            Self::ExtAlu(chip) => chip.prepare_preprocessed_device(program),
+            Self::Poseidon2Wide(chip) => chip.prepare_preprocessed_device(program),
+            Self::Poseidon2LinearLayer(chip) => chip.prepare_preprocessed_device(program),
+            Self::Poseidon2SBox(chip) => chip.prepare_preprocessed_device(program),
+            Self::ExtFeltConvert(chip) => chip.prepare_preprocessed_device(program),
+            Self::Select(chip) => chip.prepare_preprocessed_device(program),
+            _ => None,
+        }
+    }
+
+    async fn generate_preprocessed_trace_device_prepared(
+        &self,
+        program: &Self::Program,
+        prep: Option<PreprocessedPrep>,
+        scope: &TaskScope,
+    ) -> Result<Option<DeviceMle<F>>, CopyError> {
+        match self {
+            Self::BaseAlu(chip) => {
+                chip.generate_preprocessed_trace_device_prepared(program, prep, scope).await
+            }
+            Self::ExtAlu(chip) => {
+                chip.generate_preprocessed_trace_device_prepared(program, prep, scope).await
+            }
+            Self::Poseidon2Wide(chip) => {
+                chip.generate_preprocessed_trace_device_prepared(program, prep, scope).await
+            }
+            Self::Poseidon2LinearLayer(chip) => {
+                chip.generate_preprocessed_trace_device_prepared(program, prep, scope).await
+            }
+            Self::Poseidon2SBox(chip) => {
+                chip.generate_preprocessed_trace_device_prepared(program, prep, scope).await
+            }
+            Self::ExtFeltConvert(chip) => {
+                chip.generate_preprocessed_trace_device_prepared(program, prep, scope).await
+            }
+            Self::Select(chip) => {
+                chip.generate_preprocessed_trace_device_prepared(program, prep, scope).await
+            }
+            _ => self.generate_preprocessed_trace_device(program, scope).await,
         }
     }
 
@@ -153,6 +198,23 @@ pub(crate) mod tests {
             .to_host()
             .expect("should copy trace to host successfully")
             .into_guts();
+
+        // The prepared path (host scan done ahead of time) must give the identical trace.
+        let prep = chip.prepare_preprocessed_device(&program);
+        assert!(prep.is_some(), "device preprocessed chips should prepare their instructions");
+        let gpu_trace_prepared = chip
+            .generate_preprocessed_trace_device_prepared(&program, prep, &scope)
+            .await
+            .expect("should copy events to device successfully")
+            .expect("should generate Some(preprocessed_trace)")
+            .to_host()
+            .expect("should copy trace to host successfully")
+            .into_guts();
+        assert_eq!(gpu_trace.dimensions, gpu_trace_prepared.dimensions);
+        assert!(
+            gpu_trace.as_slice() == gpu_trace_prepared.as_slice(),
+            "prepared preprocessed trace differs from the unprepared one"
+        );
 
         let Some(SeqBlock::Basic(BasicBlock { instrs })) =
             program.into_inner().inner.seq_blocks.pop()
