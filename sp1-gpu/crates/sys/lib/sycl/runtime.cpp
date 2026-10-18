@@ -401,9 +401,25 @@ rustCudaError_t cached_malloc(void** p, size_t s, sycl::queue* q) {
         take_cached_block(block, q);
         return SP1_SUCCESS;
     }
-    if (g_cached_bytes > 0) {
+    // Allocations under 16 MiB skip this: the margin covers them.
+    if (g_cached_bytes > 0 && s >= (size_t(16) << 20)) {
         const size_t headroom = device_headroom();
-        if (s + FIT_MARGIN_BYTES > headroom) evict_until_fits(s, headroom);
+        if (s + FIT_MARGIN_BYTES > headroom) {
+            // The smallest cached block of any larger size, rather than freeing the largest
+            // blocks to allocate anew (as in the HIP allocator).
+            auto it3 = g_free_pool.lower_bound(s);
+            while (it3 != g_free_pool.end() && it3->second.empty()) ++it3;
+            if (it3 != g_free_pool.end()) {
+                CachedBlock block = it3->second.back();
+                it3->second.pop_back();
+                g_cached_bytes -= it3->first;
+                *p = block.ptr;
+                g_alloc_sizes[*p] = it3->first;
+                take_cached_block(block, q);
+                return SP1_SUCCESS;
+            }
+            evict_until_fits(s, headroom);
+        }
     }
     void* ptr = raw_device_alloc(s);
     if (!ptr && g_cached_bytes > 0) {
