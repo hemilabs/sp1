@@ -145,6 +145,27 @@ class Totals {
                     (unsigned long long)idle[i].second.second,
                     idle[i].first.c_str());
             }
+            // Idle time by the pair of operations around it: what the host did in between.
+            std::map<std::string, std::pair<double, uint64_t>> idle_between;
+            for (auto& g : gaps) {
+                auto& e = idle_between[std::string(g.before) + " -> " + g.after];
+                e.first += g.ms;
+                e.second += 1;
+            }
+            std::vector<std::pair<std::string, std::pair<double, uint64_t>>> pairs(
+                idle_between.begin(),
+                idle_between.end());
+            std::sort(pairs.begin(), pairs.end(), [](const auto& a, const auto& b) {
+                return a.second.first > b.second.first;
+            });
+            for (size_t i = 0; i < pairs.size() && i < 25; i++) {
+                std::fprintf(
+                    f,
+                    "# between %10.1f ms in %6llu gaps: %s\n",
+                    pairs[i].second.first,
+                    (unsigned long long)pairs[i].second.second,
+                    pairs[i].first.c_str());
+            }
             std::sort(gaps.begin(), gaps.end(), [](const Gap& a, const Gap& b) {
                 return a.ms > b.ms;
             });
