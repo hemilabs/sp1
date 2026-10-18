@@ -49,42 +49,61 @@ class Totals {
     void add(const char* name, double ms) {
         std::lock_guard<std::mutex> lock(m_);
         auto& t = totals_[name];
-        t.first += 1;
-        t.second += ms;
+        if (t.count == 0 || ms < t.min_ms) t.min_ms = ms;
+        if (ms > t.max_ms) t.max_ms = ms;
+        t.count += 1;
+        t.ms += ms;
     }
 
     void write() {
-        std::vector<std::pair<std::string, std::pair<uint64_t, double>>> rows;
+        std::vector<std::pair<std::string, Row>> rows;
         {
             std::lock_guard<std::mutex> lock(m_);
             rows.assign(totals_.begin(), totals_.end());
         }
         std::sort(rows.begin(), rows.end(), [](const auto& a, const auto& b) {
-            return a.second.second > b.second.second;
+            return a.second.ms > b.second.ms;
         });
         FILE* f = std::fopen(output_path(), "w");
         if (!f) return;
         double all = 0;
-        for (auto& r : rows) all += r.second.second;
+        for (auto& r : rows) all += r.second.ms;
         std::fprintf(f, "# total GPU ms %.1f (summed over streams)\n", all);
-        std::fprintf(f, "# %12s %10s %10s %6s  name\n", "total_ms", "count", "mean_us", "pct");
+        std::fprintf(
+            f,
+            "# %12s %10s %10s %6s %10s %10s  name\n",
+            "total_ms",
+            "count",
+            "mean_us",
+            "pct",
+            "min_us",
+            "max_us");
         for (auto& r : rows) {
             std::fprintf(
                 f,
-                "%14.2f %10llu %10.1f %5.1f%%  %s\n",
-                r.second.second,
-                (unsigned long long)r.second.first,
-                1000.0 * r.second.second / (double)r.second.first,
-                all > 0 ? 100.0 * r.second.second / all : 0.0,
+                "%14.2f %10llu %10.1f %5.1f%% %10.1f %10.1f  %s\n",
+                r.second.ms,
+                (unsigned long long)r.second.count,
+                1000.0 * r.second.ms / (double)r.second.count,
+                all > 0 ? 100.0 * r.second.ms / all : 0.0,
+                1000.0 * r.second.min_ms,
+                1000.0 * r.second.max_ms,
                 r.first.c_str());
         }
         std::fclose(f);
     }
 
   private:
+    struct Row {
+        uint64_t count = 0;
+        double ms = 0;
+        double min_ms = 0;
+        double max_ms = 0;
+    };
+
     std::mutex m_;
     std::unordered_map<void*, const char*> names_;
-    std::map<std::string, std::pair<uint64_t, double>> totals_;
+    std::map<std::string, Row> totals_;
 };
 
 inline Totals& totals() {
