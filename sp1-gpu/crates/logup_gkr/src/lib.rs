@@ -295,8 +295,12 @@ where
 
 fn device_rounds() -> bool {
     static DEVICE_ROUNDS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *DEVICE_ROUNDS
-        .get_or_init(|| std::env::var("SP1_LOGUP_DEVICE_ROUNDS").map(|v| v == "1").unwrap_or(false))
+    *DEVICE_ROUNDS.get_or_init(|| match std::env::var("SP1_LOGUP_DEVICE_ROUNDS") {
+        Ok(v) => v == "1",
+        // On by default on AMD GPUs, where a host round trip costs more than the round's
+        // challenger kernel.
+        Err(_) => sp1_gpu_cudart::sys::BACKEND == "hip",
+    })
 }
 
 /// End-to-end proves lookups for a given trace.
@@ -372,10 +376,11 @@ where
     let first_numerator_eval = numerator.eval_at_eq(&first_point_eq).to_host_vec().unwrap()[0];
     let first_denominator_eval = denominator.eval_at_eq(&first_point_eq).to_host_vec().unwrap()[0];
 
-    // SP1_LOGUP_DEVICE_ROUNDS=1 runs the materialized layers' rounds on the device
-    // (sumcheck::materialized_round_sumcheck_device): no host round trip per round, but a
-    // single-thread challenger kernel instead, which on a Radeon RX 9070 XT takes longer (~110 us
-    // a round) than the round trip it saves.
+    // Device rounds (SP1_LOGUP_DEVICE_ROUNDS, on by default on HIP) run the materialized layers'
+    // rounds on the device (sumcheck::materialized_round_sumcheck_device): no host round trip per
+    // round, but a challenger kernel instead. With the 16-lane Poseidon2 that saves ~0.4 s of a
+    // 144M-cycle core proof on a Radeon RX 9070 XT (9.40 s -> 8.99 s); on an Arc Pro B70 it is
+    // even (5.17 s -> 5.21 s), so off there.
     let (eval_point, round_proofs) = if device_rounds() {
         prove_gkr_circuit_gpu_challenger::<GC::Challenger, DC>(
             first_numerator_eval,
