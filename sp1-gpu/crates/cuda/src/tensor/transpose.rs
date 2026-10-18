@@ -31,17 +31,29 @@ where
         let src = &self.raw;
         let mut dst_view = dst.raw.as_view_mut();
         let num_dims = src.sizes().len();
+        assert_eq!(src.sizes()[num_dims - 2], dst_view.sizes()[num_dims - 1]);
+        assert_eq!(src.sizes()[num_dims - 1], dst_view.sizes()[num_dims - 2]);
+        unsafe { self.transpose_into_ptr(dst_view.as_mut_ptr()) };
+    }
+
+    /// Transposes the last two dimensions of the tensor into `dst`, which receives the
+    /// transposed elements contiguously (the layout of [`Self::transpose`]'s output).
+    ///
+    /// # Safety
+    /// `dst` must be valid device memory for `self.total_len()` elements on this tensor's
+    /// stream, not overlapping the tensor.
+    pub unsafe fn transpose_into_ptr(&self, dst: *mut T) {
+        let src = &self.raw;
+        let num_dims = src.sizes().len();
 
         let dim_x = src.sizes()[num_dims - 2];
         let dim_y = src.sizes()[num_dims - 1];
         let dim_z: usize = src.sizes().iter().take(num_dims - 2).product();
-        assert_eq!(dim_x, dst_view.sizes()[num_dims - 1]);
-        assert_eq!(dim_y, dst_view.sizes()[num_dims - 2]);
 
         let block_dim: Dim3 =
             (32u32, <TaskScope as DeviceTransposeKernel<T>>::transpose_block_rows(), 1u32).into();
         let grid_dim: Dim3 = (dim_x.div_ceil(32), dim_y.div_ceil(32), dim_z).into();
-        let args = args!(src.as_ptr(), dst_view.as_mut_ptr(), dim_x, dim_y, dim_z);
+        let args = args!(src.as_ptr(), dst, dim_x, dim_y, dim_z);
         unsafe {
             src.backend()
                 .launch_kernel(TaskScope::transpose_kernel(), grid_dim, block_dim, &args, 0)

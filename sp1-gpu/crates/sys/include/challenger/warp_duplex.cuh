@@ -1,10 +1,11 @@
 // Warp-cooperative DuplexChallenger on a shared-memory staged copy of the device challenger state
-// (same layout/semantics as DuplexChallenger::stage()/unstage()), using the warp Poseidon2.
-// All 32 lanes of one warp must call every method (control flow depends only on buffer sizes).
+// (same layout/semantics as DuplexChallenger::stage()/unstage()), using the 4-lanes-per-state
+// Poseidon2 of poseidon2_kb31_16_fast.cuh. All 32 lanes of one warp must call every method (control
+// flow depends only on buffer sizes).
 #pragma once
 #ifndef __HIPCC__
 #include "challenger/challenger.cuh"
-#include "poseidon2/poseidon2_kb31_16_warp.cuh"
+#include "poseidon2/poseidon2_kb31_16_fast.cuh"
 
 struct WarpDuplex {
     static constexpr int RATE = 8;
@@ -33,15 +34,32 @@ struct WarpDuplex {
         if (l < 16) { gs[l] = sp[l]; gi[l] = in[l]; go[l] = out[l]; }
         if (l == 0) { gz[0] = sz[0]; gz[1] = sz[1]; }
     }
-    __device__ __forceinline__ void duplexing() {
+    // Not inlined: the callers run it from a cold instruction cache (single-warp kernels), and the
+    // up-to-13 inlined copies of the unrolled permutation in a sumcheck round cost more than the
+    // call (one challenger step 14.7 -> 12.4 us vs the inlined 16-lanes-per-state permutation).
+    __device__ __noinline__ void duplexing() {
         __syncwarp();
-        const int lane = threadIdx.x & 15;
-        uint32_t x = (size_t)lane < sz[0] ? in[lane].val : sp[lane].val;
-        x = poseidon2_kb31_16_warp::permute(x);
+        // Every aligned quad of lanes computes the permutation, lane j of a quad holding state
+        // elements 4j..4j+3; the round constants are read from constant memory.
+        poseidon2_kb31_16_fast::quad::QCtx C;
+        C.rc = reinterpret_cast<const uint32_t*>(poseidon2_kb31_16::constants::EXTERNAL_ROUND_CONSTANTS);
+        C.j = threadIdx.x & 3;
+        C.mask = 0xffffffffu;
+        uint32_t x[4];
+#pragma unroll
+        for (int k = 0; k < 4; k++) {
+            const int i = 4 * C.j + k;
+            x[k] = (size_t)i < sz[0] ? in[i].val : sp[i].val;
+        }
+        poseidon2_kb31_16_fast::quad::permute(x, C);
         __syncwarp();
-        if (threadIdx.x < 16) {
-            sp[lane] = kb31_t(x);
-            out[lane] = lane < RATE ? kb31_t(x) : kb31_t(0u);
+        if (threadIdx.x < 4) {
+#pragma unroll
+            for (int k = 0; k < 4; k++) {
+                const int i = 4 * C.j + k;
+                sp[i] = kb31_t(x[k]);
+                out[i] = i < RATE ? kb31_t(x[k]) : kb31_t(0u);
+            }
         }
         if (threadIdx.x == 0) { sz[0] = 0; sz[1] = RATE; }
         __syncwarp();
