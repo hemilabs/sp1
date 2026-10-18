@@ -381,6 +381,16 @@ impl Groth16Bn254Prover {
         find_gpu_helper().is_some()
     }
 
+    /// Whether a GPU proof will try the GPU R1CS solver (`SP1_GPU_R1CS_SOLVER` is not `cpu` and
+    /// `r1cs_solve_plan` can be found) rather than gnark's solve. A prestarted helper serves only
+    /// gnark's solve, so it is not started then.
+    #[cfg(feature = "native")]
+    pub fn gpu_r1cs_solver_enabled() -> bool {
+        std::env::var("SP1_GPU_R1CS_SOLVER").ok().as_deref() != Some("cpu")
+            && crate::cpu_helper::find_executable("r1cs_solve_plan", Some("SP1_R1CS_SOLVE_PLAN"))
+                .is_some()
+    }
+
     /// Executes the prover in testing mode with a circuit definition and witness.
     pub fn test<C: Config>(constraints: Vec<Constraint>, witness: Witness<C>) {
         let serialized = serde_json::to_string(&constraints).unwrap();

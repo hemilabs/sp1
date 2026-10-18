@@ -115,6 +115,9 @@ pub(crate) struct PrestartInputs<'a> {
     /// `SP1_GROTH16_GPU`: forcing the CPU prover rules out the helper.
     pub override_env: Option<&'a str>,
     pub helper_available: bool,
+    /// Whether the proof will use the GPU R1CS solver, whose helper a prestarted one cannot
+    /// replace (it would only hold memory the real helper needs).
+    pub gpu_r1cs_solver: bool,
     /// Whether this process resets its GPU before the wrap, which would kill a prestarted helper's
     /// uploaded key along with everything else.
     pub gpu_reset: bool,
@@ -131,6 +134,7 @@ pub(crate) fn should_prestart(inputs: &PrestartInputs<'_>) -> bool {
     !matches!(inputs.prestart_env, Some("0" | "false"))
         && !matches!(inputs.override_env, Some("0" | "false"))
         && inputs.helper_available
+        && !inputs.gpu_r1cs_solver
         && !inputs.gpu_reset
         && inputs.circuit_installed
         && inputs.vram_total.is_some_and(|total| total >= PRESTART_MIN_VRAM_BYTES)
@@ -151,6 +155,7 @@ pub(crate) fn prestart_gpu_helper() -> Option<sp1_recursion_gnark_ffi::prestart:
         prestart_env: prestart_env.as_deref(),
         override_env: override_env.as_deref(),
         helper_available: Groth16Bn254Prover::gpu_helper_available(),
+        gpu_r1cs_solver: Groth16Bn254Prover::gpu_r1cs_solver_enabled(),
         gpu_reset: sp1_recursion_gnark_ffi::gpu_reset_requested(),
         vram_total: sp1_recursion_gnark_ffi::gpu_total_memory(),
         mem_available: sp1_recursion_gnark_ffi::host_memory::available(),
@@ -305,6 +310,7 @@ mod tests {
             prestart_env: None,
             override_env: None,
             helper_available: true,
+            gpu_r1cs_solver: false,
             gpu_reset: false,
             vram_total: Some(32 * GIB),
             mem_available: Some(64 * GIB),
@@ -323,6 +329,7 @@ mod tests {
         assert!(should_prestart(&PrestartInputs { override_env: Some("1"), ..base }));
         assert!(!should_prestart(&PrestartInputs { helper_available: false, ..base }));
         assert!(!should_prestart(&PrestartInputs { gpu_reset: true, ..base }));
+        assert!(!should_prestart(&PrestartInputs { gpu_r1cs_solver: true, ..base }));
         assert!(!should_prestart(&PrestartInputs { circuit_installed: false, ..base }));
         assert!(!should_prestart(&PrestartInputs { vram_total: Some(24 * GIB), ..base }));
         assert!(!should_prestart(&PrestartInputs { vram_total: None, ..base }));
