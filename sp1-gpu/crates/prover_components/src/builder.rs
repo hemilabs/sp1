@@ -12,6 +12,33 @@ use sp1_prover::{
     CORE_LOG_STACKING_HEIGHT,
 };
 
+/// Default core worker count for the GPU prover (see `cuda_worker_builder_with_machine`).
+pub const GPU_NUM_CORE_WORKERS: usize = 8;
+
+/// Host memory the process must have available for [`GPU_NUM_CORE_WORKERS`]: each extra worker
+/// holds a shard's records in host RAM (about +9 GB for the four extra on an RTX 5090 host).
+pub const GPU_NUM_CORE_WORKERS_MIN_AVAILABLE_RAM: u64 = 48 << 30;
+
+/// Whether the compress prover gets its own CUDA stream and permit (see
+/// `cuda_worker_builder_with_machine`). On by default above the 30 GB tier, where a core shard and
+/// a compress proof fit on the card together; `SP1_GPU_RECURSION_STREAM=0|1` overrides.
+fn separate_recursion_stream() -> bool {
+    match std::env::var("SP1_GPU_RECURSION_STREAM").as_deref() {
+        Ok("0") | Ok("false") => false,
+        Ok("1") | Ok("true") => true,
+        _ => gpu_memory_gb() > 30,
+    }
+}
+
+/// Whether the GPU prover should run [`GPU_NUM_CORE_WORKERS`] core workers. They pay off when
+/// the compress prover has its own stream (rsp-compressed -2.4 s on top of it on an RTX 5090);
+/// without it, more workers made no measurable difference.
+fn more_core_workers(separate_recursion_stream: bool) -> bool {
+    separate_recursion_stream
+        && sp1_recursion_gnark_ffi::host_memory::available()
+            .is_some_and(|bytes| bytes >= GPU_NUM_CORE_WORKERS_MIN_AVAILABLE_RAM)
+}
+
 pub const RECURSION_TRACE_ALLOCATION: usize = 1 << 27;
 pub const SHRINK_TRACE_ALLOCATION: usize = 1 << 25;
 
@@ -237,7 +264,27 @@ pub async fn cuda_worker_builder_with_machine(
     // an invalid proof, not a different valid one. Setup is unaffected: `commit_multilinears` never
     // drops preprocessed traces.
     // TODO: tune this more precisely and make it a constant.
-    let recursion_prover = Arc::new(recursion_prover_and_verifier(scope.clone()).await.0);
+    //
+    // The compress prover proves the ~70 small normalize/reduce proofs of a proof. Sharing the core
+    // prover's stream and permit queues them behind core shards; with their own stream and permit
+    // they run in the core prover's GPU gaps (host round trips, waits for host tracegen, H2D
+    // copies): rsp-compressed -3.1 s on an RTX 5090, -5.8 s together with 8 core workers. Each
+    // prover's buffers live on its own stream; the provers share only host data and the driver's
+    // memory pool.
+    let separate_recursion_stream = separate_recursion_stream();
+    let (recursion_scope, recursion_permits) = if separate_recursion_stream {
+        // A task kept alive for the life of the process, so the scope's stream stays valid.
+        let (tx, rx) = tokio::sync::oneshot::channel::<TaskScope>();
+        let _detached = scope.owner().spawn(move |t| async move {
+            tx.send(t.clone()).ok();
+            std::future::pending::<()>().await;
+        });
+        tracing::info!("compress prover on its own CUDA stream and permit");
+        (rx.await.expect("recursion task scope"), ProverSemaphore::new(1))
+    } else {
+        (scope.clone(), prover_permits.clone())
+    };
+    let recursion_prover = Arc::new(recursion_prover_and_verifier(recursion_scope).await.0);
 
     let shrink_verifier = SP1CudaProverComponents::shrink_verifier();
     let shrink_prover = Arc::new(
@@ -276,9 +323,23 @@ pub async fn cuda_worker_builder_with_machine(
         .with_core_opts(opts)
         .with_config(|config| {
             config.prover_config.recursion_prover_config.groth16_gpu = groth16_gpu;
+            // A core worker runs tracing, host tracegen, the core proof, its CPU verification and
+            // then the shard's normalize (lift) proof before it takes the next shard. With the
+            // upstream default of 4 workers all four are often in those CPU phases together and
+            // the GPU permit sits idle (or is held while host tracegen finishes) between batches
+            // of four core proofs. More workers keep a core shard's host tracegen running while
+            // the normalize proofs of the previous batch hold the GPU. Pinned trace buffers are
+            // still bounded by `trace_buffer_count()`; extra workers only add host-RAM records.
+            // `SP1_WORKER_NUM_CORE_WORKERS` still overrides. Only with the compress prover on its
+            // own stream, and only when the process has the host memory for the extra records.
+            if std::env::var("SP1_WORKER_NUM_CORE_WORKERS").is_err()
+                && more_core_workers(separate_recursion_stream)
+            {
+                config.prover_config.core_prover_config.num_core_workers = GPU_NUM_CORE_WORKERS;
+            }
         })
         .with_core_air_prover(core_prover, prover_permits.clone())
-        .with_compress_air_prover(recursion_prover, prover_permits.clone())
+        .with_compress_air_prover(recursion_prover, recursion_permits)
         .with_shrink_air_prover(shrink_prover, prover_permits.clone())
         .with_wrap_air_prover(ReadyWrapProverBuilder::new(wrap_prover), prover_permits);
 
