@@ -111,16 +111,58 @@ class DuplexChallenger {
         return sample_bits(bits) == 0;
     }
 
-    // Whether another thread has found a witness. On SYCL an atomic load: Intel's per-core L1 caches
-    // are not coherent, so a plain (even volatile) load can keep returning the stale `false` and
-    // leave every other work-group grinding long after the hit. The flag is a 4-byte allocation
-    // (see grinding_challenger.rs), set with a 4-byte atomicExch.
+    // Whether another thread has found a witness. On SYCL and HIP an atomic load: Intel's per-core
+    // L1 and AMD's per-CU caches are not coherent, so a plain (even volatile) load can keep returning
+    // the stale `false` and leave other work-groups grinding long after the hit. The flag is a
+    // 4-byte allocation (see grinding_challenger.rs), set with a 4-byte atomicExch.
     static __device__ __forceinline__ bool grind_found(volatile bool* found_flag) {
 #ifdef SP1_SYCL
         return ::sp1sycl::device_atomic<int>(*(int*)found_flag).load() != 0;
+#elif defined(__HIPCC__)
+        return __hip_atomic_load((int*)found_flag, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT) != 0;
 #else
         return *found_flag;
 #endif
+    }
+
+    // The same search as `grind`, without running the challenger per try. A try observes the witness
+    // and samples, and that is always one permutation: of the sponge state with its pending inputs
+    // written over its first slots and the witness in the next one (whether the observation fills
+    // the rate and duplexes, or the sample does), the sample being the permuted state's element
+    // RATE - 1. So each thread keeps that state in registers and permutes it once per candidate.
+    // Candidates [start, end) only; the host launches the next range if none is found.
+    __device__ __forceinline__ void
+    grind_fast(size_t bits, kb31_t* result, volatile bool* found_flag, size_t start, size_t end) {
+        SP1_SHARED_ARRAY(kb31_t, base, [WIDTH]);
+        const uint32_t pending = (uint32_t)buffer_sizes[0];  // < RATE: a full buffer duplexes
+        if (threadIdx.x == 0) {
+            for (int j = 0; j < WIDTH; j++) {
+                base[j] = (uint32_t)j < pending ? input_buffer[j] : sponge_state[j];
+            }
+        }
+        __syncthreads();
+        kb31_t initial[WIDTH];
+#pragma unroll
+        for (int j = 0; j < WIDTH; j++) initial[j] = base[j];
+        const uint32_t mask = (1u << bits) - 1;
+        poseidon2::KoalaBearHasher hasher;
+        const size_t stride = (size_t)blockDim.x * gridDim.x;
+        for (size_t i = start + threadIdx.x + (size_t)blockIdx.x * blockDim.x;
+             i < end && !grind_found(found_flag);
+             i += stride) {
+            kb31_t witness = kb31_t((uint32_t)i);
+            witness.to();  // Montgomery form of i, as kb31_t((int)i)
+            kb31_t state[WIDTH];
+#pragma unroll
+            for (int j = 0; j < WIDTH; j++) state[j] = (uint32_t)j == pending ? witness : initial[j];
+            hasher.permute(state, state);
+            if ((state[RATE - 1].as_canonical_u32() & mask) == 0) {
+                result[0] = witness;
+                atomicExch((int*)found_flag, 1);
+                __threadfence();
+                return;
+            }
+        }
     }
 
     __device__ __forceinline__ void

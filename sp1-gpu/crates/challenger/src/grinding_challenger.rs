@@ -62,17 +62,36 @@ where
     let grid_dim: usize = target_threads.div_ceil(block_dim).max(1);
     let n = F::ORDER_U64;
 
+    // Each launch tries a bounded range of candidates, at most CANDIDATES_PER_THREAD per thread,
+    // and the next range is launched only if it found nothing. A single launch over all of [0, n)
+    // relied on every thread seeing the found flag set by another work-group to stop: on AMD GPUs
+    // it often did not in time, and the threads swept the whole field (~60 ms per grind on an
+    // RX 9070 XT, against well under 1 ms of actual work).
+    const CANDIDATES_PER_THREAD: u64 = 4;
+    let chunk = (grid_dim * block_dim) as u64 * CANDIDATES_PER_THREAD;
     unsafe {
         result.assume_init();
-        let args = args!(
-            gpu_challenger.as_mut_raw(),
-            result.as_mut_ptr(),
-            bits,
-            n,
-            // Cast back to the `bool*` the kernel declares; only the ALLOCATION width changes.
-            found_flag.as_mut_ptr() as *mut bool
-        );
-        scope.launch_kernel(grind_kernel(), (grid_dim, 1, 1), block_dim, &args, 0).unwrap();
+    }
+    let mut start = 0u64;
+    loop {
+        let end = (start + chunk).min(n);
+        unsafe {
+            let args = args!(
+                gpu_challenger.as_mut_raw(),
+                result.as_mut_ptr(),
+                bits,
+                start,
+                end,
+                // Cast back to the `bool*` the kernel declares; only the ALLOCATION width changes.
+                found_flag.as_mut_ptr() as *mut bool
+            );
+            scope.launch_kernel(grind_kernel(), (grid_dim, 1, 1), block_dim, &args, 0).unwrap();
+        }
+        let found = found_flag.to_host().unwrap()[0] != 0;
+        if found || end == n {
+            break;
+        }
+        start = end;
     }
 
     // Copy result back to host synchronously
