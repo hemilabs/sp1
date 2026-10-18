@@ -84,7 +84,16 @@ pub fn local_gpu_opts() -> SP1CoreOpts {
 
     // Shard threshold tiers based on GPU memory. `gpu_memory_gb` = ceil(actual GiB) + 4, so a 16 GB
     // card reports 20 and a 24 GB card 28.
-    let tier_threshold = if gpu_memory_gb <= 20 {
+    let tier_threshold = if gpu_memory_gb <= 20
+        && cfg!(windows)
+        && sp1_gpu_cudart::sys::BACKEND == "hip"
+    {
+        // 16GB AMD GPUs on Windows: the video memory budget Windows grants a process is ~12.5 GB of
+        // the 16, and past it WDDM moves allocations into shared system memory rather than failing
+        // them, which slowed every kernel touching them (an RX 9070 XT proved a 144M-cycle program in
+        // 15-17 s at the tier below and 12.7-13.5 s at this one).
+        1 << 26
+    } else if gpu_memory_gb <= 20 {
         // 16 GB cards (e.g. RTX 5080, RX 9070 XT): ~134M elements per shard to fit in VRAM.
         ELEMENT_THRESHOLD - (1 << 28)
     } else if !opts.full_size_shards && gpu_memory_gb <= 30 {
