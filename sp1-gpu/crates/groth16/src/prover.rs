@@ -1040,17 +1040,16 @@ impl Groth16Prover {
             let ar = ar_msm.add(&g1_alpha.to_jacobian()).add(&r_delta);
             eprintln!("[T] 5a. Ar MSM (N={}): {:?}", wire_values_a.len(), t.elapsed());
             g1_msm_ark_verify("Ar", &self.data.pk_g1_a, wire_values_a, &ar_msm);
-            // SP1: G2 MSM concurrency option. Default spawns G2 in a worker
-            // thread to overlap with G1 MSMs (saves ~350 ms wall time on
-            // 5090). Set SP1_GROTH16_SERIALIZE_G2=1 to compute G2 sequentially
-            // after G1 — useful for diagnostic isolation of races between
-            // sppark's gpu_t singleton streams used by both G1 and G2
-            // contexts. Empirically the serial path produces the same ~4 %
-            // residual proof-verify fail rate as the parallel path, so the
+            // SP1: G2 MSM concurrency option. G2 runs after the G1 MSMs by default: on an RTX
+            // 5090 that takes the helper's peak GPU memory from 17.7 to 12.0 GB at no cost to the
+            // prove (1.07-1.12 s either way; the G2 wait is absorbed), which leaves room for the
+            // helper beside a resident shard prover. SP1_GROTH16_SERIALIZE_G2=0 runs G2 in a
+            // worker thread overlapping the G1 MSMs, as before. Empirically the serial path
+            // produces the same ~4 % residual proof-verify fail rate as the parallel path, so the
             // residual flake (post-Ar-add-safe fix) lives somewhere else.
             // See project_groth16_prover_flake.md.
             let serialize_g2 =
-                std::env::var("SP1_GROTH16_SERIALIZE_G2").ok().as_deref() == Some("1");
+                std::env::var("SP1_GROTH16_SERIALIZE_G2").ok().as_deref() != Some("0");
             std::thread::scope(|scope| {
                 // Closure that does the G2 work (extracted so it can run
                 // either in a spawned thread or synchronously on main).
@@ -1126,7 +1125,7 @@ impl Groth16Prover {
                 let bs2 = if let Some(handle) = g2_handle {
                     handle.join().expect("G2 MSM thread panicked")
                 } else {
-                    // Sequential G2 path (SP1_GROTH16_SERIALIZE_G2=1) runs
+                    // Sequential G2 path (the default) runs
                     // after all G1 MSMs to avoid sharing sppark gpu_t streams.
                     g2_compute()
                 };

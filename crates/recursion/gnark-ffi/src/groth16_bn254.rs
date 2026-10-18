@@ -73,8 +73,8 @@ const PK_CACHE_SENTINEL: &str = ".sp1_pk_cache_complete";
 /// The GPU-format proving key one proof reads: the shared per-circuit cache, or this proof's own
 /// export when the cache is disabled.
 #[cfg(feature = "native")]
-struct GpuPk {
-    dir: std::path::PathBuf,
+pub(crate) struct GpuPk {
+    pub(crate) dir: std::path::PathBuf,
     /// Only when the cache is disabled: this proof's private export, removed on drop.
     _private: Option<crate::gpu_cache::ProofDir>,
 }
@@ -82,7 +82,7 @@ struct GpuPk {
 /// Returns the GPU-format proving key for `build_dir`, exporting it first if no complete cache
 /// exists. Concurrent callers, in this process or others, share one export; see `gpu_cache`.
 #[cfg(feature = "native")]
-fn gpu_pk(build_dir: &Path, vkey_hash_hex: &str) -> GpuPk {
+pub(crate) fn gpu_pk(build_dir: &Path, vkey_hash_hex: &str) -> GpuPk {
     use crate::ffi::export_groth16_gpu_data;
     let build_dir_str = build_dir.to_str().unwrap();
     let export = |out: &Path| {
@@ -159,34 +159,26 @@ pub(crate) const R1CS_CACHE_MARKER: &str = ".sp1_r1cs_cache_complete";
 #[cfg(feature = "native")]
 pub(crate) const STRIPPED_R1CS: &str = "groth16_circuit_stripped.bin";
 
-/// The `groth16_gpu_helper` binary: `SP1_GROTH16_GPU_HELPER` when set (and only there), else next
-/// to this executable, else on `PATH`.
+/// Sets the GLV switches for a `groth16_gpu_helper` command (see `run_gpu_helper`): off on CUDA,
+/// where GLV is HIP-only and the helper would panic at its first MSM, unless set explicitly.
 #[cfg(feature = "native")]
-fn find_gpu_helper() -> Option<std::path::PathBuf> {
-    crate::cpu_helper::find_executable("groth16_gpu_helper", Some("SP1_GROTH16_GPU_HELPER"))
-}
-
-/// Locate the `r1cs_solve_plan` Go binary used by the GPU R1CS solver path
-/// (Phase 11). Priority:
-///   1. `SP1_R1CS_SOLVE_PLAN` env var (absolute path)
-///   2. Alongside the current executable
-///   3. `$PATH` lookup
-///
-/// Returns the path candidate; the caller decides whether to require it.
-#[cfg(feature = "native")]
-fn resolve_r1cs_solve_plan_path() -> std::path::PathBuf {
-    if let Ok(p) = std::env::var("SP1_R1CS_SOLVE_PLAN") {
-        return std::path::PathBuf::from(p);
-    }
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            let candidate = dir.join("r1cs_solve_plan");
-            if candidate.exists() {
-                return candidate;
+pub(crate) fn set_gpu_helper_env(cmd: &mut std::process::Command) {
+    let backend_is_cuda =
+        matches!(std::env::var("SP1_GPU_BACKEND").ok().as_deref(), Some("cuda") | Some("nvidia"));
+    if backend_is_cuda {
+        for var in ["SP1_GPU_GLV", "SP1_GPU_G2_GLV"] {
+            if std::env::var_os(var).is_none() {
+                cmd.env(var, "0");
             }
         }
     }
-    std::path::PathBuf::from("r1cs_solve_plan")
+}
+
+/// The `groth16_gpu_helper` binary: `SP1_GROTH16_GPU_HELPER` when set (and only there), else next
+/// to this executable, else on `PATH`.
+#[cfg(feature = "native")]
+pub(crate) fn find_gpu_helper() -> Option<std::path::PathBuf> {
+    crate::cpu_helper::find_executable("groth16_gpu_helper", Some("SP1_GROTH16_GPU_HELPER"))
 }
 
 /// Cache directory for `r1cs_solve_plan prep-circuit-prod` artifacts (used
@@ -237,7 +229,17 @@ fn try_prepare_gpu_r1cs_inputs(
     vkey_hash_hex: &str,
     witness_path: &Path,
 ) -> Option<GpuR1csInputs> {
-    let r1cs_bin = resolve_r1cs_solve_plan_path();
+    // Without the solver binary there is nothing to try. Checking first also saves the failed
+    // spawn, which forks this (by now large) process: ~2 s at ~60 GB resident.
+    let Some(r1cs_bin) =
+        crate::cpu_helper::find_executable("r1cs_solve_plan", Some("SP1_R1CS_SOLVE_PLAN"))
+    else {
+        tracing::info!(
+            "r1cs_solve_plan not found (SP1_R1CS_SOLVE_PLAN, next to this binary, or on PATH); \
+             using gnark.Solve"
+        );
+        return None;
+    };
     let run = |args: &[&std::ffi::OsStr], what: &str| -> anyhow::Result<()> {
         let mut cmd = std::process::Command::new(&r1cs_bin);
         cmd.args(args);
@@ -316,7 +318,6 @@ pub struct PreparedGpuProof {
     witness_json: std::path::PathBuf,
     vkey_hash_hex: String,
     gpu_r1cs: Option<GpuR1csInputs>,
-    backend_is_cuda: bool,
 }
 
 #[cfg(feature = "native")]
@@ -891,7 +892,6 @@ impl Groth16Bn254Prover {
             witness_json: witness_json.to_path_buf(),
             vkey_hash_hex,
             gpu_r1cs,
-            backend_is_cuda,
         }
     }
 
@@ -949,17 +949,8 @@ impl Groth16Bn254Prover {
             cmd.arg("--prep-circuit-dir").arg(&gpu_r1cs.prep_dir);
             cmd.arg("--wires-initial").arg(&gpu_r1cs.wires_initial);
         }
-        // CUDA builds need GLV forced off; HIP builds let auto-detect
-        // pick. (`backend_is_cuda` was computed for the GPU R1CS
-        // dispatch.)
-        if prepared.backend_is_cuda {
-            if std::env::var_os("SP1_GPU_GLV").is_none() {
-                cmd.env("SP1_GPU_GLV", "0");
-            }
-            if std::env::var_os("SP1_GPU_G2_GLV").is_none() {
-                cmd.env("SP1_GPU_G2_GLV", "0");
-            }
-        }
+        // CUDA builds need GLV forced off; HIP builds let auto-detect pick.
+        set_gpu_helper_env(&mut cmd);
         // Bound to this prover and its queue slot, and timed out if it hangs; see `subprocess`.
         let finished = crate::subprocess::run(cmd, "groth16_gpu_helper")
             .unwrap_or_else(|e| panic!("GPU Groth16 helper {}: {e:#}", helper_path.display()));

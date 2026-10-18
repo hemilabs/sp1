@@ -172,6 +172,17 @@ fn main() {
     });
 
     eprintln!("[groth16-gpu-helper] wrote proof to {}", args.out.display());
+    // Skip the teardown (pinned frees, GPU context destroy: ~0.9 s on an RTX 5090): the proof is
+    // written and closed, and the driver reclaims the device when the process ends.
+    // SP1_GROTH16_HELPER_FAST_EXIT=0 exits normally.
+    if std::env::var("SP1_GROTH16_HELPER_FAST_EXIT").ok().as_deref() != Some("0") {
+        use std::io::Write;
+        let _ = std::io::stdout().flush();
+        let _ = std::io::stderr().flush();
+        // SAFETY: `_exit` ends the process without running destructors or atexit handlers, which
+        // is the point; nothing after this needs to run.
+        unsafe { libc::_exit(0) };
+    }
 }
 
 /// Produce `Groth16WitnessData` either from the in-process GPU R1CS solver

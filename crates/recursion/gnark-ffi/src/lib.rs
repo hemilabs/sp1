@@ -35,7 +35,10 @@ pub use witness::*;
 #[cfg(feature = "native")]
 pub use cpu_helper::{cpu_helper_main, run_groth16_cpu_helper_if_requested, CPU_HELPER_ARG};
 #[cfg(feature = "native")]
-pub use gpu_device::{free_memory as gpu_free_memory, reset_requested as gpu_reset_requested};
+pub use gpu_device::{
+    free_memory as gpu_free_memory, reset_requested as gpu_reset_requested,
+    total_memory as gpu_total_memory, trim_memory_pool as gpu_trim_memory_pool,
+};
 #[cfg(feature = "native")]
 pub use groth16_queue::{final_wrap_slot, FinalWrapSlot};
 
