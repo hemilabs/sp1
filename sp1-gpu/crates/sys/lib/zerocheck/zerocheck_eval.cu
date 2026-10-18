@@ -60,14 +60,11 @@ SP1_KERNEL void jaggedConstraintPolyEval(
     // Not cleared: the programs write every register before reading it (checked where they are
     // built, in sp1-gpu-air's optimizer). Clearing them cost up to MEMORY_SIZE stores (2 KiB for
     // extension elements) of private memory per row, and later per thread.
-    K expr_f[MEMORY_SIZE];
+    K3<K> expr_f[MEMORY_SIZE];
     JaggedConstraintFolder<K> folder = JaggedConstraintFolder<K>();
 
-    ext_t thread_sum = ext_t::zero();
-
-    // This kernel assumes that a single block deals with a single `xValueIdx`.
-    size_t xValueIdx = blockDim.z * blockIdx.z + threadIdx.z;
-    felt_t eval_point = get_input_point(xValueIdx);
+    // The three evaluation points 0, 2 and 4, together (K3).
+    ext_t thread_sum[3] = {ext_t::zero(), ext_t::zero(), ext_t::zero()};
 
     for (size_t idx = blockDim.x * blockIdx.x + threadIdx.x; idx < totalLen; idx += blockDim.x * gridDim.x) {
         uint32_t packed_info = inputJaggedInfo.denseData.data[idx << 1];
@@ -99,9 +96,8 @@ SP1_KERNEL void jaggedConstraintPolyEval(
         folder.publicValues = publicValues;
         folder.powersOfAlpha = powersOfAlpha;
         folder.constraintIndex = constraint_offset;
-        folder.accumulator = ext_t::zero();
         folder.rowIdx = rowIdx;
-        folder.eval_point = eval_point;
+        ext_t acc[3] = {ext_t::zero(), ext_t::zero(), ext_t::zero()};
 
         for (size_t i = program_start_idx; i < program_end_idx; i++) {
             Instruction instr = evalProgram[i];
@@ -116,7 +112,7 @@ SP1_KERNEL void jaggedConstraintPolyEval(
                 break;
             case 2:
                 DEBUG("FAssignV: %d <- (%d, %d)\n", instr.a, instr.b_variant, instr.b);
-                expr_f[instr.a] = folder.var_f(instr.b_variant, instr.b);
+                expr_f[instr.a] = folder.var_f3(instr.b_variant, instr.b);
                 break;
             case 3:
                 DEBUG("FAssignE: %d <- %d\n", instr.a, instr.b);
@@ -124,7 +120,7 @@ SP1_KERNEL void jaggedConstraintPolyEval(
                 break;
             case 4:
                 DEBUG("FAddVC: %d <- %d + %d\n", instr.a, instr.b_variant, instr.b);
-                expr_f[instr.a] = folder.var_f(instr.b_variant, instr.b) +
+                expr_f[instr.a] = folder.var_f3(instr.b_variant, instr.b) +
                                     evalConstantsF[f_constant_offset + instr.c];
                 break;
             case 5:
@@ -135,8 +131,8 @@ SP1_KERNEL void jaggedConstraintPolyEval(
                     instr.b,
                     instr.c_variant,
                     instr.c);
-                expr_f[instr.a] = folder.var_f(instr.b_variant, instr.b) +
-                                    folder.var_f(instr.c_variant, instr.c);
+                expr_f[instr.a] = folder.var_f3(instr.b_variant, instr.b) +
+                                    folder.var_f3(instr.c_variant, instr.c);
                 break;
             case 6:
                 DEBUG(
@@ -145,7 +141,7 @@ SP1_KERNEL void jaggedConstraintPolyEval(
                     instr.b_variant,
                     instr.b,
                     instr.c);
-                expr_f[instr.a] = folder.var_f(instr.b_variant, instr.b) + expr_f[instr.c];
+                expr_f[instr.a] = folder.var_f3(instr.b_variant, instr.b) + expr_f[instr.c];
                 break;
 
             case 7:
@@ -159,7 +155,7 @@ SP1_KERNEL void jaggedConstraintPolyEval(
                     instr.b,
                     instr.c_variant,
                     instr.c);
-                expr_f[instr.a] = expr_f[instr.b] + folder.var_f(instr.c_variant, instr.c);
+                expr_f[instr.a] = expr_f[instr.b] + folder.var_f3(instr.c_variant, instr.c);
                 break;
             case 9:
                 DEBUG("FAddEE: %d <- %d + %d\n", instr.a, instr.b, instr.c);
@@ -172,7 +168,7 @@ SP1_KERNEL void jaggedConstraintPolyEval(
 
             case 11:
                 DEBUG("FSubVC: %d <- %d - %d\n", instr.a, instr.b_variant, instr.b);
-                expr_f[instr.a] = folder.var_f(instr.b_variant, instr.b) -
+                expr_f[instr.a] = folder.var_f3(instr.b_variant, instr.b) -
                                     evalConstantsF[f_constant_offset + instr.c];
                 break;
             case 12:
@@ -183,8 +179,8 @@ SP1_KERNEL void jaggedConstraintPolyEval(
                     instr.b,
                     instr.c_variant,
                     instr.c);
-                expr_f[instr.a] = folder.var_f(instr.b_variant, instr.b) -
-                                    folder.var_f(instr.c_variant, instr.c);
+                expr_f[instr.a] = folder.var_f3(instr.b_variant, instr.b) -
+                                    folder.var_f3(instr.c_variant, instr.c);
                 break;
             case 13:
                 DEBUG(
@@ -193,7 +189,7 @@ SP1_KERNEL void jaggedConstraintPolyEval(
                     instr.b_variant,
                     instr.b,
                     instr.c);
-                expr_f[instr.a] = folder.var_f(instr.b_variant, instr.b) - expr_f[instr.c];
+                expr_f[instr.a] = folder.var_f3(instr.b_variant, instr.b) - expr_f[instr.c];
                 break;
 
             case 14:
@@ -207,7 +203,7 @@ SP1_KERNEL void jaggedConstraintPolyEval(
                     instr.b,
                     instr.c_variant,
                     instr.c);
-                expr_f[instr.a] = expr_f[instr.b] - folder.var_f(instr.c_variant, instr.c);
+                expr_f[instr.a] = expr_f[instr.b] - folder.var_f3(instr.c_variant, instr.c);
                 break;
             case 16:
                 DEBUG("FSubEE: %d <- %d - %d\n", instr.a, instr.b, instr.c);
@@ -220,7 +216,7 @@ SP1_KERNEL void jaggedConstraintPolyEval(
 
             case 18:
                 DEBUG("FMulVC: %d <- %d * %d\n", instr.a, instr.b_variant, instr.b);
-                expr_f[instr.a] = folder.var_f(instr.b_variant, instr.b) *
+                expr_f[instr.a] = folder.var_f3(instr.b_variant, instr.b) *
                                     evalConstantsF[f_constant_offset + instr.c];
                 break;
             case 19:
@@ -231,8 +227,8 @@ SP1_KERNEL void jaggedConstraintPolyEval(
                     instr.b,
                     instr.c_variant,
                     instr.c);
-                expr_f[instr.a] = folder.var_f(instr.b_variant, instr.b) *
-                                    folder.var_f(instr.c_variant, instr.c);
+                expr_f[instr.a] = folder.var_f3(instr.b_variant, instr.b) *
+                                    folder.var_f3(instr.c_variant, instr.c);
                 break;
             case 20:
                 DEBUG(
@@ -241,7 +237,7 @@ SP1_KERNEL void jaggedConstraintPolyEval(
                     instr.b_variant,
                     instr.b,
                     instr.c);
-                expr_f[instr.a] = folder.var_f(instr.b_variant, instr.b) * expr_f[instr.c];
+                expr_f[instr.a] = folder.var_f3(instr.b_variant, instr.b) * expr_f[instr.c];
                 break;
 
             case 21:
@@ -255,7 +251,7 @@ SP1_KERNEL void jaggedConstraintPolyEval(
                     instr.b,
                     instr.c_variant,
                     instr.c);
-                expr_f[instr.a] = expr_f[instr.b] * folder.var_f(instr.c_variant, instr.c);
+                expr_f[instr.a] = expr_f[instr.b] * folder.var_f3(instr.c_variant, instr.c);
                 break;
             case 23:
                 DEBUG("FMulEE: %d <- %d * %d\n", instr.a, instr.b, instr.c);
@@ -275,32 +271,41 @@ SP1_KERNEL void jaggedConstraintPolyEval(
 
             case 59:
                 DEBUG("FAssertZero: %d\n", instr.a);
-                folder.accumulator +=
-                    (folder.powersOfAlpha[folder.constraintIndex] *
-                        expr_f[instr.a]);
+                {
+                    const ext_t alpha = folder.powersOfAlpha[folder.constraintIndex];
+                    for (int e = 0; e < 3; e++) acc[e] += alpha * expr_f[instr.a].v[e];
+                }
                 folder.constraintIndex++;
                 break;
             }
         }
 
-        ext_t gkr_correction = ext_t::zero();
-        ext_t geq_correction = ext_t::zero();
+        ext_t gkr_correction[3] = {ext_t::zero(), ext_t::zero(), ext_t::zero()};
+        ext_t geq_correction[3] = {ext_t::zero(), ext_t::zero(), ext_t::zero()};
 
         if (is_first_air_block) {
             for (size_t i = 0; i < num_main_columns; i++) {
-                gkr_correction += batchingPowers[i] * folder.var_f(4, i);
+                const K3<K> v = folder.var_f3(4, i);
+                for (int e = 0; e < 3; e++) gkr_correction[e] += batchingPowers[i] * v.v[e];
             }
             for (size_t i = 0; i < num_preprocessed_columns ; i++) {
-                gkr_correction += batchingPowers[num_main_columns + i] * folder.var_f(2, i);
+                const K3<K> v = folder.var_f3(2, i);
+                for (int e = 0; e < 3; e++)
+                    gkr_correction[e] += batchingPowers[num_main_columns + i] * v.v[e];
             }
             ext_t zeroVal = geq_eval(rowIdx << 1, geq_thresholds[chip_idx], eq_coefficients[chip_idx]);
             ext_t oneVal = geq_eval(rowIdx << 1 | 1, geq_thresholds[chip_idx], eq_coefficients[chip_idx]);
-            geq_correction = (zeroVal + eval_point * (oneVal - zeroVal)) * paddedRowAdjustment[chip_idx];
+            for (int e = 0; e < 3; e++) {
+                geq_correction[e] = (zeroVal + get_input_point(e) * (oneVal - zeroVal)) *
+                                    paddedRowAdjustment[chip_idx];
+            }
         }
 
         if (rowIdx < (1 << rest_point_dim)) {
             ext_t eq = ext_t::load(partialLagrange, rowIdx);
-            thread_sum += (folder.accumulator + gkr_correction - geq_correction) * eq * powersOfLambda[chip_idx];
+            const ext_t weight = eq * powersOfLambda[chip_idx];
+            for (int e = 0; e < 3; e++)
+                thread_sum[e] += (acc[e] + gkr_correction[e] - geq_correction[e]) * weight;
         }
     }
 
@@ -309,10 +314,13 @@ SP1_KERNEL void jaggedConstraintPolyEval(
 
     auto block = cg::this_thread_block();
     auto tile = cg::tiled_partition<32>(block);
-    ext_t thread_block_sum = partialBlockReduce(block, tile, thread_sum, shared);
-
-    if (threadIdx.x == 0 && threadIdx.y == 0 && threadIdx.z == 0) {
-        ext_t::store(constraintValues, xValueIdx * gridDim.x + blockIdx.x, thread_block_sum);
+    for (int e = 0; e < 3; e++) {
+        ext_t thread_block_sum = partialBlockReduce(block, tile, thread_sum[e], shared);
+        if (threadIdx.x == 0 && threadIdx.y == 0 && threadIdx.z == 0) {
+            ext_t::store(constraintValues, e * gridDim.x + blockIdx.x, thread_block_sum);
+        }
+        // `shared` is reused by the next point's reduction.
+        block.sync();
     }
 }
 

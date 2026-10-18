@@ -12,6 +12,65 @@ struct Instruction {
     unsigned short c;
 };
 
+// A value at the three evaluation points of a row (0, 2 and 4), which the zerocheck evaluator
+// computes together: the program's instructions are fetched and dispatched, and its columns loaded,
+// once for the three.
+template <typename K>
+struct K3 {
+    K v[3];
+
+    __device__ __forceinline__ K3() {}
+    __device__ __forceinline__ explicit K3(K x) { v[0] = v[1] = v[2] = x; }
+    // A base field constant, the same at the three points.
+    __device__ __forceinline__ K3& operator=(kb31_t c) {
+        v[0] = v[1] = v[2] = K(c);
+        return *this;
+    }
+
+    friend __device__ __forceinline__ K3 operator+(const K3& a, const K3& b) {
+        K3 r;
+        for (int e = 0; e < 3; e++) r.v[e] = a.v[e] + b.v[e];
+        return r;
+    }
+    friend __device__ __forceinline__ K3 operator-(const K3& a, const K3& b) {
+        K3 r;
+        for (int e = 0; e < 3; e++) r.v[e] = a.v[e] - b.v[e];
+        return r;
+    }
+    friend __device__ __forceinline__ K3 operator*(const K3& a, const K3& b) {
+        K3 r;
+        for (int e = 0; e < 3; e++) r.v[e] = a.v[e] * b.v[e];
+        return r;
+    }
+    friend __device__ __forceinline__ K3 operator-(const K3& a) {
+        K3 r;
+        for (int e = 0; e < 3; e++) r.v[e] = -a.v[e];
+        return r;
+    }
+    // With a base field constant.
+    friend __device__ __forceinline__ K3 operator+(const K3& a, kb31_t c) {
+        K3 r;
+        const K k = K(c);
+        for (int e = 0; e < 3; e++) r.v[e] = a.v[e] + k;
+        return r;
+    }
+    friend __device__ __forceinline__ K3 operator-(const K3& a, kb31_t c) {
+        K3 r;
+        const K k = K(c);
+        for (int e = 0; e < 3; e++) r.v[e] = a.v[e] - k;
+        return r;
+    }
+    friend __device__ __forceinline__ K3 operator*(const K3& a, kb31_t c) {
+        K3 r;
+        const K k = K(c);
+        for (int e = 0; e < 3; e++) r.v[e] = a.v[e] * k;
+        return r;
+    }
+    __device__ __forceinline__ K3& operator+=(const K3& b) { return *this = *this + b; }
+    __device__ __forceinline__ K3& operator-=(const K3& b) { return *this = *this - b; }
+    __device__ __forceinline__ K3& operator*=(const K3& b) { return *this = *this * b; }
+};
+
 template <typename K>
 struct JaggedConstraintFolder {
   public:
@@ -56,6 +115,34 @@ struct JaggedConstraintFolder {
             // Case 10: globalCumulativeSum for univariate.
             assert(0);
             return K::zero();
+        }
+    }
+
+    // var_f at the three evaluation points 0, 2 and 4: the row pair is loaded once.
+    __inline__ __device__ K3<K> var_f3(unsigned char variant, unsigned int idx) {
+        switch (variant) {
+        case 0:
+            return K3<K>(K::zero());
+        case 1:
+            return K3<K>(K(idx));
+        case 2:
+        case 4: {
+            const size_t ptr = variant == 2 ? preprocessed_ptr : main_ptr;
+            K zero = K::load(data, ptr + idx * height + (rowIdx << 1));
+            K one = K::load(data, ptr + idx * height + (rowIdx << 1 | 1));
+            K d = one - zero;
+            K d2 = d + d;
+            K3<K> r;
+            r.v[0] = zero;
+            r.v[1] = zero + d2;
+            r.v[2] = r.v[1] + d2;
+            return r;
+        }
+        case 9:
+            return K3<K>(K(felt_t::load(publicValues, idx)));
+        default:
+            assert(0);
+            return K3<K>(K::zero());
         }
     }
 
