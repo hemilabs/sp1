@@ -15,4 +15,8 @@ extern "C" {
 
     pub fn compress_batched_merkle_tree_koala_bear_16_kernel() -> KernelPtr;
     pub fn compress_batched_merkle_tree_bn254_kernel() -> KernelPtr;
+
+    /// Quad-per-node kernels for small KoalaBear layers; null on HIP or with SP1_GPU_MERKLE_GENERIC.
+    pub fn compress_small_layer_merkle_tree_koala_bear_16_kernel() -> KernelPtr;
+    pub fn compress_batched_small_merkle_tree_koala_bear_16_kernel() -> KernelPtr;
 }
