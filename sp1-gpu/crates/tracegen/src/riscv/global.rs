@@ -82,7 +82,33 @@ impl CudaTracegenAir<F> for GlobalChip {
         let height = <Self as MachineAir<F>>::num_rows(self, input)
             .expect("num_rows(...) should be Some(_)");
 
-        let mut trace = Tensor::<F, TaskScope>::zeros_in([NUM_GLOBAL_COLS, height], scope.clone());
+        // The decompress kernel writes every column of every row < height, so no zero fill.
+        let mut trace =
+            Tensor::<F, TaskScope>::with_sizes_in([NUM_GLOBAL_COLS, height], scope.clone());
+        unsafe { trace.assume_init() };
+
+        // "Round 0": per-event offset search (sys/lib/tracegen/riscv/global.cu, GlobalSearchOut = 16 words).
+        const SEARCH_OUT_WORDS: usize = 16;
+        const SEARCH_PER_LANE: usize = 8; // GLOBAL_SEARCH_PER_LANE
+        let mut search =
+            Buffer::<u32, _>::with_capacity_in(events_len * SEARCH_OUT_WORDS, scope.clone());
+        if events_len > 0 {
+            const BLOCK_DIM: usize = 128;
+            let threads = events_len.div_ceil(SEARCH_PER_LANE).div_ceil(32) * 32;
+            let grid_dim = threads.div_ceil(BLOCK_DIM);
+            let args = args!(events_device.as_ptr(), events_len, search.as_mut_ptr());
+            unsafe {
+                scope
+                    .launch_kernel(
+                        TaskScope::tracegen_riscv_global_search_offsets_kernel(),
+                        grid_dim,
+                        BLOCK_DIM,
+                        &args,
+                        0,
+                    )
+                    .unwrap();
+            }
+        }
 
         // "Round 1": call the decompress kernel.
         unsafe {
@@ -92,9 +118,15 @@ impl CudaTracegenAir<F> for GlobalChip {
             // kb31_t *trace,
             // uintptr_t trace_height,
             // const sp1_gpu_sys::GlobalInteractionEvent *events,
-            // uintptr_t nb_events
-            let tracegen_riscv_global_args =
-                args!(trace.as_mut_ptr(), height, events_device.as_ptr(), events.len());
+            // uintptr_t nb_events,
+            // const GlobalSearchOut *search
+            let tracegen_riscv_global_args = args!(
+                trace.as_mut_ptr(),
+                height,
+                events_device.as_ptr(),
+                events.len(),
+                search.as_ptr()
+            );
             scope
                 .launch_kernel(
                     TaskScope::tracegen_riscv_global_decompress_kernel(),

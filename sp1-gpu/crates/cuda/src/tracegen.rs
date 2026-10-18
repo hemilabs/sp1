@@ -7,6 +7,7 @@ use crate::TaskScope;
 pub unsafe trait TracegenRiscvGlobalKernel<F> {
     fn tracegen_riscv_global_decompress_kernel() -> KernelPtr;
     fn tracegen_riscv_global_finalize_kernel() -> KernelPtr;
+    fn tracegen_riscv_global_search_offsets_kernel() -> KernelPtr;
 }
 
 unsafe impl TracegenRiscvGlobalKernel<SP1Field> for TaskScope {
@@ -15,6 +16,9 @@ unsafe impl TracegenRiscvGlobalKernel<SP1Field> for TaskScope {
     }
     fn tracegen_riscv_global_finalize_kernel() -> KernelPtr {
         unsafe { sp1_gpu_sys::tracegen::riscv_global_generate_trace_finalize_kernel() }
+    }
+    fn tracegen_riscv_global_search_offsets_kernel() -> KernelPtr {
+        unsafe { sp1_gpu_sys::tracegen::riscv_global_search_offsets_kernel() }
     }
 }
 
