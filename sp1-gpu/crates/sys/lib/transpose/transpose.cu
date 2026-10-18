@@ -27,6 +27,35 @@ __global__ void transpose_kernel(
     }
 }
 
+// Tiled transpose: same arguments as transpose_kernel, launched with block (32, 8, 1) and grid
+// (ceil(dimX / 32), ceil(dimY / 32), dimZ).  Reads and writes are both coalesced through a
+// 32x33 shared tile (the untiled kernel reads with a stride of dimY elements).
+template <typename T>
+__global__ void __launch_bounds__(256) transpose_kernel_tiled(
+    const T* __restrict__ in,
+    T* __restrict__ out,
+    size_t dimX,
+    size_t dimY,
+    size_t dimZ) {
+    __shared__ T tile[32][33];
+    const size_t z = blockIdx.z;
+    if (z >= dimZ) return;
+    in += z * dimX * dimY;
+    out += z * dimX * dimY;
+    const size_t x0 = (size_t)blockIdx.x * 32, y0 = (size_t)blockIdx.y * 32;
+#pragma unroll
+    for (int k = 0; k < 32; k += 8) {
+        const size_t x = x0 + threadIdx.y + k, y = y0 + threadIdx.x;
+        if (x < dimX && y < dimY) tile[threadIdx.y + k][threadIdx.x] = in[x * dimY + y];
+    }
+    __syncthreads();
+#pragma unroll
+    for (int k = 0; k < 32; k += 8) {
+        const size_t y = y0 + threadIdx.y + k, x = x0 + threadIdx.x;
+        if (x < dimX && y < dimY) out[y * dimX + x] = tile[threadIdx.x][threadIdx.y + k];
+    }
+}
+
 template <typename T, int N>
 __global__ void transpose_array_kernel(
     T (*__restrict__ in)[N],
@@ -55,20 +84,20 @@ __global__ void transpose_array_kernel(
     }
 }
 
-extern "C" void* transpose_kernel_koala_bear() { return (void*)transpose_kernel<kb31_t>; }
+extern "C" void* transpose_kernel_koala_bear() { return (void*)transpose_kernel_tiled<kb31_t>; }
 
 extern "C" void* transpose_kernel_koala_bear_digest() {
     return (void*)transpose_array_kernel<kb31_t, 8>;
 }
 
-extern "C" void* transpose_kernel_u32() { return (void*)transpose_kernel<uint32_t>; }
+extern "C" void* transpose_kernel_u32() { return (void*)transpose_kernel_tiled<uint32_t>; }
 
 extern "C" void* transpose_kernel_u32_digest() {
     return (void*)transpose_array_kernel<uint32_t, 8>;
 }
 
 extern "C" void* transpose_kernel_koala_bear_extension() {
-    return (void*)transpose_kernel<kb31_extension_t>;
+    return (void*)transpose_kernel_tiled<kb31_extension_t>;
 }
 
 // #define TILE_DIM 32

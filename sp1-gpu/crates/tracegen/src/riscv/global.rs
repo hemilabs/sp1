@@ -177,13 +177,10 @@ impl CudaTracegenAir<F> for GlobalChip {
             assert_eq!(dim_x, dst_sizes[num_dims - 1]);
             assert_eq!(dim_y, dst_sizes[num_dims - 2]);
 
-            let block_dim: Dim3 = (32u32, 32u32, 1u32).into();
-            let grid_dim: Dim3 = (
-                dim_x.div_ceil(block_dim.x as usize),
-                dim_y.div_ceil(block_dim.y as usize),
-                dim_z.div_ceil(block_dim.z as usize),
-            )
-                .into();
+            let block_dim: Dim3 =
+                (32u32, <TaskScope as DeviceTransposeKernel<F>>::transpose_block_rows(), 1u32)
+                    .into();
+            let grid_dim: Dim3 = (dim_x.div_ceil(32), dim_y.div_ceil(32), dim_z).into();
             let args = args!(src_ptr, dst_mut_ptr, dim_x, dim_y, dim_z);
             unsafe {
                 scope

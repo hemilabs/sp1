@@ -44,6 +44,7 @@ cudaError_t nvidia_ntt_batch_coset(
 #endif
 
 #include "runtime/exception.cuh"
+#include "ntt/lde_fused.cuh"
 
 #ifndef __CUDA_ARCH__
 
@@ -204,6 +205,40 @@ extern "C" rustCudaError_t batch_coset_dft(
                         lg_ext_domain_size,
                         stream);
                 }
+            }
+            return CUDA_SUCCESS_CSL;
+        }
+#endif
+#if !defined(NVIDIA_NTT) && !defined(__HIPCC__)
+        // Fused LDE + NTT (2 passes, no copy/memset) for the basefold encoder's shapes; the
+        // output is bit-identical to the generic path below.
+        if (!perform_shift && bit_rev_output && lde_fused::supported(lg_domain_size, lg_blowup)) {
+            CUDA_OK(lde_fused::batch_lde(d_out, d_in, lg_domain_size, poly_count, stream));
+            return CUDA_SUCCESS_CSL;
+        }
+        // Small LDEs: batch all columns into one copy/pad launch and batched GS passes.
+        if (!perform_shift && bit_rev_output && lg_domain_size + lg_blowup <= 21 && poly_count > 1) {
+            const uint32_t lg = lg_domain_size + lg_blowup;
+            const auto& params = NTTParameters::all(false)[NTT::gpu_id()];
+            for (uint32_t b0 = 0; b0 < poly_count; b0 += 1024) {
+                const uint32_t nb = poly_count - b0 < 1024 ? poly_count - b0 : 1024;
+                fr_t* out = d_out + (size_t)b0 * ext_domain_size;
+                dim3 grid(std::max<uint32_t>(1, std::min<uint32_t>(ext_domain_size / 1024, 680)), nb);
+                lde_fused::lde_copy_pad_batched<<<grid, 1024, 0, stream>>>(
+                    out, d_in + (size_t)b0 * domain_size, domain_size, ext_domain_size);
+                CUDA_OK(cudaGetLastError());
+                GS_launcher gs{out, (int)lg, false, params, stream, nb, ext_domain_size};
+                if (lg <= 10) {
+                    gs.step(lg);
+                } else if (lg <= 17) {
+                    gs.step(lg / 2);
+                    gs.step(lg / 2 + lg % 2);
+                } else {
+                    gs.step(lg / 3 + lg % 3);
+                    gs.step(lg / 3);
+                    gs.step(lg / 3);
+                }
+                CUDA_OK(cudaGetLastError());
             }
             return CUDA_SUCCESS_CSL;
         }
