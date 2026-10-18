@@ -799,12 +799,13 @@ class Bn254 {
     static constexpr pF_t* MAT_INTERNAL_DIAG_M1 = constants::MAT_INTERNAL_DIAG_M1;
     static constexpr pF_t MONTY_INVERSE = constants::MONTY_INVERSE;
 
+    // state[i] = state[i] * MAT_INTERNAL_DIAG_M1[i] + sum, with the diagonal (1, 1, 2) as additions:
+    // three Montgomery multiplications fewer in each of the 56 partial rounds, out of about 7.
     __device__ static void internalLinearLayer(F_t state[WIDTH], pF_t*, F_t _) {
         F_t s = state[0] + state[1] + state[2];
-        for (int i = 0; i < WIDTH; i++) {
-            state[i] *= MAT_INTERNAL_DIAG_M1[i];
-            state[i] += s;
-        }
+        state[0] += s;
+        state[1] += s;
+        state[2] = state[2].dbl() + s;
     }
 
     __device__ static void externalLinearLayer(F_t state[WIDTH]) {
