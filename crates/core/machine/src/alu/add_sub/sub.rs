@@ -121,7 +121,7 @@ impl<F: PrimeField32, M: TrustMode> MachineAir<F> for SubChip<M> {
             |(row, event)| {
                 let cols: &mut SubCols<F, M> = row.borrow_mut();
 
-                let mut byte_lookup_events = Vec::new();
+                let mut byte_lookup_events = sp1_core_executor::events::DiscardByteRecord;
                 self.event_to_row(&event.0, cols, &mut byte_lookup_events);
                 cols.state.populate(&mut byte_lookup_events, event.0.clk, event.0.pc);
                 cols.adapter.populate(&mut byte_lookup_events, event.1);
@@ -146,8 +146,10 @@ impl<F: PrimeField32, M: TrustMode> MachineAir<F> for SubChip<M> {
             .par_chunks(chunk_size)
             .map(|events| {
                 let mut blu: HashMap<ByteLookupEvent, usize> = HashMap::new();
+                // One scratch row per chunk instead of an allocation per event.
+                let mut row = vec![F::zero(); width];
                 events.iter().for_each(|event| {
-                    let mut row = vec![F::zero(); width];
+                    row.fill(F::zero());
                     let cols: &mut SubCols<F, M> = row.as_mut_slice().borrow_mut();
                     self.event_to_row(&event.0, cols, &mut blu);
                     cols.state.populate(&mut blu, event.0.clk, event.0.pc);
