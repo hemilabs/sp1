@@ -118,6 +118,7 @@ if(USE_HIP)
     add_subdirectory(lib/zerocheck)
     add_subdirectory(lib/msm)
     add_subdirectory(lib/plonk)
+    add_subdirectory(lib/groth16)
 
     # Sppark sources -- compile as HIP (they include cuda2hip.hpp via __HIPCC__ guard)
     add_library(sppark_objs OBJECT
@@ -141,7 +142,7 @@ if(USE_HIP)
         logup_gkr_objs merkle_tree_objs mle_objs ntt_objs
         runtime_objs scan_objs sum_and_reduce_objs sumcheck_objs
         tracegen_objs transpose_objs zerocheck_objs
-        msm_objs
+        msm_objs groth16_objs
     )
     foreach(tgt ${_hip_targets})
         if(TARGET ${tgt})
@@ -180,6 +181,7 @@ if(USE_HIP)
         $<TARGET_OBJECTS:plonk_objs>
         $<TARGET_OBJECTS:ntt_bn254_objs>
         $<TARGET_OBJECTS:sppark_objs>
+        $<TARGET_OBJECTS:groth16_objs>
     )
 
     # Create static library.

@@ -561,6 +561,7 @@ const SYCL_KERNEL_SOURCES: &[&str] = &[
     "lib/zerocheck/zerocheck.cu",
     "lib/zerocheck/zerocheck_eval.cu",
     "lib/ntt/kb_ntt.cu",
+    "lib/groth16/groth16.cu",
     "lib/sycl/runtime.cpp",
     "lib/sycl/ntt.cpp",
 ];

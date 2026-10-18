@@ -55,6 +55,9 @@ extern "C" rustCudaError_t cuda_stream_wait_event(cudaStream_t stream, cudaEvent
 
 extern "C" rustCudaError_t cuda_malloc_async(void** devPtr, size_t size, cudaStream_t stream);
 
+// Frees the allocator's cached blocks (a no-op where the allocator caches none).
+extern "C" void cuda_release_cached_memory();
+
 extern "C" rustCudaError_t cuda_free_async(void* devPtr, cudaStream_t stream);
 
 extern "C" rustCudaError_t

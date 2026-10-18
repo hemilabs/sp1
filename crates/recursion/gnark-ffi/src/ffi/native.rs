@@ -36,6 +36,15 @@ fn register_callbacks() {
     }
 }
 
+/// Registers the host's GPU entry points for the Groth16 prover (see `go/sp1/groth16_gpu.go`), as
+/// C function pointers: `compute_h` for gnark's quotient polynomial, `msm_g1` and `msm_g2` for its
+/// multi-scalar multiplications. Zeros unregister them; the prover then runs on the CPU, as it does
+/// when `SP1_GROTH16_GPU=0`.
+pub fn set_groth16_gpu_hooks(compute_h: usize, msm_g1: usize, msm_g2: usize) {
+    register_callbacks();
+    unsafe { SetGroth16GpuHooks(compute_h as _, msm_g1 as _, msm_g2 as _) }
+}
+
 enum ProofSystem {
     Plonk,
     Groth16,
