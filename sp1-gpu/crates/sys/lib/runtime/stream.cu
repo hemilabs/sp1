@@ -1,6 +1,7 @@
 // CUDA/HIP runtime bindings.
 
 #include "runtime/exception.cuh"
+#include "runtime/kernel_profile.hpp"
 
 #ifdef __HIPCC__
 using cudaStream_t = hipStream_t;
@@ -80,7 +81,35 @@ static std::map<size_t, std::vector<CachedBlock>> g_free_pool;  // ordered for r
 static std::unordered_map<void*, size_t> g_alloc_sizes;
 static std::vector<hipEvent_t> g_spare_events;
 static size_t g_cached_bytes = 0;
-static constexpr size_t MAX_CACHED_BYTES = 2ULL * 1024 * 1024 * 1024; // 2 GB limit
+
+// Allocation policy, shared by the HIP and SYCL caching allocators. Allocating and freeing device
+// memory is slow on Windows (milliseconds per large block: the driver maps and makes resident
+// whole allocations), and shards allocate many large buffers whose sizes differ a little from one
+// shard to the next. So sizes above 1 MiB are rounded up to a sixteenth of their power of two,
+// for a cached block to fit the next shard's slightly different request, and the cache may hold
+// up to half the card. When an allocation would not fit, cached blocks are freed, largest first,
+// only until it does, each once its own last use has finished, instead of draining the device
+// and freeing them all.
+static size_t roundAllocSize(size_t s) {
+    if (s <= (size_t(1) << 20)) return (s + 4095) & ~size_t(4095);
+    int lg = 63;
+    while (!(s >> lg)) lg--;
+    const size_t step = size_t(1) << (lg - 4);
+    return (s + step - 1) & ~(step - 1);
+}
+
+// Half the card.
+static size_t maxCachedBytes() {
+    static const size_t cap = [] {
+        size_t free_b = 0, total_b = 0;
+        if (hipMemGetInfo(&free_b, &total_b) != hipSuccess || total_b == 0) {
+            (void)hipGetLastError();
+            return size_t(2) << 30;
+        }
+        return total_b / 2;
+    }();
+    return cap;
+}
 
 // Make `stream` wait until the block's free has been reached on the stream that freed it, then
 // keep its event for reuse (a wait observes the event as recorded when the wait is queued).
@@ -143,6 +172,7 @@ static bool deviceHeadroom(size_t* headroom) {
 
 // Wait for the device, then free every cached block. The caller holds g_alloc_mutex.
 static void releaseCachedBlocks() {
+    sp1prof::HostTimer timer("host: release cached blocks (wait + free)");
     hipDeviceSynchronize();
     for (auto& [sz, blocks] : g_free_pool) {
         for (auto& block : blocks) {
@@ -156,8 +186,32 @@ static void releaseCachedBlocks() {
     g_cached_bytes = 0;
 }
 
+// Free cached blocks, largest first, until `need` bytes fit in `headroom`. The caller holds
+// g_alloc_mutex.
+static void evictUntilFits(size_t need, size_t headroom) {
+    sp1prof::HostTimer timer("host: evict cached blocks");
+    while (g_cached_bytes > 0 && need + FIT_MARGIN_BYTES > headroom) {
+        auto it = std::prev(g_free_pool.end());
+        if (it->second.empty()) {
+            g_free_pool.erase(it);
+            continue;
+        }
+        CachedBlock block = it->second.back();
+        it->second.pop_back();
+        const size_t size = it->first;
+        if (it->second.empty()) g_free_pool.erase(it);
+        hipEventSynchronize(block.freed);
+        hipFree(block.ptr);
+        g_alloc_sizes.erase(block.ptr);
+        g_spare_events.push_back(block.freed);
+        g_cached_bytes -= size;
+        headroom += size;
+    }
+}
+
 static hipError_t cachedHipMalloc(void** p, size_t s, hipStream_t stream) {
     if (s == 0) { *p = nullptr; return hipSuccess; }
+    s = roundAllocSize(s);
     std::lock_guard<std::mutex> lock(g_alloc_mutex);
     // Try exact-size match first.
     auto it = g_free_pool.find(s);
@@ -190,10 +244,14 @@ static hipError_t cachedHipMalloc(void** p, size_t s, hipStream_t stream) {
     if (g_cached_bytes > 0) {
         size_t headroom = 0;
         if (deviceHeadroom(&headroom) && s + FIT_MARGIN_BYTES > headroom) {
-            releaseCachedBlocks();
+            evictUntilFits(s, headroom);
         }
     }
-    hipError_t err = hipMalloc(p, s);
+    hipError_t err;
+    {
+        sp1prof::HostTimer timer("host: hipMalloc");
+        err = hipMalloc(p, s);
+    }
     if (err != hipSuccess) {
         // OOM: synchronize GPU work, evict all cached entries, and retry
         releaseCachedBlocks();
@@ -211,7 +269,7 @@ static hipError_t cachedHipFree(void* p, hipStream_t stream) {
     auto it = g_alloc_sizes.find(p);
     if (it != g_alloc_sizes.end()) {
         size_t s = it->second;
-        if (g_cached_bytes + s <= MAX_CACHED_BYTES) {
+        if (g_cached_bytes + s <= maxCachedBytes()) {
             hipEvent_t freed;
             if (!g_spare_events.empty()) {
                 freed = g_spare_events.back();
@@ -233,6 +291,7 @@ static hipError_t cachedHipFree(void* p, hipStream_t stream) {
     }
     // Not cached: let the work queued on the freeing stream, which may still use the block,
     // finish before the block goes back to the driver.
+    sp1prof::HostTimer timer("host: uncached free (wait + free)");
     hipError_t err = hipStreamSynchronize(stream);
     if (err != hipSuccess) return err;
     return hipFree(p);
@@ -261,10 +320,15 @@ struct GpuProfiler {
     std::mutex m;
     std::deque<Pending> pending;
     std::vector<cudaEvent_t> spare;
+    cudaEvent_t reference = nullptr;  // positions are measured from it
 
     static GpuProfiler& get() {
         static GpuProfiler* p = [] {
             auto* p = new GpuProfiler();
+            if (cudaEventCreate(&p->reference) == cudaSuccess) {
+                cudaEventRecord(p->reference, 0);
+                cudaEventSynchronize(p->reference);
+            }
             std::atexit([] {
                 GpuProfiler::get().resolve(0);
                 sp1prof::totals().write();
@@ -316,10 +380,15 @@ struct GpuProfiler {
                 p = pending.front();
                 pending.pop_front();
             }
-            float ms = 0;
+            float ms = 0, at = 0, until = 0;
             if (cudaEventSynchronize(p.end) == cudaSuccess &&
                 cudaEventElapsedTime(&ms, p.start, p.end) == cudaSuccess) {
-                sp1prof::totals().add(p.name, ms);
+                if (reference && cudaEventElapsedTime(&at, reference, p.start) == cudaSuccess &&
+                    cudaEventElapsedTime(&until, reference, p.end) == cudaSuccess) {
+                    sp1prof::totals().add(p.name, ms, at, until);
+                } else {
+                    sp1prof::totals().add(p.name, ms);
+                }
             }
             std::lock_guard<std::mutex> lock(m);
             spare.push_back(p.start);

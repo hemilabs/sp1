@@ -179,7 +179,11 @@ struct GpuProfiler {
                 auto start =
                     p.second.get_profiling_info<sycl::info::event_profiling::command_start>();
                 auto end = p.second.get_profiling_info<sycl::info::event_profiling::command_end>();
-                sp1prof::totals().add(p.first, (double)(end - start) * 1e-6);
+                sp1prof::totals().add(
+                    p.first,
+                    (double)(end - start) * 1e-6,
+                    (double)start * 1e-6,
+                    (double)end * 1e-6);
             } catch (const sycl::exception&) {
             }
         }
@@ -215,7 +219,28 @@ std::mutex g_alloc_mutex;
 std::map<size_t, std::vector<CachedBlock>> g_free_pool;
 std::unordered_map<void*, size_t> g_alloc_sizes;
 size_t g_cached_bytes = 0;
-constexpr size_t MAX_CACHED_BYTES = 2ULL << 30;
+
+// Allocation policy, shared by the HIP and SYCL caching allocators. Allocating and freeing device
+// memory is slow on Windows (milliseconds per large block: the driver maps and makes resident
+// whole allocations), and shards allocate many large buffers whose sizes differ a little from one
+// shard to the next. So sizes above 1 MiB are rounded up to a sixteenth of their power of two,
+// for a cached block to fit the next shard's slightly different request, and the cache may hold
+// up to half the card. When an allocation would not fit, cached blocks are freed, largest first,
+// only until it does, each once its own last use has finished, instead of draining the device
+// and freeing them all.
+size_t round_alloc_size(size_t s) {
+    if (s <= (size_t(1) << 20)) return (s + 4095) & ~size_t(4095);
+    int lg = 63;
+    while (!(s >> lg)) lg--;
+    const size_t step = size_t(1) << (lg - 4);
+    return (s + step - 1) & ~(step - 1);
+}
+
+// Half the card.
+size_t max_cached_bytes() {
+    static const size_t cap = rt().device.get_info<sycl::info::device::global_mem_size>() / 2;
+    return cap;
+}
 constexpr size_t FIT_MARGIN_BYTES = 256ULL << 20;
 
 size_t device_headroom() {
@@ -232,6 +257,7 @@ void take_cached_block(const CachedBlock& block, sycl::queue* q) {
 
 // Free every cached block once the device is idle. The caller holds g_alloc_mutex.
 void release_cached_blocks() {
+    sp1prof::HostTimer timer("host: release cached blocks (wait + free)");
     rt().wait_all();
     for (auto& [size, blocks] : g_free_pool) {
         for (auto& block : blocks) {
@@ -243,7 +269,30 @@ void release_cached_blocks() {
     g_cached_bytes = 0;
 }
 
+// Free cached blocks, largest first, until `need` bytes fit in `headroom`. The caller holds
+// g_alloc_mutex.
+void evict_until_fits(size_t need, size_t headroom) {
+    sp1prof::HostTimer timer("host: evict cached blocks");
+    while (g_cached_bytes > 0 && need + FIT_MARGIN_BYTES > headroom) {
+        auto it = std::prev(g_free_pool.end());
+        if (it->second.empty()) {
+            g_free_pool.erase(it);
+            continue;
+        }
+        CachedBlock block = it->second.back();
+        it->second.pop_back();
+        const size_t size = it->first;
+        if (it->second.empty()) g_free_pool.erase(it);
+        block.freed.wait();
+        sycl::free(block.ptr, rt().context);
+        g_alloc_sizes.erase(block.ptr);
+        g_cached_bytes -= size;
+        headroom += size;
+    }
+}
+
 void* raw_device_alloc(size_t size) {
+    sp1prof::HostTimer timer("host: malloc_device");
     return sycl::malloc_device(size, rt().device, rt().context);
 }
 
@@ -252,6 +301,7 @@ rustCudaError_t cached_malloc(void** p, size_t s, sycl::queue* q) {
         *p = nullptr;
         return SP1_SUCCESS;
     }
+    s = round_alloc_size(s);
     std::lock_guard<std::mutex> lock(g_alloc_mutex);
     auto it = g_free_pool.find(s);
     if (it != g_free_pool.end() && !it->second.empty()) {
@@ -273,7 +323,10 @@ rustCudaError_t cached_malloc(void** p, size_t s, sycl::queue* q) {
         take_cached_block(block, q);
         return SP1_SUCCESS;
     }
-    if (g_cached_bytes > 0 && s + FIT_MARGIN_BYTES > device_headroom()) release_cached_blocks();
+    if (g_cached_bytes > 0) {
+        const size_t headroom = device_headroom();
+        if (s + FIT_MARGIN_BYTES > headroom) evict_until_fits(s, headroom);
+    }
     void* ptr = raw_device_alloc(s);
     if (!ptr && g_cached_bytes > 0) {
         release_cached_blocks();
@@ -291,7 +344,7 @@ rustCudaError_t cached_free(void* p, sycl::queue* q) {
     auto it = g_alloc_sizes.find(p);
     if (it != g_alloc_sizes.end()) {
         size_t s = it->second;
-        if (g_cached_bytes + s <= MAX_CACHED_BYTES) {
+        if (g_cached_bytes + s <= max_cached_bytes()) {
             g_free_pool[s].push_back(CachedBlock{p, q, q->ext_oneapi_submit_barrier()});
             g_cached_bytes += s;
             return SP1_SUCCESS;
@@ -299,6 +352,7 @@ rustCudaError_t cached_free(void* p, sycl::queue* q) {
         g_alloc_sizes.erase(it);
     }
     // Not cached: let the freeing stream's work, which may still use it, finish first.
+    sp1prof::HostTimer timer("host: uncached free (wait + free)");
     q->wait_and_throw();
     sycl::free(p, rt().context);
     return SP1_SUCCESS;

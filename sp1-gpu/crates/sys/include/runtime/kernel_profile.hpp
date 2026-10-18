@@ -10,6 +10,7 @@
 #pragma once
 
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -46,6 +47,15 @@ class Totals {
         return it == names_.end() ? "<unnamed kernel>" : it->second;
     }
 
+    // With the operation's absolute start and end (ms on one GPU clock), for the busy-time union.
+    void add(const char* name, double ms, double start_ms, double end_ms) {
+        {
+            std::lock_guard<std::mutex> lock(m_);
+            intervals_.push_back(Interval{start_ms, end_ms, name});
+        }
+        add(name, ms);
+    }
+
     void add(const char* name, double ms) {
         std::lock_guard<std::mutex> lock(m_);
         auto& t = totals_[name];
@@ -69,6 +79,78 @@ class Totals {
         double all = 0;
         for (auto& r : rows) all += r.second.ms;
         std::fprintf(f, "# total GPU ms %.1f (summed over streams)\n", all);
+        std::vector<Interval> iv;
+        {
+            std::lock_guard<std::mutex> lock(m_);
+            iv = intervals_;
+        }
+        if (!iv.empty()) {
+            std::sort(iv.begin(), iv.end(), [](const Interval& a, const Interval& b) {
+                return a.start < b.start;
+            });
+            struct Gap {
+                double ms, at;
+                const char* before;
+                const char* after;
+            };
+            std::vector<Gap> gaps;
+            double busy = 0, cur_start = iv[0].start, cur_end = iv[0].end, last = iv[0].end;
+            const char* cur_name = iv[0].name;
+            for (auto& v : iv) {
+                if (v.end > last) last = v.end;
+                if (v.start > cur_end) {
+                    busy += cur_end - cur_start;
+                    gaps.push_back(Gap{v.start - cur_end, cur_end - iv[0].start, cur_name, v.name});
+                    cur_start = v.start;
+                    cur_end = v.end;
+                    cur_name = v.name;
+                } else if (v.end > cur_end) {
+                    cur_end = v.end;
+                    cur_name = v.name;
+                }
+            }
+            busy += cur_end - cur_start;
+            const double span = last - iv[0].start;
+            // Idle time by the operation it follows, and the longest gaps.
+            std::map<std::string, std::pair<double, uint64_t>> idle_after;
+            for (auto& g : gaps) {
+                auto& e = idle_after[g.before];
+                e.first += g.ms;
+                e.second += 1;
+            }
+            std::vector<std::pair<std::string, std::pair<double, uint64_t>>> idle(
+                idle_after.begin(),
+                idle_after.end());
+            std::sort(idle.begin(), idle.end(), [](const auto& a, const auto& b) {
+                return a.second.first > b.second.first;
+            });
+            for (size_t i = 0; i < idle.size() && i < 25; i++) {
+                std::fprintf(
+                    f,
+                    "# idle %10.1f ms in %6llu gaps after  %s\n",
+                    idle[i].second.first,
+                    (unsigned long long)idle[i].second.second,
+                    idle[i].first.c_str());
+            }
+            std::sort(gaps.begin(), gaps.end(), [](const Gap& a, const Gap& b) {
+                return a.ms > b.ms;
+            });
+            for (size_t i = 0; i < gaps.size() && i < 25; i++) {
+                std::fprintf(
+                    f,
+                    "# gap %8.1f ms at %9.1f ms: %s -> %s\n",
+                    gaps[i].ms,
+                    gaps[i].at,
+                    gaps[i].before,
+                    gaps[i].after);
+            }
+            std::fprintf(
+                f,
+                "# GPU busy %.1f ms of a %.1f ms span (%.0f%%), first timed operation to last\n",
+                busy,
+                span,
+                span > 0 ? 100.0 * busy / span : 0.0);
+        }
         std::fprintf(
             f,
             "# %12s %10s %10s %6s %10s %10s  name\n",
@@ -104,6 +186,11 @@ class Totals {
     std::mutex m_;
     std::unordered_map<void*, const char*> names_;
     std::map<std::string, Row> totals_;
+    struct Interval {
+        double start, end;
+        const char* name;
+    };
+    std::vector<Interval> intervals_;
 };
 
 inline Totals& totals() {
@@ -119,6 +206,27 @@ extern "C" void* sp1_profile_begin(void* stream);
 extern "C" void sp1_profile_end(void* token, const char* name, void* stream);
 
 namespace sp1prof {
+
+// Times a scope on the host (allocator calls and the like), listed with the GPU operations.
+class HostTimer {
+  public:
+    explicit HostTimer(const char* name) : name_(name) {
+        if (enabled()) start_ = std::chrono::steady_clock::now();
+    }
+    ~HostTimer() {
+        if (!enabled()) return;
+        const double ms =
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start_)
+                .count();
+        totals().add(name_, ms);
+    }
+    HostTimer(const HostTimer&) = delete;
+    HostTimer& operator=(const HostTimer&) = delete;
+
+  private:
+    const char* name_;
+    std::chrono::steady_clock::time_point start_{};
+};
 
 // Times the GPU work a scope queues on a stream.
 class Scope {
