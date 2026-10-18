@@ -254,9 +254,24 @@ static hipError_t cachedHipMalloc(void** p, size_t s, hipStream_t stream) {
     // On Windows an allocation beyond the card's free memory doesn't fail: the driver backs it
     // with shared system memory, which is much slower. So give the cached blocks back before an
     // allocation that would not fit, rather than only after a failed one.
-    if (g_cached_bytes > 0) {
+    // Allocations under 16 MiB skip this: the margin covers them.
+    if (g_cached_bytes > 0 && s >= (size_t(16) << 20)) {
         size_t headroom = 0;
         if (deviceHeadroom(&headroom) && s + FIT_MARGIN_BYTES > headroom) {
+            // A cached block of any larger size serves the allocation without the device memory
+            // it would take: the smallest one, rather than freeing the largest blocks (waiting for
+            // their last use) to allocate anew (on a Radeon RX 9070 XT, ~100 evictions per proof
+            // cost ~0.5 s of a 9 s proof with the 2 GiB margin).
+            auto it3 = g_free_pool.lower_bound(s);
+            while (it3 != g_free_pool.end() && it3->second.empty()) ++it3;
+            if (it3 != g_free_pool.end()) {
+                CachedBlock block = it3->second.back();
+                it3->second.pop_back();
+                g_cached_bytes -= it3->first;
+                *p = block.ptr;
+                g_alloc_sizes[*p] = it3->first;
+                return takeCachedBlock(block, stream);
+            }
             evictUntilFits(s, headroom);
         }
     }
