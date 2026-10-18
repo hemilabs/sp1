@@ -23,6 +23,17 @@
 
 #include <deque>
 
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#include <dxgi1_4.h>
+#endif
+
 #include "runtime/gpu_backend.cuh"
 #include "runtime/kernel_profile.hpp"
 
@@ -236,14 +247,81 @@ size_t round_alloc_size(size_t s) {
     return (s + step - 1) & ~(step - 1);
 }
 
-// Half the card.
+// A size in MiB from the environment, or `fallback`.
+size_t env_mib(const char* name, size_t fallback) {
+    const char* v = std::getenv(name);
+    return v ? (size_t)std::strtoull(v, nullptr, 10) << 20 : fallback;
+}
+
+// The most the allocator keeps cached: half the card (SP1_GPU_ALLOC_CACHE_MB).
 size_t max_cached_bytes() {
-    static const size_t cap = rt().device.get_info<sycl::info::device::global_mem_size>() / 2;
+    static const size_t cap = env_mib(
+        "SP1_GPU_ALLOC_CACHE_MB", rt().device.get_info<sycl::info::device::global_mem_size>() / 2);
     return cap;
 }
-constexpr size_t FIT_MARGIN_BYTES = 256ULL << 20;
 
+// Kept free on top of an allocation when deciding whether it fits (SP1_GPU_ALLOC_MARGIN_MB): 2 GiB.
+// With 256 MiB, back-to-back proofs on an Arc Pro B70 eventually overran the video memory budget
+// (one took 435 s instead of 5.4); with 2 GiB, eight in a row stay at 5.3-5.6 s.
+size_t fit_margin_bytes() {
+    static const size_t margin = env_mib("SP1_GPU_ALLOC_MARGIN_MB", 2048ULL << 20);
+    return margin;
+}
+#define FIT_MARGIN_BYTES fit_margin_bytes()
+
+#ifdef _WIN32
+// The device's DXGI adapter: by LUID where the device reports one, else the Intel adapter with the
+// most dedicated memory. Null if there is none.
+IDXGIAdapter3* dxgi_adapter() {
+    static IDXGIAdapter3* adapter = [] {
+        IDXGIAdapter3* found = nullptr;
+        IDXGIFactory4* factory = nullptr;
+        if (FAILED(CreateDXGIFactory1(__uuidof(IDXGIFactory4), (void**)&factory))) return found;
+        auto& d = rt().device;
+        if (d.has(sycl::aspect::ext_intel_device_info_luid)) {
+            auto luid_bytes = d.get_info<sycl::ext::intel::info::device::luid>();
+            LUID luid;
+            std::memcpy(&luid, luid_bytes.data(), sizeof(luid));
+            factory->EnumAdapterByLuid(luid, __uuidof(IDXGIAdapter3), (void**)&found);
+        }
+        if (!found) {
+            SIZE_T best = 0;
+            IDXGIAdapter1* a = nullptr;
+            for (UINT i = 0; factory->EnumAdapters1(i, &a) != DXGI_ERROR_NOT_FOUND; i++) {
+                DXGI_ADAPTER_DESC1 desc;
+                if (SUCCEEDED(a->GetDesc1(&desc)) && desc.VendorId == 0x8086 &&
+                    desc.DedicatedVideoMemory > best) {
+                    IDXGIAdapter3* a3 = nullptr;
+                    if (SUCCEEDED(a->QueryInterface(__uuidof(IDXGIAdapter3), (void**)&a3))) {
+                        if (found) found->Release();
+                        found = a3;
+                        best = desc.DedicatedVideoMemory;
+                    }
+                }
+                a->Release();
+            }
+        }
+        factory->Release();
+        return found;
+    }();
+    return adapter;
+}
+#endif
+
+// Device memory this process can still allocate before it runs out. On Windows that is the DXGI
+// video memory budget less this process's usage: it accounts for other processes and the desktop,
+// and an allocation beyond it does not fail but goes to shared system memory, where kernels run
+// several times slower. Sysman's free memory does not see the budget (with it, the caches here
+// filled the card and successive proofs slowed from 5.5 s to 20-30 s on an Arc Pro B70).
 size_t device_headroom() {
+#ifdef _WIN32
+    if (IDXGIAdapter3* adapter = dxgi_adapter()) {
+        DXGI_QUERY_VIDEO_MEMORY_INFO info;
+        if (SUCCEEDED(adapter->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &info))) {
+            return info.Budget > info.CurrentUsage ? info.Budget - info.CurrentUsage : 0;
+        }
+    }
+#endif
     auto& d = rt().device;
     if (d.has(sycl::aspect::ext_intel_free_memory)) {
         return d.get_info<sycl::ext::intel::info::device::free_memory>();

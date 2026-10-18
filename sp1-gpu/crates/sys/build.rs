@@ -808,6 +808,8 @@ fn build_sycl(
             link.arg(format!("-L{}", lib_dir.display()));
         }
         link.arg(format!("-Wl,/DEF:{}", def.display()));
+        // DXGI's video memory budget (lib/sycl/runtime.cpp, device_headroom).
+        link.arg("-ldxgi");
     } else {
         link.arg("-fPIC");
     }

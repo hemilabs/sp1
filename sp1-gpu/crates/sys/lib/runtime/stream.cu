@@ -68,6 +68,7 @@ typedef void* nvtxDomainHandle_t;
 #include <unordered_map>
 #include <map>
 #include <vector>
+#include <cstdlib>
 #include <mutex>
 
 struct CachedBlock {
@@ -98,15 +99,21 @@ static size_t roundAllocSize(size_t s) {
     return (s + step - 1) & ~(step - 1);
 }
 
-// Half the card.
+// A size in MiB from the environment, or `fallback`.
+static size_t envMib(const char* name, size_t fallback) {
+    const char* v = std::getenv(name);
+    return v ? (size_t)std::strtoull(v, nullptr, 10) << 20 : fallback;
+}
+
+// The most the allocator keeps cached: half the card (SP1_GPU_ALLOC_CACHE_MB).
 static size_t maxCachedBytes() {
     static const size_t cap = [] {
         size_t free_b = 0, total_b = 0;
         if (hipMemGetInfo(&free_b, &total_b) != hipSuccess || total_b == 0) {
             (void)hipGetLastError();
-            return size_t(2) << 30;
+            return envMib("SP1_GPU_ALLOC_CACHE_MB", size_t(2) << 30);
         }
-        return total_b / 2;
+        return envMib("SP1_GPU_ALLOC_CACHE_MB", total_b / 2);
     }();
     return cap;
 }
@@ -122,8 +129,14 @@ static hipError_t takeCachedBlock(const CachedBlock& block, hipStream_t stream) 
     return err;
 }
 
-// Kept free on top of an allocation when deciding whether it fits.
-static constexpr size_t FIT_MARGIN_BYTES = 256ULL << 20;
+// Kept free on top of an allocation when deciding whether it fits (SP1_GPU_ALLOC_MARGIN_MB): 2 GiB.
+// With less, back-to-back proofs on a Radeon RX 9070 XT overran the video memory budget and every
+// proof after the first took 16-19 s instead of ~9 s.
+static size_t fitMarginBytes() {
+    static const size_t margin = envMib("SP1_GPU_ALLOC_MARGIN_MB", 2048ULL << 20);
+    return margin;
+}
+#define FIT_MARGIN_BYTES fitMarginBytes()
 
 #ifdef _WIN32
 // The current device's DXGI adapter, matched by LUID, or null.
