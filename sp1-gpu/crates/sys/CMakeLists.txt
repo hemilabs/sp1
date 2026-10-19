@@ -48,14 +48,17 @@ if(USE_HIP)
     # set(CMAKE_HIP_FLAGS "${CMAKE_HIP_FLAGS} -fgpu-rdc")
     set(CMAKE_HIP_FLAGS "${CMAKE_HIP_FLAGS} -ffast-math")
     set(CMAKE_HIP_FLAGS "${CMAKE_HIP_FLAGS} -munsafe-fp-atomics")
-    set(CMAKE_HIP_FLAGS "${CMAKE_HIP_FLAGS} -fopenmp")
-    set(CMAKE_HIP_FLAGS "${CMAKE_HIP_FLAGS} -fPIE")
+    if(NOT WIN32)
+        set(CMAKE_HIP_FLAGS "${CMAKE_HIP_FLAGS} -fPIE")
+    endif()
 
     # HIP's compiler handles CUDA API mapping natively in ROCm 7.2+.
     # No need for cuda2hip.hpp global include.
 
     # Release optimization
-    set(CMAKE_HIP_FLAGS_RELEASE "-O3")
+    # NDEBUG: device asserts cost a load or more each in hot kernels, and on Windows, which has no
+    # HIP trap handler, a failing one cannot report anyway.
+    set(CMAKE_HIP_FLAGS_RELEASE "-O3 -DNDEBUG")
     set(CMAKE_HIP_FLAGS_DEBUG "-O3")
 
     # Get the actual source directory
@@ -115,6 +118,7 @@ if(USE_HIP)
     add_subdirectory(lib/zerocheck)
     add_subdirectory(lib/msm)
     add_subdirectory(lib/plonk)
+    add_subdirectory(lib/groth16)
 
     # Sppark sources -- compile as HIP (they include cuda2hip.hpp via __HIPCC__ guard)
     add_library(sppark_objs OBJECT
@@ -138,7 +142,7 @@ if(USE_HIP)
         logup_gkr_objs merkle_tree_objs mle_objs ntt_objs
         runtime_objs scan_objs sum_and_reduce_objs sumcheck_objs
         tracegen_objs transpose_objs zerocheck_objs
-        msm_objs
+        msm_objs groth16_objs
     )
     foreach(tgt ${_hip_targets})
         if(TARGET ${tgt})
@@ -177,6 +181,7 @@ if(USE_HIP)
         $<TARGET_OBJECTS:plonk_objs>
         $<TARGET_OBJECTS:ntt_bn254_objs>
         $<TARGET_OBJECTS:sppark_objs>
+        $<TARGET_OBJECTS:groth16_objs>
     )
 
     # Create static library.

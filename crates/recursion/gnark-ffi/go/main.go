@@ -2,6 +2,7 @@ package main
 
 /*
 #include "./koalabear.h"
+#include <stdint.h>
 #include <stdlib.h>
 
 typedef struct {
@@ -136,6 +137,14 @@ func ProveGroth16Bn254(dataDir *C.char, witnessPath *C.char) *C.C_Groth16Bn254Pr
 	structPtr.EncodedProof = C.CString(sp1Groth16Bn254Proof.EncodedProof)
 	structPtr.RawProof = C.CString(sp1Groth16Bn254Proof.RawProof)
 	return structPtr
+}
+
+// SetGroth16GpuHooks registers the host's GPU entry points for the Groth16 prover (C function
+// pointers, see sp1/groth16_gpu.go; zeros unregister them).
+//
+//export SetGroth16GpuHooks
+func SetGroth16GpuHooks(computeH C.uintptr_t, msmG1 C.uintptr_t, msmG2 C.uintptr_t) {
+	sp1.SetGpuHooks(uintptr(computeH), uintptr(msmG1), uintptr(msmG2))
 }
 
 //export FreeGroth16Bn254Proof

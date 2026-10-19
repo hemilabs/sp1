@@ -65,6 +65,7 @@ extern "C" {
     pub fn mle_fix_last_variable_koala_bear_base_base_constant_padding() -> KernelPtr;
     pub fn mle_fix_last_variable_koala_bear_base_extension_constant_padding() -> KernelPtr;
     pub fn mle_fix_last_variable_koala_bear_ext_ext_constant_padding() -> KernelPtr;
+    pub fn mle_fix_last_variable_koala_bear_ext_ext_constant_padding_dev() -> KernelPtr;
 
     pub fn mle_fix_last_variable_koala_bear_ext_ext_zero_padding() -> KernelPtr;
 
@@ -91,6 +92,12 @@ extern "C" {
     pub fn logup_gkr_fix_and_sum_circuit_layer() -> KernelPtr;
     pub fn logup_gkr_fix_and_sum_last_circuit_layer() -> KernelPtr;
     pub fn logup_gkr_fix_and_sum_interactions_layer() -> KernelPtr;
+
+    // The same with alpha read from device memory.
+    pub fn logup_gkr_fix_last_variable_interactions_layer_dev() -> KernelPtr;
+    pub fn logup_gkr_fix_and_sum_circuit_layer_dev() -> KernelPtr;
+    pub fn logup_gkr_fix_and_sum_last_circuit_layer_dev() -> KernelPtr;
+    pub fn logup_gkr_fix_and_sum_interactions_layer_dev() -> KernelPtr;
 
     // ******** Jagged sumcheck kernels ********
     pub fn jagged_sum_as_poly() -> KernelPtr;

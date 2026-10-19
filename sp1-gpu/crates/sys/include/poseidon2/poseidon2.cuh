@@ -1,5 +1,7 @@
 #pragma once
 
+#include "runtime/gpu_backend.cuh"
+
 #include "poseidon2/poseidon2_kb31_16.cuh"
 #include "poseidon2/poseidon2_bn254_3.cuh"
 
@@ -75,13 +77,17 @@ class Hasher {
             Params::externalLinearLayer(state);
         }
 
-        for (int i = 0; i < Params::ROUNDS_P; i++) {
-            state[0] += roundConstants.internalRoundConstants[i];
-            state[0] ^= Params::D;
-            Params::internalLinearLayer(
-                state,
-                roundConstants.matInternalDiagM1,
-                roundConstants.montyInverse);
+        if constexpr (Params::DEFERRED_PARTIAL_ROUNDS) {
+            Params::partialRounds(state);
+        } else {
+            for (int i = 0; i < Params::ROUNDS_P; i++) {
+                state[0] += roundConstants.internalRoundConstants[i];
+                state[0] ^= Params::D;
+                Params::internalLinearLayer(
+                    state,
+                    roundConstants.matInternalDiagM1,
+                    roundConstants.montyInverse);
+            }
         }
 
         for (int i = rounds_f_half; i < Params::ROUNDS_F; i++) {
@@ -259,12 +265,47 @@ struct MultiFieldHasherState : public HasherState<Params, Hasher_t> {
 };
 
 using KoalaBearHasher = StaticHasher<poseidon2_kb31_16::KoalaBear>;
-#ifndef __HIPCC__
+#ifndef SP1_PORTABLE
 using Bn254Hasher = StaticHasher<poseidon2_bn254_3::Bn254>;
 #else
-// HIP stub: Bn254Hasher is not used on AMD (only DuplexChallenger/KoalaBear path).
-// Use a minimal DynamicHasher instead to satisfy template instantiations.
-using Bn254Hasher = DynamicHasher<poseidon2_bn254_3::Bn254>;
+// HIP: StaticHasher's `static constexpr` pointer-to-__constant__ pattern fails without
+// -fgpu-rdc (disabled for performance). DeviceInitHasher initializes round constants at
+// device runtime instead of constexpr time — __constant__ addresses are valid on device.
+// (A default-constructed DynamicHasher, used here before, left its round-constant pointers
+// unset, and the wrap's MultiField32 challenger faulted on its first permutation.)
+template <typename Params>
+class DeviceInitHasher : public Hasher<Params> {
+    using F_t = typename Params::F_t;
+    using pF_t = typename Params::pF_t;
+    using Hasher_t = Hasher<Params>;
+    using RoundConstants_t = RoundConstants<Params>;
+
+  public:
+    RoundConstants_t roundConstants;
+
+    __device__ DeviceInitHasher() : roundConstants{
+        Params::INTERNAL_ROUND_CONSTANTS,
+        Params::EXTERNAL_ROUND_CONSTANTS,
+        Params::MAT_INTERNAL_DIAG_M1,
+        Params::MONTY_INVERSE
+    } {}
+
+    __device__ void permute(F_t in[Params::WIDTH], F_t out[Params::WIDTH]) {
+        Hasher_t::permute(in, out, roundConstants);
+    }
+
+    __device__ void compress(
+        F_t left[Params::DIGEST_WIDTH],
+        F_t right[Params::DIGEST_WIDTH],
+        F_t out[Params::DIGEST_WIDTH]) {
+        Hasher_t::compress(left, right, out, roundConstants);
+    }
+
+    __device__ void hash(F_t* in, size_t nIn, F_t out[Params::DIGEST_WIDTH]) {
+        Hasher_t::hash(in, nIn, out, roundConstants);
+    }
+};
+using Bn254Hasher = DeviceInitHasher<poseidon2_bn254_3::Bn254>;
 #endif
 
 class KoalaBearHasherState : public HasherState<poseidon2_kb31_16::KoalaBear, KoalaBearHasher> {

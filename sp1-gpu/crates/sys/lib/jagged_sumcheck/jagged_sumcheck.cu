@@ -1,3 +1,4 @@
+#include "runtime/gpu_backend.cuh"
 #include "jagged_sumcheck/jagged_sumcheck.cuh"
 #include "sum_and_reduce/reduce.cuh"
 #include "tracegen/jagged_tracegen/jagged.cuh"
@@ -35,7 +36,7 @@ jaggedSumAsPoly(ext_t* __restrict__ evaluations, const JaggedMle<JaggedSumcheckD
     }
 
     // Allocate shared memory
-    extern __shared__ unsigned char memory[];
+    SP1_EXTERN_SHARED(unsigned char, memory);
     ext_t* shared = reinterpret_cast<ext_t*>(memory);
 
     auto block = cg::this_thread_block();
@@ -98,7 +99,7 @@ SP1_KERNEL void jaggedFixAndSum(
     }
 
     // Allocate shared memory
-    extern __shared__ unsigned char memory[];
+    SP1_EXTERN_SHARED(unsigned char, memory);
     ext_t* shared = reinterpret_cast<ext_t*>(memory);
 
     auto block = cg::this_thread_block();
@@ -122,7 +123,11 @@ SP1_KERNEL void paddedHadamardFixAndSum(
     ext_t* __restrict__ ext_output,
     ext_t alpha,
     ext_t* __restrict__ univariate_result,
-    size_t inputHeight) {
+    size_t inputHeight,
+    // If not null, alpha is read from here instead (a round sampled on the device). The callers
+    // have always passed this argument, null.
+    const ext_t* __restrict__ alphaPtr) {
+    if (alphaPtr) alpha = *alphaPtr;
 
     size_t outputHeight = (inputHeight + 1) >> 1;
     ext_t evalZero = ext_t::zero();
@@ -178,7 +183,7 @@ SP1_KERNEL void paddedHadamardFixAndSum(
     }
 
     // Allocate shared memory
-    extern __shared__ unsigned char memory[];
+    SP1_EXTERN_SHARED(unsigned char, memory);
     ext_t* shared = reinterpret_cast<ext_t*>(memory);
 
     auto reduce_tile = cg::tiled_partition<32>(block);
@@ -195,8 +200,8 @@ SP1_KERNEL void paddedHadamardFixAndSum(
 }
 
 
-extern "C" void* jagged_sum_as_poly() { return (void*)jaggedSumAsPoly; }
+extern "C" void* jagged_sum_as_poly() { return SP1_KERNEL_PTR(jaggedSumAsPoly); }
 
-extern "C" void* jagged_fix_and_sum() { return (void*)jaggedFixAndSum; }
+extern "C" void* jagged_fix_and_sum() { return SP1_KERNEL_PTR(jaggedFixAndSum); }
 
-extern "C" void* padded_hadamard_fix_and_sum() { return (void*)paddedHadamardFixAndSum; }
+extern "C" void* padded_hadamard_fix_and_sum() { return SP1_KERNEL_PTR(paddedHadamardFixAndSum); }

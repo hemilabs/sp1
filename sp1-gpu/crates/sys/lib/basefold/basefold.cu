@@ -1,3 +1,4 @@
+#include "runtime/gpu_backend.cuh"
 #include "basefold/basefold.cuh"
 
 #include "fields/kb31_t.cuh"
@@ -16,7 +17,7 @@ __global__ void batchKernel(F* input, EF* output, EF* betaPowers, size_t height,
 }
 
 extern "C" void* batch_koala_bear_base_ext_kernel() {
-    return (void*)batchKernel<kb31_t, kb31_extension_t>;
+    return SP1_KERNEL_PTR(batchKernel<kb31_t, kb31_extension_t>);
 }
 
 template <typename F, typename EF>
@@ -39,7 +40,7 @@ __global__ void batchKernelFlattened(
 }
 
 extern "C" void* batch_koala_bear_base_ext_kernel_flattened() {
-    return (void*)batchKernelFlattened<kb31_t, kb31_extension_t>;
+    return SP1_KERNEL_PTR(batchKernelFlattened<kb31_t, kb31_extension_t>);
 }
 
 template <typename F, typename EF>
@@ -57,7 +58,7 @@ transposeEvenOdd(F* __restrict__ input, F* __restrict__ output, size_t outputHei
 }
 
 extern "C" void* transpose_even_odd_koala_bear_base_ext_kernel() {
-    return (void*)transposeEvenOdd<kb31_t, kb31_extension_t>;
+    return SP1_KERNEL_PTR(transposeEvenOdd<kb31_t, kb31_extension_t>);
 }
 
 template <typename F, typename EF>
@@ -73,5 +74,5 @@ __global__ void flattenToBase(EF* __restrict__ input, F* __restrict__ output, si
 }
 
 extern "C" void* flatten_to_base_koala_bear_base_ext_kernel() {
-    return (void*)flattenToBase<kb31_t, kb31_extension_t>;
+    return SP1_KERNEL_PTR(flattenToBase<kb31_t, kb31_extension_t>);
 }

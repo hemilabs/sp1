@@ -1,3 +1,4 @@
+#include "runtime/gpu_backend.cuh"
 #include "jagged_assist/branching_program.cuh"
 #include "fields/kb31_extension_t.cuh"
 #include "fields/kb31_t.cuh"
@@ -148,36 +149,46 @@ __global__ void interpolateAndObserve(
     EF *sampled_value,
     int8_t round_num,
     EF *sum_values,
-    EF claim
+    const EF *claim_ptr
 ){
-    if (blockIdx.x == 0 && threadIdx.x == 0 && blockIdx.y == 0 && threadIdx.y == 0) {
+    // A DuplexChallenger runs on 16 lanes, which compute the same values (permuteCoop); lane 0
+    // writes them.
+    constexpr unsigned LANES = Challenger::COOPERATIVE ? 16 : 1;
+    if (blockIdx.x != 0 || blockIdx.y != 0 || threadIdx.y != 0 || threadIdx.x >= LANES) return;
+    const bool writer = threadIdx.x == 0;
+    auto ch = challenger.localize_coop();
 
+    // The round's claim, from the previous round's results[0] on the device (no host round trip).
+    EF claim = *claim_ptr;
 
     EF y_0 = results[0];
     EF y_half = results[1];
     EF y_1 = claim - y_0;
-    F x_0 = F::zero();
-    F x_one = F::one();
-    F x_half = F::one() / F::two();
 
-    sum_values[3*round_num + 0] = y_0;
-    sum_values[3*round_num + 1] = y_half;
-    sum_values[3*round_num + 2] = y_1;
+    if (writer) {
+        sum_values[3*round_num + 0] = y_0;
+        sum_values[3*round_num + 1] = y_half;
+        sum_values[3*round_num + 2] = y_1;
+    }
 
-
-
+    // The quadratic through (0, y_0), (1/2, y_half) and (1, y_1), the points being fixed:
+    // c0 = y_0, c1 = 4 y_half - 3 y_0 - y_1, c2 = 2 (y_0 + y_1 - 2 y_half).
+    EF two_half = y_half + y_half;
     EF coefficients[3];
-    interpolateQuadratic<F, EF>(x_0, x_half, x_one, y_0, y_half, y_1, coefficients);
+    coefficients[0] = y_0;
+    coefficients[1] = two_half + two_half - (y_0 + y_0 + y_0) - y_1;
+    EF c2 = y_0 + y_1 - two_half;
+    coefficients[2] = c2 + c2;
 
-    challenger.observe_ext(&coefficients[0]);
-    challenger.observe_ext(&coefficients[1]);
-    challenger.observe_ext(&coefficients[2]);
+    ch.observe_ext(&coefficients[0]);
+    ch.observe_ext(&coefficients[1]);
+    ch.observe_ext(&coefficients[2]);
 
-    EF alpha = challenger.sample_ext();
+    EF alpha = ch.sample_ext();
+    if (!writer) return;
+    challenger.store_coop(ch);
 
     sampled_value[0] = alpha;
-
-    // results[0] = coefficients[0] + coefficients[1] * alpha + coefficients[2] * alpha * alpha;
 
     EF t(coefficients[2]);
     t *= alpha;
@@ -185,75 +196,8 @@ __global__ void interpolateAndObserve(
     t *= alpha;
     t += coefficients[0];
     results[0] = t;
-    }
 }
 
-template<typename F, typename EF>
-__device__ void interpolateQuadratic(
-    F x_0,
-    F x_1,
-    F x_2,
-    EF y_0,
-    EF y_1,
-    EF y_2,
-    EF coefficients[3])
-{
-    /* Compute the coefficients of the quadratic polynomial.
-
-    EF coeff_0 = y_0/((x_0-x_1)*(x_0-x_2));
-    EF coeff_1 = y_1/((x_1-x_0)*(x_1-x_2));
-    EF coeff_2 = y_2/((x_2-x_0)*(x_2-x_1));
-    */
-
-    F x0102 = (x_0-x_1)*(x_0-x_2);
-    F x1012 = (x_1-x_0)*(x_1-x_2);
-    F x2021 = (x_2-x_0)*(x_2-x_1);
-    F x0102x1012 = x0102 * x1012;
-    F denom = x0102x1012 * x2021;
-    F inv = denom.reciprocal();
-
-    EF coeff_0 = y_0 * inv * x1012 * x2021;
-    EF coeff_1 = y_1 * inv * x0102 * x2021;
-    EF coeff_2 = y_2 * inv * x0102x1012;
-
-    /* Compute the value of the polynomial at x.
-
-    // 3 F+F
-    // 4 EF+EF
-    // 9 EF*F
-    coefficients[2] =coeff_0+ coeff_1 + coeff_2;
-    coefficients[1] = -(coeff_0 * (x_1 + x_2) + coeff_1 * (x_0 + x_2) + coeff_2 * (x_0 + x_1));
-    coefficients[0] = coeff_0 * x_1 * x_2 + coeff_1 * x_0 * x_2 + coeff_2 * x_0 * x_1;
-    */
-
-    // 2 F+F
-    // 6 EF+EF
-    // 7 EF*F
-    EF
-        t0, t1, t2,
-        c0c1 = coeff_0 + coeff_1,       // EF+EF
-        c0x1 = coeff_0 * x_1,           // EF*F
-        c1x0 = coeff_1 * x_0,           // EF*F
-        c2x0 = coeff_2 * x_0,           // EF*F
-        c0c1x2 = c0c1 * x_2;            // EF*F
-
-    F x0x1 = x_0 + x_1;                 // F+F
-
-    t2 = c0c1 + coeff_2;                // F+F
-
-    t1  = coeff_2 * x0x1;               // EF*F
-    t1 += c0x1;                         // EF+EF
-    t1 += c1x0;                         // EF+EF
-    t1 += c0c1x2;                       // EF+EF
-
-    t0 = c0x1 + c1x0;                   // EF+EF
-    t0 *= x_2;                          // EF*F
-    t0 += c2x0 * x_1;                   // EF + EF*F
-
-    coefficients[2] = t2;
-    coefficients[1] = -t1;
-    coefficients[0] = t0;
-}
 
 
 template<typename F, typename EF>
@@ -488,27 +432,305 @@ __global__ void transition(
 
 extern "C" void *branching_program_kernel()
 {
-    return (void *)branchingProgram<kb31_t, kb31_extension_t>;
+    return SP1_KERNEL_PTR(branchingProgram<kb31_t, kb31_extension_t>);
 }
 
 
 extern "C" void *transition_kernel()
 {
-    return (void *)transition;
+    return SP1_KERNEL_PTR(transition);
 }
 
 
 extern "C" void *interpolateAndObserve_kernel_duplex()
 {
-    return (void *)interpolateAndObserve<kb31_t, kb31_extension_t, DuplexChallenger>;
+    return SP1_KERNEL_PTR(interpolateAndObserve<kb31_t, kb31_extension_t, DuplexChallenger>);
 }
 
 extern "C" void *interpolateAndObserve_kernel_multi_field_32()
 {
-    return (void *)interpolateAndObserve<kb31_t, kb31_extension_t, MultiField32Challenger>;
+    return SP1_KERNEL_PTR(interpolateAndObserve<kb31_t, kb31_extension_t, MultiField32Challenger>);
 }
 
 extern "C" void *fixLastVariable_kernel()
 {
-    return (void *)fixLastVariable<kb31_t, kb31_extension_t>;
+    return SP1_KERNEL_PTR(fixLastVariable<kb31_t, kb31_extension_t>);
+}
+
+// ---------------------------------------------------------------------------------------------
+// The branching program, incrementally across sumcheck rounds.
+//
+// For a column and lambda, branchingProgram computes e_init^T M_0 M_1 ... M_{L-1} e_success, where
+// M_k is layer k's transition (from its point: z_row, z_index, and the current and next prefix
+// sums' values at the layer, each a prefix sum bit, a sampled rho or the round's lambda). Within a
+// phase of the sumcheck (rounds 0..P-1 fold the next prefix sums, rounds P..2P-1 the current
+// ones), round s's lambda sits at layer s, the layers above hold values that do not change over
+// the phase, and the layers below hold the alphas sampled in the phase's earlier rounds. So
+//
+//   result = u_s^T M_s(lambda) w_{s+1},  w_k = M_k ... M_{L-1} e_success,  u_s^T = e_init^T M_0 ... M_{s-1}
+//
+// with every w_k computed once per phase (bpSuffix) and u advanced by one layer per round
+// (bpAdvance), which makes a round's work two layers instead of all of them.
+//
+// The FAIL state is absorbing with a zero row, so the vectors live on the other four states.
+// W is laid out [(k * 4 + state) * num_columns + column], U [state * num_columns + column].
+// ---------------------------------------------------------------------------------------------
+
+#define BP_STATES 4
+
+// state <- M state, for the layer at `point` (a column vector, as branchingProgram applies).
+template <typename F, typename EF>
+__device__ __forceinline__ void bpApplyColumn(const EF point[4], EF state[BP_STATES]) {
+    EF pl[16];
+    computePartialLagrange<F, EF>(point[0], point[1], point[2], point[3], pl);
+    EF next[BP_STATES];
+#pragma unroll
+    for (int in = 0; in < BP_STATES; in++) {
+        EF acc = EF::zero();
+#pragma unroll
+        for (int bit = 0; bit < BIT_STATE_COUNT; bit++) {
+            int out = TRANSITIONS[bit][in];
+            if (out != FAIL) acc += pl[bit] * state[out];
+        }
+        next[in] = acc;
+    }
+#pragma unroll
+    for (int i = 0; i < BP_STATES; i++) state[i] = next[i];
+}
+
+// u^T <- u^T M, for the layer at `point` (a row vector).
+template <typename F, typename EF>
+__device__ __forceinline__ void bpApplyRow(const EF point[4], EF u[BP_STATES]) {
+    EF pl[16];
+    computePartialLagrange<F, EF>(point[0], point[1], point[2], point[3], pl);
+    EF next[BP_STATES] = {EF::zero(), EF::zero(), EF::zero(), EF::zero()};
+#pragma unroll
+    for (int in = 0; in < BP_STATES; in++) {
+#pragma unroll
+        for (int bit = 0; bit < BIT_STATE_COUNT; bit++) {
+            int out = TRANSITIONS[bit][in];
+            if (out != FAIL) next[out] += u[in] * pl[bit];
+        }
+    }
+#pragma unroll
+    for (int i = 0; i < BP_STATES; i++) u[i] = next[i];
+}
+
+// The current and next prefix sums' values at layer k above the round's lambda: the prefix sums,
+// except that in the second phase the next prefix sums are the first phase's alphas (`next_rho`).
+template <typename F, typename EF>
+__device__ __forceinline__ void bpUpperLayerValues(
+    int phase,
+    int k,
+    size_t column_idx,
+    size_t num_columns,
+    const F* current_prefix_sums,
+    const F* next_prefix_sums,
+    size_t prefix_sum_length,
+    const EF* next_rho,
+    size_t next_rho_length,
+    EF& curr,
+    EF& next) {
+    curr = EF(getIthLeastSignificantValFromPoints<F>(
+        current_prefix_sums, prefix_sum_length, column_idx, num_columns, k));
+    if (phase == 0) {
+        next = EF(getIthLeastSignificantValFromPoints<F>(
+            next_prefix_sums, prefix_sum_length, column_idx, num_columns, k));
+    } else {
+        next = getIthLeastSignificantVal<EF>(next_rho, next_rho_length, k);
+    }
+}
+
+template <typename F, typename EF>
+__global__ void bpSuffix(
+    const F* current_prefix_sums,
+    const F* next_prefix_sums,
+    size_t prefix_sum_length,
+    const EF* z_row,
+    size_t z_row_length,
+    const EF* z_index,
+    size_t z_index_length,
+    const EF* next_rho,
+    size_t next_rho_length,
+    int phase,
+    size_t num_columns,
+    EF* __restrict__ W,
+    EF* __restrict__ U) {
+    const int num_layers = static_cast<int>(max(z_index_length, z_row_length)) + 1;
+    for (size_t c = blockDim.x * blockIdx.x + threadIdx.x; c < num_columns;
+         c += blockDim.x * gridDim.x) {
+        EF state[BP_STATES] = {EF::zero(), EF::zero(), EF::zero(), EF::zero()};
+        state[SUCCESS_STATE] = EF::one();
+#pragma unroll
+        for (int i = 0; i < BP_STATES; i++)
+            W[((size_t)num_layers * BP_STATES + i) * num_columns + c] = state[i];
+        for (int k = num_layers - 1; k >= 0; k--) {
+            EF point[4];
+            point[0] = getIthLeastSignificantVal<EF>(z_row, z_row_length, k);
+            point[1] = getIthLeastSignificantVal<EF>(z_index, z_index_length, k);
+            bpUpperLayerValues<F, EF>(
+                phase,
+                k,
+                c,
+                num_columns,
+                current_prefix_sums,
+                next_prefix_sums,
+                prefix_sum_length,
+                next_rho,
+                next_rho_length,
+                point[2],
+                point[3]);
+            bpApplyColumn<F, EF>(point, state);
+#pragma unroll
+            for (int i = 0; i < BP_STATES; i++)
+                W[((size_t)k * BP_STATES + i) * num_columns + c] = state[i];
+        }
+#pragma unroll
+        for (int i = 0; i < BP_STATES; i++)
+            U[i * num_columns + c] = i == INITIAL_MEMORY_STATE ? EF::one() : EF::zero();
+    }
+}
+
+// The layer's (curr, next) at the round's own layer s, for `value` (lambda, or the sampled alpha).
+template <typename F, typename EF>
+__device__ __forceinline__ void bpRoundLayerValues(
+    int phase,
+    int s,
+    size_t column_idx,
+    size_t num_columns,
+    const F* current_prefix_sums,
+    size_t prefix_sum_length,
+    const EF* next_rho,
+    size_t next_rho_length,
+    EF value,
+    EF& curr,
+    EF& next) {
+    if (phase == 0) {
+        curr = EF(getIthLeastSignificantValFromPoints<F>(
+            current_prefix_sums, prefix_sum_length, column_idx, num_columns, s));
+        next = value;
+    } else {
+        curr = value;
+        next = getIthLeastSignificantVal<EF>(next_rho, next_rho_length, s);
+    }
+}
+
+template <typename F, typename EF>
+__global__ void bpRound(
+    const F* current_prefix_sums,
+    const F* next_prefix_sums,
+    size_t prefix_sum_length,
+    const EF* z_row,
+    size_t z_row_length,
+    const EF* z_index,
+    size_t z_index_length,
+    const EF* next_rho,
+    size_t next_rho_length,
+    int phase,
+    int s,
+    size_t num_columns,
+    const EF* lambdas,
+    const EF* z_col_eq_vals,
+    const EF* intermediate_eq_full_evals,
+    const EF* __restrict__ W,
+    const EF* __restrict__ U,
+    EF* __restrict__ output) {
+    for (size_t c = blockDim.x * blockIdx.x + threadIdx.x; c < num_columns;
+         c += blockDim.x * gridDim.x) {
+        for (size_t lambda_idx = blockDim.y * blockIdx.y + threadIdx.y; lambda_idx < 2;
+             lambda_idx += blockDim.y * gridDim.y) {
+            EF lambda = lambdas[lambda_idx];
+            EF state[BP_STATES];
+#pragma unroll
+            for (int i = 0; i < BP_STATES; i++)
+                state[i] = W[((size_t)(s + 1) * BP_STATES + i) * num_columns + c];
+            EF point[4];
+            point[0] = getIthLeastSignificantVal<EF>(z_row, z_row_length, s);
+            point[1] = getIthLeastSignificantVal<EF>(z_index, z_index_length, s);
+            bpRoundLayerValues<F, EF>(
+                phase,
+                s,
+                c,
+                num_columns,
+                current_prefix_sums,
+                prefix_sum_length,
+                next_rho,
+                next_rho_length,
+                lambda,
+                point[2],
+                point[3]);
+            bpApplyColumn<F, EF>(point, state);
+            EF result = EF::zero();
+#pragma unroll
+            for (int i = 0; i < BP_STATES; i++) result += U[i * num_columns + c] * state[i];
+
+            EF eq_eval = getEqVal<F, EF>(
+                             lambda_idx,
+                             c,
+                             num_columns,
+                             current_prefix_sums,
+                             next_prefix_sums,
+                             prefix_sum_length,
+                             phase == 0 ? -1 : s,
+                             phase == 0 ? s : -1,
+                             lambdas[1]) *
+                         intermediate_eq_full_evals[c];
+            EF::store(output, lambda_idx * num_columns + c, result * z_col_eq_vals[c] * eq_eval);
+        }
+    }
+}
+
+// Advances U past layer s, at the alpha the round sampled (`alpha`, on the device).
+template <typename F, typename EF>
+__global__ void bpAdvance(
+    const F* current_prefix_sums,
+    size_t prefix_sum_length,
+    const EF* z_row,
+    size_t z_row_length,
+    const EF* z_index,
+    size_t z_index_length,
+    const EF* next_rho,
+    size_t next_rho_length,
+    int phase,
+    int s,
+    size_t num_columns,
+    const EF* alpha,
+    EF* __restrict__ U) {
+    const EF a = *alpha;
+    for (size_t c = blockDim.x * blockIdx.x + threadIdx.x; c < num_columns;
+         c += blockDim.x * gridDim.x) {
+        EF u[BP_STATES];
+#pragma unroll
+        for (int i = 0; i < BP_STATES; i++) u[i] = U[i * num_columns + c];
+        EF point[4];
+        point[0] = getIthLeastSignificantVal<EF>(z_row, z_row_length, s);
+        point[1] = getIthLeastSignificantVal<EF>(z_index, z_index_length, s);
+        bpRoundLayerValues<F, EF>(
+            phase,
+            s,
+            c,
+            num_columns,
+            current_prefix_sums,
+            prefix_sum_length,
+            next_rho,
+            next_rho_length,
+            a,
+            point[2],
+            point[3]);
+        bpApplyRow<F, EF>(point, u);
+#pragma unroll
+        for (int i = 0; i < BP_STATES; i++) U[i * num_columns + c] = u[i];
+    }
+}
+
+extern "C" void* branching_program_suffix_kernel() {
+    return SP1_KERNEL_PTR(bpSuffix<kb31_t, kb31_extension_t>);
+}
+
+extern "C" void* branching_program_round_kernel() {
+    return SP1_KERNEL_PTR(bpRound<kb31_t, kb31_extension_t>);
+}
+
+extern "C" void* branching_program_advance_kernel() {
+    return SP1_KERNEL_PTR(bpAdvance<kb31_t, kb31_extension_t>);
 }

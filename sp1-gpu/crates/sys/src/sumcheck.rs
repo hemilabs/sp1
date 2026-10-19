@@ -16,6 +16,10 @@ extern "C" {
     // (1/2, eval_half), (b_const, 0), and challenger observe/sample entirely on the GPU.
     pub fn sumcheck_observe_and_sample_cubic_duplex() -> KernelPtr;
     pub fn sumcheck_observe_and_sample_cubic_multi_field_32() -> KernelPtr;
+    pub fn sumcheck_observe_and_sample_quadratic_device_duplex() -> KernelPtr;
+    pub fn sumcheck_observe_and_sample_quadratic_device_multi_field_32() -> KernelPtr;
+    pub fn sumcheck_observe_and_sample_cubic_device_duplex() -> KernelPtr;
+    pub fn sumcheck_observe_and_sample_cubic_device_multi_field_32() -> KernelPtr;
 
     // GPU-side Fiat-Shamir observe-and-sample kernels for the zerocheck sumcheck (degree-4).
     // These handle eq-correction, 5-point interpolation, and challenger observe/sample on GPU.

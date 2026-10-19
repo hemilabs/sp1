@@ -9,6 +9,8 @@ use sp1_gpu_challenger::FromHostChallengerSync;
 use sp1_gpu_cudart::sys::runtime::Dim3;
 use sp1_gpu_cudart::sys::runtime::KernelPtr;
 use sp1_gpu_cudart::sys::sumcheck::{
+    sumcheck_observe_and_sample_quadratic_device_duplex,
+    sumcheck_observe_and_sample_quadratic_device_multi_field_32,
     sumcheck_observe_and_sample_quadratic_duplex,
     sumcheck_observe_and_sample_quadratic_multi_field_32,
 };
@@ -56,11 +58,16 @@ impl<F, PF> AsMutRawChallenger for sp1_gpu_challenger::MultiField32Challenger<F,
 /// The kernel pointer returned must match the challenger type's raw representation.
 pub unsafe trait ObserveAndSampleKernel {
     fn observe_and_sample_quadratic_kernel() -> KernelPtr;
+    /// The round with its state on the device (sumcheckObserveAndSampleQuadraticDevice).
+    fn observe_and_sample_quadratic_device_kernel() -> KernelPtr;
 }
 
 unsafe impl<F> ObserveAndSampleKernel for sp1_gpu_challenger::DuplexChallenger<F, TaskScope> {
     fn observe_and_sample_quadratic_kernel() -> KernelPtr {
         unsafe { sumcheck_observe_and_sample_quadratic_duplex() }
+    }
+    fn observe_and_sample_quadratic_device_kernel() -> KernelPtr {
+        unsafe { sumcheck_observe_and_sample_quadratic_device_duplex() }
     }
 }
 
@@ -69,6 +76,9 @@ unsafe impl<F, PF> ObserveAndSampleKernel
 {
     fn observe_and_sample_quadratic_kernel() -> KernelPtr {
         unsafe { sumcheck_observe_and_sample_quadratic_multi_field_32() }
+    }
+    fn observe_and_sample_quadratic_device_kernel() -> KernelPtr {
+        unsafe { sumcheck_observe_and_sample_quadratic_device_multi_field_32() }
     }
 }
 
@@ -296,10 +306,13 @@ where
 /// Like `fix_last_variable_and_sum_as_poly`, but returns the reduced evals as a device tensor
 /// with shape [2] containing [eval_zero, eval_half] instead of interpolating on CPU.
 /// Used by the GPU challenger path.
+/// `alpha_ptr`: if not null, the kernel reads alpha from this device pointer instead (only
+/// padded_hadamard_fix_and_sum takes it).
 pub(crate) fn fix_last_variable_and_sum_as_poly_device<F>(
     base: Mle<F, TaskScope>,
     ext: Mle<Ext, TaskScope>,
     alpha: Ext,
+    alpha_ptr: *const Ext,
     kernel: unsafe extern "C" fn() -> KernelPtr,
 ) -> (Mle<Ext, TaskScope>, Mle<Ext, TaskScope>, DeviceTensor<Ext>)
 where
@@ -323,7 +336,6 @@ where
         Tensor::<Ext, TaskScope>::with_sizes_in([2, grid_size_x], backend.clone());
 
     unsafe {
-        let null_ptr: *mut Ext = std::ptr::null_mut();
         let args = args!(
             base.guts().as_ptr(),
             ext.guts().as_ptr(),
@@ -332,7 +344,7 @@ where
             alpha,
             univariate_evals.as_mut_ptr(),
             input_height,
-            null_ptr
+            alpha_ptr
         );
         univariate_evals.assume_init();
         base_output.assume_init();
@@ -374,6 +386,60 @@ pub(crate) fn launch_observe_and_sample<DC: AsMutRawChallenger + ObserveAndSampl
             .launch_kernel(DC::observe_and_sample_quadratic_kernel(), 1usize, 1usize, &args, 0)
             .unwrap();
     }
+}
+
+/// The padded hadamard rounds after the first two, with their state on the device: each round's
+/// fix reads the previous alpha through a pointer and sumcheckObserveAndSampleQuadraticDevice
+/// samples the next, so the rounds run with no host round trip. `first_alpha` and `claim` are
+/// the last host round's alpha and next claim. Returns the folded MLEs, the rounds' alphas in
+/// order, and their reduced evaluations [eval_zero, eval_half * 4]: one read back at the end.
+pub(crate) fn padded_hadamard_rounds_on_device<DC: AsMutRawChallenger + ObserveAndSampleKernel>(
+    mut base: Mle<Ext, TaskScope>,
+    mut ext: Mle<Ext, TaskScope>,
+    device_challenger: &mut DC,
+    first_alpha: Ext,
+    claim: Ext,
+    rounds: usize,
+    backend: &TaskScope,
+) -> (Mle<Ext, TaskScope>, Mle<Ext, TaskScope>, Vec<Ext>, Vec<[Ext; 2]>) {
+    if rounds == 0 {
+        return (base, ext, vec![], vec![]);
+    }
+    // [claim, the previous rounds' alphas (first_alpha, then each round's), each round's evals]
+    let alphas_at = 1;
+    let evals_at = alphas_at + 1 + rounds;
+    let mut init = vec![Ext::zero(); evals_at + 2 * rounds];
+    init[0] = claim;
+    init[alphas_at] = first_alpha;
+    let mut state = DeviceBuffer::from_host_slice(&init, backend).unwrap();
+    let st = state.as_mut_ptr();
+    for r in 0..rounds {
+        let reduced;
+        let alpha_prev: *const Ext = unsafe { st.add(alphas_at + r) };
+        (base, ext, reduced) = fix_last_variable_and_sum_as_poly_device(
+            base,
+            ext,
+            Ext::zero(),
+            alpha_prev,
+            padded_hadamard_fix_and_sum,
+        );
+        let challenger_raw = device_challenger.as_mut_raw();
+        unsafe {
+            let evals_ptr = reduced.as_ptr();
+            let alpha_out = st.add(alphas_at + 1 + r);
+            let claim_io = st;
+            let evals_out = st.add(evals_at + 2 * r);
+            let args = args!(evals_ptr, challenger_raw, alpha_out, claim_io, evals_out);
+            // 16 threads: a DuplexChallenger permutes on 16 lanes (the kernel uses one otherwise).
+            backend
+                .launch_kernel(DC::observe_and_sample_quadratic_device_kernel(), 1usize, 16usize, &args, 0)
+                .unwrap();
+        }
+    }
+    let host = state.to_host().unwrap();
+    let alphas = host[alphas_at + 1..alphas_at + 1 + rounds].to_vec();
+    let evals = (0..rounds).map(|r| [host[evals_at + 2 * r], host[evals_at + 2 * r + 1]]).collect();
+    (base, ext, alphas, evals)
 }
 
 /// A simpler hadamard sumcheck. Avoids using the complex slop traits, and prioritizes a simple,
@@ -542,7 +608,13 @@ where
 
     // --- Round 1: fix_last_variable_and_sum_as_poly (first round, base-ext kernel) ---
     let (mut base_mle, mut ext_mle, reduced_evals) =
-        fix_last_variable_and_sum_as_poly_device(base, ext, alpha, base_ext_fix_and_sum_kernel);
+        fix_last_variable_and_sum_as_poly_device(
+            base,
+            ext,
+            alpha,
+            std::ptr::null(),
+            base_ext_fix_and_sum_kernel,
+        );
 
     launch_observe_and_sample(
         &reduced_evals,
@@ -559,31 +631,18 @@ where
     claim = next_claim_buf.to_host().unwrap()[0];
     point.insert(0, alpha);
 
-    // --- Rounds 2..num_variables: fix_last_variable_and_sum_as_poly (padded hadamard) ---
-    for _ in 2..num_variables as usize {
-        let current_alpha = *point.first().unwrap();
-
-        let reduced_evals;
-        (base_mle, ext_mle, reduced_evals) = fix_last_variable_and_sum_as_poly_device(
-            base_mle,
-            ext_mle,
-            current_alpha,
-            padded_hadamard_fix_and_sum,
-        );
-
-        launch_observe_and_sample(
-            &reduced_evals,
-            &mut device_challenger,
-            &mut alpha_buf,
-            &mut next_claim_buf,
-            claim,
-            &backend,
-        );
-
-        saved_reduced_evals.push(reduced_evals);
-
-        let alpha = alpha_buf.to_host().unwrap()[0];
-        claim = next_claim_buf.to_host().unwrap()[0];
+    // --- Rounds 2..num_variables: on the device (padded hadamard), no host round trips ---
+    let (device_alphas, device_evals);
+    (base_mle, ext_mle, device_alphas, device_evals) = padded_hadamard_rounds_on_device(
+        base_mle,
+        ext_mle,
+        &mut device_challenger,
+        *point.first().unwrap(),
+        claim,
+        (num_variables as usize).saturating_sub(2),
+        &backend,
+    );
+    for alpha in device_alphas {
         point.insert(0, alpha);
     }
 
@@ -593,9 +652,14 @@ where
 
     // Replay the claim sequence: claim_0 = initial_claim, claim_{i+1} = p_i(alpha_i).
     let mut replay_claim = initial_claim;
-    for (round, saved_evals) in saved_reduced_evals.iter().enumerate() {
-        let host_evals = saved_evals.to_host().unwrap();
-        let [eval_zero, eval_half]: [Ext; 2] = host_evals.as_slice().try_into().unwrap();
+    // The first two rounds' evaluations, then the device rounds'.
+    let mut round_evals: Vec<[Ext; 2]> = saved_reduced_evals
+        .iter()
+        .map(|evals| evals.to_host().unwrap().as_slice().try_into().unwrap())
+        .collect();
+    round_evals.extend(device_evals);
+    let num_rounds = round_evals.len();
+    for (round, &[eval_zero, eval_half]) in round_evals.iter().enumerate() {
 
         let eval_one = replay_claim - eval_zero;
 
@@ -610,7 +674,6 @@ where
 
         // Point is [alpha_{n-1}, ..., alpha_1, alpha_0]. Alpha for round i is at
         // index (num_rounds - 1 - i).
-        let num_rounds = saved_reduced_evals.len();
         let alpha = point[num_rounds - 1 - round];
 
         replay_claim = uni_poly.eval_at_point(alpha);

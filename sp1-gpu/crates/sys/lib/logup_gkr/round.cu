@@ -1,9 +1,16 @@
+#include "runtime/gpu_backend.cuh"
 #include "sum_and_reduce/reduce.cuh"
 #include "tracegen/jagged_tracegen/jagged.cuh"
 #include "logup_gkr/round.cuh"
 #include "config.cuh"
 
 #include <cstdio>
+
+// The folding point of a round, by value (the host knows it) or read from device memory (the
+// device challenger sampled it, and the host has not seen it: rounds then run with no host
+// round trip). The kernels below are instantiated for both.
+__device__ __forceinline__ ext_t loadAlpha(ext_t alpha) { return alpha; }
+__device__ __forceinline__ ext_t loadAlpha(const ext_t* alpha) { return *alpha; }
 
 /// Currently not used.
 SP1_KERNEL void fixLastVariableCircuitLayer(
@@ -73,7 +80,7 @@ SP1_KERNEL void sumAsPolyCircuitLayer(
     }
 
     // Allocate shared memory
-    extern __shared__ unsigned char memory[];
+    SP1_EXTERN_SHARED(unsigned char, memory);
     ext_t* shared = reinterpret_cast<ext_t*>(memory);
 
     auto block = cg::this_thread_block();
@@ -150,7 +157,7 @@ SP1_KERNEL void firstSumAsPolyCircuitLayer(
     }
 
     // Allocate shared memory
-    extern __shared__ unsigned char memory[];
+    SP1_EXTERN_SHARED(unsigned char, memory);
     ext_t* shared = reinterpret_cast<ext_t*>(memory);
 
     auto block = cg::this_thread_block();
@@ -208,7 +215,7 @@ SP1_KERNEL void sumAsPolyInteractionsLayer(
     }
 
     // Allocate shared memory
-    extern __shared__ unsigned char memory[];
+    SP1_EXTERN_SHARED(unsigned char, memory);
     ext_t* shared = reinterpret_cast<ext_t*>(memory);
 
     auto block = cg::this_thread_block();
@@ -224,12 +231,14 @@ SP1_KERNEL void sumAsPolyInteractionsLayer(
     }
 }
 
+template <typename Alpha>
 SP1_KERNEL void fixLastVariableInteractionsLayer(
     const ext_t* __restrict__ input,
     ext_t* __restrict__ output,
-    ext_t alpha,
+    Alpha alphaArg,
     size_t height,
     size_t outputHeight) {
+    const ext_t alpha = loadAlpha(alphaArg);
     for (size_t i = blockDim.x * blockIdx.x + threadIdx.x; i < outputHeight;
          i += blockDim.x * gridDim.x) {
         fixLastVariableInteractionsLayerInner(input, output, alpha, height, outputHeight, i);
@@ -238,14 +247,16 @@ SP1_KERNEL void fixLastVariableInteractionsLayer(
 
 
 // Invoke this one during normal circuit layers
+template <typename Alpha>
 SP1_KERNEL void fixAndSumCircuitLayer(
     ext_t* __restrict__ univariate_result,
     const JaggedMle<JaggedGkrLayer> inputJaggedMle,
     JaggedMle<JaggedGkrLayer> outputJaggedMle,
-    ext_t alpha,
+    Alpha alphaArg,
     const ext_t* __restrict__ eqRow,
     const ext_t* __restrict__ eqInteraction,
     const ext_t lambda) {
+    const ext_t alpha = loadAlpha(alphaArg);
 
     ext_t evalZero = ext_t::zero();
     ext_t evalHalf = ext_t::zero();
@@ -287,7 +298,7 @@ SP1_KERNEL void fixAndSumCircuitLayer(
     }
 
     // Allocate shared memory
-    extern __shared__ unsigned char memory[];
+    SP1_EXTERN_SHARED(unsigned char, memory);
     ext_t* shared = reinterpret_cast<ext_t*>(memory);
 
     auto block = cg::this_thread_block();
@@ -304,13 +315,15 @@ SP1_KERNEL void fixAndSumCircuitLayer(
 }
 
 // Invoke this one for the last circuit layer, when you transition to interactions.
+template <typename Alpha>
 SP1_KERNEL void fixAndSumLastCircuitLayer(
     ext_t* __restrict__ univariate_result,
     const JaggedGkrLayer inputJaggedMle,
-    ext_t alpha,
+    Alpha alphaArg,
     ext_t* __restrict__ output,
     const ext_t* __restrict__ eqInteraction,
     const ext_t lambda) {
+    const ext_t alpha = loadAlpha(alphaArg);
 
     ext_t evalZero = ext_t::zero();
     ext_t evalHalf = ext_t::zero();
@@ -377,7 +390,7 @@ SP1_KERNEL void fixAndSumLastCircuitLayer(
     }
 
     // Allocate shared memory
-    extern __shared__ unsigned char memory[];
+    SP1_EXTERN_SHARED(unsigned char, memory);
     ext_t* shared = reinterpret_cast<ext_t*>(memory);
 
     auto block = cg::this_thread_block();
@@ -394,15 +407,17 @@ SP1_KERNEL void fixAndSumLastCircuitLayer(
 }
 
 // Invoke this one for interactions layers
+template <typename Alpha>
 SP1_KERNEL void fixAndSumInteractionsLayer(
     ext_t* __restrict__ univariate_result,
     const ext_t* __restrict__ input,
     ext_t* __restrict__ output,
-    ext_t alpha,
+    Alpha alphaArg,
     size_t height,
     size_t outputHeight,
     const ext_t* __restrict__ eqInteraction,
     const ext_t lambda) {
+    const ext_t alpha = loadAlpha(alphaArg);
 
     ext_t evalZero = ext_t::zero();
     ext_t evalHalf = ext_t::zero();
@@ -437,7 +452,7 @@ SP1_KERNEL void fixAndSumInteractionsLayer(
     }
 
     // Allocate shared memory
-    extern __shared__ unsigned char memory[];
+    SP1_EXTERN_SHARED(unsigned char, memory);
     ext_t* shared = reinterpret_cast<ext_t*>(memory);
 
     auto block = cg::this_thread_block();
@@ -454,35 +469,54 @@ SP1_KERNEL void fixAndSumInteractionsLayer(
 }
 
 extern "C" void* logup_gkr_sum_as_poly_circuit_layer() {
-    return (void*)sumAsPolyCircuitLayer;
+    return SP1_KERNEL_PTR(sumAsPolyCircuitLayer);
 }
 
 extern "C" void* logup_gkr_first_sum_as_poly_circuit_layer() {
-    return (void*)firstSumAsPolyCircuitLayer;
+    return SP1_KERNEL_PTR(firstSumAsPolyCircuitLayer);
 }
 
 extern "C" void* logup_gkr_fix_last_variable_circuit_layer() {
-    return (void*)fixLastVariableCircuitLayer;
+    return SP1_KERNEL_PTR(fixLastVariableCircuitLayer);
 }
 
 extern "C" void* logup_gkr_fix_last_variable_last_circuit_layer() {
-    return (void*)fixLastVariableLastCircuitLayer;
+    return SP1_KERNEL_PTR(fixLastVariableLastCircuitLayer);
 }
 
 extern "C" void* logup_gkr_sum_as_poly_interactions_layer() {
-    return (void*)sumAsPolyInteractionsLayer;
+    return SP1_KERNEL_PTR(sumAsPolyInteractionsLayer);
 }
 
 extern "C" void* logup_gkr_fix_last_variable_interactions_layer() {
-    return (void*)fixLastVariableInteractionsLayer;
+    return SP1_KERNEL_PTR(fixLastVariableInteractionsLayer<ext_t>);
 }
 
-extern "C" void* logup_gkr_fix_and_sum_circuit_layer() { return (void*)fixAndSumCircuitLayer; }
+extern "C" void* logup_gkr_fix_and_sum_circuit_layer() {
+    return SP1_KERNEL_PTR(fixAndSumCircuitLayer<ext_t>);
+}
 
 extern "C" void* logup_gkr_fix_and_sum_last_circuit_layer() {
-    return (void*)fixAndSumLastCircuitLayer;
+    return SP1_KERNEL_PTR(fixAndSumLastCircuitLayer<ext_t>);
 }
 
 extern "C" void* logup_gkr_fix_and_sum_interactions_layer() {
-    return (void*)fixAndSumInteractionsLayer;
+    return SP1_KERNEL_PTR(fixAndSumInteractionsLayer<ext_t>);
+}
+
+// The same, with alpha read from device memory.
+extern "C" void* logup_gkr_fix_last_variable_interactions_layer_dev() {
+    return SP1_KERNEL_PTR(fixLastVariableInteractionsLayer<const ext_t*>);
+}
+
+extern "C" void* logup_gkr_fix_and_sum_circuit_layer_dev() {
+    return SP1_KERNEL_PTR(fixAndSumCircuitLayer<const ext_t*>);
+}
+
+extern "C" void* logup_gkr_fix_and_sum_last_circuit_layer_dev() {
+    return SP1_KERNEL_PTR(fixAndSumLastCircuitLayer<const ext_t*>);
+}
+
+extern "C" void* logup_gkr_fix_and_sum_interactions_layer_dev() {
+    return SP1_KERNEL_PTR(fixAndSumInteractionsLayer<const ext_t*>);
 }

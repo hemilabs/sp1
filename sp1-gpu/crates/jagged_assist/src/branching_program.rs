@@ -106,11 +106,52 @@ pub fn branching_program_and_sample<
     challenger: &mut Challenger,
     randomness_point: &Point<EF, TaskScope>,
     sum_values: &mut Buffer<EF, TaskScope>,
-    claim: EF,
+    claim: *const EF,
 ) -> (Tensor<EF, TaskScope>, Buffer<EF, TaskScope>)
 where
     TaskScope: BranchingProgramKernel<F, EF, Challenger> + DeviceSumKernel<EF>,
 {
+    let bp_results = branching_program_results(
+        curr_prefix_sums_device,
+        next_prefix_sums_device,
+        prefix_sum_length,
+        current_prefix_sum_rho_device,
+        next_prefix_sum_rho_device,
+        z_row_device,
+        z_index_device,
+        num_columns,
+        round_num,
+        lambdas_device,
+        z_col_eq_vals_device,
+        intermediate_eq_full_evals_device,
+    );
+    reduce_and_sample::<F, EF, Challenger>(
+        bp_results,
+        challenger,
+        randomness_point,
+        sum_values,
+        claim,
+        round_num,
+    )
+}
+
+/// A round's per-column branching program results ([2, num_columns]: lambda 0 and 1/2), the whole
+/// program evaluated for each column.
+#[allow(clippy::too_many_arguments)]
+pub fn branching_program_results<F: Field, EF: ExtensionField<F>>(
+    curr_prefix_sums_device: &Tensor<F, TaskScope>,
+    next_prefix_sums_device: &Tensor<F, TaskScope>,
+    prefix_sum_length: usize,
+    current_prefix_sum_rho_device: &Point<EF, TaskScope>,
+    next_prefix_sum_rho_device: &Point<EF, TaskScope>,
+    z_row_device: &Point<EF, TaskScope>,
+    z_index_device: &Point<EF, TaskScope>,
+    num_columns: usize,
+    round_num: i8,
+    lambdas_device: &Tensor<EF, TaskScope>,
+    z_col_eq_vals_device: &Buffer<EF, TaskScope>,
+    intermediate_eq_full_evals_device: &Buffer<EF, TaskScope>,
+) -> Tensor<EF, TaskScope> {
     // Right now, we assume there are two points.
     assert!(lambdas_device.total_len() == 2);
 
@@ -147,17 +188,28 @@ where
         bp_results.assume_init();
 
         backend
-            .launch_kernel(
-                <TaskScope as BranchingProgramKernel<F, EF, Challenger>>::branching_program_kernel(
-                ),
-                grid_size,
-                (BLOCK_SIZE, 1, 1),
-                &args,
-                0,
-            )
+            .launch_kernel(branching_program_kernel(), grid_size, (BLOCK_SIZE, 1, 1), &args, 0)
             .unwrap();
     }
+    bp_results
+}
 
+/// Sums a round's per-column branching program results, then interpolates the round polynomial,
+/// observes it and samples the next alpha on the device. Returns the reduced results (the next
+/// claim at index 0) and the new randomness point (the alpha prepended to `randomness_point`).
+pub fn reduce_and_sample<F: Field, EF: ExtensionField<F>, Challenger: AsMutRawChallenger>(
+    bp_results: Tensor<EF, TaskScope>,
+    challenger: &mut Challenger,
+    randomness_point: &Point<EF, TaskScope>,
+    sum_values: &mut Buffer<EF, TaskScope>,
+    claim: *const EF,
+    round_num: i8,
+) -> (Tensor<EF, TaskScope>, Buffer<EF, TaskScope>)
+where
+    TaskScope: BranchingProgramKernel<F, EF, Challenger> + DeviceSumKernel<EF>,
+{
+    const BLOCK_SIZE: usize = 256;
+    let backend = bp_results.backend().clone();
     let mut results = DeviceTensor::from_raw(bp_results).sum_dim(1).into_inner();
 
     let mut sampled_value =
@@ -718,6 +770,7 @@ mod tests {
 
                 let time = std::time::Instant::now();
                 let _span = tracing::info_span!("branching_program", round_num).entered();
+                let claim_device = DeviceBuffer::from_host(&Buffer::from(vec![claim]), &t).unwrap();
                 let bp_results_device = branching_program_and_sample(
                     &curr_prefix_sums_device,
                     &next_prefix_sums_device,
@@ -734,7 +787,7 @@ mod tests {
                     &mut challenger_device,
                     &Point::new(randomness_point_device.clone()),
                     &mut sum_values_device,
-                    claim,
+                    claim_device.as_ptr(),
                 );
 
                 tracing::info!("branching program time: {:?}", time.elapsed());

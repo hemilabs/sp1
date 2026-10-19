@@ -92,11 +92,18 @@ func ProveGroth16(dataDir string, witnessPath string) Proof {
 	fmt.Printf("Generating witness took %s\n", time.Since(start))
 
 	start = time.Now()
-	// Generate the proof.
-	proof, err := groth16.Prove(globalR1cs, globalPk, witness)
-	if err != nil {
-		fmt.Printf("Error: %v\n", err)
-		panic(err)
+	// Generate the proof: on the GPU when the host registered it (groth16_gpu.go), checked against
+	// the verifying key, with gnark's CPU prover as the fallback.
+	var proof groth16.Proof
+	if useGpuProver() {
+		proof = proveGroth16OnGpu(dataDir, witness)
+	}
+	if proof == nil {
+		proof, err = groth16.Prove(globalR1cs, globalPk, witness)
+		if err != nil {
+			fmt.Printf("Error: %v\n", err)
+			panic(err)
+		}
 	}
 	fmt.Printf("Generating proof took %s\n", time.Since(start))
 

@@ -1,13 +1,17 @@
 #pragma once
 
-#ifdef __HIPCC__
+#include "runtime/gpu_backend.cuh"
+
+#ifdef SP1_PORTABLE
 // Full BN254 scalar field (Fr) Montgomery arithmetic for HIP/AMD.
 // Uses portable 32-bit CIOS (same algorithm as bn254_fq_t but with scalar field modulus r).
 //
 // Fr modulus r = 21888242871839275222246405745257275088548364400416034343698204186575808495617
 // M0 = -r^{-1} mod 2^32 = 0xefffffff
 #include <cstdint>
+#ifdef __HIPCC__
 #include <hip/hip_runtime.h>
+#endif
 #include "fields/alt_bn128.hpp"
 
 struct bn254_t {
@@ -117,45 +121,32 @@ struct bn254_t {
     }
 
     // Montgomery multiplication: computes (a * b * R^{-1}) mod r
-    // Using CIOS (Coarsely Integrated Operand Scanning) method
+    // Using CIOS (Coarsely Integrated Operand Scanning) method, in its "no-carry" form (gnark's):
+    // r's top limb, 0x30644e72, is below (2^32 - 1) / 2 - 1, so the running value fits N limbs,
+    // and each outer step's multiply and reduce share one pass over the limbs.
     __device__ __forceinline__ bn254_t operator*(const bn254_t& b) const {
         const uint32_t m0 = device::ALT_BN128_m0;
-        uint32_t t[N + 2] = {0};
-
+        uint32_t t[N] = {0};
         for (int i = 0; i < N; i++) {
-            // Step 1: t += a[i] * b
-            uint64_t carry = 0;
-            for (int j = 0; j < N; j++) {
-                uint64_t prod = (uint64_t)data[i] * b.data[j] + t[j] + carry;
-                t[j] = (uint32_t)prod;
-                carry = prod >> 32;
+            const uint32_t bi = b.data[i];
+            uint64_t p = (uint64_t)data[0] * bi + t[0];
+            uint32_t A = (uint32_t)(p >> 32);
+            const uint32_t t0 = (uint32_t)p;
+            const uint32_t m = t0 * m0;
+            uint64_t q = (uint64_t)m * device::ALT_BN128_r[0] + t0;
+            uint32_t C = (uint32_t)(q >> 32);
+            for (int j = 1; j < N; j++) {
+                p = (uint64_t)data[j] * bi + t[j] + A;
+                A = (uint32_t)(p >> 32);
+                q = (uint64_t)m * device::ALT_BN128_r[j] + (uint32_t)p + C;
+                C = (uint32_t)(q >> 32);
+                t[j - 1] = (uint32_t)q;
             }
-            uint64_t sum = (uint64_t)t[N] + carry;
-            t[N] = (uint32_t)sum;
-            t[N + 1] = (uint32_t)(sum >> 32);
-
-            // Step 2: Montgomery reduction
-            uint32_t m = t[0] * m0;
-            carry = 0;
-            for (int j = 0; j < N; j++) {
-                uint64_t prod = (uint64_t)m * device::ALT_BN128_r[j] + t[j] + carry;
-                t[j] = (uint32_t)prod;
-                carry = prod >> 32;
-            }
-            sum = (uint64_t)t[N] + carry;
-            t[N] = (uint32_t)sum;
-            t[N + 1] += (uint32_t)(sum >> 32);
-
-            // Shift right by one limb
-            for (int j = 0; j < N + 1; j++) {
-                t[j] = t[j + 1];
-            }
-            t[N + 1] = 0;
+            t[N - 1] = C + A;
         }
-
         bn254_t r;
         for (int i = 0; i < N; i++) r.data[i] = t[i];
-        if (t[N] || r.gte_p()) r.sub_p();
+        if (r.gte_p()) r.sub_p();
         return r;
     }
 

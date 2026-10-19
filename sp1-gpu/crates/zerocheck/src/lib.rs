@@ -17,8 +17,8 @@ use slop_sumcheck::PartialSumcheckProof;
 use slop_tensor::Tensor;
 use sp1_gpu_air::instruction::Instruction16;
 use sp1_gpu_air::{air_block::BlockAir, SymbolicProverFolder};
-use sp1_gpu_cudart::sys::runtime::KernelPtr;
 use sp1_gpu_challenger::FromHostChallengerSync;
+use sp1_gpu_cudart::sys::runtime::KernelPtr;
 use sp1_gpu_cudart::sys::v2_kernels::{
     jagged_constraint_poly_eval_1024_koala_bear_extension_kernel,
     jagged_constraint_poly_eval_1024_koala_bear_kernel,
@@ -60,6 +60,43 @@ pub struct EvalProgramInfo<B: Backend = CpuBackend> {
     pub f_constants_indices: Buffer<u32, B>,
     pub ef_constants: Buffer<Ext, B>,
     pub ef_constants_indices: Buffer<u32, B>,
+    /// Per air block: its generated straight-line evaluator, or u32::MAX to interpret its
+    /// instructions (see `generated_ids`).
+    pub generated_ids: Buffer<u32, B>,
+}
+
+/// FNV-1a over an evaluation program's instructions (opcode, variants, then a, b and c little
+/// endian): how the generated evaluators (sp1-gpu-sys scripts/gen_zerocheck_eval.py) are found.
+pub fn program_hash(instructions: &[Instruction16]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for i in instructions {
+        let bytes = [i.opcode, i.b_variant, i.c_variant]
+            .into_iter()
+            .chain(i.a.to_le_bytes())
+            .chain(i.b.to_le_bytes())
+            .chain(i.c.to_le_bytes());
+        for byte in bytes {
+            h ^= byte as u64;
+            h = h.wrapping_mul(0x100_0000_01b3);
+        }
+    }
+    h
+}
+
+/// Each air block's generated evaluator (u32::MAX for none). SP1_GPU_EVAL_INTERPRETER=1
+/// interprets every program.
+fn generated_ids(operations: &[Instruction16], operations_indices: &[u32]) -> Vec<u32> {
+    let interpret = std::env::var("SP1_GPU_EVAL_INTERPRETER").map(|v| v == "1").unwrap_or(false);
+    operations_indices
+        .windows(2)
+        .map(|w| {
+            if interpret {
+                return u32::MAX;
+            }
+            let block = &operations[w[0] as usize..w[1] as usize];
+            unsafe { sp1_gpu_cudart::sys::zerocheck::sp1_zerocheck_generated_id(program_hash(block)) }
+        })
+        .collect()
 }
 
 pub type CudaEvalResult =
@@ -166,8 +203,15 @@ where
         ef_ctr = ef_ctr.max(*chip_ef_ctr);
     }
     operations_indices.push(operations.len() as u32);
+    let generated_ids = generated_ids(&operations, &operations_indices);
+    tracing::debug!(
+        "zerocheck: {} of {} air blocks run generated evaluators",
+        generated_ids.iter().filter(|&&id| id != u32::MAX).count(),
+        generated_ids.len()
+    );
 
     EvalProgramInfo {
+        generated_ids: Buffer::from(generated_ids),
         constraint_indices: Buffer::from(constraint_indices),
         operations: Buffer::from(operations),
         operations_indices: Buffer::from(operations_indices),
@@ -205,7 +249,11 @@ where
     let ef_constants_indices_device =
         DeviceBuffer::from_host(&cpu_info.ef_constants_indices, scope).unwrap().into_inner();
 
+    let generated_ids_device =
+        DeviceBuffer::from_host(&cpu_info.generated_ids, scope).unwrap().into_inner();
+
     EvalProgramInfo {
+        generated_ids: generated_ids_device,
         constraint_indices: constraint_indices_device,
         operations: operations_device,
         operations_indices: operations_indices_device,
@@ -391,8 +439,11 @@ impl JaggedConstraintPolyEvalKernel<Ext> for TaskScope {
 
 /// Returns the MEMORY_SIZE bucket for a given f_ctr value.
 /// Must match the kernel template instantiation sizes.
+/// The register-file size (the interpreter kernel's MEMORY_SIZE) for a program whose highest
+/// register index is `f_ctr`: the optimizer reports the highest index used, not a count, so a
+/// program using register 32 needs 33 registers.
 fn memory_size_bucket(f_ctr: u32) -> usize {
-    match f_ctr {
+    match f_ctr + 1 {
         0..=32 => 32,
         33..=64 => 64,
         65..=128 => 128,
@@ -414,8 +465,13 @@ where
     const NUM_EVAL_POINT: usize = 3;
 
     let n_chunks = input.total_len.div_ceil(1 << 12);
-    let grid_size_x = n_chunks.max(256);
-    let grid_size = (grid_size_x, 1, NUM_EVAL_POINT);
+    // At least 256 blocks for parallelism, but no more than one row per thread: late rounds have
+    // few rows, and every thread costs its register file's setup.
+    let rows = input.total_len / 2;
+    let grid_size_x = n_chunks.max(256).min(rows.div_ceil(BLOCK_SIZE).max(1));
+    // Each thread evaluates its row at zerocheck_points_per_thread() of the points (the kernel's K3).
+    let points = unsafe { sp1_gpu_cudart::sys::zerocheck::zerocheck_points_per_thread() } as usize;
+    let grid_size = (grid_size_x, 1, NUM_EVAL_POINT / points);
 
     let num_tiles = BLOCK_SIZE.div_ceil(32);
     let shared_mem = num_tiles * std::mem::size_of::<Ext>();
@@ -475,7 +531,8 @@ where
                 input.main_column.as_ptr(),
                 input.total_num_preprocessed_column,
                 output.as_mut_ptr(),
-                rest_point_dim
+                rest_point_dim,
+                input.program.generated_ids.as_ptr()
             );
             backend
                 .launch_kernel(
@@ -528,8 +585,13 @@ where
     const NUM_EVAL_POINT: usize = 3;
 
     let n_chunks = input.total_len.div_ceil(1 << 12);
-    let grid_size_x = n_chunks.max(256);
-    let grid_size = (grid_size_x, 1, NUM_EVAL_POINT);
+    // At least 256 blocks for parallelism, but no more than one row per thread: late rounds have
+    // few rows, and every thread costs its register file's setup.
+    let rows = input.total_len / 2;
+    let grid_size_x = n_chunks.max(256).min(rows.div_ceil(BLOCK_SIZE).max(1));
+    // Each thread evaluates its row at zerocheck_points_per_thread() of the points (the kernel's K3).
+    let points = unsafe { sp1_gpu_cudart::sys::zerocheck::zerocheck_points_per_thread() } as usize;
+    let grid_size = (grid_size_x, 1, NUM_EVAL_POINT / points);
 
     let num_tiles = BLOCK_SIZE.div_ceil(32);
     let shared_mem = num_tiles * std::mem::size_of::<Ext>();
@@ -578,7 +640,8 @@ where
                 input.main_column.as_ptr(),
                 input.total_num_preprocessed_column,
                 output.as_mut_ptr(),
-                rest_point_dim
+                rest_point_dim,
+                input.program.generated_ids.as_ptr()
             );
             backend
                 .launch_kernel(
@@ -661,7 +724,9 @@ pub unsafe trait ObserveAndSampleQuarticKernel {
     fn observe_and_sample_quartic_kernel() -> KernelPtr;
 }
 
-unsafe impl<F> ObserveAndSampleQuarticKernel for sp1_gpu_challenger::DuplexChallenger<F, TaskScope> {
+unsafe impl<F> ObserveAndSampleQuarticKernel
+    for sp1_gpu_challenger::DuplexChallenger<F, TaskScope>
+{
     fn observe_and_sample_quartic_kernel() -> KernelPtr {
         unsafe { sp1_gpu_cudart::sys::sumcheck::sumcheck_observe_and_sample_quartic_duplex() }
     }
@@ -677,14 +742,34 @@ unsafe impl<F, PF> ObserveAndSampleQuarticKernel
     }
 }
 
+/// Copies a round's 3 reduced evaluations to `round_out[2..5]`, after the observe-and-sample
+/// kernel's alpha and claim, on the stream (no synchronization).
+fn copy_reduced_evals(
+    reduced_evals: &DeviceTensor<Ext>,
+    round_out: &mut DeviceBuffer<Ext>,
+    backend: &TaskScope,
+) {
+    use slop_alloc::mem::{CopyDirection, DeviceMemory};
+    assert_eq!(reduced_evals.total_len(), 3);
+    unsafe {
+        backend
+            .copy_nonoverlapping(
+                reduced_evals.as_ptr() as *const u8,
+                round_out.as_mut_ptr().add(2) as *mut u8,
+                3 * std::mem::size_of::<Ext>(),
+                CopyDirection::DeviceToDevice,
+            )
+            .unwrap();
+    }
+}
+
 /// Launch the GPU observe-and-sample kernel for a quartic (degree-4) zerocheck round.
 fn launch_observe_and_sample_quartic<
     DC: sp1_gpu_jagged_sumcheck::AsMutRawChallenger + ObserveAndSampleQuarticKernel,
 >(
     reduced_evals: &DeviceTensor<Ext>,
     device_challenger: &mut DC,
-    alpha_buf: &mut DeviceBuffer<Ext>,
-    next_claim_buf: &mut DeviceBuffer<Ext>,
+    round_out: &mut DeviceBuffer<Ext>,
     claim: Ext,
     eq_adjustment: Ext,
     point_last: Ext,
@@ -695,9 +780,9 @@ fn launch_observe_and_sample_quartic<
         let args = args!(
             reduced_evals.as_ptr(),
             challenger_raw,
-            alpha_buf.as_mut_ptr(),
+            round_out.as_mut_ptr(),
             claim,
-            next_claim_buf.as_mut_ptr(),
+            round_out.as_mut_ptr().add(1),
             eq_adjustment,
             point_last
         );
@@ -819,14 +904,12 @@ where
     let backend = trace_mle.dense_data.backend();
     *device_challenger = DC::from_host_challenger_sync(challenger, &backend);
 
-    let mut alpha_buf = DeviceBuffer::<Ext>::with_capacity_in(1, backend.clone());
-    let mut next_claim_buf = DeviceBuffer::<Ext>::with_capacity_in(1, backend.clone());
+    // Each round's alpha, next claim and reduced evaluations, read back together: one
+    // synchronization per round (the evaluations are copied next to the kernel's outputs).
+    let mut round_out = DeviceBuffer::<Ext>::with_capacity_in(5, backend.clone());
     unsafe {
-        alpha_buf.set_len(1);
-        next_claim_buf.set_len(1);
+        round_out.set_len(5);
     }
-    let mut alpha_staging = sp1_gpu_cudart::pinned::PinnedBuffer::<Ext>::with_capacity(1);
-    let mut claim_staging = sp1_gpu_cudart::pinned::PinnedBuffer::<Ext>::with_capacity(1);
 
     let mut univariate_polys: Vec<UnivariatePolynomial<Ext>> =
         Vec::with_capacity(max_log_row_count as usize);
@@ -834,13 +917,19 @@ where
     let mut current_claim = claim;
     let mut replay_claim = claim;
 
-    // Helper: reconstruct polynomial from reduced evals + D2H one at a time
-    let reconstruct_poly = |reduced: &DeviceTensor<Ext>, eq_adj: Ext, last: Ext, rclaim: &mut Ext, alpha: Ext| -> UnivariatePolynomial<Ext> {
-        let host_evals = reduced.to_host().unwrap();
-        let raw = host_evals.as_slice();
+    // Helper: reconstruct the round polynomial from its reduced evaluations (read back with the
+    // round's alpha).
+    let reconstruct_poly = |raw: &[Ext],
+                            eq_adj: Ext,
+                            last: Ext,
+                            rclaim: &mut Ext,
+                            alpha: Ext|
+     -> UnivariatePolynomial<Ext> {
         let xs = vec![
-            Ext::from_canonical_u32(0), Ext::from_canonical_u32(2),
-            Ext::from_canonical_u32(4), Ext::from_canonical_u32(1),
+            Ext::from_canonical_u32(0),
+            Ext::from_canonical_u32(2),
+            Ext::from_canonical_u32(4),
+            Ext::from_canonical_u32(1),
             (last - Ext::one()) / (last + last - Ext::one()),
         ];
         let eq_0 = Ext::one() - last;
@@ -863,14 +952,27 @@ where
     {
         let (reduced_device, eq_adj, pt_last) = evaluate_zerocheck_device(&main_poly);
         launch_observe_and_sample_quartic(
-            &reduced_device, device_challenger, &mut alpha_buf, &mut next_claim_buf,
-            current_claim, eq_adj, pt_last, &backend,
+            &reduced_device,
+            device_challenger,
+            &mut round_out,
+            current_claim,
+            eq_adj,
+            pt_last,
+            &backend,
         );
-        let point = alpha_buf.to_host().unwrap()[0];
-        current_claim = next_claim_buf.to_host().unwrap()[0];
+        copy_reduced_evals(&reduced_device, &mut round_out, &backend);
+        let out = round_out.to_host().unwrap();
+        let point = out[0];
+        current_claim = out[1];
 
         // Reconstruct CPU polynomial (for proof) + update replay_claim
-        univariate_polys.push(reconstruct_poly(&reduced_device, eq_adj, pt_last, &mut replay_claim, point));
+        univariate_polys.push(reconstruct_poly(
+            &out[2..5],
+            eq_adj,
+            pt_last,
+            &mut replay_claim,
+            point,
+        ));
         drop(reduced_device); // free GPU memory
 
         jagged_point.add_dimension(point);
@@ -881,13 +983,26 @@ where
     for _ in 0..max_log_row_count - 1 {
         let (reduced_device, eq_adj, pt_last) = evaluate_zerocheck_device(&next_poly);
         launch_observe_and_sample_quartic(
-            &reduced_device, device_challenger, &mut alpha_buf, &mut next_claim_buf,
-            current_claim, eq_adj, pt_last, &backend,
+            &reduced_device,
+            device_challenger,
+            &mut round_out,
+            current_claim,
+            eq_adj,
+            pt_last,
+            &backend,
         );
-        let point = alpha_buf.to_host().unwrap()[0];
-        current_claim = next_claim_buf.to_host().unwrap()[0];
+        copy_reduced_evals(&reduced_device, &mut round_out, &backend);
+        let out = round_out.to_host().unwrap();
+        let point = out[0];
+        current_claim = out[1];
 
-        univariate_polys.push(reconstruct_poly(&reduced_device, eq_adj, pt_last, &mut replay_claim, point));
+        univariate_polys.push(reconstruct_poly(
+            &out[2..5],
+            eq_adj,
+            pt_last,
+            &mut replay_claim,
+            point,
+        ));
         drop(reduced_device);
 
         jagged_point.add_dimension(point);
@@ -2236,6 +2351,13 @@ pub mod tests {
 
             let logup_evaluations = LogUpEvaluations { point: zeta, chip_openings };
 
+            let mut device_challenger = <sp1_gpu_challenger::DuplexChallenger<
+                Felt,
+                sp1_gpu_cudart::TaskScope,
+            > as sp1_gpu_challenger::FromHostChallengerSync<_>>::from_host_challenger_sync(
+                &challenger_prover,
+                slop_alloc::HasBackend::backend(&trace_mle.dense_data),
+            );
             let (opened_values, zerocheck_proof) = zerocheck(
                 &chips,
                 &cache,
@@ -2245,6 +2367,7 @@ pub mod tests {
                 &logup_evaluations,
                 public_values.clone(),
                 &mut challenger_prover,
+                &mut device_challenger,
                 max_log_row_count as u32,
             );
 
@@ -2344,6 +2467,13 @@ pub mod tests {
 
             let logup_evaluations = LogUpEvaluations { point: zeta, chip_openings };
 
+            let mut device_challenger = <sp1_gpu_challenger::DuplexChallenger<
+                Felt,
+                sp1_gpu_cudart::TaskScope,
+            > as sp1_gpu_challenger::FromHostChallengerSync<_>>::from_host_challenger_sync(
+                &challenger_prover,
+                slop_alloc::HasBackend::backend(&trace_mle.dense_data),
+            );
             let (opened_values, zerocheck_proof) = zerocheck(
                 chips,
                 &cache,
@@ -2353,6 +2483,7 @@ pub mod tests {
                 &logup_evaluations,
                 public_values.clone(),
                 &mut challenger_prover,
+                &mut device_challenger,
                 max_log_row_count,
             );
 

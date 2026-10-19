@@ -7,6 +7,9 @@ extern "C" {
     pub fn jagged_koala_bear_extension_virtual_fix_last_variable() -> KernelPtr;
 
     pub fn branching_program_kernel() -> KernelPtr;
+    pub fn branching_program_suffix_kernel() -> KernelPtr;
+    pub fn branching_program_round_kernel() -> KernelPtr;
+    pub fn branching_program_advance_kernel() -> KernelPtr;
 
     pub fn interpolateAndObserve_kernel_duplex() -> KernelPtr;
 

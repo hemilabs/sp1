@@ -168,15 +168,17 @@ mod tests {
     fn test_batch_coset_dft() {
         let mut rng = thread_rng();
 
-        let log_degrees = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
+        // Up to 2^21 outputs: every split of the stages into global passes and a tile. (2^21 inputs
+        // would exceed the 65535-block grid limit of the input transpose below on CUDA and HIP.)
+        let log_degrees = 1..=20;
         let log_blowup = 1;
         let shift = SP1Field::generator();
-        let batch_size = 16;
 
         let p3_dft = Radix2DitParallel;
 
-        for log_d in log_degrees.iter() {
+        for log_d in log_degrees {
             let d = 1 << log_d;
+            let batch_size = if log_d > 15 { 3 } else { 16 };
 
             let tensor_h = Tensor::<SP1Field>::rand(&mut rng, [d, batch_size]);
 
@@ -212,5 +214,49 @@ mod tests {
                 assert_eq!(r, e, "Mismatch at index {i}");
             }
         }
+    }
+
+    /// Coset DFT throughput: 64 columns of 2^21 coefficients to 2^22 bit-reversed evaluations.
+    /// `cargo test --release -p sp1-gpu-basefold bench_batch_coset_dft -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn bench_batch_coset_dft() {
+        let (batch_size, log_d, log_blowup) = (64usize, 21usize, 1usize);
+        let d = 1 << log_d;
+        let host: Vec<SP1Field> = (0..batch_size * d)
+            .map(|i| SP1Field::from_canonical_u32((i as u32).wrapping_mul(2654435761) >> 2))
+            .collect();
+        let host = Tensor::from(host).reshape([batch_size, d]);
+        run_sync_in_place(|t| {
+            let tensor = DeviceTensor::from_host(&host, &t).unwrap().into_inner();
+            let dft = SpparkDftKoalaBear::default();
+            let mut dst = Tensor::<Felt, _>::with_sizes_in([batch_size, d << log_blowup], t.clone());
+            // The GPU's clocks ramp up over the first iterations: the best of the last ten.
+            let mut best = f64::MAX;
+            for i in 0..20 {
+                t.synchronize_blocking().unwrap();
+                let start = std::time::Instant::now();
+                dft.coset_dft_into(
+                    tensor.as_view(),
+                    &mut dst,
+                    SP1Field::generator(),
+                    log_blowup,
+                    DftOrdering::BitReversed,
+                    1,
+                )
+                .unwrap();
+                t.synchronize_blocking().unwrap();
+                if i >= 10 {
+                    best = best.min(start.elapsed().as_secs_f64());
+                }
+            }
+            let out_bytes = (batch_size * (d << log_blowup) * 4) as f64;
+            println!(
+                "coset dft best: {:.2} ms, {:.1} GB/s of output",
+                best * 1e3,
+                out_bytes / best / 1e9
+            );
+        })
+        .unwrap();
     }
 }

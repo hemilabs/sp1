@@ -1,3 +1,4 @@
+#include "runtime/gpu_backend.cuh"
 #pragma once
 
 #ifdef __HIPCC__
@@ -51,8 +52,13 @@ __device__ __inline__ void BrentKungScan(
 
 template <typename T>
 __global__ void SingleBlockScan(T* d_out, T* d_in, size_t n) {
-    __shared__ alignas(T) char aux_raw[sizeof(T) * SECTION_SIZE];
+#ifdef SP1_SYCL
+    SP1_SHARED_ARRAY(T, aux_storage, [SECTION_SIZE]);
+    T* aux = aux_storage;
+#else
+    alignas(T) __shared__ char aux_raw[sizeof(T) * SECTION_SIZE];
     T* aux = reinterpret_cast<T*>(aux_raw);
+#endif
     size_t block_idx = blockIdx.x;
     size_t block_dim = blockDim.x;
     size_t thread_idx = threadIdx.x;
@@ -63,7 +69,7 @@ template <typename T>
 __global__ void
 Scan(T* d_out, T* d_in, size_t n, T* scan_values, uint32_t* BlockCounter, uint32_t* flags) {
     // Set up a global block_id to make contiguous blocks which are scheduled sequentially.
-    __shared__ size_t bid_s;
+    SP1_SHARED_VAR(size_t, bid_s);
     if (threadIdx.x == 0) {
         bid_s = atomicAdd(BlockCounter, 1);
     }
@@ -71,14 +77,23 @@ Scan(T* d_out, T* d_in, size_t n, T* scan_values, uint32_t* BlockCounter, uint32
     size_t bid = bid_s;
 
     // Peform a scan on the local block.
-    __shared__ alignas(T) char aux_raw[sizeof(T) * SECTION_SIZE];
+#ifdef SP1_SYCL
+    SP1_SHARED_ARRAY(T, aux_storage, [SECTION_SIZE]);
+    T* aux = aux_storage;
+#else
+    alignas(T) __shared__ char aux_raw[sizeof(T) * SECTION_SIZE];
     T* aux = reinterpret_cast<T*>(aux_raw);
+#endif
     BrentKungScan(d_out, d_in, aux, bid, blockDim.x, threadIdx.x, n);
 
     // Get the sum of the previous block, add it to the sum of the current block and broadcast it
     // to the next block.
-    __shared__ alignas(T) char previous_sum_raw[sizeof(T)];
+#ifdef SP1_SYCL
+    SP1_SHARED_VAR(T, previous_sum);
+#else
+    alignas(T) __shared__ char previous_sum_raw[sizeof(T)];
     T& previous_sum = *reinterpret_cast<T*>(previous_sum_raw);
+#endif
     if (threadIdx.x == 0) {
         // Wait for the previous flag.
         while (atomicAdd(&flags[bid], 0) == 0) {

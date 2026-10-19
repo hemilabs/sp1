@@ -77,10 +77,15 @@ impl Trace<TaskScope> {
 }
 
 pub struct CudaShardProverData<GC: IopCtx, Air: MachineAir<GC::F>> {
-    /// The preprocessed traces.
+    /// The preprocessed traces, followed by a proof's main traces while one runs.
     pub preprocessed_traces: JaggedTraceMle<Felt, TaskScope>,
     /// The pcs data for the preprocessed traces.
     pub preprocessed_data: JaggedProverData<GC, CudaStackedPcsProverData<GC>>,
+    /// The dense capacity a proof needs: the preprocessed traces plus room for the main ones.
+    full_trace_size: usize,
+    /// Whether this is a proving key kept between proofs, which then holds only its preprocessed
+    /// traces (see `shrink_to_preprocessed`).
+    persistent: bool,
     phantom: PhantomData<Air>,
 }
 
@@ -89,7 +94,69 @@ impl<GC: IopCtx, Air: MachineAir<GC::F>> CudaShardProverData<GC, Air> {
         preprocessed_traces: JaggedTraceMle<Felt, TaskScope>,
         preprocessed_data: JaggedProverData<GC, CudaStackedPcsProverData<GC>>,
     ) -> Self {
-        Self { preprocessed_traces, preprocessed_data, phantom: PhantomData }
+        let full_trace_size = preprocessed_traces.dense().dense.capacity();
+        Self {
+            preprocessed_traces,
+            preprocessed_data,
+            full_trace_size,
+            persistent: false,
+            phantom: PhantomData,
+        }
+    }
+
+    /// Makes this a key kept between proofs: its trace buffers shrink to the preprocessed traces
+    /// now and after each proof, and grow back to full size for the next (`grow_for_main`).
+    ///
+    /// The full-size buffers are the bulk of a key's device memory (a recursion key's are 2^27
+    /// elements plus a column index, about 768 MiB), and several keys stay alive at once: without
+    /// this the recursion keys alone held several GB from startup, which on a 16 GB card under
+    /// Windows' video memory budget pushed proving into shared system memory.
+    pub fn make_persistent(&mut self) {
+        self.persistent = true;
+        self.shrink_to_preprocessed();
+    }
+
+    /// After a proof: a persistent key drops its main traces and the room for them.
+    pub fn release_main_traces(&mut self) {
+        if self.persistent {
+            self.shrink_to_preprocessed();
+        }
+    }
+
+    fn shrink_to_preprocessed(&mut self) {
+        let JaggedMle { dense_data, col_index, column_heights, .. } =
+            &mut *self.preprocessed_traces;
+        let pre = dense_data.preprocessed_offset;
+        if dense_data.dense.capacity() == pre {
+            return;
+        }
+        let backend = dense_data.dense.backend().clone();
+        let mut dense = Buffer::with_capacity_in(pre, backend.clone());
+        dense.extend_from_device_slice(&dense_data.dense[..pre]).unwrap();
+        let mut cols = Buffer::with_capacity_in(pre >> 1, backend);
+        cols.extend_from_device_slice(&col_index[..pre >> 1]).unwrap();
+        dense_data.dense = dense;
+        *col_index = cols;
+        column_heights.truncate(dense_data.preprocessed_cols);
+        dense_data.main_table_index.clear();
+        dense_data.main_padding = 0;
+    }
+
+    /// Before a proof: the buffers at full size again, the preprocessed traces at their start.
+    fn grow_for_main(&mut self) {
+        let full = self.full_trace_size;
+        let JaggedMle { dense_data, col_index, .. } = &mut *self.preprocessed_traces;
+        if dense_data.dense.capacity() >= full {
+            return;
+        }
+        let pre = dense_data.preprocessed_offset;
+        let backend = dense_data.dense.backend().clone();
+        let mut dense = Buffer::with_capacity_in(full, backend.clone());
+        dense.extend_from_device_slice(&dense_data.dense[..pre]).unwrap();
+        let mut cols = Buffer::with_capacity_in(full >> 1, backend);
+        cols.extend_from_device_slice(&col_index[..pre >> 1]).unwrap();
+        dense_data.dense = dense;
+        *col_index = cols;
     }
 
     pub fn preprocessed_table_heights(&self) -> BTreeMap<String, usize> {
@@ -857,6 +924,7 @@ pub async fn main_tracegen<GC: IopCtx<F = Felt>, A: CudaTracegenAir<Felt>>(
     let permit =
         prover_permit.acquire().instrument(tracing::debug_span!("acquire permit")).await.unwrap();
     let mut jagged_traces = jagged_traces.lock().await;
+    jagged_traces.grow_for_main();
 
     // Now that the permit is acquired, we can begin the following two tasks:
     // - Copying host traces to the device.

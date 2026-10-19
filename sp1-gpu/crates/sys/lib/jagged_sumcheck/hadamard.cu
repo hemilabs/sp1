@@ -1,3 +1,4 @@
+#include "runtime/gpu_backend.cuh"
 /**
  * This is just a playground hadamard sumcheck. For example, some kernels don't work with padding,
  * etc. The hadamard kernels used in the actual Jagged Sumcheck are found in
@@ -37,7 +38,7 @@ SP1_KERNEL void hadamardSumAsPoly(
     }
 
     // Allocate shared memory
-    extern __shared__ unsigned char memory[];
+    SP1_EXTERN_SHARED(unsigned char, memory);
     EF* shared = reinterpret_cast<EF*>(memory);
 
     auto block = cg::this_thread_block();
@@ -116,7 +117,7 @@ SP1_KERNEL void hadamardFixLastVariableAndSumAsPoly(
 
 
     // Allocate shared memory
-    extern __shared__ unsigned char memory[];
+    SP1_EXTERN_SHARED(unsigned char, memory);
     EF* shared = reinterpret_cast<EF*>(memory);
 
     auto reduce_tile = cg::tiled_partition<32>(block);
@@ -133,17 +134,17 @@ SP1_KERNEL void hadamardFixLastVariableAndSumAsPoly(
 }
 
 extern "C" void* hadamard_sum_as_poly_base_ext_kernel() {
-    return (void*)hadamardSumAsPoly<felt_t, ext_t>;
+    return SP1_KERNEL_PTR(hadamardSumAsPoly<felt_t, ext_t>);
 }
 
 extern "C" void* hadamard_sum_as_poly_ext_ext_kernel() {
-    return (void*)hadamardSumAsPoly<ext_t, ext_t>;
+    return SP1_KERNEL_PTR(hadamardSumAsPoly<ext_t, ext_t>);
 }
 
 extern "C" void* hadamard_fix_last_variable_and_sum_as_poly_base_ext_kernel() {
-    return (void*)hadamardFixLastVariableAndSumAsPoly<felt_t, ext_t>;
+    return SP1_KERNEL_PTR(hadamardFixLastVariableAndSumAsPoly<felt_t, ext_t>);
 }
 
 extern "C" void* hadamard_fix_last_variable_and_sum_as_poly_ext_ext_kernel() {
-    return (void*)hadamardFixLastVariableAndSumAsPoly<ext_t, ext_t>;
+    return SP1_KERNEL_PTR(hadamardFixLastVariableAndSumAsPoly<ext_t, ext_t>);
 }

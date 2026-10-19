@@ -10,12 +10,22 @@
 #include <vector>
 #include <cstring>
 #include <algorithm>
-#include <omp.h>
+#include <thread>
 #include "fields/bn254_t.cuh"
 #include "fields/alt_bn128.hpp"
 #include "runtime/exception.cuh"
 
 using fr_t = bn254_t;
+
+// Runs f(0) .. f(n - 1) on n threads and waits for them (std::thread rather than OpenMP: the
+// Windows HIP SDK has no OpenMP runtime).
+template <typename F>
+static void run_threads(int n, F f) {
+    std::vector<std::thread> threads;
+    threads.reserve(n);
+    for (int tid = 0; tid < n; tid++) threads.emplace_back(f, tid);
+    for (auto& t : threads) t.join();
+}
 
 // ============================================================
 // GPU Kernels
@@ -408,9 +418,7 @@ struct TwiddleCache {
                 // tw[start] = omega_stage^start = omega_stage^(chunk_size * t).
                 int num_threads = 32;  // match typical CPU core count
                 uint32_t chunk = (half + num_threads - 1) / num_threads;
-                #pragma omp parallel num_threads(num_threads)
-                {
-                    int tid = omp_get_thread_num();
+                run_threads(num_threads, [&](int tid) {
                     uint32_t start = tid * chunk;
                     uint32_t end = std::min(start + chunk, half);
                     if (start < half) {
@@ -429,7 +437,7 @@ struct TwiddleCache {
                             tw = tw * omega_stage;
                         }
                     }
-                }
+                });
             }
             // Cache host data for fast re-upload after GPU-side clear
             h_twiddles[s] = std::move(h_tw);
@@ -669,9 +677,7 @@ void bn254_ntt_precompute_host(uint32_t lg_n, bool inverse) {
         } else {
             int num_threads = 32;
             uint32_t chunk = (half + num_threads - 1) / num_threads;
-            #pragma omp parallel num_threads(num_threads)
-            {
-                int tid = omp_get_thread_num();
+            run_threads(num_threads, [&](int tid) {
                 uint32_t start = tid * chunk;
                 uint32_t end = std::min(start + chunk, half);
                 if (start < half) {
@@ -688,7 +694,7 @@ void bn254_ntt_precompute_host(uint32_t lg_n, bool inverse) {
                         tw = tw * omega_stage;
                     }
                 }
-            }
+            });
         }
         cache.h_twiddles[s] = std::move(h_tw);
     }

@@ -7173,6 +7173,7 @@ dependencies = [
  "sp1-primitives",
  "sp1-prover",
  "sp1-prover-types",
+ "sp1-recursion-gnark-ffi",
  "sysinfo 0.31.4",
  "tracing",
 ]

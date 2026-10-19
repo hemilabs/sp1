@@ -1,3 +1,4 @@
+#include "runtime/gpu_backend.cuh"
 #include "mle/fixlastvariable.cuh"
 #include "config.cuh"
 #include "mle/fixlastvariable.cuh"
@@ -34,21 +35,32 @@ __global__ void fixLastVariable(
 }
 
 extern "C" void* fix_last_variable_felt_ext_kernel() {
-    return (void*)fixLastVariable<felt_t, ext_t>;
+    return SP1_KERNEL_PTR(fixLastVariable<felt_t, ext_t>);
 }
 
-extern "C" void* fix_last_variable_ext_ext_kernel() { return (void*)fixLastVariable<ext_t, ext_t>; }
+extern "C" void* fix_last_variable_ext_ext_kernel() { return SP1_KERNEL_PTR(fixLastVariable<ext_t, ext_t>); }
 
 
 
-template <typename F, typename EF>
+template <typename EF>
+__device__ __forceinline__ EF loadFixAlpha(EF alpha) {
+    return alpha;
+}
+template <typename EF>
+__device__ __forceinline__ EF loadFixAlpha(const EF* alpha) {
+    return *alpha;
+}
+
+// Alpha by value, or (Alpha = const EF*) read from device memory.
+template <typename F, typename EF, typename Alpha = EF>
 __global__ void fixLastVariableConstantPadding(
     const F* input,
     EF* __restrict__ output,
     F paddingValue,
-    EF alpha,
+    Alpha alphaArg,
     size_t inputHeight,
     size_t width) {
+    const EF alpha = loadFixAlpha<EF>(alphaArg);
     size_t outputHeight = (inputHeight + 1) >> 1;
     bool padding = inputHeight & 1;
     for (size_t j = blockDim.y * blockIdx.y + threadIdx.y; j < width; j += blockDim.y * gridDim.y) {
@@ -105,13 +117,18 @@ __global__ void fixLastVariableZeroPadding(
 
 
 extern "C" void* mle_fix_last_variable_koala_bear_base_extension_constant_padding() {
-    return (void*)fixLastVariableConstantPadding<kb31_t, kb31_extension_t>;
+    return SP1_KERNEL_PTR(fixLastVariableConstantPadding<kb31_t, kb31_extension_t>);
 }
 
 extern "C" void* mle_fix_last_variable_koala_bear_ext_ext_constant_padding() {
-    return (void*)fixLastVariableConstantPadding<kb31_extension_t, kb31_extension_t>;
+    return SP1_KERNEL_PTR(fixLastVariableConstantPadding<kb31_extension_t, kb31_extension_t>);
+}
+
+extern "C" void* mle_fix_last_variable_koala_bear_ext_ext_constant_padding_dev() {
+    return SP1_KERNEL_PTR(
+        fixLastVariableConstantPadding<kb31_extension_t, kb31_extension_t, const kb31_extension_t*>);
 }
 
 extern "C" void* mle_fix_last_variable_koala_bear_ext_ext_zero_padding() {
-    return (void*)fixLastVariableZeroPadding<kb31_extension_t, kb31_extension_t>;
+    return SP1_KERNEL_PTR(fixLastVariableZeroPadding<kb31_extension_t, kb31_extension_t>);
 }

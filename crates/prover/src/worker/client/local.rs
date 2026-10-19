@@ -79,6 +79,23 @@ impl LocalWorkerClient {
         (Self { inner: Arc::new(inner) }, channels)
     }
 
+    /// Queue a task that failed with a retryable error again, under its original id, so that
+    /// whoever waits on that id sees the retry's outcome.
+    pub async fn retry_task(
+        &self,
+        task_id: TaskId,
+        kind: TaskType,
+        task: RawTaskRequest,
+    ) -> anyhow::Result<()> {
+        if !self.inner.db.read().await.contains_key(&task_id) {
+            anyhow::bail!("task does not exist");
+        }
+        self.inner.input_task_queues[&kind]
+            .send((task_id, task))
+            .await
+            .map_err(|e| anyhow::anyhow!("failed to send task of kind {:?} to queue: {e}", kind))
+    }
+
     pub async fn update_task_status(
         &self,
         task_id: TaskId,

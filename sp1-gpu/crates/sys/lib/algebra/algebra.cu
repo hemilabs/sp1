@@ -1,3 +1,4 @@
+#include "runtime/gpu_backend.cuh"
 #include <cstdint>
 #include "algebra/algebra.cuh"
 
@@ -18,20 +19,20 @@ __global__ void addAssignKernel(T* a, T b, size_t n) {
     }
 }
 
-extern "C" void* addKernelu32Ptr() { return (void*)addKernel<uint32_t, uint32_t>; }
+extern "C" void* addKernelu32Ptr() { return SP1_KERNEL_PTR(addKernel<uint32_t, uint32_t>); }
 
-extern "C" void* add_koala_bear_kernel() { return (void*)addKernel<kb31_t, kb31_t>; }
+extern "C" void* add_koala_bear_kernel() { return SP1_KERNEL_PTR(addKernel<kb31_t, kb31_t>); }
 
 extern "C" void* add_koala_bear_ext_ext_kernel() {
-    return (void*)addKernel<kb31_extension_t, kb31_extension_t>;
+    return SP1_KERNEL_PTR(addKernel<kb31_extension_t, kb31_extension_t>);
 }
 
 extern "C" void* add_koala_bear_base_ext_kernel() {
-    return (void*)addKernel<kb31_extension_t, kb31_t>;
+    return SP1_KERNEL_PTR(addKernel<kb31_extension_t, kb31_t>);
 }
 
-extern "C" void* add_assign_koala_bear_kernel() { return (void*)addAssignKernel<kb31_t>; }
+extern "C" void* add_assign_koala_bear_kernel() { return SP1_KERNEL_PTR(addAssignKernel<kb31_t>); }
 
 extern "C" void* add_assign_koala_bear_ext_kernel() {
-    return (void*)addAssignKernel<kb31_extension_t>;
+    return SP1_KERNEL_PTR(addAssignKernel<kb31_extension_t>);
 }

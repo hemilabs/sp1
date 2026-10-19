@@ -51,15 +51,21 @@ pub fn local_gpu_opts() -> (SP1CoreOpts, bool) {
     // `PADDED_ELEMENT_THRESHOLD`, so a value ABOVE the constant produces a shape the circuit cannot
     // accept; a lower one stays inside the enumerated set, which is what every shipped tier already
     // relies on. A larger request is therefore clamped rather than honoured, and said out loud.
-    let env_threshold = std::env::var("SP1_GPU_ELEMENT_THRESHOLD")
-        .ok()
-        .and_then(|v| v.trim().parse::<u64>().ok());
-    let tier_threshold = if gpu_memory_gb <= 20 {
-        // 16GB GPUs (e.g. RX 9070 XT): ~134M elements per shard to fit in VRAM.
-        ELEMENT_THRESHOLD - (1 << 28)
-    } else {
-        ELEMENT_THRESHOLD
-    };
+    let env_threshold =
+        std::env::var("SP1_GPU_ELEMENT_THRESHOLD").ok().and_then(|v| v.trim().parse::<u64>().ok());
+    let tier_threshold =
+        if gpu_memory_gb <= 20 && cfg!(windows) && sp1_gpu_cudart::sys::BACKEND == "hip" {
+            // 16GB AMD GPUs on Windows: the video memory budget Windows grants a process is ~12.5 GB of
+            // the 16, and past it WDDM moves allocations into shared system memory rather than failing
+            // them, which slowed every kernel touching them (an RX 9070 XT proved a 144M-cycle program in
+            // 15-17 s at the tier below and 12.7-13.5 s at this one).
+            1 << 26
+        } else if gpu_memory_gb <= 20 {
+            // 16GB GPUs (e.g. RX 9070 XT): ~134M elements per shard to fit in VRAM.
+            ELEMENT_THRESHOLD - (1 << 28)
+        } else {
+            ELEMENT_THRESHOLD
+        };
 
     // The override is a CAP on the tier's choice, never a replacement for it.
     //
@@ -98,6 +104,24 @@ pub fn local_gpu_opts() -> (SP1CoreOpts, bool) {
 
 /// Create a [SP1CudaProverWorkerBuilder]
 pub async fn cuda_worker_builder(scope: TaskScope) -> SP1WorkerBuilder<SP1CudaProverComponents> {
+    // gnark's Groth16 prover runs its quotient polynomial and MSMs on this GPU where the build has
+    // them (HIP and SYCL; SP1_GROTH16_GPU=0 keeps them on the CPU).
+    if let Some((compute_h, msm_g1, msm_g2)) = sp1_gpu_cudart::sys::groth16_entry_points() {
+        sp1_recursion_gnark_ffi::ffi::set_groth16_gpu_hooks(compute_h, msm_g1, msm_g2);
+    }
+
+    // The wrap prover keeps its proving key between Groth16/PLONK proofs (sp1-prover's WrapProver)
+    // where the card has the memory for it: on a 32 GB Arc Pro B70 that saves ~3 s a proof, while
+    // on a 16 GB Radeon RX 9070 XT the key's memory slowed the rest of each proof by more (19 s ->
+    // 25 s). SP1_WRAP_PERSISTENT_PK set by the user decides either way.
+    if std::env::var_os("SP1_WRAP_PERSISTENT_PK").is_none() {
+        if let Ok((_, total)) = sp1_gpu_cudart::cuda_memory_info() {
+            if total < 24 << 30 {
+                std::env::set_var("SP1_WRAP_PERSISTENT_PK", "0");
+            }
+        }
+    }
+
     // Create a prover permits, assuming a single proof happens at a time.
     let prover_permits = ProverSemaphore::new(1);
 
@@ -114,8 +138,14 @@ pub async fn cuda_worker_builder(scope: TaskScope) -> SP1WorkerBuilder<SP1CudaPr
 
     let core_verifier = SP1CudaProverComponents::core_verifier();
     let core_prover = Arc::new(
-        new_cuda_prover(core_verifier.clone(), num_elts, num_workers, recompute_first_layer, scope.clone())
-            .await,
+        new_cuda_prover(
+            core_verifier.clone(),
+            num_elts,
+            num_workers,
+            recompute_first_layer,
+            scope.clone(),
+        )
+        .await,
     );
 
     // TODO: tune this more precisely and make it a constant.
@@ -163,7 +193,7 @@ pub async fn cuda_worker_builder(scope: TaskScope) -> SP1WorkerBuilder<SP1CudaPr
             recompute_first_layer,
             scope.clone(),
         )
-            .await,
+        .await,
     );
 
     let wrap_verifier = SP1CudaProverComponents::wrap_verifier();
@@ -175,7 +205,7 @@ pub async fn cuda_worker_builder(scope: TaskScope) -> SP1WorkerBuilder<SP1CudaPr
             recompute_first_layer,
             scope.clone(),
         )
-            .await,
+        .await,
     );
 
     SP1WorkerBuilder::new()

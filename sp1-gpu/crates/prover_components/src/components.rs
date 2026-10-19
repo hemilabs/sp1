@@ -77,6 +77,9 @@ where
     let mut cache = BTreeMap::new();
     for chip in machine.chips() {
         let result = codegen_cuda_eval(chip.air.as_ref());
+        if let Ok(path) = std::env::var("SP1_GPU_EVAL_DUMP") {
+            dump_eval_program(&path, chip.air.name(), &result.1, &result.2);
+        }
         cache.insert(chip.air.name().to_string(), result);
     }
 
@@ -120,4 +123,28 @@ where
         recompute_first_layer,
         recompute_first_layer,
     )
+}
+
+/// Appends a chip's evaluation programs to `path`, one JSON line per block: the input of
+/// sp1-gpu-sys's `scripts/gen_zerocheck_eval.py`, which generates the straight-line evaluators
+/// in `include/zerocheck/zerocheck_generated.cuh` (SP1_GPU_EVAL_DUMP=<path>).
+fn dump_eval_program(
+    path: &str,
+    chip: &str,
+    operations: &[sp1_gpu_air::instruction::Instruction16],
+    block_indices: &[u32],
+) {
+    use std::io::Write;
+    let mut out = String::new();
+    for (block, &start) in block_indices.iter().enumerate() {
+        let end = block_indices.get(block + 1).map_or(operations.len(), |&e| e as usize);
+        let ops = operations[start as usize..end]
+            .iter()
+            .map(|i| format!("[{},{},{},{},{},{}]", i.opcode, i.b_variant, i.c_variant, i.a, i.b, i.c))
+            .collect::<Vec<_>>()
+            .join(",");
+        out.push_str(&format!("{{\"chip\":\"{chip}\",\"block\":{block},\"ops\":[{ops}]}}\n"));
+    }
+    let mut file = std::fs::OpenOptions::new().create(true).append(true).open(path).unwrap();
+    file.write_all(out.as_bytes()).unwrap();
 }

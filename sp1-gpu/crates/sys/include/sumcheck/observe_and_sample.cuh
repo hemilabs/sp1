@@ -151,6 +151,55 @@ __global__ __launch_bounds__(256) void sumcheckObserveAndSampleQuadratic(
     next_claim_out[0] = result;
 }
 
+/// The quadratic round with its state on the device, so that a hadamard sumcheck's rounds run
+/// with no host round trip (the next round's fix reads `alpha_out` through a pointer).
+///   evals      - [in]     the round's reduced evaluations [eval_zero, eval_half * 4]
+///   alpha_out  - [out]    the sampled alpha
+///   claim_io   - [in/out] the round's claim; afterwards the next round's, p(alpha)
+///   evals_out  - [out]    a copy of `evals`, for the proof's polynomials (read back at the end)
+/// The interpolation through (0, e0), (1, e1 = claim - e0) and (1/2, raw / 4) is closed-form:
+/// c0 = e0, c2 = 2 (e0 + e1) - raw, c1 = e1 - e0 - c2.
+template <typename F, typename EF, typename Challenger>
+__global__ __launch_bounds__(256) void sumcheckObserveAndSampleQuadraticDevice(
+    const EF* __restrict__ evals,
+    Challenger challenger,
+    EF* __restrict__ alpha_out,
+    EF* __restrict__ claim_io,
+    EF* __restrict__ evals_out) {
+    // A DuplexChallenger runs on 16 lanes (permuteCoop); the launch gives the kernel 16 threads,
+    // which compute the same values, and lane 0 writes them.
+    constexpr unsigned LANES = Challenger::COOPERATIVE ? 16 : 1;
+    if (blockIdx.x != 0 || threadIdx.x >= LANES) return;
+    const bool writer = threadIdx.x == 0;
+    auto ch = challenger.localize_coop();
+
+    const EF claim = claim_io[0];
+    const EF e0 = evals[0];
+    const EF raw = evals[1];
+    const EF e1 = claim - e0;
+    EF coefficients[3];
+    coefficients[0] = e0;
+    coefficients[2] = (e0 + e1) + (e0 + e1) - raw;
+    coefficients[1] = e1 - e0 - coefficients[2];
+
+    ch.observe_ext(&coefficients[0]);
+    ch.observe_ext(&coefficients[1]);
+    ch.observe_ext(&coefficients[2]);
+    EF alpha = ch.sample_ext();
+    if (!writer) return;
+    challenger.store_coop(ch);
+    alpha_out[0] = alpha;
+    evals_out[0] = e0;
+    evals_out[1] = raw;
+
+    EF result(coefficients[2]);
+    result *= alpha;
+    result += coefficients[1];
+    result *= alpha;
+    result += coefficients[0];
+    claim_io[0] = result;
+}
+
 /// Lagrange interpolation through 4 points to get degree-3 polynomial coefficients.
 /// Given points (x0, y0), (x1, y1), (x2, y2), (x3, y3), computes coefficients [c0, c1, c2, c3]
 /// such that p(x) = c0 + c1*x + c2*x^2 + c3*x^3.
@@ -342,6 +391,98 @@ __global__ __launch_bounds__(256) void sumcheckObserveAndSampleCubic(
 
     // Step 13: Write next_claim
     next_claim_out[0] = result;
+}
+
+/// The cubic round with its state kept on the device, so that a LogUp-GKR layer's rounds run with
+/// no host round trip (the rounds that follow read `alpha_out` through a pointer).
+///
+///   evals         - [in]     the round's reduced evaluations [eval_zero, eval_half, eq_sum]
+///   state         - [in/out] [claim, padding_adjustment, eq_adjustment]: as the host-side round
+///                            functions would carry them; after the round, the next round's
+///   alpha_out     - [out]    the sampled alpha
+///   coeffs_out    - [out]    the round polynomial's 4 coefficients (for the proof)
+///   point_last    - [in]     the last coordinate of the round's point
+///   switch_to_eq  - [in]     the next fold is the last circuit layer's: afterwards
+///                            eq_adjustment = padding_adjustment and padding_adjustment = 1
+/// The round polynomial's coefficients as a linear map of (eval_zero, eval_one, eval_half):
+/// coefficient k = m[3k] eval_zero + m[3k + 1] eval_one + m[3k + 2] eval_half. The interpolation
+/// through (0, eval_zero), (1, eval_one), (1/2, eval_half / 8) and (b, 0), b = (1 - point_last) /
+/// (1 - 2 point_last), depends on the point alone, and the host computes it (cubic_basis in
+/// sp1-gpu-logup-gkr): a lone GPU thread would spend most of the round on its inversions.
+template <typename EF>
+struct CubicBasis {
+    EF m[12];
+};
+
+template <typename F, typename EF, typename Challenger>
+__global__ __launch_bounds__(256) void sumcheckObserveAndSampleCubicDevice(
+    const EF* __restrict__ evals,
+    Challenger challenger,
+    EF* __restrict__ state,
+    EF* __restrict__ alpha_out,
+    EF* __restrict__ coeffs_out,
+    EF point_last,
+    int switch_to_eq,
+    CubicBasis<EF> basis) {
+    // A DuplexChallenger runs on 16 lanes (permuteCoop); the launch gives the kernel 16 threads,
+    // which compute the same values, and lane 0 writes them.
+    constexpr unsigned LANES = Challenger::COOPERATIVE ? 16 : 1;
+    if (blockIdx.x != 0 || threadIdx.x >= LANES) return;
+    const bool writer = threadIdx.x == 0;
+    auto ch = challenger.localize_coop();
+
+    const EF claim = state[0];
+    const EF padding_adjustment = state[1];
+    const EF eq_adjustment = state[2];
+
+    EF eval_zero = evals[0];
+    EF eval_half = evals[1];
+    EF eq_sum = evals[2];
+    EF eq_correction_term = padding_adjustment - eq_sum;
+    EF one = EF::one();
+    eval_zero += eq_correction_term * (one - point_last);
+    EF four = EF(F(4));
+    eval_half += eq_correction_term * four;
+    eval_zero = eval_zero * eq_adjustment;
+    eval_half = eval_half * eq_adjustment;
+    EF eval_one = claim - eval_zero;
+
+    EF coefficients[4];
+    for (int k = 0; k < 4; k++) {
+        coefficients[k] = basis.m[3 * k] * eval_zero + basis.m[3 * k + 1] * eval_one +
+                          basis.m[3 * k + 2] * eval_half;
+    }
+
+    ch.observe_ext(&coefficients[0]);
+    ch.observe_ext(&coefficients[1]);
+    ch.observe_ext(&coefficients[2]);
+    ch.observe_ext(&coefficients[3]);
+    EF alpha = ch.sample_ext();
+    if (!writer) return;
+    challenger.store_coop(ch);
+    alpha_out[0] = alpha;
+    for (int i = 0; i < 4; i++) coeffs_out[i] = coefficients[i];
+
+    EF next_claim(coefficients[3]);
+    next_claim *= alpha;
+    next_claim += coefficients[2];
+    next_claim *= alpha;
+    next_claim += coefficients[1];
+    next_claim *= alpha;
+    next_claim += coefficients[0];
+
+    // The next fold removes this round's last coordinate and scales the padding adjustment by
+    // eq(point_last, alpha), as fix_and_sum_materialized_round_raw does on the host.
+    EF next_padding =
+        padding_adjustment * (point_last * alpha + (one - point_last) * (one - alpha));
+    EF next_eq = eq_adjustment;
+    if (switch_to_eq) {
+        next_eq = next_padding;
+        next_padding = one;
+    }
+    state[0] = next_claim;
+    state[1] = next_padding;
+    state[2] = next_eq;
 }
 
 /// Lagrange interpolation through 5 points to get degree-4 polynomial coefficients.

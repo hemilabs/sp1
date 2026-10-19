@@ -1,3 +1,4 @@
+#include "runtime/gpu_backend.cuh"
 #include "config.cuh"
 #include "sum_and_reduce/reduce.cuh"
 #include "runtime/gpu_compat.cuh"
@@ -18,7 +19,7 @@ __global__ void reduceKernel(F* input, F* output, size_t width, size_t height) {
     auto tile = cg::tiled_partition<32>(block);
 
     // Allocate shared memory
-    extern __shared__ unsigned char memory[];
+    SP1_EXTERN_SHARED(unsigned char, memory);
     F* shared = reinterpret_cast<F*>(memory);
 
     // Stride loop on columns
