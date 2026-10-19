@@ -178,20 +178,85 @@ impl Drop for StagedUpload {
     }
 }
 
+/// A cache of device data that can be rebuilt, emptied when device memory runs low.
+///
+/// Like staged uploads, cached data only uses device memory the rest of the process does not:
+/// it is left out of the peak that [`UploadStream::upload`] checks, and an allocation that would
+/// take the live device memory above the upload limit, or that runs out of device memory, first
+/// empties the caches (see [`register_device_cache`]).
+pub trait DeviceCache: Send + Sync {
+    /// Drops what the cache holds. Called inside device allocations, so it must not allocate.
+    /// With `wait`, also waits until the memory is back in the pool. Returns whether anything
+    /// was dropped.
+    fn release(&self, wait: bool) -> bool;
+}
+
+/// The registered device caches.
+static CACHES: Mutex<Vec<Weak<dyn DeviceCache>>> = Mutex::new(Vec::new());
+/// The device bytes the registered caches hold (kept up to date by the caches).
+static CACHED_BYTES: AtomicU64 = AtomicU64::new(0);
+
+/// Registers a cache to empty when device memory runs low.
+pub fn register_device_cache(cache: Weak<dyn DeviceCache>) {
+    let mut caches = CACHES.lock().unwrap_or_else(|e| e.into_inner());
+    caches.retain(|c| c.strong_count() > 0);
+    caches.push(cache);
+}
+
+/// The device bytes held by caches (see [`DeviceCache`]).
+pub fn device_cache_bytes() -> u64 {
+    CACHED_BYTES.load(Ordering::Relaxed)
+}
+
+/// Records that a cache now holds `bytes` more device bytes.
+pub fn add_device_cache_bytes(bytes: u64) {
+    CACHED_BYTES.fetch_add(bytes, Ordering::Relaxed);
+}
+
+/// Records that a cache released `bytes` device bytes.
+pub fn sub_device_cache_bytes(bytes: u64) {
+    CACHED_BYTES.fetch_sub(bytes, Ordering::Relaxed);
+}
+
+/// Empties the registered caches. Returns whether anything was dropped.
+pub(crate) fn release_device_caches(wait: bool) -> bool {
+    let caches: Vec<Arc<dyn DeviceCache>> = {
+        let caches = CACHES.lock().unwrap_or_else(|e| e.into_inner());
+        caches.iter().filter_map(Weak::upgrade).collect()
+    };
+    let mut released = false;
+    for cache in caches {
+        released |= cache.release(wait);
+    }
+    if released {
+        tracing::debug!(wait, "device memory low: released device caches");
+    }
+    released
+}
+
 /// Called after a device allocation, with the live device memory including it.
 pub(crate) fn note_live_bytes(live: u64) {
-    let unstaged = live.saturating_sub(STAGED_BYTES.load(Ordering::Relaxed));
+    let unstaged = live
+        .saturating_sub(STAGED_BYTES.load(Ordering::Relaxed))
+        .saturating_sub(CACHED_BYTES.load(Ordering::Relaxed));
     UNSTAGED_PEAK.fetch_max(unstaged, Ordering::Relaxed);
 }
 
-/// Called before a device allocation of `size` bytes: if staged uploads hold memory and the
-/// allocation would take the live device memory above the limit, frees them (see
-/// [`StagedUpload`]).
+/// Called before a device allocation of `size` bytes: if staged uploads or caches hold memory
+/// and the allocation would take the live device memory above the limit, frees them (see
+/// [`StagedUpload`] and [`DeviceCache`]).
 pub(crate) fn make_room_for(size: u64) {
-    if STAGED_BYTES.load(Ordering::Relaxed) > 0
+    let staged = STAGED_BYTES.load(Ordering::Relaxed);
+    let cached = CACHED_BYTES.load(Ordering::Relaxed);
+    if (staged > 0 || cached > 0)
         && crate::vram_current_bytes() + size > STAGED_LIMIT.load(Ordering::Relaxed)
     {
-        reclaim_staged_uploads(false);
+        if staged > 0 {
+            reclaim_staged_uploads(false);
+        }
+        if cached > 0 {
+            release_device_caches(false);
+        }
     }
 }
 

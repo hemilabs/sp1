@@ -1,3 +1,4 @@
+use crate::prep_cache::{prep_cache_keeps_codeword, PrepCache, PrepEntry};
 use crate::{MainTraceData, ShardData};
 use slop_algebra::AbstractField;
 use slop_alloc::{Buffer, HasBackend};
@@ -19,7 +20,8 @@ use sp1_gpu_cudart::{DeviceMle, DevicePoint, TaskScope};
 use sp1_gpu_jagged_assist::prove_jagged_evaluation_sync;
 use sp1_gpu_jagged_sumcheck::{generate_jagged_sumcheck_poly, jagged_sumcheck};
 use sp1_gpu_jagged_tracegen::{
-    full_tracegen_permit, main_tracegen_permit, CudaShardProverData, TracePrefetcher,
+    copy_preprocessed_traces, full_tracegen_permit, main_tracegen_permit, CudaShardProverData,
+    TracePrefetcher,
 };
 use sp1_gpu_logup_gkr::{prove_logup_gkr, CudaLogUpGkrOptions, Interactions};
 use sp1_gpu_merkle_tree::{CudaTcsProver, SingleLayerMerkleTreeProverError};
@@ -32,7 +34,7 @@ use sp1_hypercube::{
     prover::{AirProver, PreprocessedData, ProverPermit, ProverSemaphore, ProvingKey},
     Machine, MachineVerifyingKey, ShardProof,
 };
-use sp1_hypercube::{SP1PcsProof, ShardContextImpl};
+use sp1_hypercube::{septic_digest::SepticDigest, SP1PcsProof, ShardContextImpl};
 use std::collections::{BTreeMap, BTreeSet};
 use std::iter::once;
 use std::vec;
@@ -149,6 +151,7 @@ impl<GC: IopCtx<F = Felt, EF = Ext>, PC: CudaShardProverComponents<GC>> CudaShar
             let chip_set: BTreeSet<_> = machine.chips().iter().cloned().collect();
             Arc::new(upload_machine_bytecode(&chip_set, ChunkBudget::recommended(), &backend))
         };
+        let prep_cache = PrepCache::new(backend.clone());
         Self {
             inner: Arc::new(CudaShardProverInner {
                 trace_buffers,
@@ -162,6 +165,7 @@ impl<GC: IopCtx<F = Felt, EF = Ext>, PC: CudaShardProverComponents<GC>> CudaShar
                 recompute_first_layer,
                 drop_ldes,
                 trace_prefetcher: TracePrefetcher::new(),
+                prep_cache,
                 _marker: PhantomData,
             }),
         }
@@ -220,6 +224,8 @@ pub(crate) struct CudaShardProverInner<GC: IopCtx, PC: CudaShardProverComponents
     pub drop_ldes: bool,
     /// Uploads the next shard's host traces while a shard is proved (`None` if disabled).
     pub trace_prefetcher: Option<TracePrefetcher>,
+    /// The preprocessed data of the programs set up last (`None` if disabled).
+    pub(crate) prep_cache: Option<Arc<PrepCache<GC, PC::Air>>>,
     pub _marker: PhantomData<GC>,
 }
 
@@ -312,14 +318,21 @@ where
                 .unwrap()
         };
 
+        let prep_cache = self.inner.prep_cache.as_ref();
+        let cached = prep_cache.and_then(|c| c.get(&program, &initial_global_cumulative_sum));
+        // Kept to cache the program's preprocessed data after the proof.
+        let cache_program = (cached.is_none() && prep_cache.is_some()).then(|| program.clone());
+
         let buffer = self.inner.get_buffer().await;
 
         let record = Arc::new(record);
 
-        // Generate trace.
+        // Generate trace. If the program's preprocessed traces and commitment are cached, the
+        // traces are copied on the device instead of being generated and committed again.
         let (public_values, trace_data, chip_set, permit) = full_tracegen_permit(
             self.machine(),
             program,
+            cached.as_ref().map(|entry| &entry.traces),
             record,
             &buffer,
             self.inner.max_trace_size,
@@ -329,26 +342,33 @@ where
             prover_permits,
             true,
         )
-        .instrument(tracing::debug_span!("generate all traces"))
+        .instrument(tracing::debug_span!("generate all traces", cached = cached.is_some()))
         .await;
 
-        let inner = self.inner.clone();
-        let (pk, vk) = tokio::task::spawn_blocking({
-            let span = tracing::debug_span!("setup_from_preprocessed_data_and_traces");
-            move || {
-                under_permit(|| {
-                    let _guard = span.enter();
-                    inner.setup_from_preprocessed_data_and_traces(
-                        pc_start,
-                        initial_global_cumulative_sum,
-                        trace_data,
-                        untrusted_config,
-                    )
-                })
-            }
-        })
-        .await
-        .unwrap();
+        let (pk, vk) = if let Some(entry) = &cached {
+            (
+                CudaShardProverData::from_shared(entry.shared.clone(), vec![trace_data]),
+                entry.vk.clone(),
+            )
+        } else {
+            let inner = self.inner.clone();
+            tokio::task::spawn_blocking({
+                let span = tracing::debug_span!("setup_from_preprocessed_data_and_traces");
+                move || {
+                    under_permit(|| {
+                        let _guard = span.enter();
+                        inner.setup_from_preprocessed_data_and_traces(
+                            pc_start,
+                            initial_global_cumulative_sum,
+                            trace_data,
+                            untrusted_config,
+                        )
+                    })
+                }
+            })
+            .await
+            .unwrap()
+        };
 
         let trace_data = Mutex::new(pk);
 
@@ -367,7 +387,7 @@ where
         let trace_buffer = pool.pop().await.expect("acquire trace buffer from setup pool");
 
         let main_trace_data = MainTraceData {
-            traces: pk,
+            traces: pk.clone(),
             public_values,
             shard_chips: chip_set,
             permit,
@@ -397,6 +417,17 @@ where
         // tracing::debug_span!("prove shard with data")
         //     .in_scope(|| self.prove_shard_with_data(shard_data, challenger));
         drop(buffer);
+
+        if let (Some(program), Some(cache)) = (cache_program, prep_cache) {
+            self.cache_prep_entry(
+                cache,
+                program,
+                initial_global_cumulative_sum,
+                &vk,
+                &pk.preprocessed_data,
+            )
+            .await;
+        }
 
         (vk, shard_proof, permit)
     }
@@ -467,6 +498,54 @@ where
         // suffices — no need to reach into a trace buffer.
         let preprocessed_data = pk.preprocessed_data.lock().await;
         preprocessed_data.preprocessed_table_heights().clone()
+    }
+}
+
+impl<GC: IopCtx<F = Felt, EF = Ext>, PC: CudaShardProverComponents<GC>> CudaShardProver<GC, PC>
+where
+    GC::Challenger: DeviceGrindingChallenger<Witness = GC::F>,
+    GC::Challenger: slop_challenger::FieldChallenger<
+        <GC::Challenger as slop_challenger::GrindingChallenger>::Witness,
+    >,
+    SP1PcsProof<GC>: Into<<PC::C as MultilinearPcsVerifier<GC>>::Proof>,
+    TaskScope: sp1_gpu_jagged_assist::BranchingProgramKernel<GC::F, GC::EF, PC::DeviceChallenger>,
+{
+    /// Caches the preprocessed data of `program`, which `data` was just set up from and proved a
+    /// shard with (see [`PrepCache`]).
+    async fn cache_prep_entry(
+        &self,
+        cache: &PrepCache<GC, PC::Air>,
+        program: Arc<<PC::Air as MachineAir<GC::F>>::Program>,
+        initial_global_cumulative_sum: SepticDigest<GC::F>,
+        vk: &MachineVerifyingKey<GC>,
+        data: &Mutex<CudaShardProverData<GC, PC::Air>>,
+    ) {
+        let (shared, pool) = {
+            let data = data.lock().await;
+            (data.shared.clone(), data.trace_buffer_pool.clone())
+        };
+        let traces = pool.pop().await.expect("trace buffer of a proved shard");
+        let dense = traces.dense();
+        let traces_bytes = (dense.preprocessed_offset * std::mem::size_of::<Felt>()
+            + ((dense.preprocessed_offset >> 1) + 2 * dense.preprocessed_cols + 1)
+                * std::mem::size_of::<u32>()) as u64;
+        if dense.preprocessed_offset == 0 || !cache.admits(traces_bytes) {
+            return;
+        }
+        // Ordered on the prover's stream after the shard's proof, which leaves the preprocessed
+        // part of its traces as they were set up.
+        let traces = copy_preprocessed_traces(&traces, &self.inner.backend);
+        // The codeword is most of the data (the traces at the FRI blowup, ~2.7x the cached traces
+        // of a normalize program) and cheap to encode again when basefold opens it, unlike its
+        // Merkle tree; `SP1_GPU_PREP_CACHE_CODEWORD=1` keeps it.
+        let shared =
+            if prep_cache_keeps_codeword() { shared } else { Arc::new(shared.without_codeword()) };
+        let entry =
+            PrepEntry::new(program, initial_global_cumulative_sum, vk.clone(), shared, traces);
+        tracing::debug!(bytes = entry.bytes(), "caching preprocessed data");
+        if cache.admits(entry.bytes()) {
+            cache.insert(entry);
+        }
     }
 }
 
@@ -1036,6 +1115,7 @@ mod tests {
                     drop_ldes: false,
                     backend: scope.clone(),
                     trace_prefetcher: None,
+                    prep_cache: None,
                     _marker: PhantomData,
                 };
             let shard_prover = CudaShardProver { inner: Arc::new(shard_prover_inner) };

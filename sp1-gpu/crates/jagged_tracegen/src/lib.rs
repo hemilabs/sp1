@@ -362,6 +362,20 @@ pub struct CudaShardProverShared<GC: IopCtx, Air: MachineAir<GC::F>> {
     phantom: PhantomData<Air>,
 }
 
+impl<GC: IopCtx, Air: MachineAir<GC::F>> CudaShardProverShared<GC, Air> {
+    /// A copy without the preprocessed codeword, which basefold then encodes again from the
+    /// traces when it opens them. The Merkle tree is copied on the device.
+    pub fn without_codeword(&self) -> Self {
+        let mut preprocessed_data = self.preprocessed_data.clone();
+        preprocessed_data.pcs_prover_data.codeword_mle = None;
+        Self {
+            preprocessed_data,
+            preprocessed_table_heights: self.preprocessed_table_heights.clone(),
+            phantom: PhantomData,
+        }
+    }
+}
+
 pub struct CudaShardProverData<GC: IopCtx, Air: MachineAir<GC::F>> {
     /// Read-only PCS data + metadata, shared across all concurrent shards.
     pub shared: Arc<CudaShardProverShared<GC, Air>>,
@@ -397,6 +411,15 @@ impl<GC: IopCtx, Air: MachineAir<GC::F>> CudaShardProverData<GC, Air> {
         });
         let trace_buffer_pool = Arc::new(WorkerQueue::new(trace_buffers));
         Self { shared, trace_buffer_pool }
+    }
+
+    /// Data for `trace_buffers`, whose preprocessed slots hold the traces `shared` commits to.
+    pub fn from_shared(
+        shared: Arc<CudaShardProverShared<GC, Air>>,
+        trace_buffers: Vec<JaggedTraceMle<Felt, TaskScope>>,
+    ) -> Self {
+        assert!(!trace_buffers.is_empty(), "CudaShardProverData requires a trace buffer");
+        Self { shared, trace_buffer_pool: Arc::new(WorkerQueue::new(trace_buffers)) }
     }
 
     pub fn preprocessed_table_heights(&self) -> &BTreeMap<String, usize> {
@@ -1578,10 +1601,67 @@ pub async fn full_tracegen<A: CudaTracegenAir<Felt>>(
     (public_values, jagged_mle, chip_set, permit)
 }
 
+/// Copies the first `len` elements of `src` into a new device buffer of `capacity` elements.
+fn copy_prefix_into<T: Copy>(
+    src: &Buffer<T, TaskScope>,
+    len: usize,
+    capacity: usize,
+    backend: &TaskScope,
+) -> Buffer<T, TaskScope> {
+    let mut dst: Buffer<T, TaskScope> = Buffer::with_capacity_in(capacity, backend.clone());
+    unsafe {
+        dst.assume_init();
+        dst[..len].copy_from_slice(&src[..len], backend).unwrap();
+    }
+    dst
+}
+
+/// Copies the preprocessed part of `traces` (what [`setup_tracegen`] and [`full_tracegen`] put
+/// there before the main traces) into device buffers of its own size, to be reused by
+/// [`full_tracegen_permit`] for later shards of the same program.
+///
+/// The main traces never write below `preprocessed_offset` (nor below `preprocessed_cols` in the
+/// column tables), so this can be taken after the shard is proved.
+pub fn copy_preprocessed_traces(
+    traces: &JaggedTraceMle<Felt, TaskScope>,
+    backend: &TaskScope,
+) -> JaggedTraceMle<Felt, TaskScope> {
+    let dense = traces.dense();
+    let (offset, cols) = (dense.preprocessed_offset, dense.preprocessed_cols);
+    let dense_data = TraceDenseData {
+        dense: copy_prefix_into(&dense.dense, offset, offset, backend),
+        preprocessed_offset: offset,
+        preprocessed_cols: cols,
+        preprocessed_table_index: dense.preprocessed_table_index.clone(),
+        main_table_index: BTreeMap::new(),
+        preprocessed_padding: dense.preprocessed_padding,
+        main_padding: 0,
+        prep_padding_col_count: dense.prep_padding_col_count,
+        main_padding_col_count: 0,
+    };
+    JaggedTraceMle(JaggedMle {
+        dense_data,
+        col_index: copy_prefix_into(&traces.col_index, offset >> 1, offset >> 1, backend),
+        start_indices: copy_prefix_into(&traces.start_indices, cols + 1, cols + 1, backend),
+        column_heights: copy_prefix_into(&traces.column_heights, cols, cols, backend),
+        host_column_heights: None,
+    })
+}
+
+/// The device bytes held by a copy made by [`copy_preprocessed_traces`].
+pub fn preprocessed_traces_bytes(traces: &JaggedTraceMle<Felt, TaskScope>) -> usize {
+    traces.dense().dense.capacity() * std::mem::size_of::<Felt>()
+        + (traces.col_index.capacity()
+            + traces.start_indices.capacity()
+            + traces.column_heights.capacity())
+            * std::mem::size_of::<u32>()
+}
+
 #[allow(clippy::type_complexity, clippy::too_many_arguments)]
 pub async fn full_tracegen_permit<A: CudaTracegenAir<Felt>>(
     machine: &Machine<Felt, A>,
     program: Arc<<A as MachineAir<Felt>>::Program>,
+    preprocessed: Option<&JaggedTraceMle<Felt, TaskScope>>,
     record: Arc<<A as MachineAir<Felt>>::Record>,
     buffer: &Worker<PinnedBuffer<Felt>>,
     max_trace_size: usize,
@@ -1591,19 +1671,89 @@ pub async fn full_tracegen_permit<A: CudaTracegenAir<Felt>>(
     prover_permits: ProverSemaphore,
     global_dependencies_opt: bool,
 ) -> (Vec<Felt>, JaggedTraceMle<Felt, TaskScope>, BTreeSet<Chip<Felt, A>>, ProverPermit) {
-    let (public_values, jagged_mle, chip_set, permit) = full_tracegen(
-        machine,
-        program,
+    let Some(preprocessed) = preprocessed else {
+        return full_tracegen(
+            machine,
+            program,
+            record,
+            buffer,
+            max_trace_size,
+            log_stacking_height,
+            max_log_row_count,
+            backend,
+            prover_permits,
+            global_dependencies_opt,
+        )
+        .await;
+    };
+    // The program's preprocessed traces were copied by [`copy_preprocessed_traces`]: copy them
+    // on the device into the shard's traces instead of generating (and uploading) them again.
+    // The traces are the same.
+    drop(program);
+    let (
+        main_host_phase_tracegen,
+        HostPhaseShapeInfo { traces_by_name: initial_traces, chip_set, .. },
+        _,
+    ) = host_main_tracegen(machine, buffer.as_ptr() as usize, buffer.capacity(), 0, record.clone())
+        .await;
+
+    let permit =
+        prover_permits.acquire().instrument(tracing::debug_span!("acquire")).await.unwrap();
+
+    let (main_traces, public_values) = device_main_tracegen(
+        main_host_phase_tracegen.device_airs,
+        main_host_phase_tracegen.host_traces,
+        main_host_phase_tracegen.device_staged,
+        None,
         record,
-        buffer,
-        max_trace_size,
+        initial_traces,
+        backend,
+    )
+    .await;
+
+    log_chip_stats(machine, &chip_set, &main_traces);
+
+    // The layout `allocate_and_initialize_traces` gives the preprocessed traces.
+    let dense = preprocessed.dense();
+    let (offset, cols) = (dense.preprocessed_offset, dense.preprocessed_cols);
+    let dense_data = TraceDenseData {
+        dense: copy_prefix_into(&dense.dense, offset, max_trace_size, backend),
+        preprocessed_offset: offset,
+        preprocessed_cols: cols,
+        preprocessed_table_index: dense.preprocessed_table_index.clone(),
+        main_table_index: BTreeMap::new(),
+        preprocessed_padding: dense.preprocessed_padding,
+        main_padding: 0,
+        prep_padding_col_count: dense.prep_padding_col_count,
+        main_padding_col_count: 0,
+    };
+    let mut jagged_mle = JaggedTraceMle(JaggedMle {
+        dense_data,
+        col_index: copy_prefix_into(
+            &preprocessed.col_index,
+            offset >> 1,
+            max_trace_size >> 1,
+            backend,
+        ),
+        start_indices: copy_prefix_into(
+            &preprocessed.start_indices,
+            cols + 1,
+            MAX_COLS_PER_TRACE,
+            backend,
+        ),
+        column_heights: copy_prefix_into(&preprocessed.column_heights, cols, cols, backend),
+        host_column_heights: None,
+    });
+
+    copy_main_jagged_traces(
+        main_traces,
+        &mut jagged_mle,
         log_stacking_height,
         max_log_row_count,
-        backend,
-        prover_permits,
         global_dependencies_opt,
     )
     .await;
+
     (public_values, jagged_mle, chip_set, permit)
 }
 
