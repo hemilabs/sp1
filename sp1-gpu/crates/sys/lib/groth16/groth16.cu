@@ -244,8 +244,34 @@ __global__ __launch_bounds__(256) void g16MsmChunks(
     }
 }
 
+// Sums of the chunk heads in groups, so that a bucket spanning many chunks (a witness has buckets
+// with millions of points) adds a few group sums instead of every chunk's head: sums[g] = the sum
+// of in[g * MSM_GROUP ..] over MSM_GROUP of the window's `count` inputs, where count is its chunks
+// (level 1, in = head) or level-1 groups (level 2), from its entry count.
+constexpr uint32_t MSM_GROUP = 64;
+
+template <class F>
+__global__ __launch_bounds__(256) void g16MsmGroupSums(
+    uint32_t w,
+    const uint32_t* hist,
+    uint32_t level,
+    const Xyzz<F>* in,
+    Xyzz<F>* sums) {
+    const uint32_t m = hist[(size_t)w * MSM_BUCKETS + MSM_BUCKETS - 1];
+    uint32_t count = (m + MSM_CHUNK - 1) / MSM_CHUNK;
+    if (level == 2) count = (count + MSM_GROUP - 1) / MSM_GROUP;
+    for (size_t g = g16Tid(); g * MSM_GROUP < count; g += g16Stride()) {
+        const uint32_t lo = (uint32_t)g * MSM_GROUP;
+        const uint32_t hi = lo + MSM_GROUP < count ? lo + MSM_GROUP : count;
+        Xyzz<F> acc = in[lo];
+        for (uint32_t c = lo + 1; c < hi; c++) acc = acc.add(in[c]);
+        sums[g] = acc;
+    }
+}
+
 // Each bucket of window w that starts or ends a chunk: its sum from the chunks' heads and tails
 // (the buckets inside a chunk are already in `buckets`). Empty buckets are set to infinity.
+// group1 and group2 are g16MsmGroupSums' levels 1 and 2 over the heads.
 template <class F>
 __global__ __launch_bounds__(256) void g16MsmBucketFixup(
     uint32_t w,
@@ -253,7 +279,9 @@ __global__ __launch_bounds__(256) void g16MsmBucketFixup(
     const uint32_t* hist,
     Xyzz<F>* buckets,
     const Xyzz<F>* head,
-    const Xyzz<F>* tail) {
+    const Xyzz<F>* tail,
+    const Xyzz<F>* group1,
+    const Xyzz<F>* group2) {
     const uint32_t m = hist[(size_t)w * MSM_BUCKETS + MSM_BUCKETS - 1];
     for (size_t b = g16Tid(); b < MSM_BUCKETS; b += g16Stride()) {
         size_t wb = (size_t)w * MSM_BUCKETS + b;
@@ -274,9 +302,22 @@ __global__ __launch_bounds__(256) void g16MsmBucketFixup(
             continue;
         }
         // Spanning chunks cs..ce: the last bucket of cs (or all of it), all of the chunks between,
-        // and the first bucket of ce.
+        // and the first bucket of ce: the heads of cs + 1..ce, by whole groups where they fit.
+        constexpr uint32_t G2 = MSM_GROUP * MSM_GROUP;
         Xyzz<F> acc = start == chunk_start ? head[cs] : tail[cs];
-        for (uint32_t c = cs + 1; c <= ce; c++) acc = acc.add(head[c]);
+        uint32_t c = cs + 1;
+        while (c <= ce) {
+            if (c % G2 == 0 && c + G2 - 1 <= ce) {
+                acc = acc.add(group2[c / G2]);
+                c += G2;
+            } else if (c % MSM_GROUP == 0 && c + MSM_GROUP - 1 <= ce) {
+                acc = acc.add(group1[c / MSM_GROUP]);
+                c += MSM_GROUP;
+            } else {
+                acc = acc.add(head[c]);
+                c++;
+            }
+        }
         buckets[wb] = acc;
     }
 }
@@ -308,6 +349,8 @@ SP1_SYCL_LARGE_GRF(g16MsmChunks<Fp>)
 SP1_SYCL_LARGE_GRF(g16MsmChunks<Fp2>)
 SP1_SYCL_LARGE_GRF(g16MsmBucketFixup<Fp>)
 SP1_SYCL_LARGE_GRF(g16MsmBucketFixup<Fp2>)
+SP1_SYCL_LARGE_GRF(g16MsmGroupSums<Fp>)
+SP1_SYCL_LARGE_GRF(g16MsmGroupSums<Fp2>)
 SP1_SYCL_LARGE_GRF(g16MsmReduce<Fp>)
 SP1_SYCL_LARGE_GRF(g16MsmReduce<Fp2>)
 
@@ -520,13 +563,23 @@ Xyzz<F> msm(State& st, const Affine<F>* host_points, const Fr* host_scalars, siz
         Timer t("msm buckets", s);
         size_t chunks = (n + MSM_CHUNK - 1) / MSM_CHUNK;
         Dev<Xyzz<F>> head(chunks, s), tail(chunks, s);
+        const size_t groups1 = (chunks + MSM_GROUP - 1) / MSM_GROUP;
+        const size_t groups2 = (groups1 + MSM_GROUP - 1) / MSM_GROUP;
+        Dev<Xyzz<F>> group1(groups1, s), group2(groups2, s);
         for (uint32_t w = 0; w < MSM_WINDOWS; w++) {
             void* scatter[] = {&scalars.ptr, &n, &w, &hist.ptr, &sorted.ptr};
             launch(SP1_KERNEL_PTR(g16MsmScatter), n, scatter, s);
             void* sum[] = {&points.ptr, &scalars.ptr, &n, &w, &hist.ptr, &sorted.ptr, &buckets.ptr,
                            &head.ptr, &tail.ptr};
             launch(SP1_KERNEL_PTR(g16MsmChunks<F>), chunks, sum, s);
-            void* fix[] = {&w, &offset.ptr, &hist.ptr, &buckets.ptr, &head.ptr, &tail.ptr};
+            uint32_t level = 1;
+            void* g1[] = {&w, &hist.ptr, &level, &head.ptr, &group1.ptr};
+            launch(SP1_KERNEL_PTR(g16MsmGroupSums<F>), groups1, g1, s);
+            uint32_t level2 = 2;
+            void* g2[] = {&w, &hist.ptr, &level2, &group1.ptr, &group2.ptr};
+            launch(SP1_KERNEL_PTR(g16MsmGroupSums<F>), groups2, g2, s);
+            void* fix[] = {&w, &offset.ptr, &hist.ptr, &buckets.ptr, &head.ptr, &tail.ptr,
+                           &group1.ptr, &group2.ptr};
             launch(SP1_KERNEL_PTR(g16MsmBucketFixup<F>), MSM_BUCKETS, fix, s);
         }
     }
