@@ -251,8 +251,9 @@ impl<GC: IopCtx, Air: MachineAir<GC::F>> CudaShardProverData<GC, Air> {
     /// this the recursion keys alone held several GB from startup, which on a 16 GB card under
     /// Windows' video memory budget pushed proving into shared system memory.
     pub fn make_persistent(&mut self) {
-        Arc::get_mut(&mut self.shared).expect("a new key's shared data is not shared yet").persistent =
-            true;
+        Arc::get_mut(&mut self.shared)
+            .expect("a new key's shared data is not shared yet")
+            .persistent = true;
         let mut buffers = Vec::new();
         while let Ok(buffer) = self.trace_buffer_pool.clone().try_pop() {
             buffers.push(buffer);

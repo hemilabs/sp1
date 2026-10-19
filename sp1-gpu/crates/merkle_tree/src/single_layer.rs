@@ -576,10 +576,12 @@ mod tests {
         run_in_place(|scope| async move {
             let (width, log_height) = (64usize, 22usize);
             let n = width << log_height;
-            let host: Vec<SP1Field> =
-                (0..n).map(|i| SP1Field::from_canonical_u32((i as u32).wrapping_mul(2654435761) >> 2)).collect();
+            let host: Vec<SP1Field> = (0..n)
+                .map(|i| SP1Field::from_canonical_u32((i as u32).wrapping_mul(2654435761) >> 2))
+                .collect();
             let host = Tensor::from(host).reshape([width, 1 << log_height]);
-            let tensor = sp1_gpu_cudart::DeviceTensor::from_host(&host, &scope).unwrap().into_inner();
+            let tensor =
+                sp1_gpu_cudart::DeviceTensor::from_host(&host, &scope).unwrap().into_inner();
             let prover = Poseidon2SP1Field16CudaProver::new(&scope);
             // The GPU's clocks ramp up over the first iterations: the best of the last ten.
             let mut best = f64::MAX;

@@ -260,7 +260,8 @@ mod tests {
         run_sync_in_place(|t| {
             let tensor = DeviceTensor::from_host(&host, &t).unwrap().into_inner();
             let dft = CudaDftKoalaBear::default();
-            let mut dst = Tensor::<Felt, _>::with_sizes_in([batch_size, d << log_blowup], t.clone());
+            let mut dst =
+                Tensor::<Felt, _>::with_sizes_in([batch_size, d << log_blowup], t.clone());
             // The GPU's clocks ramp up over the first iterations: the best of the last ten.
             let mut best = f64::MAX;
             for i in 0..20 {
