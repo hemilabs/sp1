@@ -61,13 +61,17 @@ class Hasher {
             Params::externalLinearLayer(state);
         }
 
-        for (int i = 0; i < Params::ROUNDS_P; i++) {
-            state[0] += roundConstants.internalRoundConstants[i];
-            state[0] ^= Params::D;
-            Params::internalLinearLayer(
-                state,
-                roundConstants.matInternalDiagM1,
-                roundConstants.montyInverse);
+        if constexpr (Params::DEFERRED_PARTIAL_ROUNDS) {
+            Params::partialRounds(state);
+        } else {
+            for (int i = 0; i < Params::ROUNDS_P; i++) {
+                state[0] += roundConstants.internalRoundConstants[i];
+                state[0] ^= Params::D;
+                Params::internalLinearLayer(
+                    state,
+                    roundConstants.matInternalDiagM1,
+                    roundConstants.montyInverse);
+            }
         }
 
         for (int i = rounds_f_half; i < Params::ROUNDS_F; i++) {
