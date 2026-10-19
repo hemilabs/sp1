@@ -3,6 +3,16 @@
 
 #include "zerocheck/jagged_mle.cuh"
 #include "zerocheck/zerocheck_eval.cuh"
+// The generated straight-line evaluators, on HIP only: Intel's JIT does not finish compiling the
+// kernel with them, and they are untested on CUDA.
+#ifdef __HIPCC__
+#include "zerocheck/zerocheck_generated.cuh"
+#define SP1_ZEROCHECK_HAS_GENERATED 1
+#else
+#define SP1_ZEROCHECK_HAS_GENERATED 0
+#define SP1_ZEROCHECK_GENERATED_NONE 0xffffffffu
+extern "C" uint32_t sp1_zerocheck_generated_id(uint64_t) { return SP1_ZEROCHECK_GENERATED_NONE; }
+#endif
 #include "config.cuh"
 #include "sum_and_reduce/reduce.cuh"
 #include "tracegen/jagged_tracegen/jagged.cuh"
@@ -55,7 +65,10 @@ SP1_KERNEL void jaggedConstraintPolyEval(
     const uint32_t* __restrict__ main_column,
     uint32_t total_num_preprocessed_column,
     ext_t* __restrict__ constraintValues,
-    uint32_t rest_point_dim
+    uint32_t rest_point_dim,
+    // Per air block: its generated straight-line program (zerocheck_generated.cuh), or
+    // SP1_ZEROCHECK_GENERATED_NONE to interpret its instructions.
+    const uint32_t* __restrict__ generatedIds
 ) {
     // Not cleared: the programs write every register before reading it (checked where they are
     // built, in sp1-gpu-air's optimizer). Clearing them cost up to MEMORY_SIZE stores (2 KiB for
@@ -102,6 +115,14 @@ SP1_KERNEL void jaggedConstraintPolyEval(
         folder.pointBase = pointBase;
         ext_t acc[ZC_POINTS];
         for (int e = 0; e < ZC_POINTS; e++) acc[e] = ext_t::zero();
+
+#if SP1_ZEROCHECK_HAS_GENERATED
+        const uint32_t generated = generatedIds[airBlockIdx];
+        if (generated != SP1_ZEROCHECK_GENERATED_NONE) {
+            zcGenEval<K>(generated, folder, evalConstantsF + f_constant_offset, acc);
+            program_end_idx = program_start_idx;
+        }
+#endif
 
         for (size_t i = program_start_idx; i < program_end_idx; i++) {
             Instruction instr = evalProgram[i];

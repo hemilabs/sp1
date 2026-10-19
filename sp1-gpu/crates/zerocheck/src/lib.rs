@@ -60,6 +60,43 @@ pub struct EvalProgramInfo<B: Backend = CpuBackend> {
     pub f_constants_indices: Buffer<u32, B>,
     pub ef_constants: Buffer<Ext, B>,
     pub ef_constants_indices: Buffer<u32, B>,
+    /// Per air block: its generated straight-line evaluator, or u32::MAX to interpret its
+    /// instructions (see `generated_ids`).
+    pub generated_ids: Buffer<u32, B>,
+}
+
+/// FNV-1a over an evaluation program's instructions (opcode, variants, then a, b and c little
+/// endian): how the generated evaluators (sp1-gpu-sys scripts/gen_zerocheck_eval.py) are found.
+pub fn program_hash(instructions: &[Instruction16]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for i in instructions {
+        let bytes = [i.opcode, i.b_variant, i.c_variant]
+            .into_iter()
+            .chain(i.a.to_le_bytes())
+            .chain(i.b.to_le_bytes())
+            .chain(i.c.to_le_bytes());
+        for byte in bytes {
+            h ^= byte as u64;
+            h = h.wrapping_mul(0x100_0000_01b3);
+        }
+    }
+    h
+}
+
+/// Each air block's generated evaluator (u32::MAX for none). SP1_GPU_EVAL_INTERPRETER=1
+/// interprets every program.
+fn generated_ids(operations: &[Instruction16], operations_indices: &[u32]) -> Vec<u32> {
+    let interpret = std::env::var("SP1_GPU_EVAL_INTERPRETER").map(|v| v == "1").unwrap_or(false);
+    operations_indices
+        .windows(2)
+        .map(|w| {
+            if interpret {
+                return u32::MAX;
+            }
+            let block = &operations[w[0] as usize..w[1] as usize];
+            unsafe { sp1_gpu_cudart::sys::zerocheck::sp1_zerocheck_generated_id(program_hash(block)) }
+        })
+        .collect()
 }
 
 pub type CudaEvalResult =
@@ -166,8 +203,15 @@ where
         ef_ctr = ef_ctr.max(*chip_ef_ctr);
     }
     operations_indices.push(operations.len() as u32);
+    let generated_ids = generated_ids(&operations, &operations_indices);
+    tracing::debug!(
+        "zerocheck: {} of {} air blocks run generated evaluators",
+        generated_ids.iter().filter(|&&id| id != u32::MAX).count(),
+        generated_ids.len()
+    );
 
     EvalProgramInfo {
+        generated_ids: Buffer::from(generated_ids),
         constraint_indices: Buffer::from(constraint_indices),
         operations: Buffer::from(operations),
         operations_indices: Buffer::from(operations_indices),
@@ -205,7 +249,11 @@ where
     let ef_constants_indices_device =
         DeviceBuffer::from_host(&cpu_info.ef_constants_indices, scope).unwrap().into_inner();
 
+    let generated_ids_device =
+        DeviceBuffer::from_host(&cpu_info.generated_ids, scope).unwrap().into_inner();
+
     EvalProgramInfo {
+        generated_ids: generated_ids_device,
         constraint_indices: constraint_indices_device,
         operations: operations_device,
         operations_indices: operations_indices_device,
@@ -483,7 +531,8 @@ where
                 input.main_column.as_ptr(),
                 input.total_num_preprocessed_column,
                 output.as_mut_ptr(),
-                rest_point_dim
+                rest_point_dim,
+                input.program.generated_ids.as_ptr()
             );
             backend
                 .launch_kernel(
@@ -591,7 +640,8 @@ where
                 input.main_column.as_ptr(),
                 input.total_num_preprocessed_column,
                 output.as_mut_ptr(),
-                rest_point_dim
+                rest_point_dim,
+                input.program.generated_ids.as_ptr()
             );
             backend
                 .launch_kernel(

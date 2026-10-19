@@ -1,0 +1,181 @@
+#!/usr/bin/env python3
+"""Generates straight-line constraint evaluators for the zerocheck kernel.
+
+The zerocheck kernel (lib/zerocheck/zerocheck_eval.cu) interprets each chip block's evaluation
+program, with the program's registers in a per-thread array that dynamic indexing keeps in
+private (scratch) memory. For the blocks generated here it calls a function that executes the
+same program as straight-line code instead, the registers in real registers.
+
+Input: the programs as SP1_GPU_EVAL_DUMP writes them (sp1-gpu-prover, one JSON line per block).
+Output: include/zerocheck/zerocheck_generated.cuh. A block is matched at runtime by the hash of
+its instructions (sp1_zerocheck_generated_id, the same FNV-1a as zerocheck's `program_hash`), so
+a program that changes falls back to the interpreter instead of running stale code.
+
+Usage: gen_zerocheck_eval.py <dump.jsonl> [max_instructions_per_block]
+"""
+import json
+import os
+import sys
+
+FNV_OFFSET = 0xCBF29CE484222325
+FNV_PRIME = 0x100000001B3
+
+
+def program_hash(ops):
+    h = FNV_OFFSET
+    for op, bv, cv, a, b, c in ops:
+        for byte in [op, bv, cv, a & 0xFF, a >> 8, b & 0xFF, b >> 8, c & 0xFF, c >> 8]:
+            h ^= byte
+            h = (h * FNV_PRIME) & 0xFFFFFFFFFFFFFFFF
+    return h
+
+
+def gen_function(index, ops):
+    """The block's program as a function, or None if it uses an opcode not handled here."""
+    lines = []
+    regs = set()
+    loaded = {}
+    constraints = 0
+
+    def var(variant, idx):
+        key = (variant, idx)
+        if key not in loaded:
+            name = f"v{variant}_{idx}"
+            loaded[key] = name
+            lines.append(f"    const K3<K> {name} = folder.var_f3({variant}, {idx});")
+        return loaded[key]
+
+    def r(i):
+        regs.add(i)
+        return f"r{i}"
+
+    for op, bv, cv, a, b, c in ops:
+        if op == 0:
+            continue
+        if op == 1:
+            lines.append(f"    {r(a)} = fc[{b}];")
+        elif op == 2:
+            lines.append(f"    {r(a)} = {var(bv, b)};")
+        elif op == 3:
+            lines.append(f"    {r(a)} = {r(b)};")
+        elif op in (4, 11, 18):
+            sym = {4: "+", 11: "-", 18: "*"}[op]
+            lines.append(f"    {r(a)} = {var(bv, b)} {sym} fc[{c}];")
+        elif op in (5, 12, 19):
+            sym = {5: "+", 12: "-", 19: "*"}[op]
+            lines.append(f"    {r(a)} = {var(bv, b)} {sym} {var(cv, c)};")
+        elif op in (6, 13, 20):
+            sym = {6: "+", 13: "-", 20: "*"}[op]
+            lines.append(f"    {r(a)} = {var(bv, b)} {sym} {r(c)};")
+        elif op in (7, 14, 21):
+            sym = {7: "+", 14: "-", 21: "*"}[op]
+            lines.append(f"    {r(a)} = {r(b)} {sym} fc[{c}];")
+        elif op in (8, 15, 22):
+            sym = {8: "+", 15: "-", 22: "*"}[op]
+            lines.append(f"    {r(a)} = {r(b)} {sym} {var(cv, c)};")
+        elif op in (9, 16, 23):
+            sym = {9: "+", 16: "-", 23: "*"}[op]
+            lines.append(f"    {r(a)} = {r(b)} {sym} {r(c)};")
+        elif op in (10, 17, 24):
+            sym = {10: "+=", 17: "-=", 24: "*="}[op]
+            lines.append(f"    {r(a)} {sym} {r(b)};")
+        elif op == 25:
+            lines.append(f"    {r(a)} = -{r(b)};")
+        elif op == 59:
+            lines.append(
+                f"    {{ const ext_t al = alpha[{constraints}]; "
+                f"for (int e = 0; e < ZC_POINTS; e++) acc[e] += al * {r(a)}.v[e]; }}"
+            )
+            constraints += 1
+        else:
+            return None, 0
+    decl = ""
+    if regs:
+        decl = "    K3<K> " + ", ".join(f"r{i}" for i in sorted(regs)) + ";\n"
+    body = (
+        f"template <typename K>\n"
+        f"__device__ __noinline__ void zcGen{index}(JaggedConstraintFolder<K> folder, "
+        f"const kb31_t* __restrict__ fc, ext_t* __restrict__ acc) {{\n"
+        f"    const ext_t* alpha = folder.powersOfAlpha + folder.constraintIndex;\n"
+        + decl + "\n".join(lines) + "\n}\n"
+    )
+    return body, constraints
+
+
+def main():
+    dump = sys.argv[1]
+    limit = int(sys.argv[2]) if len(sys.argv) > 2 else 6000
+    blocks = {}
+    for line in open(dump):
+        d = json.loads(line)
+        ops = d["ops"]
+        if not ops or len(ops) > limit:
+            continue
+        h = program_hash(ops)
+        blocks.setdefault(h, (d["chip"], d["block"], ops))
+
+    funcs, cases, ids = [], [], []
+    for h, (chip, block, ops) in sorted(blocks.items(), key=lambda kv: (kv[1][0], kv[1][1], kv[0])):
+        index = len(funcs)
+        body, constraints = gen_function(index, ops)
+        if body is None:
+            continue
+        funcs.append(f"// {chip}, block {block}: {len(ops)} instructions\n" + body)
+        cases.append(
+            f"    case {index}:\n"
+            f"        zcGen{index}<K>(folder, fc, acc);\n"
+            f"        constraints = {constraints};\n"
+            f"        break;"
+        )
+        ids.append(f"    case 0x{h:016x}ull:\n        return {index};  // {chip} {block}")
+
+    out = [
+        "// Generated by scripts/gen_zerocheck_eval.py from the programs SP1_GPU_EVAL_DUMP writes:",
+        "// do not edit. Straight-line versions of the zerocheck evaluation programs of the chip",
+        "// blocks with up to %d instructions (see zerocheck_eval.cu)." % limit,
+        "#pragma once",
+        "",
+        '#include "zerocheck/zerocheck_eval.cuh"',
+        "",
+        "#define SP1_ZEROCHECK_GENERATED_NONE 0xffffffffu",
+        "",
+    ]
+    out += funcs
+    out += [
+        "// Runs generated program `id` for the folder's row: adds its constraints, times their powers",
+        "// of alpha, to `acc` (one per evaluation point) and moves the folder's constraint index past",
+        "// them, as the interpreter does.",
+        "template <typename K>",
+        "__device__ __forceinline__ void zcGenEval(",
+        "    uint32_t id, JaggedConstraintFolder<K>& folder, const kb31_t* fc, ext_t* acc) {",
+        "    uint32_t constraints = 0;",
+        "    switch (id) {",
+    ]
+    out += cases
+    out += [
+        "    default:",
+        "        break;",
+        "    }",
+        "    folder.constraintIndex += constraints;",
+        "}",
+        "",
+        "// The generated program for a block's instructions, by their hash; NONE if there is none.",
+        'extern "C" uint32_t sp1_zerocheck_generated_id(uint64_t hash) {',
+        "    switch (hash) {",
+    ]
+    out += ids
+    out += [
+        "    default:",
+        "        return SP1_ZEROCHECK_GENERATED_NONE;",
+        "    }",
+        "}",
+        "",
+    ]
+    here = os.path.dirname(os.path.abspath(__file__))
+    path = os.path.join(here, "..", "include", "zerocheck", "zerocheck_generated.cuh")
+    open(path, "w", encoding="utf-8", newline="\n").write("\n".join(out))
+    print(f"{len(funcs)} programs, {sum(len(b[2]) for b in blocks.values())} instructions -> {path}")
+
+
+if __name__ == "__main__":
+    main()

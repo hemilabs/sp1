@@ -18,4 +18,8 @@ extern "C" {
 
     /// The evaluation points each thread of the jagged zerocheck evaluator computes (3 or 1).
     pub fn zerocheck_points_per_thread() -> u32;
+
+    /// The generated straight-line evaluator for an air block's evaluation program, by the
+    /// program's hash (zerocheck's `program_hash`); u32::MAX if there is none.
+    pub fn sp1_zerocheck_generated_id(hash: u64) -> u32;
 }
