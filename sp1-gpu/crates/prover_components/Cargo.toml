@@ -19,6 +19,7 @@ sp1-gpu-logup-gkr = { workspace = true }
 sp1-gpu-basefold = { workspace = true }
 sp1-gpu-merkle-tree = { workspace = true }
 sp1-gpu-jagged-tracegen = { workspace = true }
+sp1-recursion-gnark-ffi = { workspace = true }
 
 # slop
 slop-air = { workspace = true }
@@ -38,6 +39,7 @@ sp1-prover-types = { workspace = true }
 sp1-core-executor = { workspace = true }
 
 tracing = { workspace = true }
+tokio = { workspace = true, features = ["sync"] }
 sysinfo = "0.31.2"
 serde = { workspace = true }
 clap = { version = "4.5.7", features = ["derive"] }

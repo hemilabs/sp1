@@ -7754,7 +7754,9 @@ dependencies = [
  "sp1-primitives 6.8.1",
  "sp1-prover",
  "sp1-prover-types",
+ "sp1-recursion-gnark-ffi",
  "sysinfo 0.31.4",
+ "tokio",
  "tracing",
 ]
 

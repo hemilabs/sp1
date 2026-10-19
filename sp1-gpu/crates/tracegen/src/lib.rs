@@ -364,6 +364,20 @@ where
 }
 
 /// An AIR that potentially supports device trace generation over the given field.
+/// Opaque output of [`CudaTracegenAir::prepare_preprocessed_device`].
+pub type PreprocessedPrep = Box<dyn std::any::Any + Send + Sync>;
+
+/// Use the prepared value if it has the expected type, else compute it now.
+pub(crate) fn take_prep_or<T: 'static>(
+    prep: Option<PreprocessedPrep>,
+    compute: impl FnOnce() -> Vec<T>,
+) -> Vec<T> {
+    match prep.and_then(|p| p.downcast::<Vec<T>>().ok()) {
+        Some(v) => *v,
+        None => compute(),
+    }
+}
+
 pub trait CudaTracegenAir<F: Field>: MachineAir<F> {
     /// Whether this AIR supports preprocessed trace generation on the device.
     fn supports_device_preprocessed_tracegen(&self) -> bool {
@@ -382,6 +396,28 @@ pub trait CudaTracegenAir<F: Field>: MachineAir<F> {
     ) -> impl Future<Output = Result<Option<DeviceMle<F>>, CopyError>> + Send {
         #[allow(unreachable_code)]
         ready(unimplemented!())
+    }
+
+    /// Host-side preparation for [`CudaTracegenAir::generate_preprocessed_trace_device_prepared`].
+    ///
+    /// This is pure CPU work (e.g. filtering the program's instructions for this chip). Callers
+    /// run it before taking the prover permit so the permit, which serializes all GPU proving, is
+    /// not held while the CPU scans the program. `None` means there is nothing to prepare.
+    #[allow(unused_variables)]
+    fn prepare_preprocessed_device(&self, program: &Self::Program) -> Option<PreprocessedPrep> {
+        None
+    }
+
+    /// Like [`CudaTracegenAir::generate_preprocessed_trace_device`], but reuses the output of
+    /// [`CudaTracegenAir::prepare_preprocessed_device`] when given. The trace is identical.
+    #[allow(unused_variables)]
+    fn generate_preprocessed_trace_device_prepared(
+        &self,
+        program: &Self::Program,
+        prep: Option<PreprocessedPrep>,
+        scope: &TaskScope,
+    ) -> impl Future<Output = Result<Option<DeviceMle<F>>, CopyError>> + Send {
+        self.generate_preprocessed_trace_device(program, scope)
     }
 
     /// Whether this AIR supports main trace generation on the device.
