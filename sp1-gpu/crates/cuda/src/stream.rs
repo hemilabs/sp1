@@ -394,18 +394,27 @@ fn vram_log_threshold() -> u64 {
 unsafe impl Allocator for CudaStream {
     #[inline]
     unsafe fn allocate(&self, layout: Layout) -> Result<ptr::NonNull<[u8]>, AllocError> {
+        crate::upload::make_room_for(layout.size() as u64);
         let mut ptr: *mut c_void = ptr::null_mut();
-        unsafe {
+        let malloc = |ptr: &mut *mut c_void| unsafe {
             CudaError::result_from_ffi(cuda_malloc_async(
-                &mut ptr as *mut *mut c_void,
+                ptr as *mut *mut c_void,
                 layout.size(),
                 self.0,
             ))
-            .map_err(|_| AllocError)?;
         };
+        match malloc(&mut ptr) {
+            Ok(()) => {}
+            // Prefetched uploads not yet in use can be dropped; their owners copy again.
+            Err(CudaError::OutOfMemory) if crate::upload::reclaim_staged_uploads(true) => {
+                malloc(&mut ptr).map_err(|_| AllocError)?
+            }
+            Err(_) => return Err(AllocError),
+        }
         let size = layout.size() as u64;
         let new_cur = VRAM_STATS.current.fetch_add(size, Ordering::Relaxed) + size;
         VRAM_STATS.peak.fetch_max(new_cur, Ordering::Relaxed);
+        crate::upload::note_live_bytes(new_cur);
         VRAM_STATS.alloc_count.fetch_add(1, Ordering::Relaxed);
         VRAM_STATS.alloc_bytes_total.fetch_add(size, Ordering::Relaxed);
         if size >= vram_log_threshold() {
