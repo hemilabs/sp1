@@ -290,6 +290,7 @@ pub(crate) fn prove_with_prestarted_gpu(
     witness_dir: &Path,
     witness_json: &Path,
     out: &Path,
+    go_memory: &mut Option<crate::groth16_bn254::GoSolveMemory>,
 ) -> Option<Groth16Bn254Proof> {
     let mut p = PRESTARTED.lock().unwrap_or_else(|e| e.into_inner()).take()?;
     if p.pk_dir != pk_dir {
@@ -298,6 +299,7 @@ pub(crate) fn prove_with_prestarted_gpu(
     }
     let t0 = Instant::now();
     let timeout = helper_timeout();
+    let mut handing_back = None;
     let mut run = || -> Result<Groth16Bn254Proof> {
         if !p.upload_sent {
             p.upload_sent = true;
@@ -311,6 +313,9 @@ pub(crate) fn prove_with_prestarted_gpu(
             t0.elapsed(),
             p.started.elapsed()
         );
+        // The helper has its key, so the solve's memory (~0.4 s to hand back) is not needed
+        // before it proves: hand it back meanwhile, rather than before sending the witness.
+        handing_back = go_memory.take().map(|memory| std::thread::spawn(move || drop(memory)));
         let deadline = Instant::now() + timeout;
         let status = loop {
             if let Some(status) = p.child.try_wait()? {
@@ -319,12 +324,23 @@ pub(crate) fn prove_with_prestarted_gpu(
             anyhow::ensure!(Instant::now() < deadline, "the prestarted GPU helper hung");
             std::thread::sleep(Duration::from_millis(5));
         };
+        tracing::debug!(
+            "Groth16: the prestarted GPU helper exited {:?} after its start",
+            p.started.elapsed()
+        );
         anyhow::ensure!(status.success(), "the prestarted GPU helper failed: {status}");
         let bytes = std::fs::read(out).with_context(|| format!("reading {}", out.display()))?;
         Ok(serde_json::from_slice(&bytes)?)
     };
     let result = run();
-    // The solve gave back the R1CS already; only the process remains.
+    if let Some(handing_back) = handing_back {
+        let _ = handing_back.join();
+        tracing::debug!(
+            "Groth16: the solve's memory is handed back ({:?} after the helper's start)",
+            p.started.elapsed()
+        );
+    }
+    // The solve's memory is handed back already; only the process remains.
     p.prefetched = false;
     match result {
         Ok(proof) => {

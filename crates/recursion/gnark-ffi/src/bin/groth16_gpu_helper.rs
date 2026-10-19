@@ -98,11 +98,22 @@ fn main() {
     let gpu_dir_str = args.gpu_dir.to_str().expect("--gpu-dir is not valid UTF-8");
 
     eprintln!("[groth16-gpu-helper] loading proving data from {gpu_dir_str}");
-    let proving_data = sp1_gpu_groth16::types::Groth16ProvingData::load(gpu_dir_str)
-        .unwrap_or_else(|e| {
-            eprintln!("[groth16-gpu-helper] failed to load Groth16ProvingData: {e}");
-            std::process::exit(2);
-        });
+    // Prestarted, the key loads while the parent proves, so it gets a few threads only
+    // (SP1_GROTH16_PRESTART_LOAD_THREADS, 0 for all): on all cores it slowed the parent's shard
+    // proving by more than it saved here. It is still loaded seconds before the wrap needs it.
+    let load_threads = args.upload_fifo.as_ref().and_then(|_| {
+        match std::env::var("SP1_GROTH16_PRESTART_LOAD_THREADS").ok().map(|v| v.parse::<usize>()) {
+            Some(Ok(0)) => None,
+            Some(Ok(n)) => Some(n),
+            _ => Some(std::thread::available_parallelism().map_or(2, |n| (n.get() / 8).max(2))),
+        }
+    });
+    let proving_data =
+        sp1_gpu_groth16::types::Groth16ProvingData::load_with_threads(gpu_dir_str, load_threads)
+            .unwrap_or_else(|e| {
+                eprintln!("[groth16-gpu-helper] failed to load Groth16ProvingData: {e}");
+                std::process::exit(2);
+            });
 
     // A prestarted helper uploads the key as soon as the GPU has room, then waits for its proof.
     let mut proving_data = Some(proving_data);

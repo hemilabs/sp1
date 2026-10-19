@@ -274,13 +274,10 @@ impl Groth16Prover {
         #[cfg(feature = "cuda")]
         let (persistent_g1_a, persistent_g1_b, persistent_g1_k, persistent_g1_z) = {
             let t = std::time::Instant::now();
-            let to_g1 = |pts: &[BN254G1Affine]| -> Vec<G1Affine> {
-                pts.par_iter().map(G1Affine::from_bn254).collect()
-            };
-            let g1_a = to_g1(&data.pk_g1_a);
-            let g1_b = to_g1(&data.pk_g1_b);
-            let g1_k = to_g1(&data.pk_g1_k);
-            let g1_z = to_g1(&data.pk_g1_z);
+            // The contexts read `BN254G1Affine`s, so the points are uploaded as loaded, without
+            // the 4 GB `G1Affine` copy (on all cores, while the parent solves the witness).
+            let (g1_a, g1_b, g1_k, g1_z) =
+                (&data.pk_g1_a, &data.pk_g1_b, &data.pk_g1_k, &data.pk_g1_z);
             // Pre-reserve the shared GLV pool to the max-of-all-contexts size,
             // so subsequent per-context `init_glv_buffers` calls all reuse the
             // pre-allocated buffers instead of growing (which would transiently
@@ -292,10 +289,10 @@ impl Groth16Prover {
                     eprintln!("[groth16] WARN: glv_pool_reserve({}) failed; continuing", max_n);
                 }
             }
-            let pa = sp1_gpu_plonk::g1::PersistentMsm::new(&g1_a);
-            let pb = sp1_gpu_plonk::g1::PersistentMsm::new(&g1_b);
-            let pk = sp1_gpu_plonk::g1::PersistentMsm::new(&g1_k);
-            let pz = sp1_gpu_plonk::g1::PersistentMsm::new(&g1_z);
+            let pa = sp1_gpu_plonk::g1::PersistentMsm::from_bn254_points(g1_a);
+            let pb = sp1_gpu_plonk::g1::PersistentMsm::from_bn254_points(g1_b);
+            let pk = sp1_gpu_plonk::g1::PersistentMsm::from_bn254_points(g1_k);
+            let pz = sp1_gpu_plonk::g1::PersistentMsm::from_bn254_points(g1_z);
             eprintln!("[groth16] Pre-uploaded 4 G1 SRS to GPU: {:?}", t.elapsed());
             (pa, pb, pk, pz)
         };

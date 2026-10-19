@@ -900,6 +900,7 @@ impl<A: ArtifactClient, C: SP1ProverComponents> SP1RecursionProver<A, C> {
                         "synthetic verify failure (SP1_GPU_VERIFY_FAIL_INJECT)"
                     ));
                 }
+                let _span = tracing::debug_span!("verify groth16 proof").entered();
                 prover
                     .verify(
                         proof,

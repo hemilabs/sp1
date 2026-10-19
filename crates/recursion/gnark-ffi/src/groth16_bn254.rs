@@ -318,6 +318,44 @@ pub struct PreparedGpuProof {
     witness_json: std::path::PathBuf,
     vkey_hash_hex: String,
     gpu_r1cs: Option<GpuR1csInputs>,
+    /// What gnark's solve left in the Go runtime, until it is handed back.
+    go_memory: std::sync::Mutex<Option<GoSolveMemory>>,
+}
+
+/// What gnark's solve leaves in this process's Go runtime: the cached circuit (~2.7 GB) and the
+/// solve's own garbage (~4 GB). Dropping it hands that back to the host, keeping the circuit for
+/// the next proof where the host has the memory (see [`keep_groth16_circuit`]).
+#[cfg(feature = "native")]
+pub(crate) struct GoSolveMemory(());
+
+#[cfg(feature = "native")]
+impl Drop for GoSolveMemory {
+    fn drop(&mut self) {
+        let keep_env = std::env::var("SP1_GROTH16_KEEP_R1CS").ok();
+        if keep_groth16_circuit(keep_env.as_deref(), memory_available()) {
+            crate::ffi::trim_groth16_caches();
+        } else {
+            crate::ffi::release_groth16_caches();
+        }
+    }
+}
+
+/// Least host memory available, as a proof's solve ends, for keeping the circuit it solved
+/// (~3 GB) in this process for the next proof, which then reads no R1CS (~5 s of CPU on all cores,
+/// during the next proof's start-up).
+#[cfg(feature = "native")]
+const KEEP_CIRCUIT_MIN_AVAILABLE_BYTES: u64 = 48 << 30;
+
+/// Whether to keep the solved circuit cached: as `SP1_GROTH16_KEEP_R1CS` (`keep_env`) says (`0`/
+/// `false` never, `1`/`true` always), otherwise where `available` host memory is at least
+/// [`KEEP_CIRCUIT_MIN_AVAILABLE_BYTES`].
+#[cfg(feature = "native")]
+fn keep_groth16_circuit(keep_env: Option<&str>, available: Option<u64>) -> bool {
+    match keep_env {
+        Some("0" | "false") => false,
+        Some("1" | "true") => true,
+        _ => available.is_some_and(|a| a >= KEEP_CIRCUIT_MIN_AVAILABLE_BYTES),
+    }
 }
 
 #[cfg(feature = "native")]
@@ -805,7 +843,11 @@ impl Groth16Bn254Prover {
 
         // Steps 2 and 3. The witness must outlive the helper, which reads it.
         let prepared = Self::prepare_gpu_proof(build_dir, &witness_json);
-        Self::run_gpu_helper(&prepared)
+        let proof = Self::run_gpu_helper(&prepared);
+        // Removing the proof's files (~2 GB of witness in `/dev/shm`: ~80 ms) need not hold up
+        // the proof. Each directory stays locked by its owner until it is gone, as before.
+        std::thread::spawn(move || drop((prepared, scratch)));
+        proof
     }
 
     /// The in-process half of [`Self::prove_gpu_subprocess`], CPU-only: make sure the circuit's
@@ -874,17 +916,12 @@ impl Groth16Bn254Prover {
         // This proof's witness files. With the GPU R1CS solver the helper builds them itself and
         // this stays empty.
         let witness_dir = witness_dir(&vkey_hash_hex);
+        let mut go_memory = None;
         if gpu_r1cs.is_none() {
-            // The solve leaves the circuit and proving key in Go globals (~12 GB). Hand them back
-            // once it is over, failed or not: before the helper or a CPU fallback needs the
-            // memory, and so that this long-lived process does not stay that much larger.
-            struct ReleaseGoCaches;
-            impl Drop for ReleaseGoCaches {
-                fn drop(&mut self) {
-                    crate::ffi::release_groth16_caches();
-                }
-            }
-            let _release = ReleaseGoCaches;
+            // The solve leaves the circuit and its garbage in the Go runtime. They are handed back
+            // when this is dropped: here if the solve fails, otherwise in `run_gpu_helper`, before a
+            // new helper or a CPU fallback needs the memory, or while a prestarted helper proves.
+            let memory = GoSolveMemory(());
             tracing::info!("Solving R1CS and exporting witness (gnark.Solve)...");
             export_groth16_gpu_witness(
                 build_dir.to_str().unwrap(),
@@ -892,6 +929,7 @@ impl Groth16Bn254Prover {
                 pk.dir.to_str().unwrap(),
                 witness_dir.path().to_str().unwrap(),
             );
+            go_memory = Some(memory);
         } else {
             tracing::info!("Skipping gnark.Solve — using in-process GPU R1CS solver");
         }
@@ -902,6 +940,7 @@ impl Groth16Bn254Prover {
             witness_json: witness_json.to_path_buf(),
             vkey_hash_hex,
             gpu_r1cs,
+            go_memory: std::sync::Mutex::new(go_memory),
         }
     }
 
@@ -921,18 +960,23 @@ impl Groth16Bn254Prover {
         // In the proof's own directory, so a crash leaves nothing behind that is not swept.
         let out_path = prepared.witness_dir.path().join("proof.json");
 
+        let mut go_memory = prepared.go_memory.lock().unwrap_or_else(|e| e.into_inner()).take();
         // A helper prestarted for this circuit has its key loaded (and maybe uploaded) already;
-        // it reads the witness files gnark's solve wrote, so not with the GPU R1CS solver.
+        // it reads the witness files gnark's solve wrote, so not with the GPU R1CS solver. It
+        // hands back the solve's memory while the helper proves.
         if prepared.gpu_r1cs.is_none() {
             if let Some(proof) = crate::prestart::prove_with_prestarted_gpu(
                 &prepared.pk.dir,
                 prepared.witness_dir.path(),
                 &prepared.witness_json,
                 &out_path,
+                &mut go_memory,
             ) {
                 return proof;
             }
         }
+        // A new helper loads its key into host memory: hand back the solve's first.
+        drop(go_memory);
 
         // The helper needs ~15 GB of GPU memory, which a prover keeping its shard-prover state on
         // a 24 GB card does not have free. Only a process that exits after this proof may reset
@@ -1026,6 +1070,19 @@ impl Groth16Bn254Prover {
 #[cfg(all(test, feature = "native"))]
 mod pk_cache_tests {
     use super::*;
+
+    #[test]
+    fn the_solved_circuit_is_kept_only_where_memory_allows_or_when_asked() {
+        let gib = |n: u64| Some(n << 30);
+        assert!(keep_groth16_circuit(None, gib(48)));
+        assert!(!keep_groth16_circuit(None, gib(47)));
+        assert!(!keep_groth16_circuit(None, None));
+        assert!(!keep_groth16_circuit(Some("0"), gib(100)));
+        assert!(!keep_groth16_circuit(Some("false"), gib(100)));
+        assert!(keep_groth16_circuit(Some("1"), gib(1)));
+        assert!(keep_groth16_circuit(Some("true"), None));
+        assert!(keep_groth16_circuit(Some("yes"), gib(48)));
+    }
 
     #[test]
     fn the_cpu_helper_heap_is_limited_only_where_memory_is_short() {
