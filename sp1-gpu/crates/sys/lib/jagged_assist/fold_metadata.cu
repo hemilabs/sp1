@@ -103,7 +103,10 @@ __global__ void jaggedFoldMetadata(
         if (bid > 0u) {
             while (atomicAdd(&flags[bid], 0u) == 0u) {
             }
-            previous_sum = scan_values[bid];
+            // An atomic read, from the coherent level: a plain load may be served by this compute
+            // unit's L1, which on AMD is not coherent and can hold the line from before the
+            // previous block's store (another block on this unit read a neighbouring value).
+            previous_sum = atomicAdd(&scan_values[bid], 0u);
         } else {
             previous_sum = 0u;
         }

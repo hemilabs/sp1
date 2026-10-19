@@ -355,9 +355,46 @@ extern "C" rustCudaError_t cuda_free_async(void* devPtr, cudaStream_t stream) {
     return CUDA_SUCCESS_CSL;
 }
 
+#ifdef __HIPCC__
+// Memsets as kernels on HIP: on Windows a hipMemsetAsync did not wait for the kernel queued before
+// it on the same stream (it ran while the kernel still read the memory: the jagged fold-metadata
+// scan's flags were reset under it, and zerocheck's folds went wrong; AMD_SERIALIZE_COPY=3 made
+// it pass). A kernel is ordered like every other on the stream.
+__global__ void memsetWordsKernel(uint32_t* __restrict__ dst, uint32_t word, size_t words) {
+    for (size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x; i < words;
+         i += (size_t)gridDim.x * blockDim.x) {
+        dst[i] = word;
+    }
+}
+
+__global__ void memsetBytesKernel(uint8_t* __restrict__ dst, uint8_t value, size_t count) {
+    for (size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x; i < count;
+         i += (size_t)gridDim.x * blockDim.x) {
+        dst[i] = value;
+    }
+}
+#endif
+
 extern "C" rustCudaError_t
 cuda_mem_set_async(void* dst, uint8_t value, size_t count, cudaStream_t stream) {
+#ifdef __HIPCC__
+    if (count == 0) return CUDA_SUCCESS_CSL;
+    const unsigned block = 256;
+    if ((uintptr_t)dst % 4 == 0 && count % 4 == 0) {
+        const size_t words = count / 4;
+        const uint32_t word = 0x01010101u * value;
+        const unsigned grid = (unsigned)std::min<size_t>((words + block - 1) / block, 65536);
+        hipLaunchKernelGGL(memsetWordsKernel, dim3(grid), dim3(block), 0, stream, (uint32_t*)dst,
+                           word, words);
+    } else {
+        const unsigned grid = (unsigned)std::min<size_t>((count + block - 1) / block, 65536);
+        hipLaunchKernelGGL(memsetBytesKernel, dim3(grid), dim3(block), 0, stream, (uint8_t*)dst,
+                           value, count);
+    }
+    CUDA_OK(hipGetLastError());
+#else
     CUDA_OK(cudaMemsetAsync(dst, value, count, stream));
+#endif
     return CUDA_SUCCESS_CSL;
 }
 
@@ -395,18 +432,32 @@ static bool isPinnedHost(const void* ptr) {
 // asynchronous.
 extern "C" rustCudaError_t
 cuda_mem_copy_host_to_device_async(void* dst, const void* src, size_t count, cudaStream_t stream) {
+#ifdef __HIPCC__
+    // A copy from pageable memory waits for the stream's earlier work first: see the device to
+    // host copy below.
+    const bool pinned = isPinnedHost(src);
+    if (!pinned) CUDA_OK(cudaStreamSynchronize(stream));
+#endif
     CUDA_OK(cudaMemcpyAsync(dst, src, count, cudaMemcpyHostToDevice, stream));
 #ifdef __HIPCC__
-    if (!isPinnedHost(src)) CUDA_OK(cudaStreamSynchronize(stream));
+    if (!pinned) CUDA_OK(cudaStreamSynchronize(stream));
 #endif
     return CUDA_SUCCESS_CSL;
 }
 
 extern "C" rustCudaError_t
 cuda_mem_copy_device_to_host_async(void* dst, const void* src, size_t count, cudaStream_t stream) {
+#ifdef __HIPCC__
+    // On Windows (ROCm 7.2) a copy to or from pageable memory did not wait for the kernels queued
+    // before it on the same stream: a read back started before the kernel writing the data had
+    // finished (zerocheck's jagged evaluation came out wrong, intermittently; AMD_SERIALIZE_COPY=1
+    // fixed it). So such a copy waits for the stream first.
+    const bool pinned = isPinnedHost(dst);
+    if (!pinned) CUDA_OK(cudaStreamSynchronize(stream));
+#endif
     CUDA_OK(cudaMemcpyAsync(dst, src, count, cudaMemcpyDeviceToHost, stream));
 #ifdef __HIPCC__
-    if (!isPinnedHost(dst)) CUDA_OK(cudaStreamSynchronize(stream));
+    if (!pinned) CUDA_OK(cudaStreamSynchronize(stream));
 #endif
     return CUDA_SUCCESS_CSL;
 }
