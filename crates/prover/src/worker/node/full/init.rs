@@ -154,6 +154,10 @@ impl<C: SP1ProverComponents> SP1LocalNodeBuilder<C> {
             }
         });
 
+        // Build the machine that `CoreExecute` requests deserialize into now, so the first
+        // proof's executor does not wait for it.
+        tokio::task::spawn_blocking(sp1_prover_types::riscv_machine);
+
         // Spawn the CoreExecute handler
         join_set.spawn({
             let mut execute_rx =

@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::VecDeque,
     io::Write,
     path::PathBuf,
     sync::{
@@ -214,15 +214,6 @@ pub struct CoreWorker<A, W, C: SP1ProverComponents> {
     pk_by_elf: Option<Arc<PerProofProvingKeyCache<C>>>,
     verify_intermediates: bool,
     record_write_dir_and_frequency: Option<(String, usize)>,
-    /// Per-ELF `Arc<Program>` cache keyed by the elf Artifact id.
-    ///
-    /// `Program::from(&elf)` rebuilds the full memory_image
-    /// (`HashMap<u64,u64>`, hundreds of MB at scale) + `page_prot_image`
-    /// once per shard. Same ELF -> identical Program, so we cache the
-    /// `Arc<Program>` and hand it back to subsequent shards for free.
-    /// Single ELF per proof in the common case, so the cache stays tiny
-    /// and the lock is essentially uncontested.
-    program_cache: Arc<Mutex<HashMap<String, Arc<Program>>>>,
 }
 
 impl<A, W, C: SP1ProverComponents> CoreWorker<A, W, C> {
@@ -251,7 +242,6 @@ impl<A, W, C: SP1ProverComponents> CoreWorker<A, W, C> {
             pk_by_elf: None,
             verify_intermediates,
             record_write_dir_and_frequency,
-            program_cache: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -326,38 +316,14 @@ where
             None
         };
 
+        let program = shared_program(&input.elf, &elf).await?;
         let span = tracing::debug_span!("into_record");
-        let elf_id = input.elf.0.clone();
-        let program_cache = self.program_cache.clone();
         let (program, mut record, deferred_record, is_precompile) = tokio::task::spawn_blocking({
             let artifact_client = self.artifact_client.clone();
             let opts = self.opts.clone();
             move || {
                 let _guard = span.enter();
                 {
-                    // Cache lookup: Program::from(&elf) at scale rebuilds a
-                    // hundreds-of-MB memory_image. Same ELF id => identical
-                    // Program, so cache + reuse Arc<Program> across shards.
-                    // The lock is uncontested in the steady state (one ELF
-                    // per proof; lookup happens once per shard).
-                    let cached =
-                        program_cache.lock().expect("program_cache poisoned").get(&elf_id).cloned();
-                    let program = if let Some(cached) = cached {
-                        cached
-                    } else {
-                        let program = Program::from(&elf).map_err(|e| {
-                            TaskError::Fatal(anyhow::anyhow!(
-                                "failed to disassemble program: {}",
-                                e
-                            ))
-                        })?;
-                        let program = Arc::new(program);
-                        program_cache
-                            .lock()
-                            .expect("program_cache poisoned")
-                            .insert(elf_id.clone(), program.clone());
-                        program
-                    };
                     let (record, deferred_record, is_precompile) = match record {
                         TraceData::Core(chunk_bytes) => {
                             let chunk: TraceChunk =
@@ -857,6 +823,31 @@ impl<V: Send + Sync + 'static> ReleaseByElf for PerProofCache<V> {
     fn reserve(&self, elf: &str) {
         self.get_or_insert(elf);
     }
+}
+
+/// The programs of the proofs' ELFs, shared by the executor and the core workers of this process.
+/// Not registered for release: it keeps the [`PER_PROOF_PK_CACHE_ENTRIES`] newest programs.
+static PROGRAMS: PerProofCache<Arc<Program>> =
+    PerProofCache { entries: Mutex::new(VecDeque::new()) };
+
+/// The program of the proof of `elf`, parsed once per process.
+///
+/// Parsing rebuilds the program's memory image (30-100 ms for a large program); every core
+/// worker's first shard of a proof used to parse it again, all at the same time.
+pub async fn shared_program(elf: &Artifact, elf_bytes: &[u8]) -> Result<Arc<Program>, TaskError> {
+    let program = PROGRAMS.get_or_insert(&elf.0);
+    let program = program
+        .get_or_try_init(|| async {
+            let elf_bytes = elf_bytes.to_vec();
+            tokio::task::spawn_blocking(move || Program::from(&elf_bytes).map(Arc::new))
+                .await
+                .map_err(|e| TaskError::Fatal(e.into()))?
+                .map_err(|e| {
+                    TaskError::Fatal(anyhow::anyhow!("failed to disassemble program: {}", e))
+                })
+        })
+        .await?;
+    Ok(program.clone())
 }
 
 /// Every [`PerProofCache`] in this process.
