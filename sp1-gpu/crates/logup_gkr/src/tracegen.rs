@@ -158,7 +158,8 @@ pub fn generate_first_layer<'a>(
         interaction_data,
         interaction_start_indices,
         interaction_row_counts_dev,
-    );
+    )
+    .with_host_column_heights(Some(std::sync::Arc::new(interaction_row_counts.to_vec())));
 
     let num_interaction_variables = interaction_offset.next_power_of_two().ilog2();
 

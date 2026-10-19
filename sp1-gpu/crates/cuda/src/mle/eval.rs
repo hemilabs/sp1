@@ -5,6 +5,7 @@ use slop_tensor::Tensor;
 use sp1_gpu_sys::{
     mle::{
         partial_geq_koala_bear, partial_lagrange_koala_bear, partial_lagrange_koala_bear_extension,
+        partial_lagrange_tiled_koala_bear_extension,
     },
     runtime::KernelPtr,
 };
@@ -71,6 +72,30 @@ impl<F: DeviceCopy + Field> DevicePoint<F> {
         let num_elements = 1 << dimension;
         // Shape [1, num_elements] to match MleBaseBackend convention for TaskScope: [num_polynomials, num_entries]
         let mut eq = DeviceTensor::with_sizes_in([1, num_elements], self.backend().clone());
+        // Tiled kernel (one ext mul per output, bit-identical); `SP1_GPU_PLAG_TILED=0` disables.
+        const PLAG_LB: usize = 8;
+        static TILED_ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let tiled_on = *TILED_ON
+            .get_or_init(|| std::env::var("SP1_GPU_PLAG_TILED").map(|v| v != "0").unwrap_or(true));
+        // Below 2^17 entries the naive kernel is already launch-bound and as fast.
+        const PLAG_MIN_DIM: usize = 17;
+        const PLAG_ROWS: usize = 32;
+        if tiled_on && dimension >= PLAG_MIN_DIM.max(PLAG_LB) {
+            if let Some(kernel) =
+                <TaskScope as PartialLagrangeKernel<F>>::partial_lagrange_tiled_kernel()
+            {
+                unsafe {
+                    eq.assume_init();
+                    let num_hi = 1usize << (dimension - PLAG_LB);
+                    let grid_dim = num_hi.div_ceil(PLAG_ROWS).clamp(1, 2720);
+                    let args = args!(eq.as_mut_ptr(), self.as_ptr(), dimension);
+                    self.backend()
+                        .launch_kernel(kernel, grid_dim, 1usize << PLAG_LB, &args, 0)
+                        .unwrap();
+                }
+                return DeviceMle::new(eq);
+            }
+        }
         unsafe {
             eq.assume_init();
             let block_dim = 256;
@@ -128,6 +153,11 @@ impl<F: DeviceCopy + Field> DeviceMleEval<F> {
 ///
 pub unsafe trait PartialLagrangeKernel<F: Field> {
     fn partial_lagrange_kernel() -> KernelPtr;
+
+    /// Optional tiled variant (same output, one multiplication per entry).
+    fn partial_lagrange_tiled_kernel() -> Option<KernelPtr> {
+        None
+    }
 }
 
 /// # Safety
@@ -216,6 +246,10 @@ unsafe impl PartialLagrangeKernel<SP1Field> for TaskScope {
 unsafe impl PartialLagrangeKernel<SP1ExtensionField> for TaskScope {
     fn partial_lagrange_kernel() -> KernelPtr {
         unsafe { partial_lagrange_koala_bear_extension() }
+    }
+
+    fn partial_lagrange_tiled_kernel() -> Option<KernelPtr> {
+        Some(unsafe { partial_lagrange_tiled_koala_bear_extension() })
     }
 }
 

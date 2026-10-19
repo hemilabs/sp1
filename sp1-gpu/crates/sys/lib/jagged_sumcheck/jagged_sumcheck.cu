@@ -232,3 +232,105 @@ extern "C" void* jagged_two_round_sum_as_poly() { return (void*)jaggedTwoRoundSu
 extern "C" void* jagged_two_round_fix_and_sum() { return (void*)jaggedTwoRoundFixAndSum; }
 
 extern "C" void* padded_hadamard_fix_and_sum() { return (void*)paddedHadamardFixAndSum; }
+
+// ---------------------------------------------------------------------------------------------
+// Multi-round hadamard tail: fold FOLDS (1 or 2) pending challenges and accumulate the round sums
+// of the next ROUNDS (1 or 2) rounds in one pass. FOLDS = 1, ROUNDS = 1 is exactly
+// paddedHadamardFixAndSum. With ROUNDS = 2 the 8 grid values h(X, Y) (Y the earlier round, X the
+// later; h(1,1) deduced from the claim) are accumulated in the jaggedTwoRoundSumAsPoly order:
+// h(0,0), h(0,1), 4h(0,1/2), h(1,0), 4h(1,1/2), 4h(1/2,0), 4h(1/2,1), 16h(1/2,1/2).
+// Out-of-range inputs are zeros, matching the zero padding of the single-fold kernel, so the
+// folded output equals FOLDS successive single folds and the messages are the same field elements.
+template <int FOLDS, int ROUNDS>
+__device__ __forceinline__ void hadamardFoldOne(
+    const ext_t* __restrict__ in,
+    size_t inHeight,
+    size_t o,
+    ext_t a1,
+    ext_t a2,
+    ext_t& out) {
+    if (FOLDS == 1) {
+        size_t z = o << 1;
+        ext_t x0 = ext_t::load(in, z);
+        ext_t x1 = (z + 1 < inHeight) ? ext_t::load(in, z + 1) : ext_t::zero();
+        out = a1 * x1 + (ext_t::one() - a1) * x0;
+    } else {
+        size_t z = o << 2;
+        ext_t x0 = ext_t::load(in, z);
+        ext_t x1 = (z + 1 < inHeight) ? ext_t::load(in, z + 1) : ext_t::zero();
+        ext_t x2 = (z + 2 < inHeight) ? ext_t::load(in, z + 2) : ext_t::zero();
+        ext_t x3 = (z + 3 < inHeight) ? ext_t::load(in, z + 3) : ext_t::zero();
+        ext_t oma1 = ext_t::one() - a1;
+        ext_t y0 = a1 * x1 + oma1 * x0;
+        ext_t y1 = a1 * x3 + oma1 * x2;
+        out = a2 * y1 + (ext_t::one() - a2) * y0;
+    }
+}
+
+template <int FOLDS, int ROUNDS>
+SP1_KERNEL void hadamardFoldAndGrid(
+    const ext_t* __restrict__ p_in,
+    const ext_t* __restrict__ q_in,
+    ext_t* __restrict__ p_out,
+    ext_t* __restrict__ q_out,
+    ext_t a1,
+    ext_t a2,
+    ext_t* __restrict__ result,
+    size_t inHeight) {
+    constexpr int G = 1 << ROUNDS;
+    constexpr int NACC = ROUNDS == 1 ? 2 : 8;
+    size_t outHeight = inHeight;
+    for (int f = 0; f < FOLDS; f++) outHeight = (outHeight + 1) >> 1;
+    size_t groups = (outHeight + G - 1) / G;
+
+    ext_t acc[NACC];
+#pragma unroll
+    for (int k = 0; k < NACC; k++) acc[k] = ext_t::zero();
+
+    for (size_t g = blockIdx.x * blockDim.x + threadIdx.x; g < groups; g += blockDim.x * gridDim.x) {
+        ext_t p[G], q[G];
+#pragma unroll
+        for (int t = 0; t < G; t++) {
+            size_t o = g * G + t;
+            if (o < outHeight) {
+                hadamardFoldOne<FOLDS, ROUNDS>(p_in, inHeight, o, a1, a2, p[t]);
+                hadamardFoldOne<FOLDS, ROUNDS>(q_in, inHeight, o, a1, a2, q[t]);
+                ext_t::store(p_out, o, p[t]);
+                ext_t::store(q_out, o, q[t]);
+            } else {
+                p[t] = ext_t::zero();
+                q[t] = ext_t::zero();
+            }
+        }
+        if (ROUNDS == 1) {
+            acc[0] += p[0] * q[0];
+            acc[1] += (p[0] + p[1]) * (q[0] + q[1]);
+        } else {
+            // element 2x + y
+            acc[0] += p[0] * q[0];
+            acc[1] += p[1] * q[1];
+            acc[2] += (p[0] + p[1]) * (q[0] + q[1]);
+            acc[3] += p[2] * q[2];
+            acc[4 % NACC] += (p[2] + p[3 % G]) * (q[2] + q[3 % G]);
+            acc[5 % NACC] += (p[0] + p[2]) * (q[0] + q[2]);
+            acc[6 % NACC] += (p[1] + p[3 % G]) * (q[1] + q[3 % G]);
+            acc[7 % NACC] += (p[0] + p[1] + p[2] + p[3 % G]) * (q[0] + q[1] + q[2] + q[3 % G]);
+        }
+    }
+
+    extern __shared__ unsigned char memory[];
+    ext_t* shared = reinterpret_cast<ext_t*>(memory);
+    auto block = cg::this_thread_block();
+    auto tile = cg::tiled_partition<32>(block);
+#pragma unroll
+    for (int k = 0; k < NACC; k++) {
+        ext_t s = partialBlockReduce(block, tile, acc[k], shared);
+        if (threadIdx.x == 0) ext_t::store(result, k * gridDim.x + blockIdx.x, s);
+        block.sync();
+    }
+}
+
+extern "C" void* hadamard_fold1_grid1() { return (void*)hadamardFoldAndGrid<1, 1>; }
+extern "C" void* hadamard_fold2_grid1() { return (void*)hadamardFoldAndGrid<2, 1>; }
+extern "C" void* hadamard_fold1_grid2() { return (void*)hadamardFoldAndGrid<1, 2>; }
+extern "C" void* hadamard_fold2_grid2() { return (void*)hadamardFoldAndGrid<2, 2>; }

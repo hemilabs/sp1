@@ -1,6 +1,7 @@
 use sp1_gpu_cudart::{
     args,
     sys::kernels::{
+        hadamard_fold1_grid1, hadamard_fold1_grid2, hadamard_fold2_grid1, hadamard_fold2_grid2,
         jagged_two_round_fix_and_sum, jagged_two_round_sum_as_poly,
         mle_fix_last_variable_koala_bear_ext_ext_zero_padding, padded_hadamard_fix_and_sum,
     },
@@ -208,6 +209,69 @@ fn fix_two_and_sum_first_rounds<'a>(
     (uni_poly, Mle::new(output_p), Mle::new(output_q))
 }
 
+/// `SP1_GPU_HADAMARD_2R=0` restores the one-round-per-pass hadamard tail (A/B switch).
+fn hadamard_two_round_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("SP1_GPU_HADAMARD_2R").map(|v| v != "0").unwrap_or(true))
+}
+
+/// One pass of the hadamard tail: fold the pending challenges (1 or 2, oldest first) into
+/// `(p, q)` and accumulate the sums for the next `rounds` (1 or 2) rounds. Returns the folded
+/// pair and the reduced sums (2 values for one round, the 8 two-round grid values otherwise).
+fn hadamard_fold_and_grid(
+    p: Mle<Ext, TaskScope>,
+    q: Mle<Ext, TaskScope>,
+    pending: &[Ext],
+    rounds: usize,
+) -> (Mle<Ext, TaskScope>, Mle<Ext, TaskScope>, Vec<Ext>) {
+    let backend = p.backend().clone();
+    let in_height = p.guts().sizes()[1];
+    let folds = pending.len();
+    assert!((1..=2).contains(&folds) && (1..=2).contains(&rounds));
+    let mut out_height = in_height;
+    for _ in 0..folds {
+        out_height = out_height.div_ceil(2);
+    }
+    let groups = out_height.div_ceil(1 << rounds);
+    let mut p_out: Tensor<Ext, TaskScope> = Tensor::with_sizes_in([1, out_height], backend.clone());
+    let mut q_out: Tensor<Ext, TaskScope> = Tensor::with_sizes_in([1, out_height], backend.clone());
+    const BLOCK_SIZE: usize = 256;
+    let grid = groups.div_ceil(BLOCK_SIZE).max(1);
+    let nacc = if rounds == 1 { 2 } else { 8 };
+    let mut partials = Tensor::<Ext, TaskScope>::with_sizes_in([nacc, grid], backend.clone());
+    let shared_mem = (BLOCK_SIZE / 32) * std::mem::size_of::<Ext>();
+    let a1 = pending[0];
+    let a2 = if folds == 2 { pending[1] } else { Ext::zero() };
+    let kernel = match (folds, rounds) {
+        (1, 1) => hadamard_fold1_grid1,
+        (2, 1) => hadamard_fold2_grid1,
+        (1, 2) => hadamard_fold1_grid2,
+        _ => hadamard_fold2_grid2,
+    };
+    unsafe {
+        p_out.assume_init();
+        q_out.assume_init();
+        partials.assume_init();
+        let args = args!(
+            p.guts().as_ptr(),
+            q.guts().as_ptr(),
+            p_out.as_mut_ptr(),
+            q_out.as_mut_ptr(),
+            a1,
+            a2,
+            partials.as_mut_ptr(),
+            in_height
+        );
+        backend.launch_kernel(kernel(), grid, BLOCK_SIZE, &args, shared_mem).unwrap();
+    }
+    let sums = if grid == 1 {
+        DeviceTensor::from_raw(partials).to_host().unwrap().into_buffer().into_vec()
+    } else {
+        DeviceTensor::from_raw(partials).sum_dim(1).to_host().unwrap().into_buffer().into_vec()
+    };
+    (Mle::new(p_out), Mle::new(q_out), sums)
+}
+
 /// Process a univariate polynomial by observing it with the challenger and sampling the next evaluation point
 #[inline]
 fn process_univariate_polynomial<C>(
@@ -310,34 +374,147 @@ where
 
     let mut stacked_evals =
         DeviceBuffer::with_capacity_in(1 << (num_variables as usize - log_stacking_height), task);
-    for sc_round in 3..num_variables as usize {
-        // Get the round claims from the last round's univariate poly messages.
-        let round_claim = univariate_poly_msgs.last().unwrap().eval_at_point(alpha);
+    let nv = num_variables as usize;
+    let lsh = log_stacking_height;
+    if !hadamard_two_round_enabled() {
+        for sc_round in 3..nv {
+            // Get the round claims from the last round's univariate poly messages.
+            let round_claim = univariate_poly_msgs.last().unwrap().eval_at_point(alpha);
 
-        let uni_poly;
-        (p, q, uni_poly) = fix_last_variable_and_sum_as_poly(
+            let uni_poly;
+            (p, q, uni_poly) = fix_last_variable_and_sum_as_poly(
+                p,
+                q,
+                alpha,
+                round_claim,
+                padded_hadamard_fix_and_sum,
+            );
+
+            if sc_round == lsh {
+                stacked_evals.extend_from_device_slice(p.guts().as_buffer()).unwrap();
+            }
+
+            alpha = process_univariate_polynomial(
+                uni_poly,
+                challenger,
+                &mut univariate_poly_msgs,
+                &mut point,
+            );
+        }
+        let (p, q) =
+            fix_last_variable(p, q, alpha, mle_fix_last_variable_koala_bear_ext_ext_zero_padding);
+        return finish_jagged_sumcheck(
             p,
             q,
             alpha,
-            round_claim,
-            padded_hadamard_fix_and_sum,
-        );
-
-        if sc_round == log_stacking_height {
-            stacked_evals.extend_from_device_slice(p.guts().as_buffer()).unwrap();
-        }
-
-        alpha = process_univariate_polynomial(
-            uni_poly,
-            challenger,
-            &mut univariate_poly_msgs,
-            &mut point,
+            claim,
+            univariate_poly_msgs,
+            point,
+            stacked_evals,
         );
     }
 
-    let (p, q) =
-        fix_last_variable(p, q, alpha, mle_fix_last_variable_koala_bear_ext_ext_zero_padding);
+    // Multi-round tail: each pass folds the pending challenges and accumulates the sums of the
+    // next one or two rounds (two-round grid as for rounds 1-2 above), halving the passes over
+    // (p, q) and the host round trips. The messages are the same field elements as in the
+    // one-round loop, so the transcript is unchanged.
+    let half = Ext::from_canonical_u16(2).inverse();
+    let quarter = Ext::from_canonical_u16(4).inverse();
+    let grid_points = [Ext::from_canonical_u16(0), Ext::from_canonical_u16(1), half];
+    // `pending`: sampled challenges not yet folded (oldest first); `last`: round index of the
+    // newest one. Messages 1..=last have been sent. A pass folds all pending challenges
+    // (materializing the level folded through `last`, snapshotted when `last == lsh`, exactly
+    // like the one-round loop) and computes the next one or two messages. A two-round pass for
+    // rounds (lsh, lsh + 1) would later fold both at once and skip the snapshot level, so it is
+    // demoted to a single round.
+    let mut pending: Vec<Ext> = vec![alpha];
+    let mut last = 3usize;
+    while last < nv {
+        let mut rounds = (nv - last).min(2);
+        if rounds == 2 && last + 1 == lsh {
+            rounds = 1;
+        }
+        let round_claim =
+            univariate_poly_msgs.last().unwrap().eval_at_point(*pending.last().unwrap());
+        let (np, nq, sums) = hadamard_fold_and_grid(p, q, &pending, rounds);
+        p = np;
+        q = nq;
+        if last == lsh {
+            stacked_evals.extend_from_device_slice(p.guts().as_buffer()).unwrap();
+        }
+        if rounds == 1 {
+            let [eval_zero, eval_half]: [Ext; 2] = sums.as_slice().try_into().unwrap();
+            let eval_one = round_claim - eval_zero;
+            let uni_poly = interpolate_univariate_polynomial(
+                &grid_points,
+                &[eval_zero, eval_one, eval_half * Felt::from_canonical_u16(4).inverse()],
+            );
+            let a = process_univariate_polynomial(
+                uni_poly,
+                challenger,
+                &mut univariate_poly_msgs,
+                &mut point,
+            );
+            pending = vec![a];
+        } else {
+            let [h_0_0, h_0_1, h_0_half, h_1_0, h_1_half, h_half_0, h_half_1, h_half_half]: [Ext;
+                8] = sums.as_slice().try_into().unwrap();
+            let h_0_half = h_0_half * quarter;
+            let h_1_half = h_1_half * quarter;
+            let h_half_0 = h_half_0 * quarter;
+            let h_half_1 = h_half_1 * quarter;
+            let h_half_half = h_half_half * quarter * quarter;
+            let h_1_1 = round_claim - h_0_0 - h_0_1 - h_1_0;
+            let uni_poly = interpolate_univariate_polynomial(
+                &grid_points,
+                &[h_0_0 + h_1_0, h_0_1 + h_1_1, h_0_half + h_1_half],
+            );
+            let a_1 = process_univariate_polynomial(
+                uni_poly,
+                challenger,
+                &mut univariate_poly_msgs,
+                &mut point,
+            );
+            let column_at = |h_x_0: Ext, h_x_1: Ext, h_x_half: Ext| {
+                interpolate_univariate_polynomial(&grid_points, &[h_x_0, h_x_1, h_x_half])
+                    .eval_at_point(a_1)
+            };
+            let uni_poly = interpolate_univariate_polynomial(
+                &grid_points,
+                &[
+                    column_at(h_0_0, h_0_1, h_0_half),
+                    column_at(h_1_0, h_1_1, h_1_half),
+                    column_at(h_half_0, h_half_1, h_half_half),
+                ],
+            );
+            let a_2 = process_univariate_polynomial(
+                uni_poly,
+                challenger,
+                &mut univariate_poly_msgs,
+                &mut point,
+            );
+            pending = vec![a_1, a_2];
+        }
+        last += rounds;
+    }
+    let mut p = p;
+    let mut q = q;
+    for &a in &pending {
+        (p, q) = fix_last_variable(p, q, a, mle_fix_last_variable_koala_bear_ext_ext_zero_padding);
+    }
+    let alpha = *pending.last().unwrap();
+    finish_jagged_sumcheck(p, q, alpha, claim, univariate_poly_msgs, point, stacked_evals)
+}
 
+fn finish_jagged_sumcheck(
+    p: Mle<Ext, TaskScope>,
+    q: Mle<Ext, TaskScope>,
+    alpha: Ext,
+    claim: Ext,
+    univariate_poly_msgs: Vec<UnivariatePolynomial<Ext>>,
+    point: Vec<Ext>,
+    stacked_evals: DeviceBuffer<Ext>,
+) -> (PartialSumcheckProof<Ext>, Vec<Ext>, DeviceBuffer<Ext>) {
     let proof = PartialSumcheckProof {
         univariate_polys: univariate_poly_msgs.clone(),
         claimed_sum: claim,

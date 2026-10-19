@@ -414,7 +414,7 @@ impl<F: Field, B: Backend> DenseDataMut<B> for TraceDenseData<F, B> {
 
 impl<F: Field> JaggedTraceMle<F, CpuBackend> {
     pub fn into_device(self, t: &TaskScope) -> JaggedTraceMle<F, TaskScope> {
-        let JaggedMle { col_index, start_indices, column_heights, dense_data } = self.0;
+        let JaggedMle { col_index, start_indices, column_heights, dense_data, .. } = self.0;
         JaggedTraceMle::new(
             dense_data.into_device_in(t),
             DeviceBuffer::from_host(&col_index, t).unwrap().into_inner(),
@@ -442,7 +442,7 @@ impl<F: Field> TraceDenseData<F, CpuBackend> {
 
 impl<F: Field> JaggedTraceMle<F, TaskScope> {
     pub fn into_host(self) -> JaggedTraceMle<F, CpuBackend> {
-        let JaggedMle { col_index, start_indices, column_heights, dense_data } = self.0;
+        let JaggedMle { col_index, start_indices, column_heights, dense_data, .. } = self.0;
         let host_dense = dense_data.into_host();
         // Convert device buffers to host using DeviceBuffer wrapper
         let col_index_host = DeviceBuffer::from_raw(col_index).to_host().unwrap().into();

@@ -61,6 +61,9 @@ extern "C" {
     pub fn zerocheck_fused_sequential_bivariate_kb_256_kernel() -> KernelPtr;
     pub fn zerocheck_fused_sequential_bivariate_kb_512_kernel() -> KernelPtr;
     pub fn zerocheck_fused_sequential_bivariate_kb_1024_kernel() -> KernelPtr;
+    pub fn zerocheck_fused_sequential_bivariate_vec2_kb_128_kernel() -> KernelPtr;
+    pub fn zerocheck_fused_sequential_bivariate_vec4_kb_128_kernel() -> KernelPtr;
+    pub fn zerocheck_fused_sequential_bivariate_vec12_kb_128_kernel() -> KernelPtr;
 
     // zerocheck (DAG-native): ColumnTile lowering kernels.
     pub fn zerocheck_column_tile_kb_kernel() -> KernelPtr;
@@ -200,6 +203,10 @@ extern "C" {
     pub fn jagged_two_round_sum_as_poly() -> KernelPtr;
     pub fn jagged_two_round_fix_and_sum() -> KernelPtr;
     pub fn padded_hadamard_fix_and_sum() -> KernelPtr;
+    pub fn hadamard_fold1_grid1() -> KernelPtr;
+    pub fn hadamard_fold2_grid1() -> KernelPtr;
+    pub fn hadamard_fold1_grid2() -> KernelPtr;
+    pub fn hadamard_fold2_grid2() -> KernelPtr;
 
     // Populate restrict eq
     pub fn populate_restrict_eq_host(

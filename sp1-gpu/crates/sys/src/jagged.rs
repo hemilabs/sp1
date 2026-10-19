@@ -15,4 +15,14 @@ extern "C" {
     pub fn transition_kernel() -> KernelPtr;
 
     pub fn fixLastVariable_kernel() -> KernelPtr;
+
+    pub fn bp_cached_precompute_kernel() -> KernelPtr;
+
+    pub fn bp_cached_round_kernel() -> KernelPtr;
+
+    pub fn bp_cached_round2_kernel() -> KernelPtr;
+
+    pub fn bp_cached_interpolate_kernel_duplex() -> KernelPtr;
+
+    pub fn bp_cached_interpolate_kernel_multi_field_32() -> KernelPtr;
 }

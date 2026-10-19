@@ -18,6 +18,13 @@ struct DagInstr {
     uint16_t b;
 };
 
+// `DagInstr._pad` forwarding flags — must match `FLAG_*` in
+// sp1-gpu-air/src/ir/bytecode.rs. Interpreters that ignore them (pad_adj)
+// remain correct: every register is still written there.
+constexpr uint8_t DAG_FLAG_A_PREV   = 1;
+constexpr uint8_t DAG_FLAG_B_PREV   = 2;
+constexpr uint8_t DAG_FLAG_NO_STORE = 4;
+
 // Source tag for `LeafRef.source`. Must match
 // `LEAF_SOURCE_{PREPROCESSED,MAIN}_LOCAL` in
 // `sp1-gpu-air/src/ir/bytecode.rs`. The (`PreprocessedNext`,
@@ -46,6 +53,7 @@ enum BcOp : uint8_t {
     BC_SUB_F       = 4,
     BC_MUL_F       = 5,
     BC_NEG_F       = 6,
+    BC_MUL_CONST   = 7, // rhs is consts[instr.b], not a register
 };
 
 // Shard-static per-chunk descriptor. Must match `ChunkStaticC` in

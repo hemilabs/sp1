@@ -52,36 +52,52 @@ __device__ __forceinline__ ext_t run_chunk_bytecode(
     K (&regs)[MAX_REGS],
     LoadLeaf load_leaf)
 {
+    // Operand forwarding (see `annotate_forwarding` in bytecode.rs): `prev`
+    // holds the previous instruction's result in registers. Operands flagged
+    // DAG_FLAG_A_PREV / DAG_FLAG_B_PREV read it instead of the local-memory
+    // register file, and results flagged DAG_FLAG_NO_STORE (consumed only by
+    // the next instruction) are never written back. Same arithmetic in the
+    // same order as the unflagged path, so results are bit-identical.
+    K prev = K::zero();
     for (uint32_t i = 0; i < stc.n_instrs; i++) {
         DagInstr instr = stc.instrs[i];
+        const uint32_t f = instr._pad;
+        K x;
         switch (instr.opcode) {
         case BC_LOAD_LEAF: {
-            regs[instr.out] = load_leaf(stc.leaves[instr.a]);
+            x = load_leaf(stc.leaves[instr.a]);
             break;
         }
         case BC_LOAD_CONST: {
-            regs[instr.out] = K(consts[instr.a]);
+            x = K(consts[instr.a]);
             break;
         }
         case BC_LOAD_PUBLIC: {
             uint32_t pv_idx = stc.publics[instr.a];
-            regs[instr.out] = K(felt_t::load(public_values, pv_idx));
+            x = K(felt_t::load(public_values, pv_idx));
             break;
         }
-        case BC_ADD_F: {
-            regs[instr.out] = regs[instr.a] + regs[instr.b];
-            break;
-        }
-        case BC_SUB_F: {
-            regs[instr.out] = regs[instr.a] - regs[instr.b];
-            break;
-        }
+        case BC_ADD_F:
+        case BC_SUB_F:
         case BC_MUL_F: {
-            regs[instr.out] = regs[instr.a] * regs[instr.b];
+            K va, vb;
+            if (f & DAG_FLAG_A_PREV) va = prev; else va = regs[instr.a];
+            if (f & DAG_FLAG_B_PREV) vb = prev; else vb = regs[instr.b];
+            if (instr.opcode == BC_ADD_F) x = va + vb;
+            else if (instr.opcode == BC_SUB_F) x = va - vb;
+            else x = va * vb;
+            break;
+        }
+        case BC_MUL_CONST: {
+            K va;
+            if (f & DAG_FLAG_A_PREV) va = prev; else va = regs[instr.a];
+            x = va * consts[instr.b];
             break;
         }
         case BC_NEG_F: {
-            regs[instr.out] = K::zero() - regs[instr.a];
+            K va;
+            if (f & DAG_FLAG_A_PREV) va = prev; else va = regs[instr.a];
+            x = K::zero() - va;
             break;
         }
         default:
@@ -90,6 +106,8 @@ __device__ __forceinline__ ext_t run_chunk_bytecode(
             // producing the wrong constraint value downstream.
             __trap();
         }
+        if (!(f & DAG_FLAG_NO_STORE)) regs[instr.out] = x;
+        prev = x;
     }
 
     ext_t acc = ext_t::zero();
@@ -290,7 +308,160 @@ __global__ void zerocheck_fused_sequential_bivariate(
     }
 }
 
+// ============================================================================
+// Node-vectorised bivariate variant. Same math as
+// `zerocheck_fused_sequential_bivariate`, but each interpreter pass carries G
+// grid nodes per register (`NodeVec<G>`), so a chunk's bytecode is decoded
+// 12/G times per quadruple instead of 12 times, and each leaf's four trace
+// values are loaded once per pass and interpolated to all G nodes. The
+// per-node arithmetic (and its order) is unchanged, so results are
+// bit-identical to the scalar kernel.
+// ============================================================================
+template <int G>
+struct NodeVec {
+    felt_t v[G];
+};
+template <int G>
+__device__ __forceinline__ NodeVec<G> nv_splat(felt_t x) {
+    NodeVec<G> r;
+#pragma unroll
+    for (int g = 0; g < G; g++) r.v[g] = x;
+    return r;
+}
+
+template <int G, int MAX_REGS>
+__global__ void zerocheck_fused_sequential_bivariate_vec(
+    const BlockDispatch* __restrict__ dispatch,
+    const ChunkStatic* __restrict__ chunk_static,
+    const ChipLayout* __restrict__ chip_layouts,
+    const felt_t* __restrict__ trace_data,
+    const felt_t* __restrict__ public_values,
+    const ext_t* __restrict__ powers_of_alpha,
+    const ext_t* __restrict__ partial_lagrange,
+    const ext_t* __restrict__ powers_of_lambda,
+    uint32_t rest_point_dim,
+    ext_t* __restrict__ partials
+) {
+    static_assert(BIVARIATE_NUM_NODES % G == 0, "G must divide the node count");
+    BlockDispatch disp = dispatch[blockIdx.x];
+    ChunkStatic stc = chunk_static[disp.chunk_id];
+    ChipLayout lay = chip_layouts[stc.chip_idx];
+    const felt_t* consts = reinterpret_cast<const felt_t*>(stc.consts);
+    const ext_t lambda = ext_t::load(powers_of_lambda, stc.chip_idx);
+
+    ext_t thread_acc[BIVARIATE_NUM_NODES];
+    for (int e = 0; e < BIVARIATE_NUM_NODES; e++) {
+        thread_acc[e] = ext_t::zero();
+    }
+    NodeVec<G> regs[MAX_REGS];
+
+    const uint32_t quad_limit = 1u << rest_point_dim;
+    const uint32_t quad_end = disp.row_offset + disp.n_rows;
+    for (uint32_t quad_idx = disp.row_offset + threadIdx.x; quad_idx < quad_end;
+         quad_idx += blockDim.x)
+    {
+        if (quad_idx >= quad_limit) {
+            continue;
+        }
+        const ext_t w = ext_t::load(partial_lagrange, quad_idx) * lambda;
+        const bool full_quad = ((quad_idx << 2) | 3u) < lay.height;
+        for (int e0 = 0; e0 < BIVARIATE_NUM_NODES; e0 += G) {
+            NodeVec<G> prev = nv_splat<G>(felt_t::zero());
+            for (uint32_t i = 0; i < stc.n_instrs; i++) {
+                DagInstr instr = stc.instrs[i];
+                const uint32_t f = instr._pad;
+                NodeVec<G> x;
+                switch (instr.opcode) {
+                case BC_LOAD_LEAF: {
+                    LeafRef leaf = stc.leaves[instr.a];
+                    size_t base = (leaf.source == LEAF_SOURCE_MAIN_LOCAL) ? lay.main_ptr
+                                                                         : lay.preprocessed_ptr;
+                    const size_t qb = base + (size_t)leaf.col * (size_t)lay.height
+                                      + ((size_t)quad_idx << 2);
+                    felt_t r00 = felt_t::load(trace_data, qb);
+                    felt_t r01 = felt_t::load(trace_data, qb + 1);
+                    felt_t r10 = felt_t::zero();
+                    felt_t r11 = felt_t::zero();
+                    if (full_quad) {
+                        r10 = felt_t::load(trace_data, qb + 2);
+                        r11 = felt_t::load(trace_data, qb + 3);
+                    }
+#pragma unroll
+                    for (int g = 0; g < G; g++) {
+                        x.v[g] = bivariate_interp(r00, r01, r10, r11, bivariate_node(e0 + g));
+                    }
+                    break;
+                }
+                case BC_LOAD_CONST: {
+                    x = nv_splat<G>(consts[instr.a]);
+                    break;
+                }
+                case BC_LOAD_PUBLIC: {
+                    x = nv_splat<G>(felt_t::load(public_values, stc.publics[instr.a]));
+                    break;
+                }
+                case BC_ADD_F:
+                case BC_SUB_F:
+                case BC_MUL_F: {
+                    NodeVec<G> va, vb;
+                    if (f & DAG_FLAG_A_PREV) va = prev; else va = regs[instr.a];
+                    if (f & DAG_FLAG_B_PREV) vb = prev; else vb = regs[instr.b];
+#pragma unroll
+                    for (int g = 0; g < G; g++) {
+                        x.v[g] = (instr.opcode == BC_ADD_F)   ? va.v[g] + vb.v[g]
+                                 : (instr.opcode == BC_SUB_F) ? va.v[g] - vb.v[g]
+                                                              : va.v[g] * vb.v[g];
+                    }
+                    break;
+                }
+                case BC_MUL_CONST: {
+                    NodeVec<G> va;
+                    if (f & DAG_FLAG_A_PREV) va = prev; else va = regs[instr.a];
+                    const felt_t c = consts[instr.b];
+#pragma unroll
+                    for (int g = 0; g < G; g++) x.v[g] = va.v[g] * c;
+                    break;
+                }
+                case BC_NEG_F: {
+                    NodeVec<G> va;
+                    if (f & DAG_FLAG_A_PREV) va = prev; else va = regs[instr.a];
+#pragma unroll
+                    for (int g = 0; g < G; g++) x.v[g] = felt_t::zero() - va.v[g];
+                    break;
+                }
+                default:
+                    __trap();
+                }
+                if (!(f & DAG_FLAG_NO_STORE)) regs[instr.out] = x;
+                prev = x;
+            }
+#pragma unroll
+            for (int g = 0; g < G; g++) {
+                ext_t acc = ext_t::zero();
+                for (uint32_t i = 0; i < stc.n_asserts; i++) {
+                    uint32_t alpha_idx = stc.chip_alpha_offset + stc.assert_alphas[i];
+                    acc += ext_t::load(powers_of_alpha, alpha_idx) * regs[stc.assert_regs[i]].v[g];
+                }
+                thread_acc[e0 + g] += acc * w;
+            }
+        }
+    }
+
+    extern __shared__ unsigned char smem[];
+    ext_t* shared = reinterpret_cast<ext_t*>(smem);
+    auto block = cg::this_thread_block();
+    auto tile_warp = cg::tiled_partition<32>(block);
+    for (int e = 0; e < BIVARIATE_NUM_NODES; e++) {
+        ext_t block_sum = partialBlockReduce(block, tile_warp, thread_acc[e], shared);
+        if (threadIdx.x == 0) {
+            ext_t::store(partials, blockIdx.x * BIVARIATE_NUM_NODES + (uint32_t)e, block_sum);
+        }
+        block.sync();
+    }
+}
+
 } // namespace
+
 
 // Fused dispatch entry points, tiered by MAX_REGS so the per-thread local
 // memory footprint matches the largest chunk in the tier. The launcher
@@ -352,4 +523,15 @@ extern "C" void* zerocheck_fused_sequential_bivariate_kb_512_kernel() {
 }
 extern "C" void* zerocheck_fused_sequential_bivariate_kb_1024_kernel() {
     return (void*)zerocheck_fused_sequential_bivariate<felt_t, 1024>;
+}
+
+// Node-vectorised bivariate entry points (MAX_REGS = 128 / 256 tiers).
+extern "C" void* zerocheck_fused_sequential_bivariate_vec2_kb_128_kernel() {
+    return (void*)zerocheck_fused_sequential_bivariate_vec<2, 128>;
+}
+extern "C" void* zerocheck_fused_sequential_bivariate_vec4_kb_128_kernel() {
+    return (void*)zerocheck_fused_sequential_bivariate_vec<4, 128>;
+}
+extern "C" void* zerocheck_fused_sequential_bivariate_vec12_kb_128_kernel() {
+    return (void*)zerocheck_fused_sequential_bivariate_vec<12, 128>;
 }

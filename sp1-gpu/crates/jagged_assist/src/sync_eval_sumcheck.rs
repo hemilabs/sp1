@@ -163,6 +163,22 @@ where
 {
     let num_variables = poly.num_variables();
 
+    if jagged_assist_cached_enabled() && t == 1 {
+        // All rounds on the device, no per-round host round trip, O(1) layers per round.
+        let rho = poly.bp_batch_eval.prove_all_rounds_cached(
+            &poly.merged_prefix_sums,
+            &poly.z_col_eq_vals,
+            &mut poly.intermediate_eq_full_evals,
+            sum_values,
+            challenger,
+            claim,
+            num_variables as usize,
+        );
+        poly.rho = rho;
+        poly.round_num += num_variables as usize;
+        return finish_jagged_eval_sumcheck(&poly.rho, sum_values, claim);
+    }
+
     // First round of sumcheck - sync call
     let (mut round_claim, new_point) = poly.bp_batch_eval.sum_as_poly_and_sample_into_point(
         poly.round_num,
@@ -212,6 +228,22 @@ where
         poly.round_num += 1;
     }
 
+    finish_jagged_eval_sumcheck(&poly.rho, sum_values, claim)
+}
+
+/// `SP1_GPU_JAGGED_ASSIST_CACHED=0` restores the round-by-round path (A/B switch).
+fn jagged_assist_cached_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("SP1_GPU_JAGGED_ASSIST_CACHED").map(|v| v != "0").unwrap_or(true)
+    })
+}
+
+fn finish_jagged_eval_sumcheck<EF: Field>(
+    rho: &Point<EF, TaskScope>,
+    sum_values: &Buffer<EF, TaskScope>,
+    claim: EF,
+) -> PartialSumcheckProof<EF> {
     // Move sum_as_poly evaluations to CPU
     let host_sum_values = unsafe { sum_values.copy_into_host_vec() };
 
@@ -227,7 +259,7 @@ where
         .collect::<Vec<_>>();
 
     // Move randomness point to CPU
-    let point_host = unsafe { poly.rho.values().copy_into_host_vec() };
+    let point_host = unsafe { rho.values().copy_into_host_vec() };
 
     let final_claim: EF =
         univariate_polys.last().unwrap().eval_at_point(point_host.first().copied().unwrap());
