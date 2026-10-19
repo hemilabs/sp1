@@ -123,12 +123,47 @@ fn forced_choice() -> Option<u8> {
     }
 }
 
+#[cfg(target_os = "linux")]
 fn host_ram_bytes() -> u64 {
     let mut info: libc::sysinfo = unsafe { std::mem::zeroed() };
     if unsafe { libc::sysinfo(&mut info) } != 0 {
         return 0;
     }
     (info.totalram as u64).saturating_mul(info.mem_unit.max(1) as u64)
+}
+
+/// Windows: kernel32's GlobalMemoryStatusEx (kernel32 is always linked), declared here rather
+/// than through a bindings crate.
+#[cfg(windows)]
+fn host_ram_bytes() -> u64 {
+    #[repr(C)]
+    struct MemoryStatusEx {
+        length: u32,
+        memory_load: u32,
+        total_phys: u64,
+        avail_phys: u64,
+        total_page_file: u64,
+        avail_page_file: u64,
+        total_virtual: u64,
+        avail_virtual: u64,
+        avail_extended_virtual: u64,
+    }
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GlobalMemoryStatusEx(buffer: *mut MemoryStatusEx) -> i32;
+    }
+    let mut status: MemoryStatusEx = unsafe { std::mem::zeroed() };
+    status.length = std::mem::size_of::<MemoryStatusEx>() as u32;
+    if unsafe { GlobalMemoryStatusEx(&mut status) } == 0 {
+        return 0;
+    }
+    status.total_phys
+}
+
+/// Elsewhere the host's memory is unknown: as if the query failed.
+#[cfg(not(any(target_os = "linux", windows)))]
+fn host_ram_bytes() -> u64 {
+    0
 }
 
 macro_rules! impl_global_alloc {

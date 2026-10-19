@@ -17,7 +17,11 @@ constexpr unsigned CURVE_SCAN_POINTS_PER_BLOCK = 2 * CURVE_SCAN_BLOCK_SIZE;
 // Independent local scans. Totals are recursively scanned before applying offsets.
 __global__ void curveScanLocal(bb31_septic_curve_t* output,
     const bb31_septic_curve_t* input, size_t n, bb31_septic_curve_t* totals) {
-    __shared__ bb31_septic_curve_t aux[CURVE_SCAN_POINTS_PER_BLOCK];
+    // Raw storage: bb31_septic_curve_t has a constructor, and HIP rejects initializing __shared__
+    // variables.
+    alignas(bb31_septic_curve_t) __shared__ char aux_raw[sizeof(bb31_septic_curve_t) *
+                                                        CURVE_SCAN_POINTS_PER_BLOCK];
+    bb31_septic_curve_t* aux = reinterpret_cast<bb31_septic_curve_t*>(aux_raw);
     unsigned t = threadIdx.x;
     size_t base = blockIdx.x * CURVE_SCAN_POINTS_PER_BLOCK;
     aux[t] = base + t < n ? input[base + t] : bb31_septic_curve_t();

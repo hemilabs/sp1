@@ -17,9 +17,8 @@ fn main() {
             // On Windows the library is a DLL, not a static archive. A Go c-archive starts its
             // runtime from a MinGW-style global constructor (`.ctors`), which an MSVC-linked
             // binary never runs (and cgo there needs a MinGW C compiler: set CC through
-            // SP1_GNARK_FFI_GO_ENVS). A DLL must resolve every symbol when it is linked, so the
-            // two KoalaBear callbacks the archive leaves to this crate are passed in at runtime
-            // instead: see go/koalabear_windows.c and ffi::native::register_callbacks.
+            // SP1_GNARK_FFI_GO_ENVS). A DLL must resolve every symbol when it is linked; the
+            // KoalaBear inversions it needs are in go/sp1/koalabear/koalabear_stub.c.
             let windows = env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows");
             let (dest, header_name) = if windows {
                 (dest_path.join(format!("{lib_name}.dll")), format!("{lib_name}.h"))

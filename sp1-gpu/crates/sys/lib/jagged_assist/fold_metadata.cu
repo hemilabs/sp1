@@ -14,6 +14,9 @@
 // flags[1..n_blocks+1] = 0` so the first block can proceed without
 // waiting.
 
+#ifdef __HIPCC__
+#include <hip/hip_runtime.h>
+#endif
 #include "jagged_assist/fold_metadata.cuh"
 #include <cstdint>
 
