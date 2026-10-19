@@ -221,18 +221,42 @@ __global__ void kbNttDifTile(kb31_t* data, uint32_t lg_top, uint64_t tiles, Twid
     for (uint64_t b = blockIdx.x; b < tiles; b += gridDim.x) {
         kb31_t* x = data + b * tile;
         for (uint32_t i = tid; i < tile; i += threads) s[i] = x[i];
-        for (int m = (int)lg_top - 1; m >= 0; m--) {
+        // Two stages at a time (radix 4): half the barriers and the shared memory passes. Stages
+        // m and m - 1 combine the four elements i0 + {0, h/2, h, 3h/2}, h = 2^m.
+        int m = (int)lg_top - 1;
+        for (; m >= 1; m -= 2) {
             __syncthreads();
-            const uint32_t h = 1u << m;
+            const uint32_t h = 1u << m, q = h >> 1;
+            for (uint32_t g = tid; g < tile / 4; g += threads) {
+                const uint32_t lo = g & (q - 1);
+                const uint32_t i0 = ((g >> (m - 1)) << (m + 1)) | lo;
+                const kb31_t a0 = s[i0], a1 = s[i0 + q], a2 = s[i0 + h], a3 = s[i0 + h + q];
+                // Stage m: (a0, a2) at j = lo, (a1, a3) at j = lo + q.
+                const kb31_t b0 = a0 + a2, b1 = a1 + a3;
+                kb31_t b2 = a0 - a2, b3 = a1 - a3;
+                b2 *= twiddle(tw, (uint32_t)m, lo);
+                b3 *= twiddle(tw, (uint32_t)m, lo + q);
+                // Stage m - 1: (b0, b1) and (b2, b3), both at j = lo.
+                const kb31_t w = twiddle(tw, (uint32_t)(m - 1), lo);
+                kb31_t c1 = b0 - b1, c3 = b2 - b3;
+                c1 *= w;
+                c3 *= w;
+                s[i0] = b0 + b1;
+                s[i0 + q] = c1;
+                s[i0 + h] = b2 + b3;
+                s[i0 + h + q] = c3;
+            }
+        }
+        if (m == 0) {
+            __syncthreads();
             for (uint32_t pi = tid; pi < tile / 2; pi += threads) {
-                const uint32_t j = pi & (h - 1);
-                const uint32_t i0 = ((pi >> m) << (m + 1)) | j;
+                const uint32_t i0 = pi << 1;
                 const kb31_t a = s[i0];
-                const kb31_t c = s[i0 + h];
+                const kb31_t c = s[i0 + 1];
                 s[i0] = a + c;
                 kb31_t d = a - c;
-                d *= twiddle(tw, (uint32_t)m, j);
-                s[i0 + h] = d;
+                d *= twiddle(tw, 0u, 0u);
+                s[i0 + 1] = d;
             }
         }
         __syncthreads();
