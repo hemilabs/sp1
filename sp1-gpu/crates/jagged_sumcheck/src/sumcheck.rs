@@ -22,7 +22,7 @@ use sp1_gpu_challenger::FromHostChallengerSync;
 use sp1_gpu_utils::{DenseData, Ext, Felt, JaggedTraceMle};
 
 use super::hadamard::{
-    fix_last_variable, fix_last_variable_and_sum_as_poly, fix_last_variable_and_sum_as_poly_device,
+    fix_last_variable, fix_last_variable_and_sum_as_poly, padded_hadamard_rounds_on_device,
     launch_observe_and_sample, AsMutRawChallenger, ObserveAndSampleKernel,
 };
 
@@ -452,31 +452,18 @@ where
     current_claim = next_claim_buf.to_host().unwrap()[0];
     point.insert(0, alpha);
 
-    // --- Rounds 2..num_variables: fix_last_variable_and_sum_as_poly (padded hadamard) ---
-    for _ in 2..num_variables as usize {
-        let current_alpha = *point.first().unwrap();
-
-        let reduced_evals;
-        (p, q, reduced_evals) = fix_last_variable_and_sum_as_poly_device(
-            p,
-            q,
-            current_alpha,
-            padded_hadamard_fix_and_sum,
-        );
-
-        launch_observe_and_sample(
-            &reduced_evals,
-            &mut device_challenger,
-            &mut alpha_buf,
-            &mut next_claim_buf,
-            current_claim,
-            &backend,
-        );
-
-        saved_reduced_evals.push(reduced_evals);
-
-        let alpha = alpha_buf.to_host().unwrap()[0];
-        current_claim = next_claim_buf.to_host().unwrap()[0];
+    // --- Rounds 2..num_variables: on the device (padded hadamard), no host round trips ---
+    let (device_alphas, device_evals);
+    (p, q, device_alphas, device_evals) = padded_hadamard_rounds_on_device(
+        p,
+        q,
+        &mut device_challenger,
+        *point.first().unwrap(),
+        current_claim,
+        (num_variables as usize).saturating_sub(2),
+        &backend,
+    );
+    for alpha in device_alphas {
         point.insert(0, alpha);
     }
 
@@ -487,10 +474,14 @@ where
 
     // Replay the claim sequence: claim_0 = initial_claim, claim_{i+1} = p_i(alpha_i).
     let mut replay_claim = claim;
-    let num_rounds = saved_reduced_evals.len();
-    for (round, saved_evals) in saved_reduced_evals.iter().enumerate() {
-        let host_evals = saved_evals.to_host().unwrap();
-        let [eval_zero, eval_half]: [Ext; 2] = host_evals.as_slice().try_into().unwrap();
+    // The first two rounds' evaluations, then the device rounds'.
+    let mut round_evals: Vec<[Ext; 2]> = saved_reduced_evals
+        .iter()
+        .map(|evals| evals.to_host().unwrap().as_slice().try_into().unwrap())
+        .collect();
+    round_evals.extend(device_evals);
+    let num_rounds = round_evals.len();
+    for (round, &[eval_zero, eval_half]) in round_evals.iter().enumerate() {
 
         let eval_one = replay_claim - eval_zero;
 

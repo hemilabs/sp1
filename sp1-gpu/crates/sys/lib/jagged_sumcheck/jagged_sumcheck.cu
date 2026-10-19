@@ -123,7 +123,11 @@ SP1_KERNEL void paddedHadamardFixAndSum(
     ext_t* __restrict__ ext_output,
     ext_t alpha,
     ext_t* __restrict__ univariate_result,
-    size_t inputHeight) {
+    size_t inputHeight,
+    // If not null, alpha is read from here instead (a round sampled on the device). The callers
+    // have always passed this argument, null.
+    const ext_t* __restrict__ alphaPtr) {
+    if (alphaPtr) alpha = *alphaPtr;
 
     size_t outputHeight = (inputHeight + 1) >> 1;
     ext_t evalZero = ext_t::zero();

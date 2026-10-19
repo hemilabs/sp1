@@ -742,6 +742,27 @@ unsafe impl<F, PF> ObserveAndSampleQuarticKernel
     }
 }
 
+/// Copies a round's 3 reduced evaluations to `round_out[2..5]`, after the observe-and-sample
+/// kernel's alpha and claim, on the stream (no synchronization).
+fn copy_reduced_evals(
+    reduced_evals: &DeviceTensor<Ext>,
+    round_out: &mut DeviceBuffer<Ext>,
+    backend: &TaskScope,
+) {
+    use slop_alloc::mem::{CopyDirection, DeviceMemory};
+    assert_eq!(reduced_evals.total_len(), 3);
+    unsafe {
+        backend
+            .copy_nonoverlapping(
+                reduced_evals.as_ptr() as *const u8,
+                round_out.as_mut_ptr().add(2) as *mut u8,
+                3 * std::mem::size_of::<Ext>(),
+                CopyDirection::DeviceToDevice,
+            )
+            .unwrap();
+    }
+}
+
 /// Launch the GPU observe-and-sample kernel for a quartic (degree-4) zerocheck round.
 fn launch_observe_and_sample_quartic<
     DC: sp1_gpu_jagged_sumcheck::AsMutRawChallenger + ObserveAndSampleQuarticKernel,
@@ -883,10 +904,11 @@ where
     let backend = trace_mle.dense_data.backend();
     *device_challenger = DC::from_host_challenger_sync(challenger, &backend);
 
-    // Each round's alpha and next claim, read back together (one synchronization, not two).
-    let mut round_out = DeviceBuffer::<Ext>::with_capacity_in(2, backend.clone());
+    // Each round's alpha, next claim and reduced evaluations, read back together: one
+    // synchronization per round (the evaluations are copied next to the kernel's outputs).
+    let mut round_out = DeviceBuffer::<Ext>::with_capacity_in(5, backend.clone());
     unsafe {
-        round_out.set_len(2);
+        round_out.set_len(5);
     }
 
     let mut univariate_polys: Vec<UnivariatePolynomial<Ext>> =
@@ -895,15 +917,14 @@ where
     let mut current_claim = claim;
     let mut replay_claim = claim;
 
-    // Helper: reconstruct polynomial from reduced evals + D2H one at a time
-    let reconstruct_poly = |reduced: &DeviceTensor<Ext>,
+    // Helper: reconstruct the round polynomial from its reduced evaluations (read back with the
+    // round's alpha).
+    let reconstruct_poly = |raw: &[Ext],
                             eq_adj: Ext,
                             last: Ext,
                             rclaim: &mut Ext,
                             alpha: Ext|
      -> UnivariatePolynomial<Ext> {
-        let host_evals = reduced.to_host().unwrap();
-        let raw = host_evals.as_slice();
         let xs = vec![
             Ext::from_canonical_u32(0),
             Ext::from_canonical_u32(2),
@@ -939,13 +960,14 @@ where
             pt_last,
             &backend,
         );
+        copy_reduced_evals(&reduced_device, &mut round_out, &backend);
         let out = round_out.to_host().unwrap();
         let point = out[0];
         current_claim = out[1];
 
         // Reconstruct CPU polynomial (for proof) + update replay_claim
         univariate_polys.push(reconstruct_poly(
-            &reduced_device,
+            &out[2..5],
             eq_adj,
             pt_last,
             &mut replay_claim,
@@ -969,12 +991,13 @@ where
             pt_last,
             &backend,
         );
+        copy_reduced_evals(&reduced_device, &mut round_out, &backend);
         let out = round_out.to_host().unwrap();
         let point = out[0];
         current_claim = out[1];
 
         univariate_polys.push(reconstruct_poly(
-            &reduced_device,
+            &out[2..5],
             eq_adj,
             pt_last,
             &mut replay_claim,

@@ -13,6 +13,19 @@ extern "C" void* sumcheck_observe_and_sample_quadratic_multi_field_32() {
     return SP1_KERNEL_PTR(sumcheckObserveAndSampleQuadratic<kb31_t, kb31_extension_t, MultiField32Challenger>);
 }
 
+// The quadratic round with its state on the device (hadamard sumcheck rounds without host round
+// trips).
+
+extern "C" void* sumcheck_observe_and_sample_quadratic_device_duplex() {
+    return SP1_KERNEL_PTR(
+        sumcheckObserveAndSampleQuadraticDevice<kb31_t, kb31_extension_t, DuplexChallenger>);
+}
+
+extern "C" void* sumcheck_observe_and_sample_quadratic_device_multi_field_32() {
+    return SP1_KERNEL_PTR(
+        sumcheckObserveAndSampleQuadraticDevice<kb31_t, kb31_extension_t, MultiField32Challenger>);
+}
+
 // Export kernel function pointers for the cubic observe-and-sample kernel (LogUp-GKR).
 // These handle degree-3 polynomials with eq-correction and 4-point interpolation.
 
