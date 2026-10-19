@@ -87,6 +87,23 @@ fn loaded() -> Option<(libloading::os::unix::Library, &'static Runtime)> {
 /// HIP runtime loaded (or links it statically), or the call fails.
 #[cfg(target_os = "linux")]
 pub fn free_memory() -> Option<u64> {
+    mem_get_info().map(|(free, _)| free)
+}
+
+/// Total memory of this process's current GPU, in bytes; `None` as for [`free_memory`].
+#[cfg(target_os = "linux")]
+pub fn total_memory() -> Option<u64> {
+    mem_get_info().map(|(_, total)| total)
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn total_memory() -> Option<u64> {
+    None
+}
+
+/// `(free, total)` memory of this process's current GPU, in bytes.
+#[cfg(target_os = "linux")]
+fn mem_get_info() -> Option<(u64, u64)> {
     let (library, runtime) = loaded()?;
     let (mut free, mut total) = (0usize, 0usize);
     // SAFETY: `cudaMemGetInfo` and `hipMemGetInfo` both take two `size_t*` and return an error
@@ -99,11 +116,72 @@ pub fn free_memory() -> Option<u64> {
             .ok()?;
         mem_get_info(&mut free, &mut total)
     };
-    (rc == 0).then_some(free as u64)
+    (rc == 0).then_some((free as u64, total as u64))
 }
 
 #[cfg(not(target_os = "linux"))]
 pub fn free_memory() -> Option<u64> {
+    None
+}
+
+/// Gives the unused reserve of the default memory pool on this process's current GPU back to the
+/// driver, so that a wrap helper can have it, and returns the free memory before and after, in
+/// bytes. `None` when no runtime is loaded or a call fails.
+///
+/// The shard prover allocates with `cudaMallocAsync`/`hipMallocAsync` and keeps up to its release
+/// threshold (8 GiB on cards above 24 GiB) of freed memory reserved in the pool. The pool gives
+/// memory back only at a synchronization point, which never comes once the GPU goes idle after the
+/// wrap: on a 32 GB card ~21 GB of the prover's 28 GB "resident" memory was idle reserve. This
+/// synchronizes the device (waiting for its outstanding work) and trims the pool to zero. Live
+/// allocations are untouched; the next proof grows the pool again.
+#[cfg(target_os = "linux")]
+pub fn trim_memory_pool() -> Option<(u64, u64)> {
+    let (library, runtime) = loaded()?;
+    let before = free_memory()?;
+    let (get_device, synchronize, get_pool, trim) = match runtime.name {
+        "CUDA" => (
+            "cudaGetDevice",
+            "cudaDeviceSynchronize",
+            "cudaDeviceGetDefaultMemPool",
+            "cudaMemPoolTrimTo",
+        ),
+        _ => (
+            "hipGetDevice",
+            "hipDeviceSynchronize",
+            "hipDeviceGetDefaultMemPool",
+            "hipMemPoolTrimTo",
+        ),
+    };
+    // SAFETY: these calls have the same C signatures in both runtimes (an error code, an `int*`
+    // device, an opaque pool handle written through a pointer, a `size_t` size), and every pointer
+    // is valid for its call.
+    unsafe {
+        let get_device =
+            library.get::<unsafe extern "C" fn(*mut i32) -> i32>(get_device.as_bytes()).ok()?;
+        let synchronize =
+            library.get::<unsafe extern "C" fn() -> i32>(synchronize.as_bytes()).ok()?;
+        let get_pool = library
+            .get::<unsafe extern "C" fn(*mut *mut std::ffi::c_void, i32) -> i32>(
+                get_pool.as_bytes(),
+            )
+            .ok()?;
+        let trim = library
+            .get::<unsafe extern "C" fn(*mut std::ffi::c_void, usize) -> i32>(trim.as_bytes())
+            .ok()?;
+        let mut device = 0i32;
+        if get_device(&mut device) != 0 || synchronize() != 0 {
+            return None;
+        }
+        let mut pool = std::ptr::null_mut();
+        if get_pool(&mut pool, device) != 0 || trim(pool, 0) != 0 {
+            return None;
+        }
+    }
+    Some((before, free_memory()?))
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn trim_memory_pool() -> Option<(u64, u64)> {
     None
 }
 

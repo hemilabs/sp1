@@ -336,6 +336,31 @@ impl Groth16Prover {
                 p
             } else {
                 eprintln!("[groth16] Skipping persistent G2 MSM on CUDA (sppark gpu_t conflict)");
+                // SP1 perf: the one-shot G2 MSM uploads all G2 bases (1.95 GB for SP1's circuit) on
+                // every prove. From pageable memory that runs at ~13.6 GB/s (143 ms in nsys); pinning
+                // the host copy once here (off the critical path: the helper is prestarted) makes it a
+                // DMA at PCIe speed. Measured with the production sppark one-shot path and the real
+                // PK + witness: G2 MSM 480 -> 390 ms. Non-fatal on failure. The helper exits after
+                // the proof, so the registration is not undone.
+                let g2_bytes = data.pk_g2_b.len() * std::mem::size_of::<crate::g2::G2Affine>();
+                let t = std::time::Instant::now();
+                let err = unsafe {
+                    sp1_gpu_sys::runtime::cuda_host_register(
+                        data.pk_g2_b.as_ptr() as *const std::ffi::c_void,
+                        g2_bytes,
+                    )
+                };
+                if err != unsafe { sp1_gpu_sys::runtime::CUDA_SUCCESS_CSL } {
+                    eprintln!(
+                        "[groth16] WARN: pinning the G2 bases failed; G2 upload stays pageable"
+                    );
+                } else {
+                    eprintln!(
+                        "[groth16] Pinned G2 bases ({} MB): {:?}",
+                        g2_bytes >> 20,
+                        t.elapsed()
+                    );
+                }
                 None
             }
         };
@@ -1036,21 +1061,55 @@ impl Groth16Prover {
             // CUDA path — overlap G2 with G1 MSMs via thread::scope.
             // Compute Ar before the scope (no DMA overlap on CUDA — sppark
             // handles its own internal pipelining).
-            let ar_msm = self.persistent_g1_a.msm(&wire_values_a);
+            //
+            // While the GPU runs Ar, split the hot scalars out of the B and K MSMs on the host
+            // (see `crate::hot`); Bs1, Krs and Bs2 add the split-out part back. The split writes
+            // the B and K pinned buffers, which nothing reads until it is joined; the slices of
+            // them are taken again afterwards.
+            let (ar_msm, hot) = std::thread::scope(|scope| {
+                let hot = crate::hot::hot_split_enabled().then(|| {
+                    scope.spawn(|| {
+                        let t_hot = std::time::Instant::now();
+                        let hot_b = crate::hot::HotSplit::take(self.pinned_b.as_mut_slice());
+                        let hot_k = crate::hot::HotSplit::take(self.pinned_k.as_mut_slice());
+                        let (corr_b, (corr_b2, corr_k)) = rayon::join(
+                            || hot_b.g1_correction(&self.data.pk_g1_b),
+                            || {
+                                rayon::join(
+                                    || hot_b.g2_correction(&self.data.pk_g2_b),
+                                    || hot_k.g1_correction(&self.data.pk_g1_k),
+                                )
+                            },
+                        );
+                        eprintln!(
+                            "[T] 5a'. Hot-scalar split (B {} values / {} scalars, K {} / {}): {:?}",
+                            hot_b.num_values(),
+                            hot_b.num_scalars(),
+                            hot_k.num_values(),
+                            hot_k.num_scalars(),
+                            t_hot.elapsed()
+                        );
+                        HotCorrections { corr_b, corr_b2, corr_k }
+                    })
+                });
+                let ar_msm = self.persistent_g1_a.msm(&wire_values_a);
+                (ar_msm, hot.map(|h| h.join().expect("hot-scalar split panicked")))
+            });
+            let wire_values_b = self.pinned_b.as_slice();
+            let filtered_wire_values = self.pinned_k.as_slice();
             let ar = ar_msm.add(&g1_alpha.to_jacobian()).add(&r_delta);
             eprintln!("[T] 5a. Ar MSM (N={}): {:?}", wire_values_a.len(), t.elapsed());
             g1_msm_ark_verify("Ar", &self.data.pk_g1_a, wire_values_a, &ar_msm);
-            // SP1: G2 MSM concurrency option. Default spawns G2 in a worker
-            // thread to overlap with G1 MSMs (saves ~350 ms wall time on
-            // 5090). Set SP1_GROTH16_SERIALIZE_G2=1 to compute G2 sequentially
-            // after G1 — useful for diagnostic isolation of races between
-            // sppark's gpu_t singleton streams used by both G1 and G2
-            // contexts. Empirically the serial path produces the same ~4 %
-            // residual proof-verify fail rate as the parallel path, so the
+            // SP1: G2 MSM concurrency option. G2 runs after the G1 MSMs by default: on an RTX
+            // 5090 that takes the helper's peak GPU memory from 17.7 to 12.0 GB at no cost to the
+            // prove (1.07-1.12 s either way; the G2 wait is absorbed), which leaves room for the
+            // helper beside a resident shard prover. SP1_GROTH16_SERIALIZE_G2=0 runs G2 in a
+            // worker thread overlapping the G1 MSMs, as before. Empirically the serial path
+            // produces the same ~4 % residual proof-verify fail rate as the parallel path, so the
             // residual flake (post-Ar-add-safe fix) lives somewhere else.
             // See project_groth16_prover_flake.md.
             let serialize_g2 =
-                std::env::var("SP1_GROTH16_SERIALIZE_G2").ok().as_deref() == Some("1");
+                std::env::var("SP1_GROTH16_SERIALIZE_G2").ok().as_deref() != Some("0");
             std::thread::scope(|scope| {
                 // Closure that does the G2 work (extracted so it can run
                 // either in a spawned thread or synchronously on main).
@@ -1071,6 +1130,10 @@ impl Groth16Prover {
                             if ok { "MATCH" } else { "MISMATCH" }
                         );
                     }
+                    let bs2_msm = match &hot {
+                        Some(h) => bs2_msm.add(&h.corr_b2),
+                        None => bs2_msm,
+                    };
                     let s_bytes = s.to_le_bytes();
                     let mut s_arr = [0u8; 32];
                     s_arr.copy_from_slice(&s_bytes);
@@ -1082,7 +1145,11 @@ impl Groth16Prover {
 
                 let t = std::time::Instant::now();
                 let bs1_msm = self.persistent_g1_b.msm(&wire_values_b);
-                let bs1 = bs1_msm.add(&g1_beta.to_jacobian()).add(&s_delta);
+                let bs1_full = match &hot {
+                    Some(h) => bs1_msm.add(&h.corr_b),
+                    None => bs1_msm,
+                };
+                let bs1 = bs1_full.add(&g1_beta.to_jacobian()).add(&s_delta);
                 eprintln!("[T] 5b. Bs1 MSM (N={}): {:?}", wire_values_b.len(), t.elapsed());
                 g1_msm_ark_verify("Bs1", &self.data.pk_g1_b, wire_values_b, &bs1_msm);
 
@@ -1090,6 +1157,10 @@ impl Groth16Prover {
                 let krs_msm = self.persistent_g1_k.msm(&filtered_wire_values);
                 eprintln!("[T] 5c. Krs MSM (N={}): {:?}", filtered_wire_values.len(), t.elapsed());
                 g1_msm_ark_verify("Krs", &self.data.pk_g1_k, filtered_wire_values, &krs_msm);
+                let krs_msm = match &hot {
+                    Some(h) => krs_msm.add(&h.corr_k),
+                    None => krs_msm,
+                };
 
                 let t = std::time::Instant::now();
                 let krs2_msm = match &h_result {
@@ -1126,7 +1197,7 @@ impl Groth16Prover {
                 let bs2 = if let Some(handle) = g2_handle {
                     handle.join().expect("G2 MSM thread panicked")
                 } else {
-                    // Sequential G2 path (SP1_GROTH16_SERIALIZE_G2=1) runs
+                    // Sequential G2 path (the default) runs
                     // after all G1 MSMs to avoid sharing sppark gpu_t streams.
                     g2_compute()
                 };
@@ -2053,6 +2124,14 @@ fn fr_pow_u64(base: &Fr, mut exp: u64) -> Fr {
         exp >>= 1;
     }
     result
+}
+
+/// The parts of the B and K MSMs split out by [`crate::hot::HotSplit`]: Bs1 (G1), Bs2 (G2), Krs.
+#[cfg(feature = "cuda")]
+struct HotCorrections {
+    corr_b: G1Jacobian,
+    corr_b2: crate::g2::G2Jacobian,
+    corr_k: G1Jacobian,
 }
 
 fn g1_scalar_mul(point: &G1Jacobian, scalar: &Fr) -> G1Jacobian {

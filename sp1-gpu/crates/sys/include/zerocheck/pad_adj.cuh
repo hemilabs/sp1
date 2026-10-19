@@ -32,3 +32,7 @@ extern "C" void* zerocheck_pad_adj_128_kernel();
 extern "C" void* zerocheck_pad_adj_256_kernel();
 extern "C" void* zerocheck_pad_adj_512_kernel();
 extern "C" void* zerocheck_pad_adj_1024_kernel();
+
+// Cooperative variant over the level schedule: grid (n_chunks), block 32,
+// dynamic smem = max coop_n_phys * sizeof(felt_t).
+extern "C" void* zerocheck_pad_adj_coop_kernel();

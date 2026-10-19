@@ -15,7 +15,7 @@ use tracing::{instrument, Instrument};
 
 use futures::stream::FuturesUnordered;
 use futures::StreamExt;
-use rayon::iter::{IntoParallelIterator, ParallelIterator};
+use rayon::iter::{IntoParallelIterator, IntoParallelRefIterator, ParallelIterator};
 use slop_air::BaseAir;
 use slop_alloc::{Backend, Buffer, HasBackend, Slice};
 use slop_challenger::IopCtx;
@@ -26,7 +26,7 @@ use sp1_gpu_cudart::sys::kernels::{
     sum_to_trace_kernel,
 };
 use sp1_gpu_cudart::{args, DeviceBuffer, DeviceTensor, PinnedBuffer, TaskScope};
-use sp1_gpu_tracegen::CudaTracegenAir;
+use sp1_gpu_tracegen::{CudaTracegenAir, PreprocessedPrep};
 use sp1_hypercube::prover::{ProverPermit, ProverSemaphore};
 
 use sp1_core_executor::ELEMENT_THRESHOLD;
@@ -49,6 +49,9 @@ pub struct HostPhaseTracegen<A> {
     pub device_airs: Vec<Arc<A>>,
     /// The real traces generated in the host phase.
     pub host_traces: futures::channel::mpsc::UnboundedReceiver<(String, usize, usize, usize)>,
+    /// Host-side preparation for each of `device_airs` (preprocessed phase only; empty for main),
+    /// computed before the prover permit is taken.
+    pub device_preps: Vec<Option<PreprocessedPrep>>,
 }
 
 /// Information about the traces generated in the host phase.
@@ -62,18 +65,70 @@ pub struct HostPhaseShapeInfo<A> {
 /// Traces generated
 pub enum Trace<B: Backend = TaskScope> {
     // Real trace
-    Real(Mle<Felt, B>),
+    Real(RealTrace<B>),
     // Number of columns
     Padding(usize),
+}
+
+/// The data of a real trace.
+pub enum RealTrace<B: Backend = TaskScope> {
+    /// Column-major, as an MLE (`[width, height]`).
+    ColumnMajor(Mle<Felt, B>),
+    /// Uploaded from the host in its row-major `[height, width]` layout. It is transposed
+    /// straight into its slot of the jagged dense buffer, instead of into a temporary
+    /// column-major copy that is then copied there.
+    RowMajor(Tensor<Felt, B>),
+}
+
+impl<B: Backend> From<Mle<Felt, B>> for RealTrace<B> {
+    fn from(mle: Mle<Felt, B>) -> Self {
+        RealTrace::ColumnMajor(mle)
+    }
+}
+
+impl RealTrace<TaskScope> {
+    pub fn num_rows(&self) -> usize {
+        match self {
+            RealTrace::ColumnMajor(mle) => mle.num_non_zero_entries(),
+            RealTrace::RowMajor(rows) => rows.sizes()[0],
+        }
+    }
+
+    pub fn num_cols(&self) -> usize {
+        match self {
+            RealTrace::ColumnMajor(mle) => mle.num_polynomials(),
+            RealTrace::RowMajor(rows) => rows.sizes()[1],
+        }
+    }
 }
 
 impl Trace<TaskScope> {
     pub fn num_real_entries(&self) -> usize {
         match self {
-            Trace::Real(mle) => mle.num_non_zero_entries(),
+            Trace::Real(trace) => trace.num_rows(),
             Trace::Padding(_) => 0,
         }
     }
+}
+
+/// `SP1_GPU_TRACE_TRANSPOSE_INTO_DENSE=0` keeps the host traces' temporary column-major copy
+/// (A/B switch).
+fn transpose_into_dense() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("SP1_GPU_TRACE_TRANSPOSE_INTO_DENSE").map(|v| v != "0").unwrap_or(true)
+    })
+}
+
+/// A host trace uploaded in row-major layout, as a [`Trace`].
+fn host_trace(storage: Buffer<Felt, TaskScope>, height: usize, width: usize) -> Trace<TaskScope> {
+    let dims: Dimensions = [height, width].try_into().unwrap();
+    let tensor = Tensor { storage, dimensions: dims };
+    Trace::Real(if transpose_into_dense() {
+        RealTrace::RowMajor(tensor)
+    } else {
+        Mle::new(DeviceTensor::from_raw(tensor).transpose().into_inner()).into()
+    })
 }
 
 /// Read-only data shared across all concurrent shards using this proving key:
@@ -204,10 +259,9 @@ async fn generate_jagged_traces(
     for (name, trace) in traces.iter() {
         match trace {
             Trace::Real(trace) => {
-                let trace_buf = trace.guts().as_buffer();
-                let trace_num_rows = trace.num_non_zero_entries();
-                let trace_num_cols = trace.num_polynomials();
-                let trace_size = trace_buf.len();
+                let trace_num_rows = trace.num_rows();
+                let trace_num_cols = trace.num_cols();
+                let trace_size = trace_num_rows * trace_num_cols;
 
                 let dense_range = offset..offset + trace_size;
                 let col_index_range = offset >> 1..((offset + trace_size) >> 1);
@@ -257,21 +311,28 @@ async fn generate_jagged_traces(
     offset = initial_offset;
     cols_so_far = initial_cols;
 
-    for (name, trace) in traces.iter() {
-        let (dense_range, col_index_range, start_indices_range) = trace_offsets.get(name).unwrap();
+    for (name, trace) in traces.into_iter() {
+        let (dense_range, col_index_range, start_indices_range) = trace_offsets.get(&name).unwrap();
         match trace {
             Trace::Real(trace) => {
-                let trace_buf = trace.guts().as_buffer();
-                let trace_num_rows = trace.num_non_zero_entries();
-                let trace_num_cols = trace.num_polynomials();
-                let trace_size = trace_buf.len();
-                assert_eq!(trace_num_rows * trace_num_cols, trace_buf.len());
+                let trace_num_rows = trace.num_rows();
+                let trace_num_cols = trace.num_cols();
+                let trace_size = trace_num_rows * trace_num_cols;
 
                 tracing::trace_span!("dense buffer copy", chip = %name).in_scope(|| {
                     let dst_slice: &mut Slice<_, _> = &mut dense_data[dense_range.clone()];
-                    let src_slice: &Slice<_, _> = &trace_buf[..];
-                    unsafe {
-                        dst_slice.copy_from_slice(src_slice, &backend).unwrap();
+                    match trace {
+                        RealTrace::ColumnMajor(mle) => {
+                            let src_slice: &Slice<_, _> = &mle.guts().as_buffer()[..];
+                            assert_eq!(trace_size, src_slice.len());
+                            unsafe {
+                                dst_slice.copy_from_slice(src_slice, &backend).unwrap();
+                            }
+                        }
+                        // Into the column-major layout of a `RealTrace::ColumnMajor` MLE.
+                        RealTrace::RowMajor(rows) => unsafe {
+                            DeviceTensor::from_raw(rows).transpose_into_ptr(dst_slice.as_mut_ptr());
+                        },
                     }
                 });
 
@@ -312,11 +373,11 @@ async fn generate_jagged_traces(
 
                 tracing::trace_span!("padding start indices gen and copy", chip = %name, padding_cols = %padding_cols).in_scope(
                     || unsafe {
-                        fill_buf(start_indices.as_mut_ptr().add(start_indices_range.start), (offset >> 1) as u32, *padding_cols, max_log_row_count, &backend);
+                        fill_buf(start_indices.as_mut_ptr().add(start_indices_range.start), (offset >> 1) as u32, padding_cols, max_log_row_count, &backend);
                     },
                 );
 
-                cols_so_far += *padding_cols;
+                cols_so_far += padding_cols;
             }
         }
     }
@@ -405,58 +466,73 @@ async fn host_preprocessed_tracegen<A: CudaTracegenAir<Felt>>(
     let chips: Vec<_> = machine.chips().iter().map(|chip| chip.air.clone()).collect();
 
     // Move ALL CPU-intensive work into spawn_blocking to avoid blocking the async runtime.
-    let (device_airs, host_traces, total_size) = tokio::task::spawn_blocking(move || {
-        // Split chips based on where we will generate their traces.
-        let (device_airs, host_airs): (Vec<_>, Vec<_>) =
-            chips.into_iter().partition(|air| air.supports_device_preprocessed_tracegen());
+    let (device_airs, device_preps, host_traces, total_size) =
+        tokio::task::spawn_blocking(move || {
+            // Split chips based on where we will generate their traces.
+            let (device_airs, host_airs): (Vec<_>, Vec<_>) =
+                chips.into_iter().partition(|air| air.supports_device_preprocessed_tracegen());
 
-        let mut total_size = 0;
-        let mut jobs = Vec::new();
-        for air in host_airs.iter() {
-            let height = air.preprocessed_num_rows(&program);
-            let width = air.preprocessed_width();
-            jobs.push((air.clone(), total_size, height, width));
-            if let Some(height) = height {
-                total_size += height * width;
+            // Scan the program for each device chip now, in parallel and before the prover permit is
+            // taken, instead of serially inside `device_preprocessed_tracegen` while holding it.
+            // `SP1_GPU_PREP_UNDER_PERMIT=1` restores the old behaviour (A/B switch).
+            let prep_outside =
+                std::env::var("SP1_GPU_PREP_UNDER_PERMIT").map(|v| v != "1").unwrap_or(true);
+            let device_preps: Vec<Option<PreprocessedPrep>> = if prep_outside {
+                device_airs
+                    .par_iter()
+                    .map(|air| air.prepare_preprocessed_device(&program))
+                    .collect()
+            } else {
+                device_airs.iter().map(|_| None).collect()
+            };
+
+            let mut total_size = 0;
+            let mut jobs = Vec::new();
+            for air in host_airs.iter() {
+                let height = air.preprocessed_num_rows(&program);
+                let width = air.preprocessed_width();
+                jobs.push((air.clone(), total_size, height, width));
+                if let Some(height) = height {
+                    total_size += height * width;
+                }
             }
-        }
 
-        // Spawn a rayon task to generate the traces on the CPU.
-        // `traces` is a futures Stream that will immediately begin buffering traces.
-        let (host_traces_tx, host_traces) = futures::channel::mpsc::unbounded();
-        rayon::spawn(move || {
-            jobs.into_par_iter().for_each_with(
-                host_traces_tx,
-                |tx, (air, offset, height, width)| {
-                    let base_ptr = buffer_ptr as *mut MaybeUninit<Felt>;
-                    if let Some(height) = height {
-                        let trace_len = height * width;
-                        let slice: &mut [MaybeUninit<Felt>] = unsafe {
-                            std::slice::from_raw_parts_mut(base_ptr.add(offset), trace_len)
-                        };
-                        air.generate_preprocessed_trace_into(&program, slice);
-                        let start_pointer = unsafe { base_ptr.add(offset) as usize };
-                        // Since it's unbounded, it will only error if the receiver is disconnected.
-                        // If the receiver dropped (task cancelled), exit gracefully instead of panicking.
-                        let _ = tx.unbounded_send((
-                            air.name().to_string(),
-                            start_pointer,
-                            height,
-                            width,
-                        ));
-                    }
-                },
-            );
-            // Make this explicit.
-            // If we are the last users of the program, this will expensively drop it.
-            drop(program);
-        });
-        (device_airs, host_traces, total_size)
-    })
-    .await
-    .unwrap();
+            // Spawn a rayon task to generate the traces on the CPU.
+            // `traces` is a futures Stream that will immediately begin buffering traces.
+            let (host_traces_tx, host_traces) = futures::channel::mpsc::unbounded();
+            rayon::spawn(move || {
+                jobs.into_par_iter().for_each_with(
+                    host_traces_tx,
+                    |tx, (air, offset, height, width)| {
+                        let base_ptr = buffer_ptr as *mut MaybeUninit<Felt>;
+                        if let Some(height) = height {
+                            let trace_len = height * width;
+                            let slice: &mut [MaybeUninit<Felt>] = unsafe {
+                                std::slice::from_raw_parts_mut(base_ptr.add(offset), trace_len)
+                            };
+                            air.generate_preprocessed_trace_into(&program, slice);
+                            let start_pointer = unsafe { base_ptr.add(offset) as usize };
+                            // Since it's unbounded, it will only error if the receiver is disconnected.
+                            // If the receiver dropped (task cancelled), exit gracefully instead of panicking.
+                            let _ = tx.unbounded_send((
+                                air.name().to_string(),
+                                start_pointer,
+                                height,
+                                width,
+                            ));
+                        }
+                    },
+                );
+                // Make this explicit.
+                // If we are the last users of the program, this will expensively drop it.
+                drop(program);
+            });
+            (device_airs, device_preps, host_traces, total_size)
+        })
+        .await
+        .unwrap();
 
-    (HostPhaseTracegen { device_airs, host_traces }, total_size)
+    (HostPhaseTracegen { device_airs, host_traces, device_preps }, total_size)
 }
 
 #[instrument(skip_all, level = "debug")]
@@ -465,7 +541,8 @@ async fn device_preprocessed_tracegen<A: CudaTracegenAir<Felt>>(
     host_phase_tracegen: HostPhaseTracegen<A>,
     backend: &TaskScope,
 ) -> BTreeMap<String, Trace<TaskScope>> {
-    let HostPhaseTracegen { device_airs, host_traces } = host_phase_tracegen;
+    let HostPhaseTracegen { device_airs, host_traces, device_preps } = host_phase_tracegen;
+    let mut device_preps = device_preps.into_iter();
 
     // Stream that, when polled, copies the host traces to the device.
     let copied_host_traces =
@@ -492,10 +569,7 @@ async fn device_preprocessed_tracegen<A: CudaTracegenAir<Felt>>(
                     .unwrap();
                 storage.set_len(trace_len);
             }
-            let dims: Dimensions = [height, width].try_into().unwrap();
-            let tensor = Tensor { storage, dimensions: dims };
-            let guts = DeviceTensor::from_raw(tensor).transpose().into_inner();
-            (inner_name, Mle::new(guts))
+            (inner_name, host_trace(storage, height, width))
         }));
 
     // Stream that, when polled, copies events to the device and generates traces.
@@ -504,19 +578,23 @@ async fn device_preprocessed_tracegen<A: CudaTracegenAir<Felt>>(
         .map(|air| {
             // We want to borrow the program and move the air.
             let program = program.as_ref();
+            let prep = device_preps.next().flatten();
             async move {
-                let maybe_trace =
-                    air.generate_preprocessed_trace_device(program, backend).await.unwrap();
+                let maybe_trace = air
+                    .generate_preprocessed_trace_device_prepared(program, prep, backend)
+                    .await
+                    .unwrap();
                 (air, maybe_trace)
             }
         })
         .collect::<FuturesUnordered<_>>()
         .filter_map(|(air, maybe_trace)| {
-            ready(maybe_trace.map(|trace| (air.name().to_string(), trace.into())))
+            ready(maybe_trace.map(|trace| {
+                (air.name().to_string(), Trace::Real(RealTrace::ColumnMajor(trace.into())))
+            }))
         });
 
     let named_traces = futures::stream_select!(copied_host_traces, device_traces)
-        .map(|(name, trace)| (name, Trace::Real(trace)))
         .collect::<BTreeMap<_, _>>()
         .await;
 
@@ -848,7 +926,8 @@ where
 
     let host_phase_shape_info = HostPhaseShapeInfo { traces_by_name: initial_traces, chip_set };
 
-    let host_phase_tracegen = HostPhaseTracegen { device_airs, host_traces };
+    let host_phase_tracegen =
+        HostPhaseTracegen { device_airs, host_traces, device_preps: Vec::new() };
 
     (host_phase_tracegen, host_phase_shape_info)
 }
@@ -861,7 +940,7 @@ async fn device_main_tracegen<A: CudaTracegenAir<Felt>>(
     initial_traces: BTreeMap<String, Trace>,
     backend: &TaskScope,
 ) -> (BTreeMap<String, Trace>, Vec<Felt>) {
-    let HostPhaseTracegen { device_airs, host_traces } = host_phase_tracegen;
+    let HostPhaseTracegen { device_airs, host_traces, .. } = host_phase_tracegen;
 
     let outer_span = tracing::Span::current();
     // Stream that, when polled, copies the host traces to the device.
@@ -884,10 +963,8 @@ async fn device_main_tracegen<A: CudaTracegenAir<Felt>>(
                 .unwrap();
             storage.set_len(trace_len);
         }
-        let dims: Dimensions = [height, width].try_into().unwrap();
-        let tensor = Tensor { storage, dimensions: dims };
-        let guts = DeviceTensor::from_raw(tensor).transpose().into_inner();
-        async move { (inner_name, Mle::new(guts)) }
+        let trace = host_trace(storage, height, width);
+        async move { (inner_name, trace) }
     }
     .instrument(
         tracing::debug_span!(parent: &outer_span, "copy host trace to device", chip = %name)
@@ -906,7 +983,7 @@ async fn device_main_tracegen<A: CudaTracegenAir<Felt>>(
                     .instrument(tracing::trace_span!(parent: &outer_span, "device chip tracegen", chip = %air.name()))
                     .await
                     .unwrap();
-                (air.name().to_string(), trace.into())
+                (air.name().to_string(), Trace::Real(RealTrace::ColumnMajor(trace.into())))
             }
         })
         .collect::<FuturesUnordered<_>>();
@@ -916,7 +993,7 @@ async fn device_main_tracegen<A: CudaTracegenAir<Felt>>(
     // Combine the host and device trace streams and insert them into `all_traces`.
     futures::stream_select!(copied_host_traces, device_traces)
         .for_each(|(name, trace)| {
-            all_traces.insert(name, Trace::Real(trace));
+            all_traces.insert(name, trace);
             ready(())
         })
         .instrument(tracing::debug_span!("wait for device traces"))
@@ -1151,7 +1228,8 @@ mod tests {
 
     use crate::test_utils::tracegen_setup::{self, CORE_MAX_LOG_ROW_COUNT, LOG_STACKING_HEIGHT};
     use crate::{
-        count_and_add, fill_buf, full_tracegen, generate_jagged_traces, Trace, CORE_MAX_TRACE_SIZE,
+        count_and_add, fill_buf, full_tracegen, generate_jagged_traces, RealTrace, Trace,
+        CORE_MAX_TRACE_SIZE,
     };
     use sp1_core_machine::io::SP1Stdin;
 
@@ -1310,6 +1388,76 @@ mod tests {
         .await;
     }
 
+    /// A host trace uploaded row-major and transposed straight into the dense buffer
+    /// (`RealTrace::RowMajor`) must produce the same jagged layout, bit for bit, as the
+    /// column-major copy path, including heights that are not multiples of the 32-row tile.
+    #[tokio::test]
+    #[serial]
+    async fn test_row_major_traces_match_column_major() {
+        init_tracer();
+        run_in_place(|scope| async move {
+            let (log_stacking_height, max_log_row_count) = (10u32, 12u32);
+            let shapes = [("A", 1000usize, 7usize), ("B", 64, 33), ("C", 4096, 1), ("D", 37, 100)];
+            let mut rng = StdRng::seed_from_u64(7);
+            let mut row_major = BTreeMap::new();
+            let mut col_major = BTreeMap::new();
+            for (name, height, width) in shapes {
+                let host: Vec<Felt> = (0..height * width)
+                    .map(|_| Felt::from_canonical_u32(rng.gen_range(0..2013265921)))
+                    .collect();
+                let buf =
+                    DeviceBuffer::from_host(&Buffer::from(host), &scope).unwrap().into_inner();
+                let dims: slop_tensor::Dimensions = [height, width].try_into().unwrap();
+                let rows = Tensor { storage: buf, dimensions: dims };
+                let cols = DeviceTensor::from_raw(rows.clone()).transpose().into_inner();
+                row_major.insert(name.to_string(), Trace::Real(RealTrace::RowMajor(rows)));
+                col_major.insert(name.to_string(), Trace::Real(Mle::new(cols).into()));
+            }
+            row_major.insert("E".to_string(), Trace::Padding(3));
+            col_major.insert("E".to_string(), Trace::Padding(3));
+
+            let mut outputs = Vec::new();
+            for traces in [row_major, col_major] {
+                let capacity = 1 << 20;
+                let mut dense: Buffer<Felt, TaskScope> =
+                    Buffer::with_capacity_in(capacity, scope.clone());
+                let mut col_index: Buffer<u32, TaskScope> =
+                    Buffer::with_capacity_in(capacity >> 1, scope.clone());
+                let mut start_indices: Buffer<u32, TaskScope> =
+                    Buffer::with_capacity_in(1024, scope.clone());
+                let mut heights = Vec::new();
+                unsafe {
+                    dense.assume_init();
+                    col_index.assume_init();
+                    start_indices.assume_init();
+                }
+                let (offset, cols, ..) = generate_jagged_traces(
+                    &mut dense,
+                    &mut col_index,
+                    &mut start_indices,
+                    &mut heights,
+                    traces,
+                    0,
+                    0,
+                    log_stacking_height,
+                    max_log_row_count,
+                )
+                .await;
+                unsafe {
+                    dense.set_len(offset);
+                    col_index.set_len(offset >> 1);
+                    start_indices.set_len(cols + 1);
+                }
+                let dense = DeviceBuffer::from_raw(dense).to_host().unwrap();
+                let col_index = DeviceBuffer::from_raw(col_index).to_host().unwrap();
+                let start_indices = DeviceBuffer::from_raw(start_indices).to_host().unwrap();
+                outputs.push((dense.to_vec(), col_index.to_vec(), start_indices.to_vec(), heights));
+            }
+            assert!(outputs[0] == outputs[1]);
+        })
+        .await;
+    }
+
     /// Tests the "Perfect multiple of 2^{}" edge case in generate_jagged_traces.
     /// Constructs traces whose total size is exactly 2^log_stacking_height, builds a
     /// JaggedTraceMle, evaluates it via the GPU pipeline, and compares against a CPU reference.
@@ -1337,7 +1485,7 @@ mod tests {
             let mle: Mle<Felt, TaskScope> = Mle::new(tensor);
 
             let mut traces = BTreeMap::new();
-            traces.insert("TestChip".to_string(), Trace::Real(mle));
+            traces.insert("TestChip".to_string(), Trace::Real(mle.into()));
 
             // Allocate device buffers.
             let mut dense_data: Buffer<Felt, TaskScope> =
@@ -1446,7 +1594,7 @@ mod tests {
             let mle: Mle<Felt, TaskScope> = Mle::new(tensor);
 
             let mut traces = BTreeMap::new();
-            traces.insert("TestChip".to_string(), Trace::Real(mle));
+            traces.insert("TestChip".to_string(), Trace::Real(mle.into()));
 
             let mut dense_data: Buffer<Felt, TaskScope> =
                 Buffer::with_capacity_in(trace_size * 4, scope.clone());

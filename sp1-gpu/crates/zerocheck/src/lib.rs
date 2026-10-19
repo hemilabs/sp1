@@ -97,8 +97,9 @@ pub mod tests {
         /// kernel template (dead in production until a chip like this
         /// exists). 200 constraints over 64 shared columns: each
         /// constraint is a degree-2 polynomial that's true when every
-        /// column equals a fixed constant. All 200 roots are alive at
-        /// the asserts pass, forcing `max_reg ≥ 200` and exercising the
+        /// column equals a fixed constant. Constraint `i` adds terms `i`
+        /// and `199 - i`, so all 200 terms are alive mid-chunk, forcing
+        /// `max_reg > 128` (188) and exercising the
         /// `BLOCK_SIZE_HIGH_REG` (= 64-thread) branch of
         /// `block_size_for`.
         HighMaxReg(ZerocheckHighMaxRegChip),
@@ -742,13 +743,16 @@ pub mod tests {
     //
     // `NUM_HMR_LEAVES = 64` columns (matches the chunker's recommended
     // `max_leafset`), `NUM_HMR_CONSTRAINTS = 200` constraints all sharing
-    // the same 64 columns. Each constraint i is
-    //   `(x[i % NUM] - c) · (x[(i+1) % NUM] - c) − (x[(i+2) % NUM] - c) · (x[(i+3) % NUM] - c) == 0`
-    // — a degree-2 polynomial over 4 shared columns and a constant. The
-    // shape is general (not LinearWeightedSum) so it lowers to
-    // Sequential; all 200 roots stay alive at the asserts pass, forcing
-    // `max_reg ≥ 200` and selecting the `MAX_REGS=256` fused-kernel
-    // template, which the review flagged as unexercised today.
+    // the same 64 columns. With the degree-2 terms
+    //   `t_i = (x[i % NUM] - c) · (x[(i+1) % NUM] - c) − (x[(i+2) % NUM] - c) · (x[(i+3) % NUM] - c)`
+    // over 4 shared columns and a constant, constraint i is
+    // `t_i + t_{199-i} == 0`. The shape is general (not LinearWeightedSum)
+    // so it lowers to Sequential. Assertions are accumulated where they are
+    // computed, so roots alone no longer hold registers; instead the first
+    // 100 constraints compute all 200 terms and the last 100 re-read them,
+    // keeping all 200 alive mid-chunk. That forces `max_reg > 128` (188) and
+    // selects the `MAX_REGS=256` fused-kernel template, which the review
+    // flagged as unexercised today.
     //
     // Trace: every column holds the same constant `c` per row. Then each
     // `(x[k] - c) = 0`, every product is 0, every difference is 0, every
@@ -809,14 +813,19 @@ pub mod tests {
             let main = builder.main();
             let local = main.row_slice(0);
             let c = AB::Expr::from_canonical_u32(HMR_CONSTANT);
+            let terms: Vec<AB::Expr> = (0..NUM_HMR_CONSTRAINTS)
+                .map(|i| {
+                    let a: AB::Expr = local[i % NUM_HMR_LEAVES].into();
+                    let b: AB::Expr = local[(i + 1) % NUM_HMR_LEAVES].into();
+                    let d: AB::Expr = local[(i + 2) % NUM_HMR_LEAVES].into();
+                    let e: AB::Expr = local[(i + 3) % NUM_HMR_LEAVES].into();
+                    let cc = c.clone();
+                    (a - cc.clone()) * (b - cc.clone()) - (d - cc.clone()) * (e - cc)
+                })
+                .collect();
             for i in 0..NUM_HMR_CONSTRAINTS {
-                let a: AB::Expr = local[i % NUM_HMR_LEAVES].into();
-                let b: AB::Expr = local[(i + 1) % NUM_HMR_LEAVES].into();
-                let d: AB::Expr = local[(i + 2) % NUM_HMR_LEAVES].into();
-                let e: AB::Expr = local[(i + 3) % NUM_HMR_LEAVES].into();
-                let cc = c.clone();
-                builder
-                    .assert_zero((a - cc.clone()) * (b - cc.clone()) - (d - cc.clone()) * (e - cc));
+                let j = NUM_HMR_CONSTRAINTS - 1 - i;
+                builder.assert_zero(terms[i].clone() + terms[j].clone());
             }
         }
     }
@@ -1563,8 +1572,9 @@ pub mod tests {
 
     /// Pushes the fused-sequential kernel into the `MAX_REGS=256`
     /// template tier. The chip has 200 constraints over 64 shared
-    /// columns; the chunker bundles them into one chunk; all 200 roots
-    /// stay alive at the asserts pass, forcing `max_reg ≥ 200`. The
+    /// columns; the chunker bundles them into one chunk; all 200 terms
+    /// are alive mid-chunk (see `ZerocheckHighMaxRegChip`), forcing
+    /// `max_reg > 128` (188). The
     /// pointer table in `fused_sequential_kernel_for` then selects the
     /// 256-register template (which `block_size_for` runs at the
     /// reduced-occupancy `BLOCK_SIZE_HIGH_REG = 64` thread block).

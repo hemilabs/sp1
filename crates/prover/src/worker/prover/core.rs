@@ -1,10 +1,10 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     io::Write,
     path::PathBuf,
     sync::{
         atomic::{AtomicUsize, Ordering},
-        Arc, Mutex,
+        Arc, Mutex, Weak,
     },
 };
 
@@ -208,6 +208,9 @@ pub struct CoreWorker<A, W, C: SP1ProverComponents> {
     permits: ProverSemaphore,
     /// Optional fixed PK cache shared across workers.
     pk: Option<CoreProvingKeyCache<C>>,
+    /// Per-proof PK cache shared across workers, keyed by the ELF artifact id (fresh for every
+    /// proof). Without it every core shard re-runs the preprocessed-trace setup.
+    pk_by_elf: Option<Arc<PerProofProvingKeyCache<C>>>,
     verify_intermediates: bool,
     record_write_dir_and_frequency: Option<(String, usize)>,
     /// Per-ELF `Arc<Program>` cache keyed by the elf Artifact id.
@@ -244,6 +247,7 @@ impl<A, W, C: SP1ProverComponents> CoreWorker<A, W, C> {
             recursion_prover,
             permits,
             pk,
+            pk_by_elf: None,
             verify_intermediates,
             record_write_dir_and_frequency,
             program_cache: Arc::new(Mutex::new(HashMap::new())),
@@ -253,9 +257,38 @@ impl<A, W, C: SP1ProverComponents> CoreWorker<A, W, C> {
     fn machine(&self) -> &Machine<SP1Field, RiscvAir<SP1Field>> {
         self.normalize_program_compiler.machine()
     }
+
+    fn with_per_proof_pk_cache(mut self, cache: Option<Arc<PerProofProvingKeyCache<C>>>) -> Self {
+        self.pk_by_elf = cache;
+        self
+    }
 }
 
 static SHARD_IDX: AtomicUsize = AtomicUsize::new(0);
+
+/// Lets only a few shards generate their dependencies at a time, in arrival order.
+///
+/// Dependency generation is parallel over the chips in the global rayon pool. When every core
+/// worker ran it at once, the shards shared the pool and finished together: at the start of a
+/// proof the first shard took 2.2 s instead of about 0.4 s, while the GPU had nothing to prove.
+/// In turns, the oldest shard gets the pool and reaches the prover first. The work and its
+/// results are unchanged. `SP1_WORKER_DEPENDENCY_TURNS` sets how many shards run at once
+/// (default: one per 16 cores, at least 2; `0` lets them all run).
+fn dependency_gate() -> &'static tokio::sync::Semaphore {
+    static GATE: std::sync::OnceLock<tokio::sync::Semaphore> = std::sync::OnceLock::new();
+    GATE.get_or_init(|| {
+        let default = std::thread::available_parallelism().map_or(2, |n| (n.get() / 16).max(2));
+        let turns = std::env::var("SP1_WORKER_DEPENDENCY_TURNS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(default);
+        tokio::sync::Semaphore::new(if turns == 0 {
+            tokio::sync::Semaphore::MAX_PERMITS
+        } else {
+            turns
+        })
+    })
+}
 
 impl<A, W, C> AsyncWorker<CoreProvingTask, Result<TaskMetadata, TaskError>> for CoreWorker<A, W, C>
 where
@@ -268,6 +301,7 @@ where
         // Keep the record id for reclamation after the proof is uploaded (below).
         let record_artifact = input.record.clone();
         let metrics = input.metrics.clone();
+        let pk_key = input.elf.0.clone();
 
         // Ok to panic because it will send a JoinError. A re-delivery whose
         // inputs a prior run already consumed fails here; the task dispatcher
@@ -548,7 +582,8 @@ where
             )
         });
 
-        // Generate dependencies on the main record.
+        // Generate dependencies on the main record. The shards take turns (see `dependency_gate`).
+        let dependency_turn = dependency_gate().acquire().await.expect("dependency gate closed");
         let span = tracing::debug_span!("generate dependencies");
         let machine_clone = self.machine().clone();
         let record = tokio::task::spawn_blocking(move || {
@@ -559,6 +594,7 @@ where
         })
         .await
         .map_err(|e| TaskError::Fatal(e.into()))?;
+        drop(dependency_turn);
 
         // Optionally dump the shard record and vk to disk for benchmarking/replay.
         if let Some((dir, frequency)) = self.record_write_dir_and_frequency.as_ref() {
@@ -607,7 +643,12 @@ where
         // === Phase 2: Core Proving ===
         let permits = self.permits.clone();
 
-        let (proof, permit) = if let Some(pk_cache) = &self.pk {
+        let pk_cache: Option<CoreProvingKeyCache<C>> = match (&self.pk, &self.pk_by_elf) {
+            (Some(fixed), _) => Some(fixed.clone()),
+            (None, Some(per_proof)) => Some(per_proof.get_or_insert(&pk_key)),
+            (None, None) => None,
+        };
+        let (proof, permit) = if let Some(pk_cache) = &pk_cache {
             // We have a fixed PK cache - use get_or_init to ensure only one worker does setup
             let pk = pk_cache
                 .get_or_init(|| async {
@@ -647,19 +688,22 @@ where
         let vk_clone = common_input.vk.vk.clone();
         let proof_clone = proof.clone();
 
-        if self.verify_intermediates {
+        // Verify the shard proof off the critical path: the CPU verification runs concurrently
+        // with the normalize (recursion) proof of this shard and is joined before the task
+        // reports success, so a failed verification still fails (and retries) the task.
+        let verify_handle = if self.verify_intermediates {
             let parent = tracing::Span::current();
             let machine = self.machine().clone();
-            tokio::task::spawn_blocking(move || {
+            Some(tokio::task::spawn_blocking(move || {
                 let _guard = parent.enter();
                 let machine_proof = MachineProof::from(vec![proof_clone]);
                 C::core_verifier(machine)
                     .verify(&vk_clone, &machine_proof)
                     .map_err(|e| TaskError::Retryable(anyhow!("shard verification failed: {e}")))
-            })
-            .await
-            .map_err(|e| TaskError::Fatal(e.into()))??;
-        }
+            }))
+        } else {
+            None
+        };
 
         let output = input.output;
         if common_input.mode != ProofMode::Core {
@@ -676,13 +720,26 @@ where
                 is_precompile,
             );
             let witness = SP1CircuitWitness::Core(input);
-            self.recursion_prover
-                .submit_prove_shard(recursion_program, witness, output, metrics.clone())
-                .instrument(tracing::debug_span!("normalize prove shard"))
-                .await?
-                .await
-                .map_err(|e| TaskError::Fatal(e.into()))??;
+            let normalize_result = async {
+                self.recursion_prover
+                    .submit_prove_shard(recursion_program, witness, output, metrics.clone())
+                    .instrument(tracing::debug_span!("normalize prove shard"))
+                    .await?
+                    .await
+                    .map_err(|e| TaskError::Fatal(e.into()))?
+            }
+            .await;
+            // A verification failure takes precedence (it is retryable, and it explains a
+            // normalize failure caused by a bad shard proof).
+            if let Some(handle) = verify_handle {
+                handle.await.map_err(|e| TaskError::Fatal(e.into()))??;
+            }
+            normalize_result?;
         } else {
+            // Core mode: the shard proof is the output, so verify it before uploading.
+            if let Some(handle) = verify_handle {
+                handle.await.map_err(|e| TaskError::Fatal(e.into()))??;
+            }
             // Upload the proof
             self.artifact_client.upload(&output, proof).await?;
         }
@@ -725,11 +782,117 @@ pub type CoreProvingKey<C> =
 /// The Core Proving Key cache is initialized once and shared across all CoreAndNormalizeWorkers.
 pub type CoreProvingKeyCache<C> = Arc<OnceCell<Arc<CoreProvingKey<C>>>>;
 
+/// Core proving keys of the proofs in flight, keyed by the ELF artifact id (which is fresh for
+/// every proof), so the preprocessed setup runs once per proof instead of once per shard.
+pub type PerProofProvingKeyCache<C> = PerProofCache<Arc<CoreProvingKey<C>>>;
+
+/// Per-proof values keyed by the proof's ELF artifact id.
+///
+/// An entry stays cached until the controller reports that the proof's core phase is over (see
+/// [`release_core_proving_keys`]); tasks still holding its cell keep the value alive until they
+/// finish. When the controller runs in another process that never happens, so at most
+/// [`PER_PROOF_PK_CACHE_ENTRIES`] entries are kept and the oldest is evicted.
+pub struct PerProofCache<V> {
+    entries: Mutex<VecDeque<(String, Arc<OnceCell<V>>)>>,
+}
+
+/// Most entries a [`PerProofCache`] keeps: two proofs of different programs can overlap on one
+/// worker without evicting each other.
+pub const PER_PROOF_PK_CACHE_ENTRIES: usize = 2;
+
+impl<V: Send + Sync + 'static> PerProofCache<V> {
+    /// A new cache, registered so [`release_core_proving_keys`] reaches it.
+    pub fn new() -> Arc<Self> {
+        let cache = Arc::new(Self { entries: Mutex::new(VecDeque::new()) });
+        let weak: Weak<Self> = Arc::downgrade(&cache);
+        let weak: Weak<dyn ReleaseByElf> = weak;
+        PER_PROOF_CACHES.lock().unwrap_or_else(|e| e.into_inner()).push(weak);
+        cache
+    }
+
+    /// The cache cell for this ELF, if there is one.
+    fn get(&self, elf: &str) -> Option<Arc<OnceCell<V>>> {
+        let entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+        entries.iter().find(|(key, _)| key == elf).map(|(_, cell)| cell.clone())
+    }
+
+    /// The cache cell for this ELF, inserting an empty one if needed.
+    fn get_or_insert(&self, elf: &str) -> Arc<OnceCell<V>> {
+        let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((_, cell)) = entries.iter().find(|(key, _)| key == elf) {
+            return cell.clone();
+        }
+        if entries.len() == PER_PROOF_PK_CACHE_ENTRIES {
+            entries.pop_front();
+        }
+        let cell = Arc::new(OnceCell::new());
+        entries.push_back((elf.to_string(), cell.clone()));
+        cell
+    }
+}
+
+trait ReleaseByElf: Send + Sync {
+    fn release(&self, elf: &str);
+    fn reserve(&self, elf: &str);
+}
+
+impl<V: Send + Sync + 'static> ReleaseByElf for PerProofCache<V> {
+    fn release(&self, elf: &str) {
+        self.entries.lock().unwrap_or_else(|e| e.into_inner()).retain(|(key, _)| key != elf);
+    }
+
+    fn reserve(&self, elf: &str) {
+        self.get_or_insert(elf);
+    }
+}
+
+/// Every [`PerProofCache`] in this process.
+static PER_PROOF_CACHES: Mutex<Vec<Weak<dyn ReleaseByElf>>> = Mutex::new(Vec::new());
+
+/// Drops the cached core proving key of the proof of `elf`, freeing its device memory once the
+/// last shard using it is done. Called by the controller when the proof's core phase is over.
+pub fn release_core_proving_keys(elf: &Artifact) {
+    let mut caches = PER_PROOF_CACHES.lock().unwrap_or_else(|e| e.into_inner());
+    caches.retain(|cache| match cache.upgrade() {
+        Some(cache) => {
+            cache.release(&elf.0);
+            true
+        }
+        None => false,
+    });
+}
+
+/// Makes this process's per-proof caches keep the core proving key of the proof of `elf`.
+///
+/// The setup task of the proof then leaves its proving key there for the proof's core shards,
+/// instead of every proof running the same setup twice (once for the vk, once on its first
+/// shard, by which time the CPU is busy with the shards' traces). Returns whether there was a
+/// cache to reserve: when the controller and the workers are different processes there is none,
+/// and the setup task keeps nothing. [`release_core_proving_keys`] undoes it.
+pub fn reserve_core_proving_keys(elf: &Artifact) -> bool {
+    let caches = PER_PROOF_CACHES.lock().unwrap_or_else(|e| e.into_inner());
+    let mut reserved = false;
+    for cache in caches.iter().filter_map(Weak::upgrade) {
+        cache.reserve(&elf.0);
+        reserved = true;
+    }
+    reserved
+}
+
+/// Whether this process runs core workers with a per-proof proving key cache.
+pub fn local_core_workers() -> bool {
+    let caches = PER_PROOF_CACHES.lock().unwrap_or_else(|e| e.into_inner());
+    caches.iter().any(|cache| cache.strong_count() > 0)
+}
+
 /// Worker for handling setup tasks only.
 pub struct CoreAndNormalizeWorker<A, C: SP1ProverComponents> {
     artifact_client: A,
     core_prover: Arc<C::CoreProver>,
     permits: ProverSemaphore,
+    /// The core workers' per-proof proving key cache. A setup task for an ELF with a reserved
+    /// cell (see [`reserve_core_proving_keys`]) leaves its proving key there.
+    pk_by_elf: Option<Arc<PerProofProvingKeyCache<C>>>,
     _marker: std::marker::PhantomData<C>,
 }
 
@@ -739,7 +902,18 @@ impl<A, C: SP1ProverComponents> CoreAndNormalizeWorker<A, C> {
         core_prover: Arc<C::CoreProver>,
         permits: ProverSemaphore,
     ) -> Self {
-        Self { artifact_client, core_prover, permits, _marker: std::marker::PhantomData }
+        Self {
+            artifact_client,
+            core_prover,
+            permits,
+            pk_by_elf: None,
+            _marker: std::marker::PhantomData,
+        }
+    }
+
+    fn with_per_proof_pk_cache(mut self, cache: Option<Arc<PerProofProvingKeyCache<C>>>) -> Self {
+        self.pk_by_elf = cache;
+        self
     }
 }
 
@@ -748,15 +922,28 @@ impl<A: ArtifactClient, C: SP1ProverComponents>
     for CoreAndNormalizeWorker<A, C>
 {
     async fn call(&self, input: SetupTask) -> Result<(TaskId, TaskMetadata), TaskError> {
-        let SetupTask { id, elf, output } = input;
+        let SetupTask { id, elf: elf_artifact, output } = input;
 
-        let elf = self.artifact_client.download_program(&elf).await?;
+        let elf = self.artifact_client.download_program(&elf_artifact).await?;
 
         let program = Program::from(&elf)?;
         let program = Arc::new(program);
 
         let permits = self.permits.clone();
-        let (_pk, vk) = self.core_prover.setup(program, permits).await;
+        let reserved_pk = self.pk_by_elf.as_ref().and_then(|cache| cache.get(&elf_artifact.0));
+        let vk = if let Some(cell) = reserved_pk {
+            // The proof's core shards use this proving key (or this task uses theirs, if one of
+            // them got there first): the same setup either way.
+            let pk = cell
+                .get_or_init(|| async {
+                    tracing::debug!("keeping the core proving key for the proof's shards");
+                    self.core_prover.setup(program, permits).await.0
+                })
+                .await;
+            pk.vk.clone()
+        } else {
+            self.core_prover.setup(program, permits).await.1
+        };
         tracing::debug!("setup completed for task {}", id);
 
         // Upload the vk
@@ -883,6 +1070,12 @@ impl<A: ArtifactClient, W: WorkerClient, C: SP1ProverComponents> SP1CoreProver<A
 
         // Create a shared fixed PK cache if enabled
         let pk_cache = if config.use_fixed_pk { Some(Arc::new(OnceCell::new())) } else { None };
+        // Per-proof PK cache (on by default; `SP1_WORKER_PER_PROOF_PK_CACHE=false` disables it).
+        let per_proof_pk_cache: Option<Arc<PerProofProvingKeyCache<C>>> =
+            match std::env::var("SP1_WORKER_PER_PROOF_PK_CACHE").as_deref() {
+                Ok("0") | Ok("false") => None,
+                _ => Some(PerProofProvingKeyCache::<C>::new()),
+            };
 
         let record_write_dir = std::env::var("SP1_RECORD_WRITE_DIR").ok();
         let record_write_frequency =
@@ -905,6 +1098,7 @@ impl<A: ArtifactClient, W: WorkerClient, C: SP1ProverComponents> SP1CoreProver<A
                     config.verify_intermediates,
                     record_write_dir_and_frequency.clone(),
                 )
+                .with_per_proof_pk_cache(per_proof_pk_cache.clone())
             })
             .collect::<Vec<_>>();
         let prove_shard_engine = Arc::new(AsyncEngine::new(core_workers, config.core_buffer_size));
@@ -917,10 +1111,75 @@ impl<A: ArtifactClient, W: WorkerClient, C: SP1ProverComponents> SP1CoreProver<A
                     air_prover.clone(),
                     permits.clone(),
                 )
+                .with_per_proof_pk_cache(per_proof_pk_cache.clone())
             })
             .collect::<Vec<_>>();
         let setup_engine = Arc::new(AsyncEngine::new(setup_workers, config.setup_buffer_size));
 
         Self { prove_shard_engine, setup_engine }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn elf(id: &str) -> Artifact {
+        Artifact(id.to_string())
+    }
+
+    #[test]
+    fn per_proof_cache_shares_a_cell_per_elf() {
+        let cache = PerProofCache::<u32>::new();
+        let a = cache.get_or_insert("a");
+        assert!(Arc::ptr_eq(&a, &cache.get_or_insert("a")));
+        assert!(!Arc::ptr_eq(&a, &cache.get_or_insert("b")));
+    }
+
+    #[test]
+    fn per_proof_cache_evicts_the_oldest_entry() {
+        let cache = PerProofCache::<u32>::new();
+        let a = cache.get_or_insert("a");
+        let b = cache.get_or_insert("b");
+        cache.get_or_insert("c");
+        assert!(!Arc::ptr_eq(&a, &cache.get_or_insert("a")), "a was evicted");
+        // Inserting "a" again evicted "b".
+        assert!(!Arc::ptr_eq(&b, &cache.get_or_insert("b")));
+    }
+
+    #[tokio::test]
+    async fn releasing_a_proof_drops_its_cached_value() {
+        let cache = PerProofCache::<Arc<u32>>::new();
+        let value = Arc::new(7);
+        let cell = cache.get_or_insert("release-me");
+        cell.get_or_init(|| async { value.clone() }).await;
+        let other = cache.get_or_insert("keep-me");
+        drop(cell);
+        assert_eq!(Arc::strong_count(&value), 2);
+
+        release_core_proving_keys(&elf("release-me"));
+        assert_eq!(Arc::strong_count(&value), 1, "the cache no longer holds the value");
+        assert!(Arc::ptr_eq(&other, &cache.get_or_insert("keep-me")));
+    }
+
+    #[tokio::test]
+    async fn a_reserved_cell_carries_the_setup_value_to_the_shards() {
+        let cache = PerProofCache::<Arc<u32>>::new();
+        assert!(cache.get("reserved").is_none(), "nothing is kept without a reservation");
+        assert!(local_core_workers());
+
+        // What `reserve_core_proving_keys` does to each cache (calling it here would also insert
+        // into the caches of the tests running alongside).
+        ReleaseByElf::reserve(&*cache, "reserved");
+        // The setup task finds the reserved cell and fills it...
+        let setup_cell = cache.get("reserved").expect("the cell was reserved");
+        setup_cell.get_or_init(|| async { Arc::new(11) }).await;
+        // ...and the shards of the proof get the same value without another setup.
+        let shard_cell = cache.get_or_insert("reserved");
+        assert!(Arc::ptr_eq(&setup_cell, &shard_cell));
+        assert_eq!(shard_cell.get().map(|v| **v), Some(11));
+
+        release_core_proving_keys(&elf("reserved"));
+        assert!(cache.get("reserved").is_none());
     }
 }

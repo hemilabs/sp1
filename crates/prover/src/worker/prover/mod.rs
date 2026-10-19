@@ -4,7 +4,7 @@ mod deferred;
 mod engine;
 mod execute;
 #[cfg(any(feature = "native-gnark", test))]
-mod groth16_backend;
+pub(crate) mod groth16_backend;
 mod metric;
 mod recursion;
 mod vk_worker;

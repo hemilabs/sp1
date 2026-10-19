@@ -10,26 +10,50 @@ use sp1_hypercube::air::MachineAir;
 use sp1_recursion_executor::Instruction;
 use sp1_recursion_machine::chips::poseidon2_wide::Poseidon2WideChip;
 
-use crate::{CudaTracegenAir, F};
+use crate::{take_prep_or, CudaTracegenAir, PreprocessedPrep, F};
 
 impl<const DEGREE: usize> CudaTracegenAir<F> for Poseidon2WideChip<DEGREE> {
     fn supports_device_preprocessed_tracegen(&self) -> bool {
         true
     }
 
-    async fn generate_preprocessed_trace_device(
+    fn prepare_preprocessed_device(&self, program: &Self::Program) -> Option<PreprocessedPrep> {
+        Some(Box::new(
+            program
+                .inner
+                .iter() // Faster than using `rayon` for some reason. Maybe vectorization?
+                .filter_map(|instruction| match instruction.inner() {
+                    Instruction::Poseidon2(instr) => Some(**instr),
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+        ))
+    }
+
+    fn generate_preprocessed_trace_device(
         &self,
         program: &Self::Program,
         scope: &TaskScope,
+    ) -> impl core::future::Future<Output = Result<Option<DeviceMle<F>>, CopyError>> + Send {
+        self.generate_preprocessed_trace_device_prepared(program, None, scope)
+    }
+
+    async fn generate_preprocessed_trace_device_prepared(
+        &self,
+        program: &Self::Program,
+        prep: Option<PreprocessedPrep>,
+        scope: &TaskScope,
     ) -> Result<Option<DeviceMle<F>>, CopyError> {
-        let instrs = program
-            .inner
-            .iter() // Faster than using `rayon` for some reason. Maybe vectorization?
-            .filter_map(|instruction| match instruction.inner() {
-                Instruction::Poseidon2(instr) => Some(**instr),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
+        let instrs = take_prep_or(prep, || {
+            program
+                .inner
+                .iter() // Faster than using `rayon` for some reason. Maybe vectorization?
+                .filter_map(|instruction| match instruction.inner() {
+                    Instruction::Poseidon2(instr) => Some(**instr),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        });
 
         let instrs_device = {
             let mut buf = Buffer::try_with_capacity_in(instrs.len(), scope.clone()).unwrap();

@@ -59,6 +59,28 @@ pub(crate) fn fill_grid(iters: usize, block: usize, old: usize) -> usize {
     old.max(iters.div_ceil(block).min(GRID_CAP)).max(1)
 }
 
+/// [`fill_grid`] capped at one block per SM, for `logupGkrTwoRoundSumLayer`: a grid-stride
+/// reduction with one resident 256-thread block per SM, so the 512-block cap ran in three waves.
+/// One wave took ~11% less kernel time on an RTX 5090 (rsp-compressed: 412 -> 368 ms), with fewer
+/// per-block partials to sum. `fixAndSumCircuitLayer` was unchanged within noise, and the
+/// two-round fix-and-sum and jagged sumcheck kernels got slower, so they keep their grids.
+/// `SP1_GPU_REDUCE_BLOCKS_PER_SM=<n>` sets the blocks per SM, `0` removes the cap (A/B switch).
+fn fill_grid_one_wave(iters: usize, block: usize, old: usize) -> usize {
+    static CAP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    let cap = *CAP.get_or_init(|| {
+        match std::env::var("SP1_GPU_REDUCE_BLOCKS_PER_SM").ok().and_then(|v| v.parse().ok()) {
+            Some(0) => usize::MAX,
+            per_sm => per_sm.unwrap_or(1) * sp1_gpu_cudart::cuda_sm_count_cached(),
+        }
+    });
+    let grid = fill_grid(iters, block, old);
+    if fill_grid_enabled() {
+        grid.min(cap).max(1)
+    } else {
+        grid
+    }
+}
+
 /// `SP1_GPU_FILL_GRID=0` restores the original grid sizes (A/B switch).
 pub fn fill_grid_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -156,7 +178,8 @@ fn two_round_sum_as_poly<D: DenseData<TaskScope>>(
     const BLOCK_SIZE: usize = 256;
     const STRIDE: usize = 32;
     // Each iteration consumes one quad (two pairs).
-    let grid_dim = fill_grid(height >> 1, BLOCK_SIZE, height.div_ceil(BLOCK_SIZE * STRIDE * 2));
+    let grid_dim =
+        fill_grid_one_wave(height >> 1, BLOCK_SIZE, height.div_ceil(BLOCK_SIZE * STRIDE * 2));
     let mut output = Tensor::<Ext, TaskScope>::with_sizes_in([10, grid_dim], scope.clone());
 
     let num_tiles = BLOCK_SIZE.checked_div(STRIDE).unwrap_or(1);

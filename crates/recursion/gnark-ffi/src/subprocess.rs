@@ -227,7 +227,7 @@ fn limit_hits_in(root: &Path, path: &str) -> Option<u64> {
 /// Lets the child inherit this thread's queue slot and die with its parent. Everything here runs
 /// between fork and exec, so it only makes async-signal-safe calls and does not allocate.
 #[cfg(unix)]
-fn bind_to_parent(cmd: &mut Command) {
+pub(crate) fn bind_to_parent(cmd: &mut Command) {
     use std::os::unix::process::CommandExt;
     let slot_fd = crate::groth16_queue::held_slot_fd();
     // SAFETY: getpid is always safe; it is read before the fork so the child can tell whether the
@@ -264,7 +264,7 @@ fn bind_to_parent(cmd: &mut Command) {
 }
 
 #[cfg(not(unix))]
-fn bind_to_parent(_cmd: &mut Command) {}
+pub(crate) fn bind_to_parent(_cmd: &mut Command) {}
 
 #[cfg(all(test, unix))]
 pub(crate) mod tests {

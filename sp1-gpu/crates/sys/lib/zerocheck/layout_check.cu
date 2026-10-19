@@ -51,7 +51,7 @@ const uint32_t* zerocheck_layout_chunk_static() {
         (uint32_t)offsetof(ChunkStatic, leaves),
         (uint32_t)offsetof(ChunkStatic, consts),
         (uint32_t)offsetof(ChunkStatic, publics),
-        (uint32_t)offsetof(ChunkStatic, assert_regs),
+        (uint32_t)offsetof(ChunkStatic, assert_pos),
         (uint32_t)offsetof(ChunkStatic, assert_alphas),
         (uint32_t)offsetof(ChunkStatic, n_instrs),
         (uint32_t)offsetof(ChunkStatic, n_asserts),
@@ -59,6 +59,11 @@ const uint32_t* zerocheck_layout_chunk_static() {
         (uint32_t)offsetof(ChunkStatic, gkr_main_width),
         (uint32_t)offsetof(ChunkStatic, gkr_prep_width),
         (uint32_t)offsetof(ChunkStatic, chip_alpha_offset),
+        (uint32_t)offsetof(ChunkStatic, coop_code),
+        (uint32_t)offsetof(ChunkStatic, coop_level_starts),
+        (uint32_t)offsetof(ChunkStatic, coop_assert_slots),
+        (uint32_t)offsetof(ChunkStatic, coop_n_levels),
+        (uint32_t)offsetof(ChunkStatic, coop_n_phys),
     };
     return L;
 }

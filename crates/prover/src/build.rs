@@ -636,7 +636,7 @@ fn publish_circuit_artifacts(staging_dir: tempfile::TempDir, build_dir: &Path) -
     Ok(())
 }
 
-fn circuit_artifacts_installed(build_dir: &Path) -> bool {
+pub(crate) fn circuit_artifacts_installed(build_dir: &Path) -> bool {
     build_dir.join(CIRCUIT_ARTIFACTS_COMPLETE_FILE).is_file()
 }
 

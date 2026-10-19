@@ -311,6 +311,24 @@ pub fn prove_groth16_bn254_with_r1cs(
     }
 }
 
+/// Reads the circuit that [`export_groth16_gpu_witness`] solves into its Go cache ahead of the
+/// proof (see `prestart`).
+pub fn prefetch_groth16_gpu_witness_circuit(data_dir: &str, pk_dir: &str) -> Result<(), String> {
+    let data_dir_cstring = CString::new(data_dir).expect("CString::new failed");
+    let pk_dir_cstring = CString::new(pk_dir).expect("CString::new failed");
+    unsafe {
+        let err = bind::PrefetchGroth16GpuWitnessCircuit(
+            data_dir_cstring.as_ptr() as *mut c_char,
+            pk_dir_cstring.as_ptr() as *mut c_char,
+        );
+        if err.is_null() {
+            Ok(())
+        } else {
+            Err(ptr_to_string_freed(err))
+        }
+    }
+}
+
 /// Drops the circuit and proving key that [`prove_groth16_bn254`] and
 /// [`export_groth16_gpu_witness`] keep in Go globals (~12 GB on the v6.1.0 circuit), and returns
 /// the memory to the host. The next call reloads them.

@@ -13,7 +13,7 @@ use tokio::{sync::mpsc, task::JoinSet};
 use tracing::Instrument;
 
 use crate::worker::{
-    controller::{create_core_proving_task, ProveShardGate},
+    controller::{create_core_proving_task, wait_for_common_input, ProveShardGate},
     CommonProverInput, DeferredMessage, FinalVmState, FinalVmStateLock, MessageSender, ProofData,
     SpawnProveOutput, TaskContext, TouchedAddresses, TouchedPages, TraceData, WorkerClient,
 };
@@ -171,6 +171,9 @@ where
             .instrument(tracing::debug_span!("spawn prove shard tasks")),
         );
 
+        wait_for_common_input(&self.artifact_client, &common_input_artifact)
+            .await
+            .map_err(|e| ExecutionError::Other(e.to_string()))?;
         let common_prover_input = self
             .artifact_client
             .download::<CommonProverInput>(&common_input_artifact)

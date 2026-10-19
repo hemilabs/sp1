@@ -65,6 +65,15 @@ struct Args {
     /// --prep-circuit-dir. Required for the in-process solver path.
     #[arg(long)]
     wires_initial: Option<PathBuf>,
+    /// Prestarted helper (see `prestart` in sp1-recursion-gnark-ffi): after loading the proving
+    /// data, wait on this FIFO for the go-ahead to upload it to the GPU, which the parent sends
+    /// once the GPU has room.
+    #[arg(long)]
+    upload_fifo: Option<PathBuf>,
+    /// Prestarted helper: then wait on this FIFO for three lines, the witness dir, the witness
+    /// JSON and the proof path, which replace --witness-dir, --witness-json and --out.
+    #[arg(long)]
+    wait_fifo: Option<PathBuf>,
 }
 
 // Subset of GnarkWitness (crates/recursion/gnark-ffi/src/witness.rs) —
@@ -79,8 +88,13 @@ struct GnarkPubInputs {
     proof_nonce: String,
 }
 
+// mimalloc with large OS pages on hosts with enough RAM: loading and converting the proving key
+// is allocation-heavy (9.1 -> 7.3 s for a standalone proof on an RTX 5090 host).
+#[global_allocator]
+static GLOBAL: sp1_gpu_host_alloc::OneShotHostAlloc = sp1_gpu_host_alloc::OneShotHostAlloc;
+
 fn main() {
-    let args = Args::parse();
+    let mut args = Args::parse();
     let gpu_dir_str = args.gpu_dir.to_str().expect("--gpu-dir is not valid UTF-8");
 
     eprintln!("[groth16-gpu-helper] loading proving data from {gpu_dir_str}");
@@ -89,6 +103,28 @@ fn main() {
             eprintln!("[groth16-gpu-helper] failed to load Groth16ProvingData: {e}");
             std::process::exit(2);
         });
+
+    // A prestarted helper uploads the key as soon as the GPU has room, then waits for its proof.
+    let mut proving_data = Some(proving_data);
+    let mut uploaded = None;
+    if let Some(fifo) = args.upload_fifo.take() {
+        eprintln!("[groth16-gpu-helper] proving data ready; waiting for room on the GPU");
+        read_fifo(&fifo);
+        eprintln!("[groth16-gpu-helper] uploading the proving key");
+        uploaded = Some(sp1_gpu_groth16::prover::Groth16Prover::new(proving_data.take().unwrap()));
+    }
+    if let Some(fifo) = args.wait_fifo.take() {
+        eprintln!("[groth16-gpu-helper] waiting for the witness");
+        let msg = read_fifo(&fifo);
+        let mut lines = msg.lines();
+        let (Some(dir), Some(json), Some(out)) = (lines.next(), lines.next(), lines.next()) else {
+            eprintln!("[groth16-gpu-helper] bad message on {}: {msg:?}", fifo.display());
+            std::process::exit(3);
+        };
+        args.witness_dir = Some(PathBuf::from(dir));
+        args.witness_json = PathBuf::from(json);
+        args.out = PathBuf::from(out);
+    }
 
     let witness_dir = args.witness_dir.as_deref().unwrap_or(&args.gpu_dir);
     let witness_data = load_witness_data(
@@ -108,7 +144,9 @@ fn main() {
     });
 
     eprintln!("[groth16-gpu-helper] running GPU Groth16 prover");
-    let prover = sp1_gpu_groth16::prover::Groth16Prover::new(proving_data);
+    let prover = uploaded.unwrap_or_else(|| {
+        sp1_gpu_groth16::prover::Groth16Prover::new(proving_data.take().unwrap())
+    });
     let gpu_proof = prover.prove(&witness_data).unwrap_or_else(|e| {
         eprintln!("[groth16-gpu-helper] GPU Groth16 prove failed: {e}");
         std::process::exit(1);
@@ -167,6 +205,17 @@ fn main() {
     });
 
     eprintln!("[groth16-gpu-helper] wrote proof to {}", args.out.display());
+    // Skip the teardown (pinned frees, GPU context destroy: ~0.9 s on an RTX 5090): the proof is
+    // written and closed, and the driver reclaims the device when the process ends.
+    // SP1_GROTH16_HELPER_FAST_EXIT=0 exits normally.
+    if std::env::var("SP1_GROTH16_HELPER_FAST_EXIT").ok().as_deref() != Some("0") {
+        use std::io::Write;
+        let _ = std::io::stdout().flush();
+        let _ = std::io::stderr().flush();
+        // SAFETY: `_exit` ends the process without running destructors or atexit handlers, which
+        // is the point; nothing after this needs to run.
+        unsafe { libc::_exit(0) };
+    }
 }
 
 /// Produce `Groth16WitnessData` either from the in-process GPU R1CS solver
@@ -236,4 +285,12 @@ fn try_gpu_r1cs_solver(
     _wires_initial_path: &std::path::Path,
 ) -> anyhow::Result<sp1_gpu_groth16::types::Groth16WitnessData> {
     Err(anyhow::anyhow!("GPU R1CS solver requires the cuda feature"))
+}
+
+/// Reads a message from a FIFO the parent writes, blocking until it has.
+fn read_fifo(fifo: &std::path::Path) -> String {
+    std::fs::read_to_string(fifo).unwrap_or_else(|e| {
+        eprintln!("[groth16-gpu-helper] failed to read {}: {e}", fifo.display());
+        std::process::exit(2);
+    })
 }
