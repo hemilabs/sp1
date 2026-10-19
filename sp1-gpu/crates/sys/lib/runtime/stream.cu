@@ -634,6 +634,29 @@ static bool isPinnedHost(const void* ptr) {
     }
     return attr.type == hipMemoryTypeHost;
 }
+
+// Small uploads from pageable memory go as the arguments of a kernel: the launch copies its
+// arguments, so the source may be reused at once and the upload needs no wait for the stream,
+// which a pageable copy does (about 8600 uploads per 144M-cycle core proof; on a Radeon RX 9070
+// XT 8.73 -> 7.82 s). The data lands in stream order, as a copy's would. SP1_HIP_ARG_UPLOAD=0
+// copies and waits instead.
+static constexpr size_t ARG_UPLOAD_WORDS = 512;
+
+struct ArgUpload {
+    uint32_t words[ARG_UPLOAD_WORDS];
+};
+
+__global__ void argUploadKernel(uint32_t* __restrict__ dst, ArgUpload data, uint32_t words) {
+    for (uint32_t i = threadIdx.x; i < words; i += blockDim.x) dst[i] = data.words[i];
+}
+
+static bool argUploadEnabled() {
+    static const bool on = [] {
+        const char* v = std::getenv("SP1_HIP_ARG_UPLOAD");
+        return !(v && v[0] == '0');
+    }();
+    return on;
+}
 #endif
 
 // CUDA's cudaMemcpyAsync with pageable host memory has returned once the source has been read
@@ -644,9 +667,22 @@ static bool isPinnedHost(const void* ptr) {
 extern "C" rustCudaError_t
 cuda_mem_copy_host_to_device_async(void* dst, const void* src, size_t count, cudaStream_t stream) {
 #ifdef __HIPCC__
-    // A copy from pageable memory waits for the stream's earlier work first: see the device to
-    // host copy below.
     const bool pinned = isPinnedHost(src);
+    // A small pageable upload goes as a kernel's arguments: ordered like any kernel, so it needs
+    // no wait for the stream.
+    if (argUploadEnabled() && count <= ARG_UPLOAD_WORDS * 4 && count % 4 == 0 &&
+        (uintptr_t)dst % 4 == 0 && !pinned) {
+        void* prof = sp1_profile_begin(stream);
+        ArgUpload data;
+        memcpy(data.words, src, count);
+        hipLaunchKernelGGL(argUploadKernel, dim3(1), dim3(128), 0, stream, (uint32_t*)dst, data,
+                           (uint32_t)(count / 4));
+        CUDA_OK(hipGetLastError());
+        sp1_profile_end(prof, "copy: host to device (kernel arguments)", stream);
+        return CUDA_SUCCESS_CSL;
+    }
+    // Any other copy from pageable memory waits for the stream's earlier work first: see the
+    // device to host copy below.
     if (!pinned) CUDA_OK(cudaStreamSynchronize(stream));
 #endif
     void* prof = sp1_profile_begin(stream);
