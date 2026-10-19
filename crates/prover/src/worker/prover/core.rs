@@ -17,6 +17,7 @@ use sp1_core_executor::{
 use sp1_core_machine::executor::trace_chunk;
 use sp1_core_machine::riscv::RiscvAir;
 use sp1_hypercube::{
+    air::MachineAir,
     prover::{shape_from_record, CoreProofShape, ProverSemaphore, ProvingKey},
     InnerSC, Machine, MachineProof, MachineVerifier, SP1VerifyingKey,
 };
@@ -586,10 +587,22 @@ where
         let dependency_turn = dependency_gate().acquire().await.expect("dependency gate closed");
         let span = tracing::debug_span!("generate dependencies");
         let machine_clone = self.machine().clone();
+        let dependencies_in_trace = C::dependencies_in_trace();
         let record = tokio::task::spawn_blocking(move || {
             let _guard = span.enter();
+            // The prover's trace generation generates the dependencies of the chips that support
+            // it (see `MachineAir::dependencies_in_trace`), so they are skipped here.
+            let chips = dependencies_in_trace.then(|| {
+                record.dependencies_in_trace = true;
+                machine_clone
+                    .chips()
+                    .iter()
+                    .filter(|chip| !chip.dependencies_in_trace())
+                    .map(|chip| chip.name().to_string())
+                    .collect::<Vec<_>>()
+            });
             let record_iter = std::iter::once(&mut record);
-            machine_clone.generate_dependencies(record_iter, None);
+            machine_clone.generate_dependencies(record_iter, chips.as_deref());
             record
         })
         .await

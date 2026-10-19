@@ -4,18 +4,12 @@ use core::{
 };
 use std::marker::PhantomData;
 
-use hashbrown::HashMap;
-use itertools::Itertools;
-use rayon::{
-    iter::{IndexedParallelIterator, IntoParallelRefIterator},
-    slice::ParallelSliceMut,
-};
 use slop_air::{Air, BaseAir};
 use slop_algebra::{AbstractField, PrimeField, PrimeField32};
 use slop_matrix::Matrix;
 use slop_maybe_rayon::prelude::{ParallelIterator, ParallelSlice};
 use sp1_core_executor::{
-    events::{AluEvent, ByteLookupEvent, ByteRecord},
+    events::{AluEvent, ByteRecord},
     ExecutionRecord, Opcode, Program, CLK_INC, PC_INC,
 };
 use sp1_derive::AlignedBorrow;
@@ -97,6 +91,64 @@ impl<F: PrimeField32, M: TrustMode> MachineAir<F> for AddiChip<M> {
         _output: &mut ExecutionRecord,
         buffer: &mut [MaybeUninit<F>],
     ) {
+        self.generate_trace_into_with::<F>(input, buffer, false);
+    }
+
+    fn dependencies_in_trace(&self) -> bool {
+        true
+    }
+
+    fn generate_trace_into_with_dependencies(
+        &self,
+        input: &ExecutionRecord,
+        _output: &mut ExecutionRecord,
+        buffer: &mut [MaybeUninit<F>],
+    ) {
+        self.generate_trace_into_with::<F>(input, buffer, true);
+    }
+
+    fn generate_dependencies(&self, input: &Self::Record, _output: &mut Self::Record) {
+        if input.program.enable_untrusted_programs == M::IS_TRUSTED {
+            return;
+        }
+
+        let chunk_size = std::cmp::max(input.addi_events.len() / num_cpus::get(), 1);
+        let width = <AddiChip<M> as BaseAir<F>>::width(self);
+
+        input.addi_events.par_chunks(chunk_size).for_each(|events| {
+            input.byte_lookup_counts.count(|blu| {
+                // One scratch row per chunk instead of an allocation per event.
+                let mut row = vec![F::zero(); width];
+                events.iter().for_each(|event| {
+                    row.fill(F::zero());
+                    let cols: &mut AddiCols<F, M> = row.as_mut_slice().borrow_mut();
+                    self.event_to_row(&event.0, cols, blu);
+                    cols.state.populate(blu, event.0.clk, event.0.pc);
+                    cols.adapter.populate(blu, event.1);
+                });
+            });
+        });
+    }
+
+    fn included(&self, shard: &Self::Record) -> bool {
+        if let Some(shape) = shard.shape.as_ref() {
+            shape.included::<F, _>(self)
+        } else {
+            !shard.addi_events.is_empty()
+                && (M::IS_TRUSTED != shard.program.enable_untrusted_programs)
+        }
+    }
+}
+
+impl<M: TrustMode> AddiChip<M> {
+    /// Writes the trace into `buffer`. With `count`, the byte lookups of the rows are counted
+    /// into `input.byte_lookup_counts`, as `generate_dependencies` does.
+    fn generate_trace_into_with<F: PrimeField32>(
+        &self,
+        input: &ExecutionRecord,
+        buffer: &mut [MaybeUninit<F>],
+        count: bool,
+    ) {
         if input.program.enable_untrusted_programs == M::IS_TRUSTED {
             return;
         }
@@ -117,58 +169,18 @@ impl<F: PrimeField32, M: TrustMode> MachineAir<F> for AddiChip<M> {
         let buffer_ptr = buffer.as_mut_ptr() as *mut F;
         let values = unsafe { core::slice::from_raw_parts_mut(buffer_ptr, num_event_rows * width) };
 
-        values.par_chunks_exact_mut(width).zip(input.addi_events.par_iter()).for_each(
-            |(row, event)| {
-                let cols: &mut AddiCols<F, M> = row.borrow_mut();
+        crate::utils::populate_event_rows(input, values, width, count, |idx, row, blu| {
+            let event = &input.addi_events[idx];
+            let cols: &mut AddiCols<F, M> = row.borrow_mut();
 
-                let mut byte_lookup_events = sp1_core_executor::events::DiscardByteRecord;
-                self.event_to_row(&event.0, cols, &mut byte_lookup_events);
-                cols.state.populate(&mut byte_lookup_events, event.0.clk, event.0.pc);
-                cols.adapter.populate(&mut byte_lookup_events, event.1);
-                if !M::IS_TRUSTED {
-                    let cols: &mut AddiCols<F, UserMode> = row.borrow_mut();
-                    cols.adapter_cols.is_trusted = F::from_bool(!event.1.is_untrusted);
-                }
-            },
-        );
-    }
-
-    fn generate_dependencies(&self, input: &Self::Record, output: &mut Self::Record) {
-        if input.program.enable_untrusted_programs == M::IS_TRUSTED {
-            return;
-        }
-
-        let chunk_size = std::cmp::max(input.addi_events.len() / num_cpus::get(), 1);
-        let width = <AddiChip<M> as BaseAir<F>>::width(self);
-
-        let blu_batches = input
-            .addi_events
-            .par_chunks(chunk_size)
-            .map(|events| {
-                let mut blu: HashMap<ByteLookupEvent, usize> = HashMap::new();
-                // One scratch row per chunk instead of an allocation per event.
-                let mut row = vec![F::zero(); width];
-                events.iter().for_each(|event| {
-                    row.fill(F::zero());
-                    let cols: &mut AddiCols<F, M> = row.as_mut_slice().borrow_mut();
-                    self.event_to_row(&event.0, cols, &mut blu);
-                    cols.state.populate(&mut blu, event.0.clk, event.0.pc);
-                    cols.adapter.populate(&mut blu, event.1);
-                });
-                blu
-            })
-            .collect::<Vec<_>>();
-
-        output.add_byte_lookup_events_from_maps(blu_batches.iter().collect_vec());
-    }
-
-    fn included(&self, shard: &Self::Record) -> bool {
-        if let Some(shape) = shard.shape.as_ref() {
-            shape.included::<F, _>(self)
-        } else {
-            !shard.addi_events.is_empty()
-                && (M::IS_TRUSTED != shard.program.enable_untrusted_programs)
-        }
+            self.event_to_row(&event.0, cols, blu);
+            cols.state.populate(blu, event.0.clk, event.0.pc);
+            cols.adapter.populate(blu, event.1);
+            if !M::IS_TRUSTED {
+                let cols: &mut AddiCols<F, UserMode> = row.borrow_mut();
+                cols.adapter_cols.is_trusted = F::from_bool(!event.1.is_untrusted);
+            }
+        });
     }
 }
 

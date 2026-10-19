@@ -8,7 +8,7 @@ use slop_air::{Air, BaseAir};
 use slop_algebra::{AbstractField, PrimeField32};
 use slop_matrix::Matrix;
 use slop_maybe_rayon::prelude::{
-    IndexedParallelIterator, IntoParallelRefMutIterator, ParallelIterator,
+    IndexedParallelIterator, IntoParallelRefMutIterator, ParallelIterator, ParallelSlice,
 };
 use sp1_core_executor::{
     events::{ByteRecord, GlobalInteractionEvent},
@@ -103,57 +103,78 @@ impl<F: PrimeField32> MachineAir<F> for MemoryLocalChip {
     }
 
     fn generate_dependencies(&self, input: &Self::Record, output: &mut Self::Record) {
-        let mut events = Vec::new();
+        // In parallel chunks; the global interaction events keep the order of the local events.
+        let mem_events = input.get_local_mem_events().collect::<Vec<_>>();
+        let chunk_size = std::cmp::max(mem_events.len() / num_cpus::get(), 1);
+        let event_chunks = mem_events
+            .par_chunks(chunk_size)
+            .map(|chunk| {
+                let mut events = Vec::with_capacity(2 * chunk.len());
+                input.byte_lookup_counts.count(|blu| {
+                    for mem_event in chunk {
+                        let initial_value_byte0 =
+                            ((mem_event.initial_mem_access.value >> 32) & 0xFF) as u32;
+                        let initial_value_byte1 =
+                            ((mem_event.initial_mem_access.value >> 40) & 0xFF) as u32;
+                        blu.add_u8_range_check(
+                            initial_value_byte0 as u8,
+                            initial_value_byte1 as u8,
+                        );
+                        blu.add_u16_range_checks_field::<F>(
+                            &Word::from(mem_event.initial_mem_access.value).0,
+                        );
 
-        input.get_local_mem_events().for_each(|mem_event| {
-            let mut blu = Vec::with_capacity(10); // 1 + 4 + 1 + 4
-            let initial_value_byte0 = ((mem_event.initial_mem_access.value >> 32) & 0xFF) as u32;
-            let initial_value_byte1 = ((mem_event.initial_mem_access.value >> 40) & 0xFF) as u32;
-            blu.add_u8_range_check(initial_value_byte0 as u8, initial_value_byte1 as u8);
-            blu.add_u16_range_checks_field::<F>(&Word::from(mem_event.initial_mem_access.value).0);
+                        events.push(GlobalInteractionEvent {
+                            message: [
+                                (mem_event.initial_mem_access.timestamp >> 24) as u32,
+                                (mem_event.initial_mem_access.timestamp & 0xFFFFFF) as u32,
+                                (mem_event.addr & 0xFFFF) as u32,
+                                ((mem_event.addr >> 16) & 0xFFFF) as u32,
+                                ((mem_event.addr >> 32) & 0xFFFF) as u32,
+                                (mem_event.initial_mem_access.value & 0xFFFF) as u32
+                                    + (1 << 16) * initial_value_byte0,
+                                ((mem_event.initial_mem_access.value >> 16) & 0xFFFF) as u32
+                                    + (1 << 16) * initial_value_byte1,
+                                ((mem_event.initial_mem_access.value >> 48) & 0xFFFF) as u32,
+                            ],
+                            is_receive: true,
+                            kind: InteractionKind::Memory as u8,
+                        });
 
-            events.push(GlobalInteractionEvent {
-                message: [
-                    (mem_event.initial_mem_access.timestamp >> 24) as u32,
-                    (mem_event.initial_mem_access.timestamp & 0xFFFFFF) as u32,
-                    (mem_event.addr & 0xFFFF) as u32,
-                    ((mem_event.addr >> 16) & 0xFFFF) as u32,
-                    ((mem_event.addr >> 32) & 0xFFFF) as u32,
-                    (mem_event.initial_mem_access.value & 0xFFFF) as u32
-                        + (1 << 16) * initial_value_byte0,
-                    ((mem_event.initial_mem_access.value >> 16) & 0xFFFF) as u32
-                        + (1 << 16) * initial_value_byte1,
-                    ((mem_event.initial_mem_access.value >> 48) & 0xFFFF) as u32,
-                ],
-                is_receive: true,
-                kind: InteractionKind::Memory as u8,
-            });
+                        let final_value_byte0 =
+                            ((mem_event.final_mem_access.value >> 32) & 0xFF) as u32;
+                        let final_value_byte1 =
+                            ((mem_event.final_mem_access.value >> 40) & 0xFF) as u32;
+                        blu.add_u8_range_check(final_value_byte0 as u8, final_value_byte1 as u8);
+                        blu.add_u16_range_checks_field::<F>(
+                            &Word::from(mem_event.final_mem_access.value).0,
+                        );
+                        events.push(GlobalInteractionEvent {
+                            message: [
+                                (mem_event.final_mem_access.timestamp >> 24) as u32,
+                                (mem_event.final_mem_access.timestamp & 0xFFFFFF) as u32,
+                                (mem_event.addr & 0xFFFF) as u32,
+                                ((mem_event.addr >> 16) & 0xFFFF) as u32,
+                                ((mem_event.addr >> 32) & 0xFFFF) as u32,
+                                (mem_event.final_mem_access.value & 0xFFFF) as u32
+                                    + (1 << 16) * final_value_byte0,
+                                ((mem_event.final_mem_access.value >> 16) & 0xFFFF) as u32
+                                    + (1 << 16) * final_value_byte1,
+                                ((mem_event.final_mem_access.value >> 48) & 0xFFFF) as u32,
+                            ],
+                            is_receive: false,
+                            kind: InteractionKind::Memory as u8,
+                        });
+                    }
+                });
+                events
+            })
+            .collect::<Vec<_>>();
 
-            let final_value_byte0 = ((mem_event.final_mem_access.value >> 32) & 0xFF) as u32;
-            let final_value_byte1 = ((mem_event.final_mem_access.value >> 40) & 0xFF) as u32;
-            blu.add_u8_range_check(final_value_byte0 as u8, final_value_byte1 as u8);
-            blu.add_u16_range_checks_field::<F>(&Word::from(mem_event.final_mem_access.value).0);
-            events.push(GlobalInteractionEvent {
-                message: [
-                    (mem_event.final_mem_access.timestamp >> 24) as u32,
-                    (mem_event.final_mem_access.timestamp & 0xFFFFFF) as u32,
-                    (mem_event.addr & 0xFFFF) as u32,
-                    ((mem_event.addr >> 16) & 0xFFFF) as u32,
-                    ((mem_event.addr >> 32) & 0xFFFF) as u32,
-                    (mem_event.final_mem_access.value & 0xFFFF) as u32
-                        + (1 << 16) * final_value_byte0,
-                    ((mem_event.final_mem_access.value >> 16) & 0xFFFF) as u32
-                        + (1 << 16) * final_value_byte1,
-                    ((mem_event.final_mem_access.value >> 48) & 0xFFFF) as u32,
-                ],
-                is_receive: false,
-                kind: InteractionKind::Memory as u8,
-            });
-
-            output.add_byte_lookup_events(blu);
-        });
-
-        output.global_interaction_events.extend(events);
+        output.global_interaction_events.reserve(2 * mem_events.len());
+        for events in event_chunks {
+            output.global_interaction_events.extend(events);
+        }
     }
 
     fn num_rows(&self, input: &Self::Record) -> Option<usize> {

@@ -89,10 +89,8 @@ impl<F: PrimeField32> MachineAir<F> for MemoryGlobalChip {
 
         let chunk_size = std::cmp::max(memory_events.len() / num_cpus::get(), 1);
         let indices = (0..memory_events.len()).collect::<Vec<_>>();
-        let blu_batches = indices
-            .par_chunks(chunk_size)
-            .map(|chunk| {
-                let mut blu = Vec::new();
+        indices.par_chunks(chunk_size).for_each(|chunk| {
+            input.byte_lookup_counts.count(|blu| {
                 let mut row = [F::zero(); NUM_MEMORY_INIT_COLS];
                 let cols: &mut MemoryInitCols<F> = row.as_mut_slice().borrow_mut();
                 chunk.iter().for_each(|&i| {
@@ -106,13 +104,11 @@ impl<F: PrimeField32> MachineAir<F> for MemoryGlobalChip {
                     let value_upper = (value >> 40 & 0xFF) as u8;
                     blu.add_u8_range_check(value_lower, value_upper);
                     if i != 0 || prev_addr != 0 {
-                        cols.lt_cols.populate_unsigned(&mut blu, 1, prev_addr, addr);
+                        cols.lt_cols.populate_unsigned(blu, 1, prev_addr, addr);
                     }
                 });
-                blu
-            })
-            .collect::<Vec<_>>();
-        output.add_byte_lookup_events(blu_batches.into_iter().flatten().collect());
+            });
+        });
 
         let events = memory_events.into_iter().map(|event| {
             let interaction_clk_high = if is_receive { (event.timestamp >> 24) as u32 } else { 0 };

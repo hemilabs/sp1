@@ -69,6 +69,26 @@ pub trait MachineAir<F: Field>: BaseAir<F> + 'static + Send + Sync {
         buffer: &mut [MaybeUninit<F>],
     );
 
+    /// Whether [`MachineAir::generate_trace_into_with_dependencies`] generates this chip's
+    /// dependencies while it writes the trace (instead of `generate_dependencies` computing the
+    /// rows a second time).
+    fn dependencies_in_trace(&self) -> bool {
+        false
+    }
+
+    /// Generates the trace into `buffer` together with the dependencies of
+    /// [`MachineAir::generate_dependencies`], for a record whose dependencies were generated
+    /// without this chip.
+    fn generate_trace_into_with_dependencies(
+        &self,
+        input: &Self::Record,
+        output: &mut Self::Record,
+        buffer: &mut [MaybeUninit<F>],
+    ) {
+        self.generate_dependencies(input, output);
+        self.generate_trace_into(input, &mut Self::Record::default(), buffer);
+    }
+
     /// Whether this execution record contains events for this air.
     fn included(&self, shard: &Self::Record) -> bool;
 

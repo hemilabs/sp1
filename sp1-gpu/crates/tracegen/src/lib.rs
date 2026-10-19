@@ -420,6 +420,19 @@ pub trait CudaTracegenAir<F: Field>: MachineAir<F> {
         self.generate_preprocessed_trace_device(program, scope)
     }
 
+    /// Whether the host trace of this AIR must also generate its dependencies (with
+    /// `generate_trace_into_with_dependencies`) because the record's dependencies were generated
+    /// without it.
+    fn host_trace_generates_dependencies(&self, _record: &Self::Record) -> bool {
+        false
+    }
+
+    /// Whether the host trace of this AIR reads dependencies that other host traces generate, so
+    /// it must be generated after them.
+    fn host_trace_after_dependencies(&self, _record: &Self::Record) -> bool {
+        false
+    }
+
     /// Whether this AIR supports main trace generation on the device.
     fn supports_device_main_tracegen(&self) -> bool {
         false

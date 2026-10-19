@@ -23,9 +23,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     events::{
-        AluEvent, BranchEvent, ByteLookupEvent, ByteRecord, GlobalInteractionEvent,
-        InstructionDecodeEvent, InstructionFetchEvent, JumpEvent, MemInstrEvent,
-        MemoryInitializeFinalizeEvent, MemoryLocalEvent, MemoryRecordEnum,
+        AluEvent, BranchEvent, ByteLookupCounts, ByteLookupEvent, ByteRecord,
+        GlobalInteractionEvent, InstructionDecodeEvent, InstructionFetchEvent, JumpEvent,
+        MemInstrEvent, MemoryInitializeFinalizeEvent, MemoryLocalEvent, MemoryRecordEnum,
         PageProtInitializeFinalizeEvent, PageProtLocalEvent, PrecompileEvent, PrecompileEvents,
         SyscallEvent, UTypeEvent,
     },
@@ -94,6 +94,13 @@ pub struct ExecutionRecord {
     pub jalr_events: Vec<(JumpEvent, ITypeRecord)>,
     /// A trace of the byte lookups that are needed.
     pub byte_lookups: HashMap<ByteLookupEvent, usize>,
+    /// Byte lookups counted by slot, which chips add to while generating dependencies (see
+    /// [`ByteLookupCounts`]). The byte and range tables count both these and `byte_lookups`.
+    pub byte_lookup_counts: ByteLookupCounts,
+    /// Whether the dependencies were generated without the chips whose `dependencies_in_trace`
+    /// holds: their trace generation must then use `generate_trace_into_with_dependencies`, and
+    /// finish before the byte and range traces are generated.
+    pub dependencies_in_trace: bool,
     /// A trace of the precompile events.
     pub precompile_events: PrecompileEvents,
     /// A trace of the global memory initialize events.
@@ -583,6 +590,7 @@ impl ExecutionRecord {
         self.jal_events.clear();
         self.jalr_events.clear();
         self.byte_lookups.clear();
+        self.byte_lookup_counts.clear();
         self.precompile_events = PrecompileEvents::default();
         self.global_memory_initialize_events.clear();
         self.global_memory_finalize_events.clear();
@@ -868,6 +876,7 @@ impl MachineRecord for ExecutionRecord {
         } else {
             self.add_byte_lookup_events_from_maps(vec![&other.byte_lookups]);
         }
+        self.byte_lookup_counts.append(&mut other.byte_lookup_counts);
 
         self.global_memory_initialize_events.append(&mut other.global_memory_initialize_events);
         self.global_memory_finalize_events.append(&mut other.global_memory_finalize_events);

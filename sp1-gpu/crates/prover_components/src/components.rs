@@ -24,6 +24,13 @@ impl SP1ProverComponents for SP1CudaProverComponents {
     type RecursionProver = CudaShardProver<SP1GlobalContext, CudaProverRecursionComponents>;
     type WrapProver = CudaShardProver<SP1OuterGlobalContext, CudaProverWrapComponents>;
     type WrapProverBuilder = ReadyWrapProverBuilder<Self>;
+
+    /// The host tracegen counts the byte lookups of most chips while it writes their traces
+    /// (instead of the workers computing every row a second time for them).
+    /// `SP1_DEPENDENCIES_IN_TRACE=0` turns it off.
+    fn dependencies_in_trace() -> bool {
+        std::env::var("SP1_DEPENDENCIES_IN_TRACE").map_or(true, |v| v != "0")
+    }
 }
 
 /// Core prover components for the CUDA prover.

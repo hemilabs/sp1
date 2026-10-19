@@ -1,9 +1,16 @@
 use slop_algebra::PrimeField32;
-use sp1_core_executor::{events::ByteRecord, ByteOpcode, ExecutionRecord, Program};
+use sp1_core_executor::{
+    events::{byte_lookup_slot, ByteRecord, BYTE_TABLE_ROWS, NUM_BYTE_OPS, RANGE_TABLE_ROWS},
+    ByteOpcode, ExecutionRecord, Program,
+};
 use sp1_hypercube::air::MachineAir;
+use static_assertions::const_assert_eq;
 use std::mem::MaybeUninit;
 
-use crate::range::columns::RangePreprocessedCols;
+use crate::{
+    bytes::trace::{sum_byte_lookup_counts, write_multiplicities},
+    range::columns::RangePreprocessedCols,
+};
 
 use super::{
     columns::{NUM_RANGE_MULT_COLS, NUM_RANGE_PREPROCESSED_COLS},
@@ -13,6 +20,8 @@ use super::{
 use struct_reflection::StructReflectionHelper;
 
 pub const NUM_ROWS: usize = 1 << 17;
+
+const_assert_eq!(NUM_ROWS * NUM_RANGE_MULT_COLS, RANGE_TABLE_ROWS);
 
 impl<F: PrimeField32> MachineAir<F> for RangeChip<F> {
     type Record = ExecutionRecord;
@@ -101,20 +110,17 @@ impl<F: PrimeField32> MachineAir<F> for RangeChip<F> {
         _output: &mut ExecutionRecord,
         buffer: &mut [MaybeUninit<F>],
     ) {
-        let buffer_ptr = buffer.as_mut_ptr() as *mut F;
-        let values =
-            unsafe { core::slice::from_raw_parts_mut(buffer_ptr, NUM_RANGE_MULT_COLS * NUM_ROWS) };
-        unsafe {
-            core::ptr::write_bytes(values.as_mut_ptr(), 0, NUM_RANGE_MULT_COLS * NUM_ROWS);
-        }
-
+        // The range table's slots of `byte_lookup_slot` are its trace values, in order.
+        let mut counts = vec![0u32; NUM_RANGE_MULT_COLS * NUM_ROWS];
+        let start = BYTE_TABLE_ROWS * NUM_BYTE_OPS;
+        sum_byte_lookup_counts(input, start, &mut counts);
         for (lookup, mult) in input.byte_lookups.iter() {
             if lookup.opcode != ByteOpcode::Range {
                 continue;
             }
-            let row = (lookup.a as usize) + (1 << lookup.b);
-            values[row] = F::from_canonical_usize(*mult);
+            counts[byte_lookup_slot(lookup) - start] += *mult as u32;
         }
+        write_multiplicities(&counts, buffer);
     }
 
     fn included(&self, _shard: &Self::Record) -> bool {
