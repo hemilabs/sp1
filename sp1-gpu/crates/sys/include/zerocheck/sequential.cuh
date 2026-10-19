@@ -42,9 +42,10 @@ struct LeafRef {
 };
 
 // Opcodes — must match `BcOp` in sp1-gpu-air/src/ir/bytecode.rs.
-// Asserts aren't an opcode: they live in a separate per-chunk
-// `(reg, alpha_idx)` array (`stc.asserts`) so the interpreter can iterate
-// them after the bytecode body, summed against `powers_of_alpha`.
+// Asserts aren't an opcode: they live in separate per-chunk arrays
+// (`stc.assert_pos` = defining instruction, ascending; `stc.assert_alphas`),
+// and the interpreter adds `powers_of_alpha[...] * x` right after the
+// instruction that computes `x` (see `AssertCursor`).
 enum BcOp : uint8_t {
     BC_LOAD_LEAF   = 0,
     BC_LOAD_CONST  = 1,
@@ -64,7 +65,7 @@ struct ChunkStatic {
     const LeafRef* leaves;             // 8
     const void* consts;                // 8 — cast to felt_t* in kernel
     const uint32_t* publics;           // 8
-    const uint16_t* assert_regs;       // 8
+    const uint16_t* assert_pos;        // 8 — defining instr per assert, ascending
     const uint32_t* assert_alphas;     // 8
     uint32_t n_instrs;                 // 4
     uint32_t n_asserts;                // 4
@@ -85,6 +86,34 @@ struct ChunkStatic {
     const uint16_t* coop_assert_slots; // 8 — n_asserts entries
     uint32_t coop_n_levels;            // 4
     uint32_t coop_n_phys;              // 4 — value slots per row
+};
+
+// Walks a chunk's assertions alongside its bytecode: after instruction `i`
+// computes `x`, `at(i, f)` calls `f(alpha_idx)` for each assertion whose root
+// is `x` (`assert_pos` is ascending), with the cluster's alpha offset applied.
+// In the row interpreters `i` is uniform across the block, so the check
+// never diverges there. Accumulating
+// at the root's definition — not in a pass after the bytecode — means a root
+// needs no register once its last reader has run (see `emit_chunk`).
+struct AssertCursor {
+    const uint16_t* pos;
+    const uint32_t* alphas;
+    uint32_t n, k, next, alpha_offset;
+    __device__ __forceinline__ explicit AssertCursor(const ChunkStatic& stc)
+        : pos(stc.assert_pos),
+          alphas(stc.assert_alphas),
+          n(stc.n_asserts),
+          k(0),
+          next(stc.n_asserts != 0 ? stc.assert_pos[0] : 0xffffffffu),
+          alpha_offset(stc.chip_alpha_offset) {}
+    template <typename F>
+    __device__ __forceinline__ void at(uint32_t i, F f) {
+        while (i == next) {
+            f(alpha_offset + alphas[k]);
+            k++;
+            next = k < n ? pos[k] : 0xffffffffu;
+        }
+    }
 };
 
 // Per-round per-chip trace pointers + height. Must match `ChipLayoutC` in
@@ -136,6 +165,8 @@ __device__ __forceinline__ K interp_load_pair(
 // Fused dispatch kernel. One launch handles every Sequential chunk tile
 // produced by the host-side dispatch builder. Each block reads its
 // `BlockDispatch` once at block init — no per-row binary search.
+// Grid (3 * n_dispatch, 1, 1): block `3·tile + e` evaluates eval point `e` of
+// dispatch tile `tile` and writes partials[3·tile + e].
 //
 // Tiered variants by MAX_REGS — the launcher partitions chunks into tiers
 // and launches one kernel per non-empty tier so each kernel's per-thread
@@ -164,10 +195,6 @@ extern "C" void* zerocheck_fused_sequential_ext_1024_kernel();
 constexpr uint32_t ZC_COOP_LANES = 8;
 constexpr uint32_t ZC_COOP_THREADS = 64;
 constexpr uint32_t ZC_COOP_ROWS = ZC_COOP_THREADS / ZC_COOP_LANES;
-// All-eval-points variant for large rounds: grid (n_dispatch, 1, 1), one
-// thread evaluates the three eval points of a row (MAX_REGS = 128 tier only).
-extern "C" void* zerocheck_fused_sequential_e3_kb_128_kernel();
-extern "C" void* zerocheck_fused_sequential_e3_ext_128_kernel();
 // Dynamic shared memory the cooperative kernel may use (bytes).
 extern "C" uint32_t zerocheck_coop_smem_cap();
 extern "C" void* zerocheck_fused_sequential_coop_kb_kernel();

@@ -9,9 +9,10 @@
 //!   to `out`; reads from `a` / `b` are either reg slots,
 //!   leaf-cache indices, or pool indices depending on opcode.
 //! - `max_reg` : size of the per-lane register file (max-live count).
-//! - `roots`   : the assertion roots, paired with their alpha index. The
-//!   kernel reads each root reg, multiplies by `α^k`, and adds
-//!   to the accumulator.
+//! - `asserts` : the assertion roots as (defining instruction, alpha index),
+//!   in instruction order. The kernel multiplies each root's value by `α^k`
+//!   and adds it to the accumulator right after computing it, so a root only
+//!   occupies a register while later instructions still read it.
 //!
 //! Uses explicit leaf/const/public pools per chunk (rather than per-chip
 //! globals), enabling shared-memory staging.
@@ -27,9 +28,9 @@ use std::collections::HashMap;
 /// Bytecode opcodes for the per-row register-machine the fused sequential
 /// kernel interprets. Must mirror the constants in `sequential.cuh`.
 /// Asserts are *not* an opcode — they live in the chunk's separate
-/// `asserts: Vec<(reg, alpha_idx)>` table so the interpreter can iterate
-/// them after the main bytecode body, summing `α[αᵢ] · regs[root]` into
-/// the accumulator.
+/// `asserts: Vec<(instr, alpha_idx)>` table, sorted by instruction; the
+/// interpreter adds `α[αᵢ] · value` to the accumulator right after the
+/// instruction `instr` that computes the root's value.
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BcOp {
@@ -97,9 +98,12 @@ pub struct ChunkBytecode {
     pub consts: Vec<F>,
     pub publics: Vec<u32>,
     pub instrs: Vec<DagInstr>,
-    /// (reg, alpha_index) per assertion in this chunk. The kernel applies
-    /// `accumulator += alpha^k * regs[reg]` at the end. Kept separate
-    /// from `instrs` so the schedule can drive the alpha-table read.
+    /// (instruction index, alpha_index) per assertion in this chunk, sorted
+    /// by instruction index. The kernel applies `accumulator += alpha^k * x`
+    /// right after instruction `instr` computes `x`, so assertion roots are
+    /// not kept live to the end of the chunk (they used to be most of
+    /// `max_reg`). Kept separate from `instrs` so the schedule can drive the
+    /// alpha-table read.
     pub asserts: Vec<(u16, u32)>,
     pub max_reg: u16,
     pub n_constraints: u32,
@@ -243,8 +247,12 @@ fn emit_chunk(local: &LocalChunk) -> ChunkBytecode {
             last[c as usize] = last[c as usize].max(i);
         }
     }
-    for &(n, _) in &local.roots {
-        last[n as usize] = topo.len();
+    // Assertion roots are accumulated where they are computed (see
+    // `ChunkBytecode::asserts`), so they need no register beyond their last
+    // read by another instruction.
+    let mut pos = vec![usize::MAX; nodes.len()];
+    for (i, &n) in topo.iter().enumerate() {
+        pos[n] = i;
     }
     let mut phys = vec![0u16; nodes.len()];
     let mut active = Vec::<(usize, u16)>::new();
@@ -318,7 +326,12 @@ fn emit_chunk(local: &LocalChunk) -> ChunkBytecode {
         };
         bc.instrs.push(instr);
     }
-    bc.asserts = local.roots.iter().map(|&(n, alpha)| (reg(n), alpha)).collect();
+    let at = |n: NodeId| {
+        u16::try_from(pos[n as usize]).expect("chunk too large for u16 assertion positions")
+    };
+    bc.asserts = local.roots.iter().map(|&(n, alpha)| (at(n), alpha)).collect();
+    // Stable: assertions of one root keep their order.
+    bc.asserts.sort_by_key(|&(i, _)| i);
     annotate_forwarding(&mut bc);
     bc
 }
@@ -327,9 +340,9 @@ fn emit_chunk(local: &LocalChunk) -> ChunkBytecode {
 pub const FLAG_A_PREV: u8 = 1;
 /// `DagInstr::_pad` flag: operand `b` is the previous instruction's result.
 pub const FLAG_B_PREV: u8 = 2;
-/// `DagInstr::_pad` flag: the result is consumed only by the next instruction
-/// (and is not an assertion root), so the kernel keeps it in a register and
-/// skips the register-file store.
+/// `DagInstr::_pad` flag: the result is read by no instruction but (possibly)
+/// the next one, so the kernel keeps it in a register and skips the
+/// register-file store. Assertion roots are consumed from that register too.
 pub const FLAG_NO_STORE: u8 = 4;
 
 /// Annotate operand forwarding for the fused sequential kernel. The kernel's
@@ -339,7 +352,8 @@ pub const FLAG_NO_STORE: u8 = 4;
 /// ~half of that traffic. Pure annotation: the instruction stream, register
 /// assignment and arithmetic are unchanged, so results are bit-identical, and
 /// consumers that ignore the flags (`zerocheck_pad_adj`) stay correct because
-/// they still read and write every register.
+/// they still read and write every register (and take assertion values from
+/// the instruction's result, never from the register file).
 fn annotate_forwarding(bc: &mut ChunkBytecode) {
     let n = bc.instrs.len();
     let mut writer = vec![usize::MAX; bc.max_reg as usize];
@@ -364,9 +378,6 @@ fn annotate_forwarding(bc: &mut ChunkBytecode) {
         }
         writer[ins.out as usize] = i;
     }
-    for &(r, _) in &bc.asserts {
-        only_next[writer[r as usize]] = false;
-    }
     for ((ins, mut flag), only_next) in bc.instrs.iter_mut().zip(flags).zip(only_next) {
         if only_next {
             flag |= FLAG_NO_STORE;
@@ -387,8 +398,9 @@ fn const_index(value: F, pool: &mut Vec<F>, indices: &mut HashMap<u32, u16>) -> 
 /// the topological order, reusing slots whose previous occupant's last use
 /// has passed.
 ///
-/// Constraint roots are kept live to the very end so the post-topo assert
-/// pass can still read them.
+/// Constraint roots are kept live to the very end, as the kernels' former
+/// post-topo assert pass required. Only `lower_sequential`'s scratch bound
+/// uses this mapping, and the longer root lifetimes only loosen it.
 fn liveness_allocate(
     chunk: &Chunk,
     constraints: &[ConstraintInfo],
@@ -414,7 +426,7 @@ fn liveness_allocate(
             }
         }
     }
-    // Constraint roots must remain live through the assert pass.
+    // Constraint roots remain live through the (former) assert pass.
     let end = topo.len();
     for &ci in &chunk.constraint_indices {
         let root = constraints[ci].root;
@@ -531,10 +543,9 @@ mod tests {
         assert_eq!(bc.instrs.len(), 2); // Only x and zero remain; the second leaf is dead.
         assert_eq!(bc.leaves.len(), 1);
         assert_eq!(bc.consts, vec![F::zero()]);
-        assert_eq!(bc.asserts.iter().map(|&(_, a)| a).collect::<Vec<_>>(), [17, 20, 23, 26, 29]);
-        assert_eq!(bc.asserts[0].0, bc.asserts[1].0);
-        assert_eq!(bc.asserts[0].0, bc.asserts[4].0);
-        assert_eq!(bc.asserts[2].0, bc.asserts[3].0);
+        // (defining instruction, alpha): roots 3, 4 and the repeated 3 alias to
+        // `x` (instruction 0), roots 5 and 7 to the zero constant (instruction 1).
+        assert_eq!(bc.asserts, [(0, 17), (0, 20), (0, 29), (1, 23), (1, 26)]);
     }
 }
 
@@ -593,8 +604,8 @@ pub fn level_schedule(bc: &ChunkBytecode) -> LevelSchedule {
         writer[ins.out as usize] = i;
     }
     let mut is_root = vec![false; n];
-    for &(r, _) in &bc.asserts {
-        is_root[writer[r as usize]] = true;
+    for &(i, _) in &bc.asserts {
+        is_root[i as usize] = true;
     }
     // ALAP for operand-free instructions (loads, constants): one level
     // before their first consumer.
@@ -667,6 +678,6 @@ pub fn level_schedule(bc: &ChunkBytecode) -> LevelSchedule {
         }
     }
     level_starts[n_levels] = j as u16;
-    let assert_slots = bc.asserts.iter().map(|&(r, _)| phys[writer[r as usize]]).collect();
+    let assert_slots = bc.asserts.iter().map(|&(i, _)| phys[i as usize]).collect();
     LevelSchedule { code, level_starts, assert_slots, n_phys }
 }

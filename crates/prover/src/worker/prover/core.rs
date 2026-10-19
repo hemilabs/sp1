@@ -266,6 +266,30 @@ impl<A, W, C: SP1ProverComponents> CoreWorker<A, W, C> {
 
 static SHARD_IDX: AtomicUsize = AtomicUsize::new(0);
 
+/// Lets only a few shards generate their dependencies at a time, in arrival order.
+///
+/// Dependency generation is parallel over the chips in the global rayon pool. When every core
+/// worker ran it at once, the shards shared the pool and finished together: at the start of a
+/// proof the first shard took 2.2 s instead of about 0.4 s, while the GPU had nothing to prove.
+/// In turns, the oldest shard gets the pool and reaches the prover first. The work and its
+/// results are unchanged. `SP1_WORKER_DEPENDENCY_TURNS` sets how many shards run at once
+/// (default: one per 16 cores, at least 2; `0` lets them all run).
+fn dependency_gate() -> &'static tokio::sync::Semaphore {
+    static GATE: std::sync::OnceLock<tokio::sync::Semaphore> = std::sync::OnceLock::new();
+    GATE.get_or_init(|| {
+        let default = std::thread::available_parallelism().map_or(2, |n| (n.get() / 16).max(2));
+        let turns = std::env::var("SP1_WORKER_DEPENDENCY_TURNS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(default);
+        tokio::sync::Semaphore::new(if turns == 0 {
+            tokio::sync::Semaphore::MAX_PERMITS
+        } else {
+            turns
+        })
+    })
+}
+
 impl<A, W, C> AsyncWorker<CoreProvingTask, Result<TaskMetadata, TaskError>> for CoreWorker<A, W, C>
 where
     A: ArtifactClient,
@@ -558,7 +582,8 @@ where
             )
         });
 
-        // Generate dependencies on the main record.
+        // Generate dependencies on the main record. The shards take turns (see `dependency_gate`).
+        let dependency_turn = dependency_gate().acquire().await.expect("dependency gate closed");
         let span = tracing::debug_span!("generate dependencies");
         let machine_clone = self.machine().clone();
         let record = tokio::task::spawn_blocking(move || {
@@ -569,6 +594,7 @@ where
         })
         .await
         .map_err(|e| TaskError::Fatal(e.into()))?;
+        drop(dependency_turn);
 
         // Optionally dump the shard record and vk to disk for benchmarking/replay.
         if let Some((dir, frequency)) = self.record_write_dir_and_frequency.as_ref() {
@@ -784,6 +810,12 @@ impl<V: Send + Sync + 'static> PerProofCache<V> {
         cache
     }
 
+    /// The cache cell for this ELF, if there is one.
+    fn get(&self, elf: &str) -> Option<Arc<OnceCell<V>>> {
+        let entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+        entries.iter().find(|(key, _)| key == elf).map(|(_, cell)| cell.clone())
+    }
+
     /// The cache cell for this ELF, inserting an empty one if needed.
     fn get_or_insert(&self, elf: &str) -> Arc<OnceCell<V>> {
         let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
@@ -801,11 +833,16 @@ impl<V: Send + Sync + 'static> PerProofCache<V> {
 
 trait ReleaseByElf: Send + Sync {
     fn release(&self, elf: &str);
+    fn reserve(&self, elf: &str);
 }
 
-impl<V: Send + Sync> ReleaseByElf for PerProofCache<V> {
+impl<V: Send + Sync + 'static> ReleaseByElf for PerProofCache<V> {
     fn release(&self, elf: &str) {
         self.entries.lock().unwrap_or_else(|e| e.into_inner()).retain(|(key, _)| key != elf);
+    }
+
+    fn reserve(&self, elf: &str) {
+        self.get_or_insert(elf);
     }
 }
 
@@ -825,11 +862,37 @@ pub fn release_core_proving_keys(elf: &Artifact) {
     });
 }
 
+/// Makes this process's per-proof caches keep the core proving key of the proof of `elf`.
+///
+/// The setup task of the proof then leaves its proving key there for the proof's core shards,
+/// instead of every proof running the same setup twice (once for the vk, once on its first
+/// shard, by which time the CPU is busy with the shards' traces). Returns whether there was a
+/// cache to reserve: when the controller and the workers are different processes there is none,
+/// and the setup task keeps nothing. [`release_core_proving_keys`] undoes it.
+pub fn reserve_core_proving_keys(elf: &Artifact) -> bool {
+    let caches = PER_PROOF_CACHES.lock().unwrap_or_else(|e| e.into_inner());
+    let mut reserved = false;
+    for cache in caches.iter().filter_map(Weak::upgrade) {
+        cache.reserve(&elf.0);
+        reserved = true;
+    }
+    reserved
+}
+
+/// Whether this process runs core workers with a per-proof proving key cache.
+pub fn local_core_workers() -> bool {
+    let caches = PER_PROOF_CACHES.lock().unwrap_or_else(|e| e.into_inner());
+    caches.iter().any(|cache| cache.strong_count() > 0)
+}
+
 /// Worker for handling setup tasks only.
 pub struct CoreAndNormalizeWorker<A, C: SP1ProverComponents> {
     artifact_client: A,
     core_prover: Arc<C::CoreProver>,
     permits: ProverSemaphore,
+    /// The core workers' per-proof proving key cache. A setup task for an ELF with a reserved
+    /// cell (see [`reserve_core_proving_keys`]) leaves its proving key there.
+    pk_by_elf: Option<Arc<PerProofProvingKeyCache<C>>>,
     _marker: std::marker::PhantomData<C>,
 }
 
@@ -839,7 +902,18 @@ impl<A, C: SP1ProverComponents> CoreAndNormalizeWorker<A, C> {
         core_prover: Arc<C::CoreProver>,
         permits: ProverSemaphore,
     ) -> Self {
-        Self { artifact_client, core_prover, permits, _marker: std::marker::PhantomData }
+        Self {
+            artifact_client,
+            core_prover,
+            permits,
+            pk_by_elf: None,
+            _marker: std::marker::PhantomData,
+        }
+    }
+
+    fn with_per_proof_pk_cache(mut self, cache: Option<Arc<PerProofProvingKeyCache<C>>>) -> Self {
+        self.pk_by_elf = cache;
+        self
     }
 }
 
@@ -848,15 +922,28 @@ impl<A: ArtifactClient, C: SP1ProverComponents>
     for CoreAndNormalizeWorker<A, C>
 {
     async fn call(&self, input: SetupTask) -> Result<(TaskId, TaskMetadata), TaskError> {
-        let SetupTask { id, elf, output } = input;
+        let SetupTask { id, elf: elf_artifact, output } = input;
 
-        let elf = self.artifact_client.download_program(&elf).await?;
+        let elf = self.artifact_client.download_program(&elf_artifact).await?;
 
         let program = Program::from(&elf)?;
         let program = Arc::new(program);
 
         let permits = self.permits.clone();
-        let (_pk, vk) = self.core_prover.setup(program, permits).await;
+        let reserved_pk = self.pk_by_elf.as_ref().and_then(|cache| cache.get(&elf_artifact.0));
+        let vk = if let Some(cell) = reserved_pk {
+            // The proof's core shards use this proving key (or this task uses theirs, if one of
+            // them got there first): the same setup either way.
+            let pk = cell
+                .get_or_init(|| async {
+                    tracing::debug!("keeping the core proving key for the proof's shards");
+                    self.core_prover.setup(program, permits).await.0
+                })
+                .await;
+            pk.vk.clone()
+        } else {
+            self.core_prover.setup(program, permits).await.1
+        };
         tracing::debug!("setup completed for task {}", id);
 
         // Upload the vk
@@ -1024,6 +1111,7 @@ impl<A: ArtifactClient, W: WorkerClient, C: SP1ProverComponents> SP1CoreProver<A
                     air_prover.clone(),
                     permits.clone(),
                 )
+                .with_per_proof_pk_cache(per_proof_pk_cache.clone())
             })
             .collect::<Vec<_>>();
         let setup_engine = Arc::new(AsyncEngine::new(setup_workers, config.setup_buffer_size));
@@ -1072,5 +1160,26 @@ mod tests {
         release_core_proving_keys(&elf("release-me"));
         assert_eq!(Arc::strong_count(&value), 1, "the cache no longer holds the value");
         assert!(Arc::ptr_eq(&other, &cache.get_or_insert("keep-me")));
+    }
+
+    #[tokio::test]
+    async fn a_reserved_cell_carries_the_setup_value_to_the_shards() {
+        let cache = PerProofCache::<Arc<u32>>::new();
+        assert!(cache.get("reserved").is_none(), "nothing is kept without a reservation");
+        assert!(local_core_workers());
+
+        // What `reserve_core_proving_keys` does to each cache (calling it here would also insert
+        // into the caches of the tests running alongside).
+        ReleaseByElf::reserve(&*cache, "reserved");
+        // The setup task finds the reserved cell and fills it...
+        let setup_cell = cache.get("reserved").expect("the cell was reserved");
+        setup_cell.get_or_init(|| async { Arc::new(11) }).await;
+        // ...and the shards of the proof get the same value without another setup.
+        let shard_cell = cache.get_or_insert("reserved");
+        assert!(Arc::ptr_eq(&setup_cell, &shard_cell));
+        assert_eq!(shard_cell.get().map(|v| **v), Some(11));
+
+        release_core_proving_keys(&elf("reserved"));
+        assert!(cache.get("reserved").is_none());
     }
 }

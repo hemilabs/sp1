@@ -24,10 +24,11 @@
 // Constants and public values are always base-field; runtime coeffs and the
 // per-row weighting/accumulator are always ext_t.
 //
-// The three eval points (the degree-2 univariate per round) live on the
-// grid's z-dimension: each block owns one eval point (blockIdx.z) and
-// reduces it independently. This keeps the per-thread register file minimal
-// and lets the GPU run all three eval points concurrently.
+// The three eval points (the degree-2 univariate per round) are interleaved
+// on the grid's x-dimension: block `3·tile + e` owns eval point `e` of tile
+// `tile` and reduces it independently. This keeps the per-thread register
+// file minimal, and the three blocks of a tile are adjacent in launch order,
+// so they run together and share the tile's trace reads in L2.
 
 #include "zerocheck/sequential.cuh"
 #include "zerocheck/bivariate.cuh"
@@ -38,9 +39,9 @@
 
 namespace {
 
-// Run one chunk's DAG bytecode for a single row position, then batch the
-// assertion registers by their alpha powers, returning the chunk's
-// constraint accumulator. Shared by the univariate and bivariate kernels,
+// Run one chunk's DAG bytecode for a single row position, adding each
+// assertion root times its alpha power as soon as it is computed, and return
+// the chunk's constraint accumulator. Shared by the univariate and bivariate kernels,
 // which differ only in how a leaf's trace value is interpolated —
 // `load_leaf(LeafRef) -> K` supplies it.
 template <typename K, int MAX_REGS, typename LoadLeaf>
@@ -59,6 +60,8 @@ __device__ __forceinline__ ext_t run_chunk_bytecode(
     // the next instruction) are never written back. Same arithmetic in the
     // same order as the unflagged path, so results are bit-identical.
     K prev = K::zero();
+    ext_t acc = ext_t::zero();
+    AssertCursor asserts(stc);
     for (uint32_t i = 0; i < stc.n_instrs; i++) {
         DagInstr instr = stc.instrs[i];
         const uint32_t f = instr._pad;
@@ -108,16 +111,11 @@ __device__ __forceinline__ ext_t run_chunk_bytecode(
         }
         if (!(f & DAG_FLAG_NO_STORE)) regs[instr.out] = x;
         prev = x;
-    }
-
-    ext_t acc = ext_t::zero();
-    for (uint32_t i = 0; i < stc.n_asserts; i++) {
-        uint16_t reg = stc.assert_regs[i];
-        // Bytecode stores chip-relative alpha indices; shift into the
-        // cluster's powers_of_alpha table here.
-        uint32_t alpha_idx = stc.chip_alpha_offset + stc.assert_alphas[i];
-        ext_t alpha = ext_t::load(powers_of_alpha, alpha_idx);
-        acc += alpha * regs[reg];
+        // Bytecode stores chip-relative alpha indices; the cursor shifts
+        // them into the cluster's powers_of_alpha table.
+        asserts.at(i, [&](uint32_t alpha_idx) {
+            acc += ext_t::load(powers_of_alpha, alpha_idx) * x;
+        });
     }
     return acc;
 }
@@ -138,14 +136,15 @@ __global__ void zerocheck_fused_sequential(
 ) {
     // Per-block uniform setup. The compiler hoists these loads — every
     // thread in the block sees the same dispatch/static/layout values.
-    BlockDispatch disp = dispatch[blockIdx.x];
+    // Block `3·tile + e`: eval point index `e` into the univariate nodes
+    // {0, 2, 4} (see `interp_load_pair` for the diff-doubling interpolation)
+    // of dispatch tile `tile`.
+    const uint32_t tile = blockIdx.x / 3;
+    const int e = (int)(blockIdx.x - 3 * tile);
+    BlockDispatch disp = dispatch[tile];
     ChunkStatic stc = chunk_static[disp.chunk_id];
     ChipLayout lay = chip_layouts[stc.chip_idx];
     const felt_t* consts = reinterpret_cast<const felt_t*>(stc.consts);
-
-    // Eval point index into the univariate nodes {0, 2, 4}; see
-    // `interp_load_pair` for the diff-doubling interpolation.
-    const int e = blockIdx.z;
 
     K regs[MAX_REGS];
     ext_t thread_acc = ext_t::zero();
@@ -202,8 +201,8 @@ __global__ void zerocheck_fused_sequential(
     ext_t block_sum = partialBlockReduce(block, tile_warp, thread_acc, shared);
     if (threadIdx.x == 0) {
         ext_t lambda = ext_t::load(powers_of_lambda, stc.chip_idx);
-        // Output layout: eval point e of block.x lives at (block.x * 3 + e).
-        ext_t::store(partials, blockIdx.x * 3 + (uint32_t)e, block_sum * lambda);
+        // Output layout: eval point e of tile t lives at (t * 3 + e).
+        ext_t::store(partials, blockIdx.x, block_sum * lambda);
     }
 }
 
@@ -313,9 +312,14 @@ __global__ void zerocheck_fused_sequential_bivariate(
 // `zerocheck_fused_sequential_bivariate`, but each interpreter pass carries G
 // grid nodes per register (`NodeVec<G>`), so a chunk's bytecode is decoded
 // 12/G times per quadruple instead of 12 times, and each leaf's four trace
-// values are loaded once per pass and interpolated to all G nodes. The
-// per-node arithmetic (and its order) is unchanged, so results are
-// bit-identical to the scalar kernel.
+// values are loaded once per pass and interpolated to all G nodes. The 12/G
+// passes of a tile run in 12/G adjacent blocks (block `NP·tile + pass`), which
+// share the tile's trace reads in L2 and keep one pass's accumulators per
+// thread. Every node value is computed by the same operations as in the
+// scalar kernel and the sums are exact field sums, so results are
+// bit-identical to it.
+//
+// Launch: grid (n_dispatch * 12 / G, 1, 1); writes partials[tile * 12 + e].
 // ============================================================================
 template <int G>
 struct NodeVec {
@@ -329,8 +333,8 @@ __device__ __forceinline__ NodeVec<G> nv_splat(felt_t x) {
     return r;
 }
 
-template <int G, int MAX_REGS>
-__global__ void zerocheck_fused_sequential_bivariate_vec(
+template <int G, int MAX_REGS, int MIN_BLOCKS>
+__global__ void __launch_bounds__(256, MIN_BLOCKS) zerocheck_fused_sequential_bivariate_vec(
     const BlockDispatch* __restrict__ dispatch,
     const ChunkStatic* __restrict__ chunk_static,
     const ChipLayout* __restrict__ chip_layouts,
@@ -343,15 +347,19 @@ __global__ void zerocheck_fused_sequential_bivariate_vec(
     ext_t* __restrict__ partials
 ) {
     static_assert(BIVARIATE_NUM_NODES % G == 0, "G must divide the node count");
-    BlockDispatch disp = dispatch[blockIdx.x];
+    constexpr uint32_t NP = BIVARIATE_NUM_NODES / G;
+    const uint32_t tile = blockIdx.x / NP;
+    const int e0 = (int)(blockIdx.x - NP * tile) * G;
+    BlockDispatch disp = dispatch[tile];
     ChunkStatic stc = chunk_static[disp.chunk_id];
     ChipLayout lay = chip_layouts[stc.chip_idx];
     const felt_t* consts = reinterpret_cast<const felt_t*>(stc.consts);
     const ext_t lambda = ext_t::load(powers_of_lambda, stc.chip_idx);
 
-    ext_t thread_acc[BIVARIATE_NUM_NODES];
-    for (int e = 0; e < BIVARIATE_NUM_NODES; e++) {
-        thread_acc[e] = ext_t::zero();
+    ext_t thread_acc[G];
+#pragma unroll
+    for (int g = 0; g < G; g++) {
+        thread_acc[g] = ext_t::zero();
     }
     NodeVec<G> regs[MAX_REGS];
 
@@ -365,217 +373,71 @@ __global__ void zerocheck_fused_sequential_bivariate_vec(
         }
         const ext_t w = ext_t::load(partial_lagrange, quad_idx) * lambda;
         const bool full_quad = ((quad_idx << 2) | 3u) < lay.height;
-        for (int e0 = 0; e0 < BIVARIATE_NUM_NODES; e0 += G) {
-            NodeVec<G> prev = nv_splat<G>(felt_t::zero());
-            for (uint32_t i = 0; i < stc.n_instrs; i++) {
-                DagInstr instr = stc.instrs[i];
-                const uint32_t f = instr._pad;
-                NodeVec<G> x;
-                switch (instr.opcode) {
-                case BC_LOAD_LEAF: {
-                    LeafRef leaf = stc.leaves[instr.a];
-                    size_t base = (leaf.source == LEAF_SOURCE_MAIN_LOCAL) ? lay.main_ptr
-                                                                         : lay.preprocessed_ptr;
-                    const size_t qb = base + (size_t)leaf.col * (size_t)lay.height
-                                      + ((size_t)quad_idx << 2);
-                    felt_t r00 = felt_t::load(trace_data, qb);
-                    felt_t r01 = felt_t::load(trace_data, qb + 1);
-                    felt_t r10 = felt_t::zero();
-                    felt_t r11 = felt_t::zero();
-                    if (full_quad) {
-                        r10 = felt_t::load(trace_data, qb + 2);
-                        r11 = felt_t::load(trace_data, qb + 3);
-                    }
+        ext_t acc[G];
 #pragma unroll
-                    for (int g = 0; g < G; g++) {
-                        x.v[g] = bivariate_interp(r00, r01, r10, r11, bivariate_node(e0 + g));
-                    }
-                    break;
-                }
-                case BC_LOAD_CONST: {
-                    x = nv_splat<G>(consts[instr.a]);
-                    break;
-                }
-                case BC_LOAD_PUBLIC: {
-                    x = nv_splat<G>(felt_t::load(public_values, stc.publics[instr.a]));
-                    break;
-                }
-                case BC_ADD_F:
-                case BC_SUB_F:
-                case BC_MUL_F: {
-                    NodeVec<G> va, vb;
-                    if (f & DAG_FLAG_A_PREV) va = prev; else va = regs[instr.a];
-                    if (f & DAG_FLAG_B_PREV) vb = prev; else vb = regs[instr.b];
-#pragma unroll
-                    for (int g = 0; g < G; g++) {
-                        x.v[g] = (instr.opcode == BC_ADD_F)   ? va.v[g] + vb.v[g]
-                                 : (instr.opcode == BC_SUB_F) ? va.v[g] - vb.v[g]
-                                                              : va.v[g] * vb.v[g];
-                    }
-                    break;
-                }
-                case BC_MUL_CONST: {
-                    NodeVec<G> va;
-                    if (f & DAG_FLAG_A_PREV) va = prev; else va = regs[instr.a];
-                    const felt_t c = consts[instr.b];
-#pragma unroll
-                    for (int g = 0; g < G; g++) x.v[g] = va.v[g] * c;
-                    break;
-                }
-                case BC_NEG_F: {
-                    NodeVec<G> va;
-                    if (f & DAG_FLAG_A_PREV) va = prev; else va = regs[instr.a];
-#pragma unroll
-                    for (int g = 0; g < G; g++) x.v[g] = felt_t::zero() - va.v[g];
-                    break;
-                }
-                default:
-                    __trap();
-                }
-                if (!(f & DAG_FLAG_NO_STORE)) regs[instr.out] = x;
-                prev = x;
-            }
-#pragma unroll
-            for (int g = 0; g < G; g++) {
-                ext_t acc = ext_t::zero();
-                for (uint32_t i = 0; i < stc.n_asserts; i++) {
-                    uint32_t alpha_idx = stc.chip_alpha_offset + stc.assert_alphas[i];
-                    acc += ext_t::load(powers_of_alpha, alpha_idx) * regs[stc.assert_regs[i]].v[g];
-                }
-                thread_acc[e0 + g] += acc * w;
-            }
-        }
-    }
-
-    extern __shared__ unsigned char smem[];
-    ext_t* shared = reinterpret_cast<ext_t*>(smem);
-    auto block = cg::this_thread_block();
-    auto tile_warp = cg::tiled_partition<32>(block);
-    for (int e = 0; e < BIVARIATE_NUM_NODES; e++) {
-        ext_t block_sum = partialBlockReduce(block, tile_warp, thread_acc[e], shared);
-        if (threadIdx.x == 0) {
-            ext_t::store(partials, blockIdx.x * BIVARIATE_NUM_NODES + (uint32_t)e, block_sum);
-        }
-        block.sync();
-    }
-}
-
-
-
-// ============================================================================
-// All-eval-points variant ("e3") for large rounds.
-//
-// The univariate kernel above runs each row three times — once per eval point
-// on blockIdx.z — re-decoding the bytecode, re-reading the row pair from
-// DRAM and keeping three independent per-thread register files alive. For
-// rounds with many rows that kernel is bound by DRAM traffic (the per-thread
-// `regs[]` local memory does not fit in L2 at full occupancy, plus 2.5x trace
-// re-reads). Here one thread evaluates all three eval points of a row: the
-// pair is loaded once, the bytecode is decoded once, and every register holds
-// the three values. Per eval point the arithmetic and its order are unchanged
-// (same forwarding flags), so the partials are bit-identical.
-//
-// Launch: grid (n_dispatch, 1, 1); writes partials[block * 3 + e] for e = 0..2.
-// ============================================================================
-template <typename K>
-struct E3Val {
-    K v[3];
-};
-template <typename K, int MAX_REGS>
-__global__ void zerocheck_fused_sequential_e3(
-    const BlockDispatch* __restrict__ dispatch,
-    const ChunkStatic* __restrict__ chunk_static,
-    const ChipLayout* __restrict__ chip_layouts,
-    const K* __restrict__ trace_data,
-    const felt_t* __restrict__ public_values,
-    const ext_t* __restrict__ powers_of_alpha,
-    const ext_t* __restrict__ partial_lagrange,
-    const ext_t* __restrict__ powers_of_lambda,
-    const ext_t* __restrict__ gkr_powers,
-    uint32_t rest_point_dim,
-    ext_t* __restrict__ partials
-) {
-    BlockDispatch disp = dispatch[blockIdx.x];
-    ChunkStatic stc = chunk_static[disp.chunk_id];
-    ChipLayout lay = chip_layouts[stc.chip_idx];
-    const felt_t* consts = reinterpret_cast<const felt_t*>(stc.consts);
-
-    // Row pair -> values at the univariate nodes {0, 2, 4}, with the same
-    // diff-doubling as `interp_load_pair`.
-    auto load3 = [&](size_t base, uint32_t col, uint32_t row_idx) {
-        const size_t off = base + (size_t)col * (size_t)lay.height + ((size_t)row_idx << 1);
-        K z = K::load(trace_data, off);
-        K o = K::load(trace_data, off + 1);
-        K diff = o - z;
-        K d2 = diff + diff;
-        E3Val<K> r;
-        r.v[0] = z;
-        r.v[1] = z + d2;
-        r.v[2] = z + d2 + d2;
-        return r;
-    };
-
-    E3Val<K> regs[MAX_REGS];
-    ext_t tacc[3] = {ext_t::zero(), ext_t::zero(), ext_t::zero()};
-    const uint32_t row_limit = 1u << rest_point_dim;
-    const uint32_t row_end = disp.row_offset + disp.n_rows;
-    for (uint32_t row_idx = disp.row_offset + threadIdx.x; row_idx < row_end;
-         row_idx += blockDim.x)
-    {
-        E3Val<K> prev;
-#pragma unroll
-        for (int k = 0; k < 3; k++) prev.v[k] = K::zero();
+        for (int g = 0; g < G; g++) acc[g] = ext_t::zero();
+        AssertCursor asserts(stc);
+        NodeVec<G> prev = nv_splat<G>(felt_t::zero());
         for (uint32_t i = 0; i < stc.n_instrs; i++) {
             DagInstr instr = stc.instrs[i];
             const uint32_t f = instr._pad;
-            E3Val<K> x;
+            NodeVec<G> x;
             switch (instr.opcode) {
             case BC_LOAD_LEAF: {
                 LeafRef leaf = stc.leaves[instr.a];
                 size_t base = (leaf.source == LEAF_SOURCE_MAIN_LOCAL) ? lay.main_ptr
                                                                      : lay.preprocessed_ptr;
-                x = load3(base, leaf.col, row_idx);
+                const size_t qb = base + (size_t)leaf.col * (size_t)lay.height
+                                  + ((size_t)quad_idx << 2);
+                felt_t r00 = felt_t::load(trace_data, qb);
+                felt_t r01 = felt_t::load(trace_data, qb + 1);
+                felt_t r10 = felt_t::zero();
+                felt_t r11 = felt_t::zero();
+                if (full_quad) {
+                    r10 = felt_t::load(trace_data, qb + 2);
+                    r11 = felt_t::load(trace_data, qb + 3);
+                }
+#pragma unroll
+                for (int g = 0; g < G; g++) {
+                    x.v[g] = bivariate_interp(r00, r01, r10, r11, bivariate_node(e0 + g));
+                }
                 break;
             }
             case BC_LOAD_CONST: {
-                K c = K(consts[instr.a]);
-#pragma unroll
-                for (int k = 0; k < 3; k++) x.v[k] = c;
+                x = nv_splat<G>(consts[instr.a]);
                 break;
             }
             case BC_LOAD_PUBLIC: {
-                K c = K(felt_t::load(public_values, stc.publics[instr.a]));
-#pragma unroll
-                for (int k = 0; k < 3; k++) x.v[k] = c;
+                x = nv_splat<G>(felt_t::load(public_values, stc.publics[instr.a]));
                 break;
             }
             case BC_ADD_F:
             case BC_SUB_F:
             case BC_MUL_F: {
-                E3Val<K> va, vb;
+                NodeVec<G> va, vb;
                 if (f & DAG_FLAG_A_PREV) va = prev; else va = regs[instr.a];
                 if (f & DAG_FLAG_B_PREV) vb = prev; else vb = regs[instr.b];
 #pragma unroll
-                for (int k = 0; k < 3; k++) {
-                    x.v[k] = (instr.opcode == BC_ADD_F)   ? va.v[k] + vb.v[k]
-                             : (instr.opcode == BC_SUB_F) ? va.v[k] - vb.v[k]
-                                                          : va.v[k] * vb.v[k];
+                for (int g = 0; g < G; g++) {
+                    x.v[g] = (instr.opcode == BC_ADD_F)   ? va.v[g] + vb.v[g]
+                             : (instr.opcode == BC_SUB_F) ? va.v[g] - vb.v[g]
+                                                          : va.v[g] * vb.v[g];
                 }
                 break;
             }
             case BC_MUL_CONST: {
-                E3Val<K> va;
+                NodeVec<G> va;
                 if (f & DAG_FLAG_A_PREV) va = prev; else va = regs[instr.a];
                 const felt_t c = consts[instr.b];
 #pragma unroll
-                for (int k = 0; k < 3; k++) x.v[k] = va.v[k] * c;
+                for (int g = 0; g < G; g++) x.v[g] = va.v[g] * c;
                 break;
             }
             case BC_NEG_F: {
-                E3Val<K> va;
+                NodeVec<G> va;
                 if (f & DAG_FLAG_A_PREV) va = prev; else va = regs[instr.a];
 #pragma unroll
-                for (int k = 0; k < 3; k++) x.v[k] = K::zero() - va.v[k];
+                for (int g = 0; g < G; g++) x.v[g] = felt_t::zero() - va.v[g];
                 break;
             }
             default:
@@ -583,34 +445,15 @@ __global__ void zerocheck_fused_sequential_e3(
             }
             if (!(f & DAG_FLAG_NO_STORE)) regs[instr.out] = x;
             prev = x;
+            asserts.at(i, [&](uint32_t alpha_idx) {
+                const ext_t alpha = ext_t::load(powers_of_alpha, alpha_idx);
+#pragma unroll
+                for (int g = 0; g < G; g++) acc[g] += alpha * x.v[g];
+            });
         }
-
-        ext_t acc[3] = {ext_t::zero(), ext_t::zero(), ext_t::zero()};
-        for (uint32_t i = 0; i < stc.n_asserts; i++) {
-            uint32_t alpha_idx = stc.chip_alpha_offset + stc.assert_alphas[i];
-            ext_t alpha = ext_t::load(powers_of_alpha, alpha_idx);
-            const E3Val<K> r = regs[stc.assert_regs[i]];
 #pragma unroll
-            for (int k = 0; k < 3; k++) acc[k] += alpha * r.v[k];
-        }
-        if (stc.gkr_main_width != 0 || stc.gkr_prep_width != 0) {
-            for (uint32_t i = 0; i < stc.gkr_main_width; i++) {
-                E3Val<K> v = load3(lay.main_ptr, i, row_idx);
-                ext_t pw = ext_t::load(gkr_powers, i);
-#pragma unroll
-                for (int k = 0; k < 3; k++) acc[k] += pw * v.v[k];
-            }
-            for (uint32_t i = 0; i < stc.gkr_prep_width; i++) {
-                E3Val<K> v = load3(lay.preprocessed_ptr, i, row_idx);
-                ext_t pw = ext_t::load(gkr_powers, stc.gkr_main_width + i);
-#pragma unroll
-                for (int k = 0; k < 3; k++) acc[k] += pw * v.v[k];
-            }
-        }
-        if (row_idx < row_limit) {
-            ext_t eq = ext_t::load(partial_lagrange, row_idx);
-#pragma unroll
-            for (int k = 0; k < 3; k++) tacc[k] += acc[k] * eq;
+        for (int g = 0; g < G; g++) {
+            thread_acc[g] += acc[g] * w;
         }
     }
 
@@ -618,11 +461,10 @@ __global__ void zerocheck_fused_sequential_e3(
     ext_t* shared = reinterpret_cast<ext_t*>(smem);
     auto block = cg::this_thread_block();
     auto tile_warp = cg::tiled_partition<32>(block);
-    const ext_t lambda = ext_t::load(powers_of_lambda, stc.chip_idx);
-    for (int k = 0; k < 3; k++) {
-        ext_t block_sum = partialBlockReduce(block, tile_warp, tacc[k], shared);
+    for (int g = 0; g < G; g++) {
+        ext_t block_sum = partialBlockReduce(block, tile_warp, thread_acc[g], shared);
         if (threadIdx.x == 0) {
-            ext_t::store(partials, blockIdx.x * 3 + (uint32_t)k, block_sum * lambda);
+            ext_t::store(partials, tile * BIVARIATE_NUM_NODES + (uint32_t)(e0 + g), block_sum);
         }
         block.sync();
     }
@@ -755,12 +597,6 @@ __global__ void zerocheck_fused_sequential_coop(
 
 } // namespace
 
-extern "C" void* zerocheck_fused_sequential_e3_kb_128_kernel() {
-    return (void*)zerocheck_fused_sequential_e3<felt_t, 128>;
-}
-extern "C" void* zerocheck_fused_sequential_e3_ext_128_kernel() {
-    return (void*)zerocheck_fused_sequential_e3<ext_t, 128>;
-}
 // The cooperative kernel may need more than the default 48 KB of dynamic
 // shared memory; raise its limit once when the launcher first asks for it.
 extern "C" uint32_t zerocheck_coop_smem_cap() {
@@ -857,13 +693,14 @@ extern "C" void* zerocheck_fused_sequential_bivariate_kb_1024_kernel() {
     return (void*)zerocheck_fused_sequential_bivariate<felt_t, 1024>;
 }
 
-// Node-vectorised bivariate entry points (MAX_REGS = 128 / 256 tiers).
+// Node-vectorised bivariate entry points (MAX_REGS = 128 tier). G = 2 and 4
+// are capped at 64 registers (4 blocks of 256 per SM); G = 12 needs ~120.
 extern "C" void* zerocheck_fused_sequential_bivariate_vec2_kb_128_kernel() {
-    return (void*)zerocheck_fused_sequential_bivariate_vec<2, 128>;
+    return (void*)zerocheck_fused_sequential_bivariate_vec<2, 128, 4>;
 }
 extern "C" void* zerocheck_fused_sequential_bivariate_vec4_kb_128_kernel() {
-    return (void*)zerocheck_fused_sequential_bivariate_vec<4, 128>;
+    return (void*)zerocheck_fused_sequential_bivariate_vec<4, 128, 4>;
 }
 extern "C" void* zerocheck_fused_sequential_bivariate_vec12_kb_128_kernel() {
-    return (void*)zerocheck_fused_sequential_bivariate_vec<12, 128>;
+    return (void*)zerocheck_fused_sequential_bivariate_vec<12, 128, 1>;
 }

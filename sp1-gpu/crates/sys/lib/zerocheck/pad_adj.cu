@@ -28,6 +28,10 @@ __global__ void zerocheck_pad_adj(
     // other op behaves normally. The bytecode is deterministic given its
     // inputs, so each thread's `regs[]` evolves independently.
     felt_t regs[MAX_REGS];
+    // Sum `α[chip_alpha_offset + αᵢ] · root` over this chunk's asserts, each
+    // as soon as its root is computed (see `AssertCursor`).
+    ext_t acc = ext_t::zero();
+    AssertCursor asserts(stc);
     for (uint32_t i = 0; i < stc.n_instrs; i++) {
         DagInstr instr = stc.instrs[i];
         switch (instr.opcode) {
@@ -69,15 +73,10 @@ __global__ void zerocheck_pad_adj(
             // than silently emitting a wrong padded_row_adjustment.
             __trap();
         }
-    }
-
-    // Sum `α[chip_alpha_offset + αᵢ] · regs[root]` over this chunk's asserts.
-    ext_t acc = ext_t::zero();
-    for (uint32_t i = 0; i < stc.n_asserts; i++) {
-        uint16_t reg = stc.assert_regs[i];
-        uint32_t alpha_idx = stc.chip_alpha_offset + stc.assert_alphas[i];
-        ext_t alpha = ext_t::load(powers_of_alpha, alpha_idx);
-        acc += alpha * regs[reg];
+        const felt_t x = regs[instr.out];
+        asserts.at(i, [&](uint32_t alpha_idx) {
+            acc += ext_t::load(powers_of_alpha, alpha_idx) * x;
+        });
     }
 
     ext_t::store(output, chunk_idx, acc);

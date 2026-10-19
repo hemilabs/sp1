@@ -1061,7 +1061,42 @@ impl Groth16Prover {
             // CUDA path — overlap G2 with G1 MSMs via thread::scope.
             // Compute Ar before the scope (no DMA overlap on CUDA — sppark
             // handles its own internal pipelining).
-            let ar_msm = self.persistent_g1_a.msm(&wire_values_a);
+            //
+            // While the GPU runs Ar, split the hot scalars out of the B and K MSMs on the host
+            // (see `crate::hot`); Bs1, Krs and Bs2 add the split-out part back. The split writes
+            // the B and K pinned buffers, which nothing reads until it is joined; the slices of
+            // them are taken again afterwards.
+            let (ar_msm, hot) = std::thread::scope(|scope| {
+                let hot = crate::hot::hot_split_enabled().then(|| {
+                    scope.spawn(|| {
+                        let t_hot = std::time::Instant::now();
+                        let hot_b = crate::hot::HotSplit::take(self.pinned_b.as_mut_slice());
+                        let hot_k = crate::hot::HotSplit::take(self.pinned_k.as_mut_slice());
+                        let (corr_b, (corr_b2, corr_k)) = rayon::join(
+                            || hot_b.g1_correction(&self.data.pk_g1_b),
+                            || {
+                                rayon::join(
+                                    || hot_b.g2_correction(&self.data.pk_g2_b),
+                                    || hot_k.g1_correction(&self.data.pk_g1_k),
+                                )
+                            },
+                        );
+                        eprintln!(
+                            "[T] 5a'. Hot-scalar split (B {} values / {} scalars, K {} / {}): {:?}",
+                            hot_b.num_values(),
+                            hot_b.num_scalars(),
+                            hot_k.num_values(),
+                            hot_k.num_scalars(),
+                            t_hot.elapsed()
+                        );
+                        HotCorrections { corr_b, corr_b2, corr_k }
+                    })
+                });
+                let ar_msm = self.persistent_g1_a.msm(&wire_values_a);
+                (ar_msm, hot.map(|h| h.join().expect("hot-scalar split panicked")))
+            });
+            let wire_values_b = self.pinned_b.as_slice();
+            let filtered_wire_values = self.pinned_k.as_slice();
             let ar = ar_msm.add(&g1_alpha.to_jacobian()).add(&r_delta);
             eprintln!("[T] 5a. Ar MSM (N={}): {:?}", wire_values_a.len(), t.elapsed());
             g1_msm_ark_verify("Ar", &self.data.pk_g1_a, wire_values_a, &ar_msm);
@@ -1095,6 +1130,10 @@ impl Groth16Prover {
                             if ok { "MATCH" } else { "MISMATCH" }
                         );
                     }
+                    let bs2_msm = match &hot {
+                        Some(h) => bs2_msm.add(&h.corr_b2),
+                        None => bs2_msm,
+                    };
                     let s_bytes = s.to_le_bytes();
                     let mut s_arr = [0u8; 32];
                     s_arr.copy_from_slice(&s_bytes);
@@ -1106,7 +1145,11 @@ impl Groth16Prover {
 
                 let t = std::time::Instant::now();
                 let bs1_msm = self.persistent_g1_b.msm(&wire_values_b);
-                let bs1 = bs1_msm.add(&g1_beta.to_jacobian()).add(&s_delta);
+                let bs1_full = match &hot {
+                    Some(h) => bs1_msm.add(&h.corr_b),
+                    None => bs1_msm,
+                };
+                let bs1 = bs1_full.add(&g1_beta.to_jacobian()).add(&s_delta);
                 eprintln!("[T] 5b. Bs1 MSM (N={}): {:?}", wire_values_b.len(), t.elapsed());
                 g1_msm_ark_verify("Bs1", &self.data.pk_g1_b, wire_values_b, &bs1_msm);
 
@@ -1114,6 +1157,10 @@ impl Groth16Prover {
                 let krs_msm = self.persistent_g1_k.msm(&filtered_wire_values);
                 eprintln!("[T] 5c. Krs MSM (N={}): {:?}", filtered_wire_values.len(), t.elapsed());
                 g1_msm_ark_verify("Krs", &self.data.pk_g1_k, filtered_wire_values, &krs_msm);
+                let krs_msm = match &hot {
+                    Some(h) => krs_msm.add(&h.corr_k),
+                    None => krs_msm,
+                };
 
                 let t = std::time::Instant::now();
                 let krs2_msm = match &h_result {
@@ -2077,6 +2124,14 @@ fn fr_pow_u64(base: &Fr, mut exp: u64) -> Fr {
         exp >>= 1;
     }
     result
+}
+
+/// The parts of the B and K MSMs split out by [`crate::hot::HotSplit`]: Bs1 (G1), Bs2 (G2), Krs.
+#[cfg(feature = "cuda")]
+struct HotCorrections {
+    corr_b: G1Jacobian,
+    corr_b2: crate::g2::G2Jacobian,
+    corr_k: G1Jacobian,
 }
 
 fn g1_scalar_mul(point: &G1Jacobian, scalar: &Fr) -> G1Jacobian {

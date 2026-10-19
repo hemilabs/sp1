@@ -137,7 +137,7 @@ impl<F: PrimeField32> MachineAir<F> for MemoryBumpChip {
                 let cols: &mut MemoryBumpCols<F> = row.borrow_mut();
 
                 if idx < input.bump_memory_events.len() {
-                    let mut byte_lookup_events = Vec::new();
+                    let mut byte_lookup_events = sp1_core_executor::events::DiscardByteRecord;
                     let (event, addr, is_refresh) = input.bump_memory_events[idx];
                     let value = event.prev_value();
                     let prev_timestamp = event.previous_record().timestamp;

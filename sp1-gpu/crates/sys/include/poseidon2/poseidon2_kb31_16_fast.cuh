@@ -10,7 +10,8 @@
 //   * round constants are compile-time immediates (full unroll).
 //   1.28x leafHashPacked throughput (RTX 5090), balanced ALU / FMA-heavy pipes.
 // quad::permute(): 4 lanes per state (lane j of an aligned quad holds the M4 block 4j..4j+3), for
-//   latency-bound small layers: 3.1 us vs 9.7 us per permutation.
+//   latency-bound work, small Merkle layers and the warp-cooperative device challenger
+//   (challenger/warp_duplex.cuh): 3.1 us per permutation vs 6.7 us for permute() on one thread.
 #pragma once
 #ifndef __HIPCC__
 #include <cstdint>

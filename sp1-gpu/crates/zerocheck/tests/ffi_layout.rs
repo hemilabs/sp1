@@ -95,7 +95,7 @@ fn chunk_static_layout_matches() {
         "leaves" => std::mem::offset_of!(ChunkStaticC, leaves),
         "consts" => std::mem::offset_of!(ChunkStaticC, consts),
         "publics" => std::mem::offset_of!(ChunkStaticC, publics),
-        "assert_regs" => std::mem::offset_of!(ChunkStaticC, assert_regs),
+        "assert_pos" => std::mem::offset_of!(ChunkStaticC, assert_pos),
         "assert_alphas" => std::mem::offset_of!(ChunkStaticC, assert_alphas),
         "n_instrs" => std::mem::offset_of!(ChunkStaticC, n_instrs),
         "n_asserts" => std::mem::offset_of!(ChunkStaticC, n_asserts),
