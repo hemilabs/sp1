@@ -253,10 +253,18 @@ size_t env_mib(const char* name, size_t fallback) {
     return v ? (size_t)std::strtoull(v, nullptr, 10) << 20 : fallback;
 }
 
-// The most the allocator keeps cached: half the card (SP1_GPU_ALLOC_CACHE_MB).
+// The most the allocator keeps cached: three quarters of the card (SP1_GPU_ALLOC_CACHE_MB). An
+// allocation that would not fit in the video memory budget frees cached blocks first either way,
+// so the cap only decides which freed blocks are kept. With half the card, an Arc Pro B70's cache
+// filled with blocks from setup and the other stages, and a core proof's 6 GiB buffers went back
+// to the driver at every free, to be allocated again (~0.3 s of host time a proof): with three
+// quarters, 144M-cycle core proofs went from ~3.6 to ~3.4 s and 2M-cycle compressed ones from 5.0
+// to 4.5 s, eight back-to-back proofs staying at 3.2-3.6 s. (On a 16 GB Radeon RX 9070 XT, the
+// HIP allocator's larger cap made no difference.)
 size_t max_cached_bytes() {
     static const size_t cap = env_mib(
-        "SP1_GPU_ALLOC_CACHE_MB", rt().device.get_info<sycl::info::device::global_mem_size>() / 2);
+        "SP1_GPU_ALLOC_CACHE_MB",
+        rt().device.get_info<sycl::info::device::global_mem_size>() / 4 * 3);
     return cap;
 }
 
