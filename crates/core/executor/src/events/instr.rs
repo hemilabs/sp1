@@ -9,7 +9,6 @@ use crate::{vm::results::TrapResult, Instruction, Opcode};
 ///
 /// This object encapsulated the information needed to prove a RISC-V ALU operation.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, DeepSizeOf)]
-#[repr(C)]
 pub struct AluEvent {
     /// The clock cycle.
     pub clk: u64,
@@ -40,7 +39,6 @@ impl AluEvent {
 ///
 /// This object encapsulated the information needed to prove a RISC-V memory operation.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, DeepSizeOf)]
-#[repr(C)]
 pub struct MemInstrEvent {
     /// The clk.
     pub clk: u64,
@@ -108,7 +106,6 @@ pub struct TrapMemInstrEvent {
 ///
 /// This object encapsulated the information needed to prove a RISC-V branch operation.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, DeepSizeOf)]
-#[repr(C)]
 pub struct BranchEvent {
     /// The clock cycle.
     pub clk: u64,
@@ -150,7 +147,6 @@ impl BranchEvent {
 ///
 /// This object encapsulated the information needed to prove a RISC-V jump operation.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, DeepSizeOf)]
-#[repr(C)]
 pub struct JumpEvent {
     /// The clock cycle.
     pub clk: u64,
@@ -191,7 +187,6 @@ impl JumpEvent {
 ///
 /// This object encapsulated the information needed to prove a RISC-V AUIPC and LUI operation.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, DeepSizeOf)]
-#[repr(C)]
 pub struct UTypeEvent {
     /// The clock cycle.
     pub clk: u64,

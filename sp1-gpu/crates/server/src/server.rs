@@ -124,7 +124,10 @@ impl Server {
             // takes seconds after a large proof (~4 s after rsp on a 186 GB host), so it runs after
             // the proof is sent, and off the runtime's worker threads.
             if proved {
-                tokio::task::spawn_blocking(sp1_gpu_host_alloc::release_free_memory);
+                tokio::task::spawn_blocking(|| {
+                    sp1_core_executor::release_recycled_event_buffers();
+                    sp1_gpu_host_alloc::release_free_memory();
+                });
             }
         }
     }

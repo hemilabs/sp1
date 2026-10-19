@@ -915,9 +915,10 @@ where
                 };
                 jobs.into_par_iter().for_each_with(host_traces_tx.clone(), generate);
                 late_jobs.into_par_iter().for_each_with(host_traces_tx, generate);
-                // Make this explicit.
-                // If we are the last users of the record, this will expensively drop it.
-                drop(record);
+                // If we are the last users of the record, give it back for reuse.
+                if let Some(record) = Arc::into_inner(record) {
+                    record.recycle();
+                }
             });
 
             (device_airs, host_traces, chip_set, shard_chips)
@@ -1014,9 +1015,12 @@ async fn device_main_tracegen<A: CudaTracegenAir<Felt>>(
     // That is, this value will have the correct global cumulative sum.
     let public_values = record.public_values::<Felt>();
 
-    // If we're the last users of the record, expensively drop it in a separate task.
-    // TODO: in general, figure out the best way to drop expensive-to-drop things.
-    tokio::task::spawn_blocking(move || drop(record));
+    // If we're the last users of the record, give it back for reuse in a separate task.
+    tokio::task::spawn_blocking(move || {
+        if let Some(record) = Arc::into_inner(record) {
+            record.recycle();
+        }
+    });
 
     (all_traces, public_values)
 }

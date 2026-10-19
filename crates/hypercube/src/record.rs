@@ -10,6 +10,10 @@ pub trait MachineRecord: Default + Sized + Send + Sync + Clone {
     /// Appends two records together.
     fn append(&mut self, other: &mut Self);
 
+    /// Called when the prover is done with the record, so that it can keep its allocations for
+    /// the next records. Dropping it is the default.
+    fn recycle(self) {}
+
     /// Returns the public values of the record.
     fn public_values<F: AbstractField>(&self) -> Vec<F>;
 

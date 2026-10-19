@@ -326,13 +326,15 @@ where
                 {
                     let (record, deferred_record, is_precompile) = match record {
                         TraceData::Core(chunk_bytes) => {
-                            let chunk: TraceChunk =
-                                bincode::deserialize(&chunk_bytes).map_err(|e| {
+                            let chunk = match TraceChunk::decode_bincode(&chunk_bytes) {
+                                Some(chunk) => chunk,
+                                None => bincode::deserialize(&chunk_bytes).map_err(|e| {
                                     TaskError::Fatal(anyhow::anyhow!(
                                         "failed to deserialize chunk: {}",
                                         e
                                     ))
-                                })?;
+                                })?,
+                            };
                             tracing::debug!(
                                 "tracing chunk at clk range: {}..{}",
                                 chunk.clk_start,

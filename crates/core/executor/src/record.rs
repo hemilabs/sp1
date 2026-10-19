@@ -157,6 +157,72 @@ pub struct ExecutionRecord {
     pub global_dependencies_opt: bool,
 }
 
+/// How many retired records' event buffers are kept for reuse (see [`ExecutionRecord::recycle`]).
+const MAX_RECYCLED_EVENT_BUFFERS: usize = 8;
+
+/// Event buffers of retired execution records, handed to the next records.
+///
+/// A shard writes about 1.5 GB of events. Fresh memory is faulted in by the kernel 4 KiB at a
+/// time as the tracing executor fills it, which costs about as much system CPU as writing the
+/// events (tens of seconds per large proof), and the allocator cannot reuse much of a retired
+/// record's memory because every event vector reserves far more than it touches. Reusing the
+/// buffers whole means the events are written to memory that is already mapped.
+static RECYCLED_EVENT_BUFFERS: Mutex<Vec<EventBuffers>> = Mutex::new(Vec::new());
+
+/// Gives back the event buffers kept by [`ExecutionRecord::recycle`] (call it between proofs).
+pub fn release_recycled_event_buffers() {
+    let buffers = std::mem::take(&mut *RECYCLED_EVENT_BUFFERS.lock().unwrap());
+    drop(buffers);
+}
+
+macro_rules! event_buffers {
+    ($($field:ident: $ty:ty),* $(,)?) => {
+        /// The per-instruction event vectors of an [`ExecutionRecord`], emptied.
+        struct EventBuffers {
+            $($field: Vec<$ty>,)*
+        }
+
+        impl EventBuffers {
+            fn take_from(record: &mut ExecutionRecord) -> Self {
+                Self { $($field: { let mut v = take(&mut record.$field); v.clear(); v },)* }
+            }
+
+            fn put_into(self, record: &mut ExecutionRecord) {
+                $(record.$field = self.$field;)*
+            }
+        }
+    };
+}
+
+event_buffers!(
+    alu_x0_events: (AluEvent, ALUTypeRecord),
+    add_events: (AluEvent, RTypeRecord),
+    addw_events: (AluEvent, ALUTypeRecord),
+    addi_events: (AluEvent, ITypeRecord),
+    mul_events: (AluEvent, RTypeRecord),
+    sub_events: (AluEvent, RTypeRecord),
+    subw_events: (AluEvent, RTypeRecord),
+    bitwise_events: (AluEvent, ALUTypeRecord),
+    shift_left_events: (AluEvent, ALUTypeRecord),
+    shift_right_events: (AluEvent, ALUTypeRecord),
+    divrem_events: (AluEvent, RTypeRecord),
+    lt_events: (AluEvent, ALUTypeRecord),
+    memory_load_byte_events: (MemInstrEvent, ITypeRecord),
+    memory_load_half_events: (MemInstrEvent, ITypeRecord),
+    memory_load_word_events: (MemInstrEvent, ITypeRecord),
+    memory_load_x0_events: (MemInstrEvent, ITypeRecord),
+    memory_load_double_events: (MemInstrEvent, ITypeRecord),
+    memory_store_byte_events: (MemInstrEvent, ITypeRecord),
+    memory_store_half_events: (MemInstrEvent, ITypeRecord),
+    memory_store_word_events: (MemInstrEvent, ITypeRecord),
+    memory_store_double_events: (MemInstrEvent, ITypeRecord),
+    utype_events: (UTypeEvent, JTypeRecord),
+    branch_events: (BranchEvent, ITypeRecord),
+    jal_events: (JumpEvent, JTypeRecord),
+    jalr_events: (JumpEvent, ITypeRecord),
+    cpu_local_memory_access: MemoryLocalEvent,
+);
+
 impl ExecutionRecord {
     /// Create a new [`ExecutionRecord`].
     #[must_use]
@@ -201,6 +267,10 @@ impl ExecutionRecord {
         #[cfg(feature = "mprotect")]
         let untrusted_memory = program.untrusted_memory;
         let mut result = Self { program, ..Default::default() };
+        let recycled = RECYCLED_EVENT_BUFFERS.lock().unwrap().pop();
+        if let Some(buffers) = recycled {
+            buffers.put_into(&mut result);
+        }
 
         // Vec::reserve mostly costs virtual address space (the kernel demand-faults
         // pages on first touch), so the per-opcode generous reserve is cheap in
@@ -254,6 +324,19 @@ impl ExecutionRecord {
         }
         result.global_dependencies_opt = global_dependencies_opt;
         result
+    }
+
+    /// Keeps the event buffers of an execution shard's record for the next record made by
+    /// [`ExecutionRecord::new_preallocated`], and drops the rest.
+    pub fn recycle(mut self) {
+        if self.cpu_event_count == 0 {
+            return;
+        }
+        let buffers = EventBuffers::take_from(&mut self);
+        let mut recycled = RECYCLED_EVENT_BUFFERS.lock().unwrap();
+        if recycled.len() < MAX_RECYCLED_EVENT_BUFFERS {
+            recycled.push(buffers);
+        }
     }
 
     /// Take out events from the [`ExecutionRecord`] that should be deferred to a separate shard.
@@ -656,6 +739,8 @@ pub struct RTypeRecord {
 }
 
 impl RTypeRecord {
+    #[allow(clippy::inline_always)]
+    #[inline(always)]
     pub(crate) fn new(value: &MemoryAccessRecord, instruction: &Instruction) -> Self {
         Self {
             op_a: instruction.op_a,
@@ -686,6 +771,8 @@ pub struct ITypeRecord {
 }
 
 impl ITypeRecord {
+    #[allow(clippy::inline_always)]
+    #[inline(always)]
     pub(crate) fn new(value: &MemoryAccessRecord, instruction: &Instruction) -> Self {
         debug_assert!(value.c.is_none());
         Self {
@@ -715,6 +802,8 @@ pub struct JTypeRecord {
 }
 
 impl JTypeRecord {
+    #[allow(clippy::inline_always)]
+    #[inline(always)]
     pub(crate) fn new(value: &MemoryAccessRecord, instruction: &Instruction) -> Self {
         debug_assert!(value.b.is_none());
         debug_assert!(value.c.is_none());
@@ -750,6 +839,8 @@ pub struct ALUTypeRecord {
 }
 
 impl ALUTypeRecord {
+    #[allow(clippy::inline_always)]
+    #[inline(always)]
     pub(crate) fn new(value: &MemoryAccessRecord, instruction: &Instruction) -> Self {
         Self {
             op_a: instruction.op_a,
@@ -776,6 +867,10 @@ pub struct UntrustedProgramInstructionRecord {
 }
 
 impl MachineRecord for ExecutionRecord {
+    fn recycle(self) {
+        ExecutionRecord::recycle(self);
+    }
+
     fn stats(&self) -> HashMap<String, usize> {
         let mut stats = HashMap::new();
         stats.insert("cpu_events".to_string(), self.cpu_event_count as usize);

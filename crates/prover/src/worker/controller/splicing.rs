@@ -312,12 +312,12 @@ pub struct SendSpliceTask {
 /// A shard's spliced trace, over whichever chunk type it was spliced from.
 pub trait SpliceBytes: Send + Sync {
     /// The trace serialized as the [`TraceChunk`] the prover reads.
-    fn to_bytes(&self) -> bincode::Result<Vec<u8>>;
+    fn to_bytes(&self) -> Vec<u8>;
 }
 
 impl<T: MinimalTrace> SpliceBytes for SplicedMinimalTrace<T> {
-    fn to_bytes(&self) -> bincode::Result<Vec<u8>> {
-        bincode::serialize(self)
+    fn to_bytes(&self) -> Vec<u8> {
+        self.to_bincode()
     }
 }
 
@@ -513,8 +513,7 @@ where
         let SendSpliceTask { chunk, range } = input;
         let chunk_bytes = await_blocking(|| chunk.to_bytes())
             .await
-            .map_err(|_| ExecutionError::Other("chunk serialization failed".to_string()))?
-            .map_err(|e| ExecutionError::Other(e.to_string()))?;
+            .map_err(|_| ExecutionError::Other("chunk serialization failed".to_string()))?;
         let data = TraceData::Core(chunk_bytes);
 
         let SpawnProveOutput { deferred_message, proof_data } = create_core_proving_task(
@@ -600,7 +599,7 @@ mod tests {
             .unwrap();
             // Serialize now: the splices hold the chunk's slot in the executor's trace ring.
             while let Ok(task) = splicing_rx.try_recv() {
-                shards.push((task.range, task.chunk.to_bytes().unwrap()));
+                shards.push((task.range, task.chunk.to_bytes()));
             }
         }
         assert!(carry.is_none(), "the program ended inside a shard");

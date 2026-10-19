@@ -441,6 +441,92 @@ impl TraceChunk {
     }
 }
 
+impl TraceChunk {
+    /// The length of the bincode encoding of a [`TraceChunk`] before its memory reads: the
+    /// registers, the pc and the clk bounds, and the number of memory reads.
+    const BINCODE_HEADER_LEN: usize = (32 + 3 + 1) * size_of::<u64>();
+
+    /// Encodes a trace chunk exactly as `bincode::serialize` encodes a [`TraceChunk`] with these
+    /// fields, copying the memory reads in one go instead of encoding them one by one.
+    #[must_use]
+    pub fn encode_bincode(
+        start_registers: &[u64; 32],
+        pc_start: u64,
+        clk_start: u64,
+        clk_end: u64,
+        mem_reads: &[MemValue],
+    ) -> Vec<u8> {
+        let mut out =
+            Vec::with_capacity(Self::BINCODE_HEADER_LEN + std::mem::size_of_val(mem_reads));
+        for word in start_registers.iter().chain(&[pc_start, clk_start, clk_end]) {
+            out.extend_from_slice(&word.to_le_bytes());
+        }
+        out.extend_from_slice(&(mem_reads.len() as u64).to_le_bytes());
+        if cfg!(target_endian = "little") {
+            // SAFETY: `MemValue` is two `u64`s with no padding, so its bytes on a little-endian
+            // target are its bincode encoding.
+            let bytes = unsafe {
+                std::slice::from_raw_parts(
+                    mem_reads.as_ptr() as *const u8,
+                    std::mem::size_of_val(mem_reads),
+                )
+            };
+            out.extend_from_slice(bytes);
+        } else {
+            for read in mem_reads {
+                out.extend_from_slice(&read.clk.to_le_bytes());
+                out.extend_from_slice(&read.value.to_le_bytes());
+            }
+        }
+        out
+    }
+
+    /// Decodes the bincode encoding of a [`TraceChunk`] (see [`Self::encode_bincode`]), copying the
+    /// memory reads in one go. Returns `None` if `bytes` is not such an encoding.
+    #[must_use]
+    pub fn decode_bincode(bytes: &[u8]) -> Option<Self> {
+        let header = bytes.get(..Self::BINCODE_HEADER_LEN)?;
+        let mut words = header
+            .as_chunks::<{ size_of::<u64>() }>()
+            .0
+            .iter()
+            .map(|word| u64::from_le_bytes(*word));
+        let mut start_registers = [0u64; 32];
+        for register in &mut start_registers {
+            *register = words.next()?;
+        }
+        let (pc_start, clk_start, clk_end) = (words.next()?, words.next()?, words.next()?);
+        let n_reads = usize::try_from(words.next()?).ok()?;
+        let tail = &bytes[Self::BINCODE_HEADER_LEN..];
+        if tail.len() != n_reads.checked_mul(size_of::<MemValue>())? {
+            return None;
+        }
+        let mem_reads: Arc<[MemValue]> = if cfg!(target_endian = "little") {
+            let mem_reads = Arc::<[MemValue]>::new_uninit_slice(n_reads);
+            // SAFETY: `tail` holds exactly `n_reads` encoded `MemValue`s, which are their bytes on
+            // a little-endian target, and `mem_reads` has room for `n_reads` of them.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    tail.as_ptr(),
+                    mem_reads.as_ptr() as *mut u8,
+                    tail.len(),
+                );
+                mem_reads.assume_init()
+            }
+        } else {
+            tail.as_chunks::<{ size_of::<MemValue>() }>()
+                .0
+                .iter()
+                .map(|read| MemValue {
+                    clk: u64::from_le_bytes(read[..8].try_into().unwrap()),
+                    value: u64::from_le_bytes(read[8..].try_into().unwrap()),
+                })
+                .collect()
+        };
+        Some(Self { start_registers, pc_start, clk_start, clk_end, mem_reads })
+    }
+}
+
 /// A trait that represents a minimal trace.
 ///
 /// A minimal trace is the minimum required information to rexecute from
@@ -510,6 +596,31 @@ mod ser {
         let as_vec = Vec::deserialize(deserializer)?;
 
         Ok(as_vec.into())
+    }
+
+    #[test]
+    #[cfg(test)]
+    fn test_bincode_codec() {
+        let mem_reads: Arc<[MemValue]> =
+            (0..1000u64).map(|i| MemValue { clk: i * 3, value: i ^ 0xdead_beef }).collect();
+        let trace = TraceChunk {
+            start_registers: core::array::from_fn(|i| i as u64 * 7),
+            pc_start: 6,
+            clk_start: 7,
+            clk_end: 8,
+            mem_reads,
+        };
+        let serialized = bincode::serialize(&trace).unwrap();
+        let encoded = TraceChunk::encode_bincode(
+            &trace.start_registers,
+            trace.pc_start,
+            trace.clk_start,
+            trace.clk_end,
+            &trace.mem_reads,
+        );
+        assert_eq!(serialized, encoded);
+        assert_eq!(TraceChunk::decode_bincode(&serialized), Some(trace));
+        assert_eq!(TraceChunk::decode_bincode(&serialized[..serialized.len() - 1]), None);
     }
 
     #[test]
