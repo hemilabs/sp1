@@ -11,6 +11,7 @@ publish = false
 
 [dependencies]
 sp1-gpu-cudart = { workspace = true }
+sp1-gpu-host-alloc = { workspace = true }
 sp1-gpu-prover = { workspace = true }
 sp1-gpu-tracing = { workspace = true }
 sp1-gpu-shard-prover = { workspace = true }

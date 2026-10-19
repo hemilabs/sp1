@@ -177,10 +177,14 @@ impl Server {
                     );
                 };
                 let context = SP1Context::builder().proof_nonce(proof_nonce).build();
-                match prover.prove_with_mode(&cached.elf, stdin, context, mode).await {
+                let response = match prover.prove_with_mode(&cached.elf, stdin, context, mode).await
+                {
                     Ok(proof) => Response::Proof { proof },
                     Err(e) => Response::ProverError(e.to_string()),
-                }
+                };
+                // Between proofs, hand the memory the allocator kept for reuse back to the OS.
+                sp1_gpu_host_alloc::release_free_memory();
+                response
             }
         }
     }

@@ -33,6 +33,10 @@ fn proof_mode_from_string(s: &str) -> ProofMode {
     }
 }
 
+// mimalloc with large OS pages on hosts with enough RAM; see `sp1_gpu_host_alloc`.
+#[global_allocator]
+static GLOBAL: sp1_gpu_host_alloc::HostAlloc = sp1_gpu_host_alloc::HostAlloc;
+
 fn main() {
     // First: when started as its own Groth16 CPU helper, prove and exit here. See
     // `sp1_recursion_gnark_ffi::run_groth16_cpu_helper_if_requested`.
@@ -77,6 +81,8 @@ async fn run() {
 
         tracing_subscriber::registry().with(fmt).with(blocked).init();
     }
+
+    tracing::info!("host allocator: {}", sp1_gpu_host_alloc::host_allocator_name());
 
     // Get the program and input.
     let (elf, stdin) = get_program_and_input(args.program.clone(), args.param);
@@ -141,6 +147,7 @@ async fn run() {
             .await
             .unwrap()
             .unwrap();
+            sp1_gpu_host_alloc::release_free_memory();
 
             let (core_time, compress_time, shrink_time, wrap_time) = match mode {
                 ProofMode::Core => (Some(proof_time), None, Duration::ZERO, Duration::ZERO),

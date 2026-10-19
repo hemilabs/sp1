@@ -35,6 +35,8 @@ sp1-gpu-groth16 = { path = "../../../sp1-gpu/crates/groth16" }
 # `sp1-recursion-gnark-ffi` without the `cuda` feature (e.g. the production
 # `node` binary in sp1-gpu-perf, which only enables `cuda` for the helper).
 sp1-gpu-plonk = { path = "../../../sp1-gpu/crates/plonk", optional = true }
+# Host allocator of the GPU helper binaries (mimalloc on hosts with enough RAM).
+sp1-gpu-host-alloc = { path = "../../../sp1-gpu/crates/host_alloc", optional = true }
 clap = { workspace = true, features = ["derive"], optional = true }
 libloading = { version = "0.8", optional = true }
 libc = { workspace = true, optional = true }
@@ -130,7 +132,7 @@ required-features = ["native", "cuda"]
 [features]
 native = ["dep:bindgen", "dep:clap", "dep:libloading", "dep:libc", "dep:tracing-subscriber"]
 groth16-cuda = []
-cuda = ["sp1-gpu-groth16/cuda", "dep:sp1-gpu-plonk", "sp1-gpu-plonk/cuda"]
+cuda = ["sp1-gpu-groth16/cuda", "dep:sp1-gpu-plonk", "sp1-gpu-plonk/cuda", "dep:sp1-gpu-host-alloc"]
 
 [lints]
 workspace = true
