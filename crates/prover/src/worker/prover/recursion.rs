@@ -635,6 +635,21 @@ impl<A: ArtifactClient, C: SP1ProverComponents> SP1RecursionProver<A, C> {
         .unwrap()
     }
 
+    /// Builds the wrap prover now, as the worker starts, rather than in the first Groth16 or PLONK
+    /// proof: ~0.35 s of CPU for the wrap program on an idle host, over 1 s on a busy one. It needs
+    /// no GPU, as the wrap vk is known when vk verification is on. `SP1_PREWARM_WRAP=0` leaves it
+    /// to the first proof that needs it.
+    pub async fn prewarm_wrap_prover(&self) {
+        if !self.prover_data.vk_verification()
+            || std::env::var("SP1_PREWARM_WRAP").ok().as_deref() == Some("0")
+        {
+            return;
+        }
+        if let Err(e) = self.wrap_prover().await {
+            tracing::warn!("building the wrap prover ahead of time failed: {e}");
+        }
+    }
+
     pub fn recursion_prover_pipeline(&self) -> &Arc<RecursionProvePipeline<A, C>> {
         self.reduce_pipeline.second()
     }
@@ -679,12 +694,20 @@ impl<A: ArtifactClient, C: SP1ProverComponents> SP1RecursionProver<A, C> {
                     let expected_wrap_vk = wrap_prover_init.expected_wrap_vk.clone();
                     let wrap_air_prover = wrap_prover_init.wrap_air_prover.build();
                     let wrap_air_permits = wrap_prover_init.wrap_air_prover.permits();
+                    // With vk verification on, the wrap vk is known: skip the GPU setup here and
+                    // check the vk that each wrap proof's own setup computes instead (see
+                    // `WrapProver::prove`). Without it, the vk is computed here.
+                    let known_vk = prover_data
+                        .recursion_vks
+                        .vk_verification()
+                        .then_some(expected_wrap_vk.clone());
                     let wrap_prover = WrapProver::new(
                         wrap_air_prover,
                         wrap_air_permits,
                         prover_data,
                         wrap_prover_init.config.clone(),
                         wrap_prover_init.shrink_shape.clone(),
+                        known_vk,
                     );
 
                     if wrap_prover.prover_data.recursion_vks.vk_verification()
@@ -1363,12 +1386,15 @@ pub struct WrapProver<C: SP1ProverComponents> {
 }
 
 impl<C: SP1ProverComponents> WrapProver<C> {
+    /// Builds the wrap program. `known_vk` is the wrap vk when it is known in advance; otherwise
+    /// it is computed with a setup on the GPU.
     pub fn new(
         prover: Arc<C::WrapProver>,
         permits: ProverSemaphore,
         prover_data: Arc<RecursionProverData<C>>,
         config: SP1RecursionProverConfig,
         shrink_shape: BTreeMap<String, usize>,
+        known_vk: Option<MachineVerifyingKey<SP1OuterGlobalContext>>,
     ) -> Self {
         let verifier = C::shrink_verifier();
         let shrink_proof_shape =
@@ -1387,14 +1413,14 @@ impl<C: SP1ProverComponents> WrapProver<C> {
             config.vk_verification,
             &wrap_input,
         ));
-        let (_, verifying_key) = {
+        let verifying_key = known_vk.unwrap_or_else(|| {
             let (prover, program, permits) = (prover.clone(), program.clone(), permits.clone());
             let (tx, rx) = oneshot::channel();
             tokio::task::spawn(async move {
                 tx.send(prover.setup(program.clone(), permits).await).ok();
             });
-            rx.blocking_recv().unwrap()
-        };
+            rx.blocking_recv().unwrap().1
+        });
 
         Self { prover, permits, program, verifying_key, prover_data }
     }
@@ -1420,7 +1446,7 @@ impl<C: SP1ProverComponents> WrapProver<C> {
             runtime.record
         };
 
-        let (_, proof, permit) = self
+        let (vk, proof, permit) = self
             .prover
             .setup_and_prove_shard(
                 self.program.clone(),
@@ -1431,6 +1457,16 @@ impl<C: SP1ProverComponents> WrapProver<C> {
             .await;
         let duration = permit.release();
         metrics.increment_permit_time(duration);
+
+        // The setup above computed the vk of the wrap program; it must be the one proofs are
+        // checked against.
+        if vk != self.verifying_key {
+            return Err(TaskError::Fatal(anyhow::anyhow!(
+                "Wrap vk mismatch, expected: {:?}, got: {:?}",
+                self.verifying_key,
+                vk
+            )));
+        }
 
         Ok(SP1WrapProof { vk: self.verifying_key.clone(), proof })
     }

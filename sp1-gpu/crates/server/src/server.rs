@@ -117,8 +117,15 @@ impl Server {
                 }
             };
 
+            let proved = matches!(request, Request::ProveWithMode { .. });
             let response = Self::handle_request(&mut ctx, request).await;
             send_response(stream, response).await?;
+            // Between proofs, hand the memory the allocator kept for reuse back to the OS. This
+            // takes seconds after a large proof (~4 s after rsp on a 186 GB host), so it runs after
+            // the proof is sent, and off the runtime's worker threads.
+            if proved {
+                tokio::task::spawn_blocking(sp1_gpu_host_alloc::release_free_memory);
+            }
         }
     }
 
@@ -177,14 +184,10 @@ impl Server {
                     );
                 };
                 let context = SP1Context::builder().proof_nonce(proof_nonce).build();
-                let response = match prover.prove_with_mode(&cached.elf, stdin, context, mode).await
-                {
+                match prover.prove_with_mode(&cached.elf, stdin, context, mode).await {
                     Ok(proof) => Response::Proof { proof },
                     Err(e) => Response::ProverError(e.to_string()),
-                };
-                // Between proofs, hand the memory the allocator kept for reuse back to the OS.
-                sp1_gpu_host_alloc::release_free_memory();
-                response
+                }
             }
         }
     }
