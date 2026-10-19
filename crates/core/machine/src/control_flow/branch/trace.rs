@@ -1,12 +1,12 @@
 use std::{borrow::BorrowMut, mem::MaybeUninit};
 
-use hashbrown::HashMap;
-use itertools::Itertools;
-use slop_maybe_rayon::prelude::{IndexedParallelIterator, ParallelIterator, ParallelSlice, ParallelSliceMut};
 use slop_air::BaseAir;
 use slop_algebra::PrimeField32;
+use slop_maybe_rayon::prelude::{
+    IndexedParallelIterator, ParallelIterator, ParallelSlice, ParallelSliceMut,
+};
 use sp1_core_executor::{
-    events::{BranchEvent, ByteLookupEvent, ByteRecord},
+    events::{BranchEvent, ByteRecord},
     ExecutionRecord, Opcode, Program,
 };
 use sp1_hypercube::air::MachineAir;
@@ -38,7 +38,7 @@ impl<F: PrimeField32, M: TrustMode> MachineAir<F> for BranchChip<M> {
         Some(nb_rows)
     }
 
-    fn generate_dependencies(&self, input: &Self::Record, output: &mut Self::Record) {
+    fn generate_dependencies(&self, input: &Self::Record, _output: &mut Self::Record) {
         if input.program.enable_untrusted_programs == M::IS_TRUSTED {
             return;
         }
@@ -46,26 +46,20 @@ impl<F: PrimeField32, M: TrustMode> MachineAir<F> for BranchChip<M> {
         let chunk_size = std::cmp::max((input.branch_events.len()) / num_cpus::get(), 1);
         let width = <BranchChip<M> as BaseAir<F>>::width(self);
 
-        let blu_batches = input
-            .branch_events
-            .par_chunks(chunk_size)
-            .map(|events| {
-                let mut blu: HashMap<ByteLookupEvent, usize> = HashMap::new();
+        input.branch_events.par_chunks(chunk_size).for_each(|events| {
+            input.byte_lookup_counts.count(|blu| {
                 // One scratch row per chunk instead of an allocation per event.
                 let mut row = vec![F::zero(); width];
                 events.iter().for_each(|event| {
                     row.fill(F::zero());
                     let cols: &mut BranchColumns<F, M> = row.as_mut_slice().borrow_mut();
 
-                    self.event_to_row(&event.0, cols, &mut blu);
-                    cols.state.populate(&mut blu, event.0.clk, event.0.pc);
-                    cols.adapter.populate(&mut blu, event.1);
+                    self.event_to_row(&event.0, cols, blu);
+                    cols.state.populate(blu, event.0.clk, event.0.pc);
+                    cols.adapter.populate(blu, event.1);
                 });
-                blu
-            })
-            .collect::<Vec<_>>();
-
-        output.add_byte_lookup_events_from_maps(blu_batches.iter().collect_vec());
+            });
+        });
     }
 
     fn generate_trace_into(
@@ -73,6 +67,45 @@ impl<F: PrimeField32, M: TrustMode> MachineAir<F> for BranchChip<M> {
         input: &ExecutionRecord,
         _output: &mut ExecutionRecord,
         buffer: &mut [MaybeUninit<F>],
+    ) {
+        self.generate_trace_into_with::<F>(input, buffer, false);
+    }
+
+    fn dependencies_in_trace(&self) -> bool {
+        true
+    }
+
+    fn generate_trace_into_with_dependencies(
+        &self,
+        input: &ExecutionRecord,
+        _output: &mut ExecutionRecord,
+        buffer: &mut [MaybeUninit<F>],
+    ) {
+        self.generate_trace_into_with::<F>(input, buffer, true);
+    }
+
+    fn included(&self, shard: &Self::Record) -> bool {
+        if let Some(shape) = shard.shape.as_ref() {
+            shape.included::<F, _>(self)
+        } else {
+            !shard.branch_events.is_empty()
+                && (M::IS_TRUSTED != shard.program.enable_untrusted_programs)
+        }
+    }
+
+    fn column_names(&self) -> Vec<String> {
+        BranchColumns::<F, M>::struct_reflection().unwrap()
+    }
+}
+
+impl<M: TrustMode> BranchChip<M> {
+    /// Writes the trace into `buffer`. With `count`, the byte lookups of the rows are counted
+    /// into `input.byte_lookup_counts`, as `generate_dependencies` does.
+    fn generate_trace_into_with<F: PrimeField32>(
+        &self,
+        input: &ExecutionRecord,
+        buffer: &mut [MaybeUninit<F>],
+        count: bool,
     ) {
         if input.program.enable_untrusted_programs == M::IS_TRUSTED {
             return;
@@ -97,36 +130,24 @@ impl<F: PrimeField32, M: TrustMode> MachineAir<F> for BranchChip<M> {
         let values = unsafe { core::slice::from_raw_parts_mut(buffer_ptr, num_event_rows * width) };
 
         values.par_chunks_mut(chunk_size * width).enumerate().for_each(|(i, rows)| {
-            let mut blu = sp1_core_executor::events::DiscardByteRecord;
-            rows.chunks_mut(width).enumerate().for_each(|(j, row)| {
-                let idx = i * chunk_size + j;
-                let cols: &mut BranchColumns<F, M> = row.borrow_mut();
+            input.byte_lookup_counts.count_if(count, |blu| {
+                rows.chunks_mut(width).enumerate().for_each(|(j, row)| {
+                    let idx = i * chunk_size + j;
+                    let cols: &mut BranchColumns<F, M> = row.borrow_mut();
 
-                if idx < input.branch_events.len() {
-                    let event = input.branch_events[idx];
-                    self.event_to_row(&event.0, cols, &mut blu);
-                    cols.state.populate(&mut blu, event.0.clk, event.0.pc);
-                    cols.adapter.populate(&mut blu, event.1);
-                    if !M::IS_TRUSTED {
-                        let cols: &mut BranchColumns<F, UserMode> = row.borrow_mut();
-                        cols.adapter_cols.is_trusted = F::from_bool(!event.1.is_untrusted);
+                    if idx < input.branch_events.len() {
+                        let event = input.branch_events[idx];
+                        self.event_to_row(&event.0, cols, blu);
+                        cols.state.populate(blu, event.0.clk, event.0.pc);
+                        cols.adapter.populate(blu, event.1);
+                        if !M::IS_TRUSTED {
+                            let cols: &mut BranchColumns<F, UserMode> = row.borrow_mut();
+                            cols.adapter_cols.is_trusted = F::from_bool(!event.1.is_untrusted);
+                        }
                     }
-                }
+                });
             });
         });
-    }
-
-    fn included(&self, shard: &Self::Record) -> bool {
-        if let Some(shape) = shard.shape.as_ref() {
-            shape.included::<F, _>(self)
-        } else {
-            !shard.branch_events.is_empty()
-                && (M::IS_TRUSTED != shard.program.enable_untrusted_programs)
-        }
-    }
-
-    fn column_names(&self) -> Vec<String> {
-        BranchColumns::<F, M>::struct_reflection().unwrap()
     }
 }
 

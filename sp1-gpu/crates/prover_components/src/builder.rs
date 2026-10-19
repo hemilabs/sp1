@@ -19,6 +19,16 @@ pub const GPU_NUM_CORE_WORKERS: usize = 8;
 /// holds a shard's records in host RAM (about +9 GB for the four extra on an RTX 5090 host).
 pub const GPU_NUM_CORE_WORKERS_MIN_AVAILABLE_RAM: u64 = 48 << 30;
 
+/// Normalize (lift) programs the GPU prover keeps compiled, on hosts with
+/// [`GPU_NORMALIZE_PROGRAM_CACHE_MIN_AVAILABLE_RAM`]. A program is compiled for each new core shard
+/// shape (0.4-1 s of CPU) and takes 50-70 MB; an rsp proof has 18 shapes, so the upstream default
+/// of 5 recompiles every one of them in every proof (~8-10 s of CPU per proof). 32 keeps a proof's
+/// programs for the next proof of a similar program, for up to ~2.3 GB.
+pub const GPU_NORMALIZE_PROGRAM_CACHE_SIZE: usize = 32;
+
+/// Host memory the process must have available for [`GPU_NORMALIZE_PROGRAM_CACHE_SIZE`].
+pub const GPU_NORMALIZE_PROGRAM_CACHE_MIN_AVAILABLE_RAM: u64 = 64 << 30;
+
 /// Whether the compress prover gets its own CUDA stream and permit (see
 /// `cuda_worker_builder_with_machine`). On by default above the 30 GB tier, where a core shard and
 /// a compress proof fit on the card together; `SP1_GPU_RECURSION_STREAM=0|1` overrides.
@@ -336,6 +346,14 @@ pub async fn cuda_worker_builder_with_machine(
                 && more_core_workers(separate_recursion_stream)
             {
                 config.prover_config.core_prover_config.num_core_workers = GPU_NUM_CORE_WORKERS;
+            }
+            // `SP1_WORKER_NORMALIZE_PROGRAM_CACHE_SIZE` still overrides.
+            if std::env::var("SP1_WORKER_NORMALIZE_PROGRAM_CACHE_SIZE").is_err()
+                && sp1_recursion_gnark_ffi::host_memory::available()
+                    .is_some_and(|bytes| bytes >= GPU_NORMALIZE_PROGRAM_CACHE_MIN_AVAILABLE_RAM)
+            {
+                config.prover_config.core_prover_config.normalize_program_cache_size =
+                    GPU_NORMALIZE_PROGRAM_CACHE_SIZE;
             }
         })
         .with_core_air_prover(core_prover, prover_permits.clone())

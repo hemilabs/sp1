@@ -147,6 +147,7 @@ async fn run() {
             .await
             .unwrap()
             .unwrap();
+            sp1_core_executor::release_recycled_event_buffers();
             sp1_gpu_host_alloc::release_free_memory();
 
             let (core_time, compress_time, shrink_time, wrap_time) = match mode {

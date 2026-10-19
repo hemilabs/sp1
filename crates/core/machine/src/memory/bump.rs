@@ -6,8 +6,6 @@ use std::{
 use crate::{air::SP1CoreAirBuilder, utils::next_multiple_of_32};
 
 use super::MemoryAccessCols;
-use hashbrown::HashMap;
-use itertools::Itertools;
 use slop_air::{Air, BaseAir};
 use slop_algebra::{AbstractField, PrimeField32};
 use slop_matrix::Matrix;
@@ -56,13 +54,12 @@ impl<F: PrimeField32> MachineAir<F> for MemoryBumpChip {
         "MemoryBump"
     }
 
-    fn generate_dependencies(&self, input: &Self::Record, output: &mut Self::Record) {
+    fn generate_dependencies(&self, input: &Self::Record, _output: &mut Self::Record) {
         let chunk_size = 1;
         let event_iter = input.bump_memory_events.chunks(chunk_size);
 
-        let blu_batches = event_iter
-            .map(|events| {
-                let mut blu: HashMap<ByteLookupEvent, usize> = HashMap::new();
+        event_iter.for_each(|events| {
+            input.byte_lookup_counts.count(|blu| {
                 events.iter().for_each(|(event, addr, is_refresh)| {
                     let mut row = [F::zero(); NUM_MEMORY_BUMP_COLS];
                     let cols: &mut MemoryBumpCols<F> = row.as_mut_slice().borrow_mut();
@@ -78,7 +75,7 @@ impl<F: PrimeField32> MachineAir<F> for MemoryBumpChip {
                         timestamp,
                         prev_page_prot_record: None,
                     });
-                    cols.access.populate(bump_event, &mut blu);
+                    cols.access.populate(bump_event, blu);
                     blu.add_u16_range_checks(&[
                         (timestamp & 0xFFFF) as u16,
                         ((timestamp >> 32) & 0xFFFF) as u16,
@@ -95,11 +92,8 @@ impl<F: PrimeField32> MachineAir<F> for MemoryBumpChip {
                     });
                     cols.is_real = F::one();
                 });
-                blu
-            })
-            .collect::<Vec<_>>();
-
-        output.add_byte_lookup_events_from_maps(blu_batches.iter().collect_vec());
+            });
+        });
     }
 
     fn num_rows(&self, input: &Self::Record) -> Option<usize> {

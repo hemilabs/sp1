@@ -683,6 +683,26 @@ impl<T: MinimalTrace> MinimalTrace for SplicedMinimalTrace<T> {
     }
 }
 
+impl<T: MinimalTrace> SplicedMinimalTrace<T> {
+    /// The bincode encoding of this trace (as a [`TraceChunk`]): the same bytes as
+    /// `bincode::serialize(self)`, written with a single copy of the memory reads.
+    #[must_use]
+    pub fn to_bincode(&self) -> Vec<u8> {
+        let len = self.last_mem_reads_idx - self.memory_reads_idx;
+        let start_mem_reads = self.mem_reads();
+        assert!(len <= start_mem_reads.len(), "spliced memory reads out of bounds");
+        // SAFETY: the reads from `memory_reads_idx` to `last_mem_reads_idx` are in the buffer.
+        let mem_reads = unsafe { std::slice::from_raw_parts(start_mem_reads.head_raw(), len) };
+        TraceChunk::encode_bincode(
+            &self.start_registers,
+            self.start_pc,
+            self.start_clk,
+            self.last_clk,
+            mem_reads,
+        )
+    }
+}
+
 impl<T: MinimalTrace> Serialize for SplicedMinimalTrace<T> {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where

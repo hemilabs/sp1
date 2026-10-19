@@ -229,6 +229,19 @@ where
         self.air.generate_dependencies(input, output);
     }
 
+    fn dependencies_in_trace(&self) -> bool {
+        self.air.dependencies_in_trace()
+    }
+
+    fn generate_trace_into_with_dependencies(
+        &self,
+        input: &A::Record,
+        output: &mut A::Record,
+        buffer: &mut [std::mem::MaybeUninit<F>],
+    ) {
+        self.air.generate_trace_into_with_dependencies(input, output, buffer);
+    }
+
     fn included(&self, shard: &Self::Record) -> bool {
         self.air.included(shard)
     }

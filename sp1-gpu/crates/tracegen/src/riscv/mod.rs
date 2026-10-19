@@ -3,10 +3,20 @@ mod global;
 use slop_alloc::mem::CopyError;
 use sp1_core_machine::riscv::RiscvAir;
 use sp1_gpu_cudart::{DeviceMle, TaskScope};
+use sp1_hypercube::air::MachineAir;
 
 use crate::{CudaTracegenAir, F};
 
 impl CudaTracegenAir<F> for RiscvAir<F> {
+    fn host_trace_generates_dependencies(&self, record: &Self::Record) -> bool {
+        record.dependencies_in_trace && self.dependencies_in_trace()
+    }
+
+    fn host_trace_after_dependencies(&self, record: &Self::Record) -> bool {
+        // The byte and range tables count the byte lookups of the other chips.
+        record.dependencies_in_trace && matches!(self, Self::ByteLookup(_) | Self::RangeLookup(_))
+    }
+
     fn supports_device_main_tracegen(&self) -> bool {
         match self {
             Self::Global(chip) => chip.supports_device_main_tracegen(),

@@ -71,6 +71,33 @@ fn under_permit<R: Send>(f: impl FnOnce() -> R + Send) -> R {
     }
 }
 
+/// Lowers the scheduling priority of the global rayon pool's threads, once per process.
+///
+/// The global pool runs the bulk host work: trace and dependency generation for the shards
+/// queued for the GPU. The stages that feed it run on other threads: shard tracing
+/// (`into_record`, one thread per shard), the executor and splicing, and the permit pool (see
+/// [`under_permit`]). At equal priority the 32 pool threads time-slice with them (about 0.8 M
+/// involuntary context switches per rsp proof), stretching the chain the GPU waits on. With a
+/// higher nice value those threads run first, and the pool still gets every core they leave
+/// idle. `SP1_GPU_GLOBAL_POOL_NICE` sets the nice value (default 10); `0` leaves the pool alone.
+fn lower_global_pool_priority() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let nice = std::env::var("SP1_GPU_GLOBAL_POOL_NICE")
+            .ok()
+            .and_then(|v| v.parse::<i32>().ok())
+            .unwrap_or(10);
+        if nice <= 0 {
+            return;
+        }
+        // Nice values are per thread on Linux; raising one needs no privileges.
+        #[cfg(target_os = "linux")]
+        rayon::broadcast(|_| unsafe {
+            libc::setpriority(libc::PRIO_PROCESS, libc::gettid() as libc::id_t, nice);
+        });
+    });
+}
+
 pub trait CudaShardProverComponents<GC: IopCtx>: Send + Sync + 'static {
     type P: CudaTcsProver<GC>;
     type Air: CudaTracegenAir<GC::F>
@@ -109,6 +136,7 @@ impl<GC: IopCtx<F = Felt, EF = Ext>, PC: CudaShardProverComponents<GC>> CudaShar
         recompute_first_layer: bool,
         drop_ldes: bool,
     ) -> Self {
+        lower_global_pool_priority();
         let max_ntt_log_size =
             basefold_prover.log_height + basefold_prover.config.log_blowup() as u32;
         CudaB31Kernels::initialize_twiddles(max_ntt_log_size, &backend).unwrap();

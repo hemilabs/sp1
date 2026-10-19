@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use slop_futures::pipeline::Pipeline;
 use sp1_core_executor::{
     events::{MemoryInitializeFinalizeEvent, MemoryRecord, PageProtInitializeFinalizeEvent},
-    CoreVM, ExecutionError, Program, SP1CoreOpts, SyscallCode, UnsafeMemory,
+    CoreVM, ExecutionError, SP1CoreOpts, SyscallCode, UnsafeMemory,
 };
 use sp1_core_executor_runner::MinimalExecutorRunner;
 use sp1_core_machine::{executor::ExecutionOutput, io::SP1Stdin, riscv::RiscvAir};
@@ -29,9 +29,9 @@ use tokio::{
 use tracing::Instrument;
 
 use crate::worker::{
-    global_memory, precompile_channel, DeferredMessage, MinimalExecutorCache,
-    PrecompileArtifactSlice, ProveShardTaskRequest, RawTaskRequest, SplicingEngine, SplicingTask,
-    TaskContext, TaskError, TaskId, WorkerClient,
+    global_memory, precompile_channel, shared_program, DeferredMessage, MinimalExecutorCache,
+    OpenShard, PrecompileArtifactSlice, ProveShardTaskRequest, RawTaskRequest, SplicingEngine,
+    SplicingTask, TaskContext, TaskError, TaskId, WorkerClient,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -234,13 +234,13 @@ where
         let stdin = self.stdin.clone();
         let opts = self.opts.clone();
 
-        // Get the program from the elf. TODO: handle errors.
-        let program = Arc::new(Program::from(&elf_bytes).map_err(|e| {
+        // Get the program from the elf; the core workers of this process reuse it.
+        let program = shared_program(&self.elf, &elf_bytes).await.map_err(|e| {
             TaskError::Execution(ExecutionError::Other(format!(
                 "failed to dissassemble program: {}",
                 e
             )))
-        })?);
+        })?;
 
         // Initialize the touched addresses map.
         let (all_touched_addresses, all_touched_pages, global_memory_handler) =
@@ -312,6 +312,8 @@ where
                 tracing::debug!("Starting minimal executor");
                 let now = std::time::Instant::now();
                 let mut chunk_count = 0;
+                // Hands the shard left open at the end of the previous chunk to the next splicer.
+                let mut carry_rx: Option<oneshot::Receiver<Option<OpenShard>>> = None;
                 while let Some(chunk) =
                     minimal_executor.try_execute_chunk().map_err(classify_chunk_error)?
                 {
@@ -333,6 +335,16 @@ where
                         }
                     }
 
+                    // The next chunk resumes the previous chunk's open shard, so wait for it.
+                    let carry = match carry_rx.take() {
+                        Some(rx) => rx.blocking_recv().map_err(|_| {
+                            anyhow::anyhow!("the previous chunk's splicer stopped before its end")
+                        })?,
+                        None => None,
+                    };
+                    let (carry_tx, next_carry_rx) = oneshot::channel();
+                    carry_rx = Some(next_carry_rx);
+
                     // Create a splicing task
                     let task = SplicingTask {
                         program: program.clone(),
@@ -347,6 +359,8 @@ where
                         context: context.clone(),
                         opts: opts.clone(),
                         deferred_marker_tx: deferred_marker_tx.clone(),
+                        carry,
+                        carry_tx,
                     };
 
                     let splicing_handle = tracing::debug_span!("splicing", idx = chunk_count)
@@ -374,6 +388,12 @@ where
                          (global_clk={}, is_done={})",
                         minimal_executor.global_clk(),
                         minimal_executor.is_done(),
+                    )));
+                }
+                // The last chunk ends the program, so it leaves no shard open.
+                if let Some(Ok(Some(_))) = carry_rx.map(|rx| rx.blocking_recv()) {
+                    return Err(TaskError::Fatal(anyhow::anyhow!(
+                        "the last trace chunk ended inside a shard"
                     )));
                 }
                 // Get the output and send it to the output channel.

@@ -4,8 +4,6 @@ use core::{
 };
 use std::marker::PhantomData;
 
-use hashbrown::HashMap;
-use itertools::Itertools;
 use slop_air::{Air, AirBuilder, BaseAir};
 use slop_algebra::{AbstractField, PrimeField32};
 use slop_matrix::Matrix;
@@ -104,6 +102,69 @@ impl<F: PrimeField32, M: TrustMode> MachineAir<F> for AluX0Chip<M> {
         _output: &mut ExecutionRecord,
         buffer: &mut [MaybeUninit<F>],
     ) {
+        self.generate_trace_into_with::<F>(input, buffer, false);
+    }
+
+    fn dependencies_in_trace(&self) -> bool {
+        true
+    }
+
+    fn generate_trace_into_with_dependencies(
+        &self,
+        input: &ExecutionRecord,
+        _output: &mut ExecutionRecord,
+        buffer: &mut [MaybeUninit<F>],
+    ) {
+        self.generate_trace_into_with::<F>(input, buffer, true);
+    }
+
+    fn generate_dependencies(&self, input: &Self::Record, _output: &mut Self::Record) {
+        if input.program.enable_untrusted_programs == M::IS_TRUSTED {
+            return;
+        }
+
+        let chunk_size = std::cmp::max(input.alu_x0_events.len() / num_cpus::get(), 1);
+        let width = <AluX0Chip<M> as BaseAir<F>>::width(self);
+
+        input.alu_x0_events.par_chunks(chunk_size).for_each(|events| {
+            input.byte_lookup_counts.count(|blu| {
+                // One scratch row per chunk instead of an allocation per event.
+                let mut row = vec![F::zero(); width];
+                events.iter().for_each(|event| {
+                    row.fill(F::zero());
+                    let cols: &mut AluX0Cols<F, M> = row.as_mut_slice().borrow_mut();
+                    blu.add_byte_lookup_event(ByteLookupEvent {
+                        opcode: ByteOpcode::LTU,
+                        a: 1,
+                        b: event.0.opcode as u8,
+                        c: 29,
+                    });
+                    cols.state.populate(blu, event.0.clk, event.0.pc);
+                    cols.adapter.populate(blu, event.1);
+                });
+            });
+        });
+    }
+
+    fn included(&self, shard: &Self::Record) -> bool {
+        if let Some(shape) = shard.shape.as_ref() {
+            shape.included::<F, _>(self)
+        } else {
+            !shard.alu_x0_events.is_empty()
+                && (M::IS_TRUSTED != shard.program.enable_untrusted_programs)
+        }
+    }
+}
+
+impl<M: TrustMode> AluX0Chip<M> {
+    /// Writes the trace into `buffer`. With `count`, the byte lookups of the rows are counted
+    /// into `input.byte_lookup_counts`, as `generate_dependencies` does.
+    fn generate_trace_into_with<F: PrimeField32>(
+        &self,
+        input: &ExecutionRecord,
+        buffer: &mut [MaybeUninit<F>],
+        count: bool,
+    ) {
         if input.program.enable_untrusted_programs == M::IS_TRUSTED {
             return;
         }
@@ -125,116 +186,75 @@ impl<F: PrimeField32, M: TrustMode> MachineAir<F> for AluX0Chip<M> {
         let values = unsafe { core::slice::from_raw_parts_mut(buffer_ptr, num_event_rows * width) };
 
         values.par_chunks_mut(chunk_size * width).enumerate().for_each(|(i, rows)| {
-            rows.chunks_mut(width).enumerate().for_each(|(j, row)| {
-                let idx = i * chunk_size + j;
-                let cols: &mut AluX0Cols<F, M> = row.borrow_mut();
+            input.byte_lookup_counts.count_if(count, |blu| {
+                rows.chunks_mut(width).enumerate().for_each(|(j, row)| {
+                    let idx = i * chunk_size + j;
+                    let cols: &mut AluX0Cols<F, M> = row.borrow_mut();
 
-                if idx < input.alu_x0_events.len() {
-                    let mut byte_lookup_events = sp1_core_executor::events::DiscardByteRecord;
-                    let event = &input.alu_x0_events[idx];
-                    cols.is_real = F::one();
-                    cols.opcode = F::from_canonical_u32(event.0.opcode as u32);
-                    cols.state.populate(&mut byte_lookup_events, event.0.clk, event.0.pc);
-                    cols.adapter.populate(&mut byte_lookup_events, event.1);
-                    if !M::IS_TRUSTED {
-                        let cols: &mut AluX0Cols<F, UserMode> = row.borrow_mut();
-                        cols.adapter_cols.is_trusted = F::from_bool(!event.1.is_untrusted);
-                        let mut sel = AluX0OpcodeSelectors::<F>::default();
-                        let op = event.0.opcode;
-                        let imm_c = event.1.c.is_none();
-                        let (instr_type, imm_instr_type) = op.instruction_type();
-                        let (base_opcode, imm_base_opcode) = op.base_opcode();
-                        if imm_c {
-                            sel.instr_type = F::from_canonical_u32(imm_instr_type.unwrap() as u32);
-                            sel.base_opcode =
-                                F::from_canonical_u32(imm_base_opcode.unwrap() as u32);
-                        } else {
-                            sel.instr_type = F::from_canonical_u32(instr_type as u32);
-                            sel.base_opcode = F::from_canonical_u32(base_opcode as u32);
-                        };
-                        sel.funct3 = F::from_canonical_u8(op.funct3().unwrap());
-                        sel.funct7 = F::from_canonical_u8(op.funct7().unwrap_or(0));
+                    if idx < input.alu_x0_events.len() {
+                        let event = &input.alu_x0_events[idx];
+                        cols.is_real = F::one();
+                        cols.opcode = F::from_canonical_u32(event.0.opcode as u32);
+                        cols.state.populate(blu, event.0.clk, event.0.pc);
+                        cols.adapter.populate(blu, event.1);
+                        if !M::IS_TRUSTED {
+                            let cols: &mut AluX0Cols<F, UserMode> = row.borrow_mut();
+                            cols.adapter_cols.is_trusted = F::from_bool(!event.1.is_untrusted);
+                            let mut sel = AluX0OpcodeSelectors::<F>::default();
+                            let op = event.0.opcode;
+                            let imm_c = event.1.c.is_none();
+                            let (instr_type, imm_instr_type) = op.instruction_type();
+                            let (base_opcode, imm_base_opcode) = op.base_opcode();
+                            if imm_c {
+                                sel.instr_type =
+                                    F::from_canonical_u32(imm_instr_type.unwrap() as u32);
+                                sel.base_opcode =
+                                    F::from_canonical_u32(imm_base_opcode.unwrap() as u32);
+                            } else {
+                                sel.instr_type = F::from_canonical_u32(instr_type as u32);
+                                sel.base_opcode = F::from_canonical_u32(base_opcode as u32);
+                            };
+                            sel.funct3 = F::from_canonical_u8(op.funct3().unwrap());
+                            sel.funct7 = F::from_canonical_u8(op.funct7().unwrap_or(0));
 
-                        match op {
-                            Opcode::ADD => sel.is_add = F::one(),
-                            Opcode::SUB => sel.is_sub = F::one(),
-                            Opcode::MUL => sel.is_mul = F::one(),
-                            Opcode::MULH => sel.is_mulh = F::one(),
-                            Opcode::MULHSU => sel.is_mulhsu = F::one(),
-                            Opcode::MULHU => sel.is_mulhu = F::one(),
-                            Opcode::DIV => sel.is_div = F::one(),
-                            Opcode::DIVU => sel.is_divu = F::one(),
-                            Opcode::REM => sel.is_rem = F::one(),
-                            Opcode::REMU => sel.is_remu = F::one(),
-                            Opcode::SLL => sel.is_sll = F::one(),
-                            Opcode::SRL => sel.is_srl = F::one(),
-                            Opcode::SRA => sel.is_sra = F::one(),
-                            Opcode::XOR => sel.is_xor = F::one(),
-                            Opcode::OR => sel.is_or = F::one(),
-                            Opcode::AND => sel.is_and = F::one(),
-                            Opcode::SLT => sel.is_slt = F::one(),
-                            Opcode::SLTU => sel.is_sltu = F::one(),
-                            Opcode::ADDI => sel.is_addi = F::one(),
-                            Opcode::ADDW => sel.is_addw = F::one(),
-                            Opcode::SUBW => sel.is_subw = F::one(),
-                            Opcode::SLLW => sel.is_sllw = F::one(),
-                            Opcode::SRLW => sel.is_srlw = F::one(),
-                            Opcode::SRAW => sel.is_sraw = F::one(),
-                            Opcode::MULW => sel.is_mulw = F::one(),
-                            Opcode::DIVW => sel.is_divw = F::one(),
-                            Opcode::DIVUW => sel.is_divuw = F::one(),
-                            Opcode::REMW => sel.is_remw = F::one(),
-                            Opcode::REMUW => sel.is_remuw = F::one(),
-                            _ => {}
+                            match op {
+                                Opcode::ADD => sel.is_add = F::one(),
+                                Opcode::SUB => sel.is_sub = F::one(),
+                                Opcode::MUL => sel.is_mul = F::one(),
+                                Opcode::MULH => sel.is_mulh = F::one(),
+                                Opcode::MULHSU => sel.is_mulhsu = F::one(),
+                                Opcode::MULHU => sel.is_mulhu = F::one(),
+                                Opcode::DIV => sel.is_div = F::one(),
+                                Opcode::DIVU => sel.is_divu = F::one(),
+                                Opcode::REM => sel.is_rem = F::one(),
+                                Opcode::REMU => sel.is_remu = F::one(),
+                                Opcode::SLL => sel.is_sll = F::one(),
+                                Opcode::SRL => sel.is_srl = F::one(),
+                                Opcode::SRA => sel.is_sra = F::one(),
+                                Opcode::XOR => sel.is_xor = F::one(),
+                                Opcode::OR => sel.is_or = F::one(),
+                                Opcode::AND => sel.is_and = F::one(),
+                                Opcode::SLT => sel.is_slt = F::one(),
+                                Opcode::SLTU => sel.is_sltu = F::one(),
+                                Opcode::ADDI => sel.is_addi = F::one(),
+                                Opcode::ADDW => sel.is_addw = F::one(),
+                                Opcode::SUBW => sel.is_subw = F::one(),
+                                Opcode::SLLW => sel.is_sllw = F::one(),
+                                Opcode::SRLW => sel.is_srlw = F::one(),
+                                Opcode::SRAW => sel.is_sraw = F::one(),
+                                Opcode::MULW => sel.is_mulw = F::one(),
+                                Opcode::DIVW => sel.is_divw = F::one(),
+                                Opcode::DIVUW => sel.is_divuw = F::one(),
+                                Opcode::REMW => sel.is_remw = F::one(),
+                                Opcode::REMUW => sel.is_remuw = F::one(),
+                                _ => {}
+                            }
+                            cols.selector_cols = sel;
                         }
-                        cols.selector_cols = sel;
                     }
-                }
+                });
             });
         });
-    }
-
-    fn generate_dependencies(&self, input: &Self::Record, output: &mut Self::Record) {
-        if input.program.enable_untrusted_programs == M::IS_TRUSTED {
-            return;
-        }
-
-        let chunk_size = std::cmp::max(input.alu_x0_events.len() / num_cpus::get(), 1);
-        let width = <AluX0Chip<M> as BaseAir<F>>::width(self);
-
-        let blu_batches = input
-            .alu_x0_events
-            .par_chunks(chunk_size)
-            .map(|events| {
-                let mut blu: HashMap<ByteLookupEvent, usize> = HashMap::new();
-                // One scratch row per chunk instead of an allocation per event.
-                let mut row = vec![F::zero(); width];
-                events.iter().for_each(|event| {
-                    row.fill(F::zero());
-                    let cols: &mut AluX0Cols<F, M> = row.as_mut_slice().borrow_mut();
-                    blu.add_byte_lookup_event(ByteLookupEvent {
-                        opcode: ByteOpcode::LTU,
-                        a: 1,
-                        b: event.0.opcode as u8,
-                        c: 29,
-                    });
-                    cols.state.populate(&mut blu, event.0.clk, event.0.pc);
-                    cols.adapter.populate(&mut blu, event.1);
-                });
-                blu
-            })
-            .collect::<Vec<_>>();
-
-        output.add_byte_lookup_events_from_maps(blu_batches.iter().collect_vec());
-    }
-
-    fn included(&self, shard: &Self::Record) -> bool {
-        if let Some(shape) = shard.shape.as_ref() {
-            shape.included::<F, _>(self)
-        } else {
-            !shard.alu_x0_events.is_empty()
-                && (M::IS_TRUSTED != shard.program.enable_untrusted_programs)
-        }
     }
 }
 
