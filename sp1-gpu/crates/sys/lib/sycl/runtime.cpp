@@ -500,6 +500,13 @@ void* sp1_kernel_named(void* kernel, const char* name) {
 void* sp1_profile_begin(void*) { return nullptr; }
 void sp1_profile_end(void*, const char*, void*) {}
 
+// Writes the profile now (see lib/runtime/stream.cu).
+void sp1_profile_flush() {
+    if (!sp1prof::enabled()) return;
+    GpuProfiler::get().resolve(0);
+    sp1prof::totals().write();
+}
+
 // ---------------------------------------------------------------------------------------------
 // Memory
 // ---------------------------------------------------------------------------------------------

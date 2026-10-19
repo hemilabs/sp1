@@ -450,6 +450,14 @@ extern "C" void sp1_profile_end(void* token, const char* name, void* stream) {
     if (token) GpuProfiler::get().end((cudaEvent_t)token, name, (cudaStream_t)stream);
 }
 
+// Writes the profile now. The atexit handler does this as well, but a process that ends with
+// ExitProcess (Rust's std::process::exit on Windows) never runs the executable's atexit handlers.
+extern "C" void sp1_profile_flush() {
+    if (!sp1prof::enabled()) return;
+    GpuProfiler::get().resolve(0);
+    sp1prof::totals().write();
+}
+
 // Create an nvtx domain.
 
 extern "C" nvtxDomainHandle_t nvtxDomainCreateARust(char* name) {

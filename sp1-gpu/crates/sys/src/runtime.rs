@@ -23,6 +23,10 @@ extern "C" {
 
     pub fn cuda_sm_count(count: *mut i32) -> CudaRustError;
 
+    /// Writes the SP1_GPU_KERNEL_PROFILE profile, when on. A process that exits through
+    /// `std::process::exit` needs this: on Windows it skips the C runtime's atexit handlers.
+    pub fn sp1_profile_flush();
+
     pub fn cuda_malloc_host(ptr: *mut *mut c_void, count: usize) -> CudaRustError;
     pub fn cuda_host_register(ptr: *const c_void, count: usize) -> CudaRustError;
     pub fn cuda_free_host(ptr: *const c_void) -> CudaRustError;
