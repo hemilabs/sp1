@@ -9,6 +9,8 @@
 
 pub mod fq2;
 pub mod g2;
+#[cfg(feature = "cuda")]
+pub mod hot;
 pub mod profile;
 pub mod proof;
 pub mod prover;

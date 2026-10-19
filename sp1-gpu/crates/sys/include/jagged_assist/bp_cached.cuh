@@ -19,6 +19,7 @@
 // buffer ends up in the same newest-first order as the sumcheck point.
 #pragma once
 #include <type_traits>
+#include "challenger/warp_duplex.cuh"
 
 #define BP_S 4  // number of live memory states (FAIL excluded)
 
@@ -377,6 +378,53 @@ __global__ void bpCachedInterpolateAndObserve(
     int round_num,
     EF* sum_values,
     EF* claim) {
+#ifndef __HIPCC__
+    if constexpr (std::is_same<Challenger, DuplexChallenger>::value &&
+                  std::is_same<EF, kb31_extension_t>::value) {
+        // Warp path (launched with 32 threads): lane-parallel partial sums, closed-form
+        // interpolation on the fixed nodes {0, 1/2, 1} (no field inversion), and the
+        // warp-cooperative Poseidon2 challenger. Bit-identical results.
+        __shared__ kb31_t sh[48];
+        __shared__ size_t shs[2];
+        if (blockIdx.x != 0 || threadIdx.x >= 32) return;
+        EF y_0 = EF::zero();
+        EF y_half = EF::zero();
+        for (int i = threadIdx.x; i < num_partials; i += 32) {
+            y_0 += partials[i];
+            y_half += partials[num_partials + i];
+        }
+        y_0 = warpSumExt(y_0);
+        y_half = warpSumExt(y_half);
+        EF y_1 = claim[0] - y_0;
+        if (threadIdx.x == 0) {
+            sum_values[3 * round_num + 0] = y_0;
+            sum_values[3 * round_num + 1] = y_half;
+            sum_values[3 * round_num + 2] = y_1;
+        }
+        // p(0) = y0, p(1/2) = yh, p(1) = y1: c0 = y0, c1 = 4yh - 3y0 - y1, c2 = 2y0 - 4yh + 2y1
+        // (the unique quadratic; identical to interpolateQuadratic(0, 1/2, 1, ...)).
+        EF y0x2 = y_0 + y_0, yhx2 = y_half + y_half, yhx4 = yhx2 + yhx2;
+        EF c0 = y_0;
+        EF c1 = yhx4 - y0x2 - y_0 - y_1;
+        EF c2 = y0x2 - yhx4 + y_1 + y_1;
+        WarpDuplex w = WarpDuplex::stage(challenger, sh, shs);
+        w.observe_ext(c0);
+        w.observe_ext(c1);
+        w.observe_ext(c2);
+        EF alpha = w.sample_ext();
+        w.unstage(challenger);
+        if (threadIdx.x == 0) {
+            rho[d.N - 1 - round_num] = alpha;
+            EF t(c2);
+            t *= alpha;
+            t += c1;
+            t *= alpha;
+            t += c0;
+            claim[0] = t;
+        }
+        return;
+    }
+#endif
     if (blockIdx.x != 0 || threadIdx.x != 0) return;
     EF y_0 = EF::zero();
     EF y_half = EF::zero();

@@ -12,10 +12,12 @@ use crate::{
 };
 use hashbrown::HashMap;
 use itertools::Itertools;
-use slop_maybe_rayon::prelude::{IndexedParallelIterator, ParallelIterator, ParallelSliceMut};
 use slop_air::{Air, AirBuilder, BaseAir};
 use slop_algebra::{AbstractField, PrimeField32};
 use slop_matrix::Matrix;
+use slop_maybe_rayon::prelude::{
+    IndexedParallelIterator, ParallelIterator, ParallelSlice, ParallelSliceMut,
+};
 use sp1_core_executor::{
     events::{ByteLookupEvent, ByteRecord, MemInstrEvent, MemoryAccessPosition},
     ExecutionRecord, Opcode, Program, CLK_INC, PC_INC,
@@ -119,11 +121,70 @@ impl<F: PrimeField32, M: TrustMode> MachineAir<F> for LoadX0Chip<M> {
     fn generate_trace_into(
         &self,
         input: &ExecutionRecord,
-        output: &mut ExecutionRecord,
+        _output: &mut ExecutionRecord,
         buffer: &mut [MaybeUninit<F>],
     ) {
+        // The byte lookups are collected by `generate_dependencies`.
+        self.generate_trace_into_with::<F, sp1_core_executor::events::DiscardByteRecord>(
+            input, buffer,
+        );
+    }
+
+    fn generate_dependencies(&self, input: &ExecutionRecord, output: &mut ExecutionRecord) {
         if input.program.enable_untrusted_programs == M::IS_TRUSTED {
             return;
+        }
+        // The same byte lookups as `generate_trace_into_with`, populating one scratch row per
+        // chunk instead of writing a whole trace.
+        let events = &input.memory_load_x0_events;
+        let chunk_size = std::cmp::max(events.len() / num_cpus::get(), 1);
+        let width = <Self as BaseAir<F>>::width(self);
+        let blu_events = events
+            .par_chunks(chunk_size)
+            .map(|chunk| {
+                let mut blu: HashMap<ByteLookupEvent, usize> = HashMap::new();
+                let mut scratch = vec![F::zero(); width];
+                for event in chunk {
+                    scratch.fill(F::zero());
+                    let row: &mut [F] = &mut scratch;
+                    let cols: &mut LoadX0Columns<F, M> = row.borrow_mut();
+                    self.event_to_row(&event.0, cols, &mut blu);
+                    cols.state.populate(&mut blu, event.0.clk, event.0.pc);
+                    cols.adapter.populate(&mut blu, event.1);
+                    if !M::IS_TRUSTED {
+                        let cols: &mut LoadX0Columns<F, UserMode> = row.borrow_mut();
+                        cols.adapter_cols.is_trusted = F::from_bool(!event.1.is_untrusted);
+                    }
+                }
+                blu
+            })
+            .collect::<Vec<_>>();
+        output.add_byte_lookup_events_from_maps(blu_events.iter().collect_vec());
+    }
+
+    fn included(&self, shard: &Self::Record) -> bool {
+        if let Some(shape) = shard.shape.as_ref() {
+            shape.included::<F, _>(self)
+        } else {
+            !shard.memory_load_x0_events.is_empty()
+                && (M::IS_TRUSTED != shard.program.enable_untrusted_programs)
+        }
+    }
+    fn column_names(&self) -> Vec<String> {
+        LoadX0Columns::<F, M>::struct_reflection().unwrap()
+    }
+}
+
+impl<M: TrustMode> LoadX0Chip<M> {
+    /// Writes the trace into `buffer` and returns the byte lookups of each parallel chunk,
+    /// collected into `R`.
+    fn generate_trace_into_with<F: PrimeField32, R: ByteRecord + Default + Send>(
+        &self,
+        input: &ExecutionRecord,
+        buffer: &mut [MaybeUninit<F>],
+    ) -> Vec<R> {
+        if input.program.enable_untrusted_programs == M::IS_TRUSTED {
+            return Vec::new();
         }
         let chunk_size = std::cmp::max((input.memory_load_x0_events.len()) / num_cpus::get(), 1);
         let padded_nb_rows = <LoadX0Chip<M> as MachineAir<F>>::num_rows(self, input).unwrap();
@@ -145,7 +206,7 @@ impl<F: PrimeField32, M: TrustMode> MachineAir<F> for LoadX0Chip<M> {
             .par_chunks_mut(chunk_size * width)
             .enumerate()
             .map(|(i, rows)| {
-                let mut blu: HashMap<ByteLookupEvent, usize> = HashMap::new();
+                let mut blu = R::default();
                 rows.chunks_mut(width).enumerate().for_each(|(j, row)| {
                     let idx = i * chunk_size + j;
                     let cols: &mut LoadX0Columns<F, M> = row.borrow_mut();
@@ -165,19 +226,7 @@ impl<F: PrimeField32, M: TrustMode> MachineAir<F> for LoadX0Chip<M> {
             })
             .collect::<Vec<_>>();
 
-        output.add_byte_lookup_events_from_maps(blu_events.iter().collect_vec());
-    }
-
-    fn included(&self, shard: &Self::Record) -> bool {
-        if let Some(shape) = shard.shape.as_ref() {
-            shape.included::<F, _>(self)
-        } else {
-            !shard.memory_load_x0_events.is_empty()
-                && (M::IS_TRUSTED != shard.program.enable_untrusted_programs)
-        }
-    }
-    fn column_names(&self) -> Vec<String> {
-        LoadX0Columns::<F, M>::struct_reflection().unwrap()
+        blu_events
     }
 }
 
@@ -186,7 +235,7 @@ impl<M: TrustMode> LoadX0Chip<M> {
         &self,
         event: &MemInstrEvent,
         cols: &mut LoadX0Columns<F, M>,
-        blu: &mut HashMap<ByteLookupEvent, usize>,
+        blu: &mut impl ByteRecord,
     ) {
         // Populate memory accesses for reading from memory.
         cols.memory_access.populate(event.mem_access, blu);

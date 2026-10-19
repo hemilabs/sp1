@@ -92,8 +92,6 @@ pub fn generate_first_layer<'a>(
         let real_height = input_data.main_poly_height(name).unwrap();
 
         const BLOCK_SIZE: usize = 256;
-        const ROW_STRIDE: usize = 8;
-        const INTERACTION_STRIDE: usize = 4;
         // To fit the padding requirement, each trace must have even height.
         assert_eq!(real_height % 2, 0);
         let is_padding = real_height == 0;
@@ -103,11 +101,9 @@ pub fn generate_first_layer<'a>(
         let half_height = matrix_height.div_ceil(2);
 
         let block_dim = BLOCK_SIZE;
-        let grid_size = (
-            half_height.div_ceil(BLOCK_SIZE * ROW_STRIDE),
-            num_interactions.div_ceil(INTERACTION_STRIDE),
-            1,
-        );
+        // One interaction per block column (x, fastest), row pairs over y (grid-stride loop
+        // in the kernel, so the y extent can be capped at the CUDA limit).
+        let grid_size = (num_interactions, half_height.div_ceil(BLOCK_SIZE).clamp(1, 65535), 1);
         unsafe {
             let preprocessed_ptr = input_data.preprocessed_ptr(name);
             let main_ptr = input_data.main_ptr(name);

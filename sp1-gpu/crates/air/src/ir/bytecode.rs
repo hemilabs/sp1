@@ -9,9 +9,10 @@
 //!   to `out`; reads from `a` / `b` are either reg slots,
 //!   leaf-cache indices, or pool indices depending on opcode.
 //! - `max_reg` : size of the per-lane register file (max-live count).
-//! - `roots`   : the assertion roots, paired with their alpha index. The
-//!   kernel reads each root reg, multiplies by `α^k`, and adds
-//!   to the accumulator.
+//! - `asserts` : the assertion roots as (defining instruction, alpha index),
+//!   in instruction order. The kernel multiplies each root's value by `α^k`
+//!   and adds it to the accumulator right after computing it, so a root only
+//!   occupies a register while later instructions still read it.
 //!
 //! Uses explicit leaf/const/public pools per chunk (rather than per-chip
 //! globals), enabling shared-memory staging.
@@ -27,9 +28,9 @@ use std::collections::HashMap;
 /// Bytecode opcodes for the per-row register-machine the fused sequential
 /// kernel interprets. Must mirror the constants in `sequential.cuh`.
 /// Asserts are *not* an opcode — they live in the chunk's separate
-/// `asserts: Vec<(reg, alpha_idx)>` table so the interpreter can iterate
-/// them after the main bytecode body, summing `α[αᵢ] · regs[root]` into
-/// the accumulator.
+/// `asserts: Vec<(instr, alpha_idx)>` table, sorted by instruction; the
+/// interpreter adds `α[αᵢ] · value` to the accumulator right after the
+/// instruction `instr` that computes the root's value.
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BcOp {
@@ -97,9 +98,12 @@ pub struct ChunkBytecode {
     pub consts: Vec<F>,
     pub publics: Vec<u32>,
     pub instrs: Vec<DagInstr>,
-    /// (reg, alpha_index) per assertion in this chunk. The kernel applies
-    /// `accumulator += alpha^k * regs[reg]` at the end. Kept separate
-    /// from `instrs` so the schedule can drive the alpha-table read.
+    /// (instruction index, alpha_index) per assertion in this chunk, sorted
+    /// by instruction index. The kernel applies `accumulator += alpha^k * x`
+    /// right after instruction `instr` computes `x`, so assertion roots are
+    /// not kept live to the end of the chunk (they used to be most of
+    /// `max_reg`). Kept separate from `instrs` so the schedule can drive the
+    /// alpha-table read.
     pub asserts: Vec<(u16, u32)>,
     pub max_reg: u16,
     pub n_constraints: u32,
@@ -243,8 +247,12 @@ fn emit_chunk(local: &LocalChunk) -> ChunkBytecode {
             last[c as usize] = last[c as usize].max(i);
         }
     }
-    for &(n, _) in &local.roots {
-        last[n as usize] = topo.len();
+    // Assertion roots are accumulated where they are computed (see
+    // `ChunkBytecode::asserts`), so they need no register beyond their last
+    // read by another instruction.
+    let mut pos = vec![usize::MAX; nodes.len()];
+    for (i, &n) in topo.iter().enumerate() {
+        pos[n] = i;
     }
     let mut phys = vec![0u16; nodes.len()];
     let mut active = Vec::<(usize, u16)>::new();
@@ -318,7 +326,12 @@ fn emit_chunk(local: &LocalChunk) -> ChunkBytecode {
         };
         bc.instrs.push(instr);
     }
-    bc.asserts = local.roots.iter().map(|&(n, alpha)| (reg(n), alpha)).collect();
+    let at = |n: NodeId| {
+        u16::try_from(pos[n as usize]).expect("chunk too large for u16 assertion positions")
+    };
+    bc.asserts = local.roots.iter().map(|&(n, alpha)| (at(n), alpha)).collect();
+    // Stable: assertions of one root keep their order.
+    bc.asserts.sort_by_key(|&(i, _)| i);
     annotate_forwarding(&mut bc);
     bc
 }
@@ -327,9 +340,9 @@ fn emit_chunk(local: &LocalChunk) -> ChunkBytecode {
 pub const FLAG_A_PREV: u8 = 1;
 /// `DagInstr::_pad` flag: operand `b` is the previous instruction's result.
 pub const FLAG_B_PREV: u8 = 2;
-/// `DagInstr::_pad` flag: the result is consumed only by the next instruction
-/// (and is not an assertion root), so the kernel keeps it in a register and
-/// skips the register-file store.
+/// `DagInstr::_pad` flag: the result is read by no instruction but (possibly)
+/// the next one, so the kernel keeps it in a register and skips the
+/// register-file store. Assertion roots are consumed from that register too.
 pub const FLAG_NO_STORE: u8 = 4;
 
 /// Annotate operand forwarding for the fused sequential kernel. The kernel's
@@ -339,7 +352,8 @@ pub const FLAG_NO_STORE: u8 = 4;
 /// ~half of that traffic. Pure annotation: the instruction stream, register
 /// assignment and arithmetic are unchanged, so results are bit-identical, and
 /// consumers that ignore the flags (`zerocheck_pad_adj`) stay correct because
-/// they still read and write every register.
+/// they still read and write every register (and take assertion values from
+/// the instruction's result, never from the register file).
 fn annotate_forwarding(bc: &mut ChunkBytecode) {
     let n = bc.instrs.len();
     let mut writer = vec![usize::MAX; bc.max_reg as usize];
@@ -364,9 +378,6 @@ fn annotate_forwarding(bc: &mut ChunkBytecode) {
         }
         writer[ins.out as usize] = i;
     }
-    for &(r, _) in &bc.asserts {
-        only_next[writer[r as usize]] = false;
-    }
     for ((ins, mut flag), only_next) in bc.instrs.iter_mut().zip(flags).zip(only_next) {
         if only_next {
             flag |= FLAG_NO_STORE;
@@ -387,8 +398,9 @@ fn const_index(value: F, pool: &mut Vec<F>, indices: &mut HashMap<u32, u16>) -> 
 /// the topological order, reusing slots whose previous occupant's last use
 /// has passed.
 ///
-/// Constraint roots are kept live to the very end so the post-topo assert
-/// pass can still read them.
+/// Constraint roots are kept live to the very end, as the kernels' former
+/// post-topo assert pass required. Only `lower_sequential`'s scratch bound
+/// uses this mapping, and the longer root lifetimes only loosen it.
 fn liveness_allocate(
     chunk: &Chunk,
     constraints: &[ConstraintInfo],
@@ -414,7 +426,7 @@ fn liveness_allocate(
             }
         }
     }
-    // Constraint roots must remain live through the assert pass.
+    // Constraint roots remain live through the (former) assert pass.
     let end = topo.len();
     for &ci in &chunk.constraint_indices {
         let root = constraints[ci].root;
@@ -531,9 +543,141 @@ mod tests {
         assert_eq!(bc.instrs.len(), 2); // Only x and zero remain; the second leaf is dead.
         assert_eq!(bc.leaves.len(), 1);
         assert_eq!(bc.consts, vec![F::zero()]);
-        assert_eq!(bc.asserts.iter().map(|&(_, a)| a).collect::<Vec<_>>(), [17, 20, 23, 26, 29]);
-        assert_eq!(bc.asserts[0].0, bc.asserts[1].0);
-        assert_eq!(bc.asserts[0].0, bc.asserts[4].0);
-        assert_eq!(bc.asserts[2].0, bc.asserts[3].0);
+        // (defining instruction, alpha): roots 3, 4 and the repeated 3 alias to
+        // `x` (instruction 0), roots 5 and 7 to the zero constant (instruction 1).
+        assert_eq!(bc.asserts, [(0, 17), (0, 20), (0, 29), (1, 23), (1, 26)]);
     }
+}
+
+/// Level schedule of a chunk for the cooperative small-round kernel
+/// `zerocheck_fused_sequential_coop`, where several lanes evaluate one row.
+///
+/// Instructions are grouped by dependency level (ASAP for operations, ALAP
+/// for loads/constants so they do not stay live longer than needed) and,
+/// within a level, sorted by opcode class so neighbouring lanes mostly take
+/// the same switch arm. Values live in `n_phys` slots allocated by liveness
+/// over the level order: a slot is reused only at a level strictly after the
+/// last level reading it, so the lanes of one level never race. Every value
+/// is computed by the same operation on the same operands as in `instrs`,
+/// and the assert accumulation is an exact field sum, so the result is
+/// bit-identical to the sequential interpreter.
+#[derive(Debug, Default, Clone)]
+pub struct LevelSchedule {
+    /// One entry per instruction: `[op | a << 16, b | out << 16]`. For
+    /// `AddF`/`SubF`/`MulF` `a`/`b` are slots; for `NegF` `a` is a slot; for
+    /// `MulConst` `a` is a slot and `b` a const-pool index; for loads `a` is
+    /// the leaf/const/public index as in `instrs`. `out` is the result slot.
+    pub code: Vec<[u32; 2]>,
+    /// `levels + 1` start offsets into `code`.
+    pub level_starts: Vec<u16>,
+    /// Slot of each assertion root, parallel to `ChunkBytecode::asserts`.
+    pub assert_slots: Vec<u16>,
+    /// Number of value slots one row needs.
+    pub n_phys: u16,
+}
+
+pub fn level_schedule(bc: &ChunkBytecode) -> LevelSchedule {
+    let n = bc.instrs.len();
+    assert!(n < u16::MAX as usize, "chunk too large for a u16 level schedule");
+    let is_bin =
+        |op: u8| op == BcOp::AddF as u8 || op == BcOp::SubF as u8 || op == BcOp::MulF as u8;
+    let is_un = |op: u8| op == BcOp::NegF as u8 || op == BcOp::MulConst as u8;
+    let mut writer = vec![usize::MAX; bc.max_reg as usize + 1];
+    let mut src: Vec<[usize; 2]> = vec![[usize::MAX; 2]; n];
+    let mut users: Vec<Vec<usize>> = vec![Vec::new(); n];
+    let mut level = vec![0usize; n];
+    for (i, ins) in bc.instrs.iter().enumerate() {
+        if is_bin(ins.opcode) {
+            let (a, b) = (writer[ins.a as usize], writer[ins.b as usize]);
+            src[i] = [a, b];
+            users[a].push(i);
+            if b != a {
+                users[b].push(i);
+            }
+            level[i] = 1 + level[a].max(level[b]);
+        } else if is_un(ins.opcode) {
+            let a = writer[ins.a as usize];
+            src[i][0] = a;
+            users[a].push(i);
+            level[i] = 1 + level[a];
+        }
+        writer[ins.out as usize] = i;
+    }
+    let mut is_root = vec![false; n];
+    for &(i, _) in &bc.asserts {
+        is_root[i as usize] = true;
+    }
+    // ALAP for operand-free instructions (loads, constants): one level
+    // before their first consumer.
+    for i in 0..n {
+        if src[i][0] == usize::MAX && !users[i].is_empty() {
+            level[i] = users[i].iter().map(|&u| level[u]).min().unwrap() - 1;
+        }
+    }
+    let last_use: Vec<usize> = (0..n)
+        .map(|i| {
+            if is_root[i] {
+                usize::MAX
+            } else {
+                users[i].iter().map(|&u| level[u]).max().unwrap_or(level[i])
+            }
+        })
+        .collect();
+    let class = |op: u8| -> u8 {
+        match op {
+            x if x == BcOp::LoadLeaf as u8 => 0,
+            x if x == BcOp::MulF as u8 => 1,
+            x if x == BcOp::MulConst as u8 => 2,
+            x if x == BcOp::AddF as u8 => 3,
+            x if x == BcOp::SubF as u8 => 4,
+            x if x == BcOp::NegF as u8 => 5,
+            x if x == BcOp::LoadConst as u8 => 6,
+            _ => 7,
+        }
+    };
+    let mut order: Vec<usize> = (0..n).collect();
+    order.sort_by_key(|&i| (level[i], class(bc.instrs[i].opcode), i));
+    let n_levels = level.iter().map(|&l| l + 1).max().unwrap_or(0);
+    let mut expire: Vec<Vec<usize>> = vec![Vec::new(); n_levels + 1];
+    let mut phys = vec![u16::MAX; n];
+    let mut free: Vec<u16> = Vec::new();
+    let mut n_phys: u16 = 0;
+    let mut level_starts = vec![0u16; n_levels + 1];
+    let mut code = Vec::with_capacity(n);
+    let mut j = 0usize;
+    for l in 0..n_levels {
+        if l > 0 {
+            // Values whose last read was at level l - 1 are dead from level l on.
+            for &x in &expire[l - 1] {
+                free.push(phys[x]);
+            }
+        }
+        level_starts[l] = j as u16;
+        while j < n && level[order[j]] == l {
+            let i = order[j];
+            let p = free.pop().unwrap_or_else(|| {
+                n_phys += 1;
+                n_phys - 1
+            });
+            phys[i] = p;
+            if last_use[i] != usize::MAX {
+                expire[last_use[i]].push(i);
+            }
+            let ins = bc.instrs[i];
+            let (a, b) = if is_bin(ins.opcode) {
+                (phys[src[i][0]] as u32, phys[src[i][1]] as u32)
+            } else if ins.opcode == BcOp::NegF as u8 {
+                (phys[src[i][0]] as u32, 0)
+            } else if ins.opcode == BcOp::MulConst as u8 {
+                (phys[src[i][0]] as u32, ins.b as u32)
+            } else {
+                (ins.a as u32, 0)
+            };
+            code.push([ins.opcode as u32 | (a << 16), b | ((p as u32) << 16)]);
+            j += 1;
+        }
+    }
+    level_starts[n_levels] = j as u16;
+    let assert_slots = bc.asserts.iter().map(|&(i, _)| phys[i as usize]).collect();
+    LevelSchedule { code, level_starts, assert_slots, n_phys }
 }

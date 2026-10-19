@@ -7788,6 +7788,7 @@ version = "6.8.1"
 dependencies = [
  "criterion",
  "rand 0.8.6",
+ "rayon",
  "serde_json",
  "serial_test",
  "slop-air",

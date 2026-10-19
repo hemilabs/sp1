@@ -46,5 +46,9 @@ extern "C" void* zerocheck_gkr_sweep_ext_kernel();
 
 // Corner sweep for the fused first-two-rounds: the GKR opening batch at the
 // four boolean grid corners (raw rows `4·quad + c`, no interpolation).
-// Round 0 only — base-field trace. Output stride 4.
+// Round 0 only — base-field trace. Output stride 4. Chips with at most
+// GKR_CORNER_NARROW_MAX columns are swept thread-per-quad, wider ones
+// warp-per-quad (must match `GKR_CORNER_NARROW_MAX` in zerocheck/src/prover.rs,
+// which picks the tile size).
+constexpr uint32_t GKR_CORNER_NARROW_MAX = 256;
 extern "C" void* zerocheck_gkr_corner_sweep_kb_kernel();

@@ -19,7 +19,8 @@ use sp1_hypercube::{
 use sp1_jit::MinimalTrace;
 use sp1_primitives::SP1Field;
 use sp1_prover_types::{
-    network_base_types::ProofMode, Artifact, ArtifactClient, SerializableRiscvMachine, TaskType,
+    network_base_types::ProofMode, Artifact, ArtifactClient, ArtifactType,
+    SerializableRiscvMachine, TaskType,
 };
 use tokio::{
     sync::{mpsc, oneshot},
@@ -642,6 +643,28 @@ pub(super) async fn create_core_proving_task<A: ArtifactClient, W: WorkerClient>
 
     let proof_data = ProofData { task_id, range, proof: proof_artifact };
     Ok(SpawnProveOutput { deferred_message, proof_data })
+}
+
+/// How long the executor waits for the controller to upload the proof's common input.
+const COMMON_INPUT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// Waits until the controller has uploaded the proof's common input.
+///
+/// The controller can start the executor while the proof's setup task is still running (the
+/// common input holds the vk), so whatever reads the common input or hands it to a task waits
+/// for it here first. Once it is there this is a single lookup.
+pub(crate) async fn wait_for_common_input<A: ArtifactClient>(
+    artifact_client: &A,
+    common_input: &Artifact,
+) -> anyhow::Result<()> {
+    let start = std::time::Instant::now();
+    while !artifact_client.exists(common_input, ArtifactType::UnspecifiedArtifactType).await? {
+        if start.elapsed() > COMMON_INPUT_TIMEOUT {
+            anyhow::bail!("timed out waiting for the common prover input {}", common_input.0);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+    }
+    Ok(())
 }
 
 /// Classifies a chunk-execution failure for the task retry policy.

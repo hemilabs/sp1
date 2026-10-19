@@ -130,6 +130,22 @@ impl ByteRecord for Vec<ByteLookupEvent> {
     }
 }
 
+/// A [`ByteRecord`] that drops every event.
+///
+/// For trace generation that only needs the trace values: the byte lookups of these chips are
+/// collected separately by `generate_dependencies`, so building them per row (in a `Vec` that is
+/// then dropped) is wasted host time.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct DiscardByteRecord;
+
+impl ByteRecord for DiscardByteRecord {
+    #[inline(always)]
+    fn add_byte_lookup_event(&mut self, _: ByteLookupEvent) {}
+
+    #[inline(always)]
+    fn add_byte_lookup_events_from_maps(&mut self, _: Vec<&HashMap<ByteLookupEvent, usize>>) {}
+}
+
 impl ByteRecord for HashMap<ByteLookupEvent, usize> {
     #[inline]
     fn add_byte_lookup_event(&mut self, blu_event: ByteLookupEvent) {
