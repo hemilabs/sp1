@@ -43,8 +43,8 @@ use tracing::Instrument;
 use crate::{
     verify::SP1Verifier,
     worker::{
-        release_core_proving_keys, MessageReceiver, RawTaskRequest, TaskContext, TaskError, TaskId,
-        WorkerClient,
+        local_core_workers, release_core_proving_keys, reserve_core_proving_keys, MessageReceiver,
+        RawTaskRequest, TaskContext, TaskError, TaskId, WorkerClient,
     },
     SP1_CIRCUIT_VERSION,
 };
@@ -246,6 +246,19 @@ where
         Ok(output)
     }
 
+    /// Submits the `CoreExecute` task and subscribes to the shard proofs it streams back.
+    async fn submit_core_execute(
+        &self,
+        request: RawTaskRequest,
+    ) -> Result<(TaskId, MessageReceiver<ProofData>), TaskError> {
+        let executor_task_id =
+            self.worker_client.submit_task(TaskType::CoreExecute, request).await?;
+        let core_proof_rx = MessageReceiver::<ProofData>::new(
+            self.worker_client.subscribe_task_messages(&executor_task_id).await?,
+        );
+        Ok((executor_task_id, core_proof_rx))
+    }
+
     pub async fn run(&self, request: RawTaskRequest) -> Result<ExecutionOutput, TaskError> {
         let RawTaskRequest { inputs, outputs, context } = request;
         let [output] = outputs.try_into().unwrap();
@@ -254,6 +267,13 @@ where
 
         // However the proof ends, the workers' cached core proving key for it goes away with it.
         let _release_core_pk = ReleaseCoreProvingKeysOnDrop(elf.clone());
+        // A Groth16 proof starts the GPU prover's helper now, so that it has its key loaded by the
+        // time the wrap is done; whatever the proof does not use goes when it ends. This helps
+        // when this process also runs the Groth16 task, as a local node or GPU server does.
+        #[cfg(feature = "native-gnark")]
+        let _groth16_prestart = (mode == ProofMode::Groth16)
+            .then(crate::worker::prover::groth16_backend::prestart_gpu_helper)
+            .flatten();
 
         let stdin_download_handle = self
             .artifact_client
@@ -283,6 +303,11 @@ where
                     tracing::debug!("setup cache hit");
                     vkey.clone()
                 } else {
+                    // Have the setup task leave its proving key for this proof's core shards
+                    // (a no-op unless the workers run in this process).
+                    if reserve_core_proving_keys(&elf_clone) {
+                        tracing::debug!("setup task keeps the core proving key");
+                    }
                     let vk_artifact = artifact_client_clone.create_artifact()?;
                     let setup_request = RawTaskRequest {
                         inputs: vec![elf_clone.clone()],
@@ -320,8 +345,6 @@ where
         });
 
         let stdin: SP1Stdin = stdin_download_handle.await?;
-        let vk = vkey_download_handle.await.map_err(|e| TaskError::Fatal(e.into()))??;
-
         let stdin = Arc::new(stdin);
 
         let deferred_proofs = stdin.proofs.iter().map(|(proof, _)| proof.clone());
@@ -329,15 +352,7 @@ where
 
         let num_deferred_proofs = deferred_inputs.num_deferred_proofs();
         let deferred_digest = deferred_inputs.deferred_digest().map(|x| x.as_canonical_u32());
-        let common_input = CommonProverInput {
-            vk,
-            mode,
-            deferred_digest,
-            num_deferred_proofs,
-            nonce: proof_nonce,
-        };
         let common_input_artifact = self.artifact_client.create_artifact()?;
-        self.artifact_client.upload(&common_input_artifact.clone(), common_input.clone()).await?;
 
         // Submit the executor as a CoreExecute task
         let execution_output_artifact = self.artifact_client.create_artifact()?;
@@ -353,14 +368,37 @@ where
             machine: self.verifier.core.machine().clone(),
             stdin_private: metadata.stdin_private,
         };
-        let executor_task_id = self
-            .worker_client
-            .submit_task(TaskType::CoreExecute, executor_request.into_raw()?)
-            .await?;
+        let executor_request = executor_request.into_raw()?;
 
-        let core_proof_rx = MessageReceiver::<ProofData>::new(
-            self.worker_client.subscribe_task_messages(&executor_task_id).await?,
-        );
+        // The executor needs the common input (and so the vk) only for its first shard, so when
+        // the workers run in this process it starts while the setup task runs, and its users
+        // wait for the common input to be uploaded (see `wait_for_common_input`). A cluster's
+        // setup task can queue for a GPU, so there it starts after the setup, as it does with
+        // `SP1_EXECUTE_DURING_SETUP=false`.
+        let execute_during_setup = std::env::var("SP1_EXECUTE_DURING_SETUP")
+            .map(|v| v != "0" && v != "false")
+            .unwrap_or(true)
+            && local_core_workers();
+        let executor = if execute_during_setup {
+            Ok(self.submit_core_execute(executor_request).await?)
+        } else {
+            Err(executor_request)
+        };
+
+        let vk = vkey_download_handle.await.map_err(|e| TaskError::Fatal(e.into()))??;
+        let common_input = CommonProverInput {
+            vk,
+            mode,
+            deferred_digest,
+            num_deferred_proofs,
+            nonce: proof_nonce,
+        };
+        self.artifact_client.upload(&common_input_artifact.clone(), common_input.clone()).await?;
+
+        let (executor_task_id, core_proof_rx) = match executor {
+            Ok(executor) => executor,
+            Err(executor_request) => self.submit_core_execute(executor_request).await?,
+        };
 
         let mut join_set = JoinSet::<Result<(), TaskError>>::new();
 

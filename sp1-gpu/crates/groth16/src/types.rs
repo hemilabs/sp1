@@ -98,6 +98,7 @@ impl Groth16ProvingData {
     /// Load Groth16 proving data from the exported binary directory.
     pub fn load(dir: &str) -> anyhow::Result<Self> {
         let dir = std::path::Path::new(dir);
+        let t_load = std::time::Instant::now();
 
         // Read metadata
         let meta = std::fs::read(dir.join("groth16_metadata.bin"))?;
@@ -214,6 +215,7 @@ impl Groth16ProvingData {
             expected_k_len,
         );
 
+        eprintln!("[groth16-load] G1 points loaded: {:?}", t_load.elapsed());
         // Load PK G2 points
         let pk_g2_b = load_g2_points(&dir.join("pk_g2_b.bin"))?;
         anyhow::ensure!(
@@ -246,6 +248,7 @@ impl Groth16ProvingData {
             anyhow::ensure!(len == 1, "{name} must contain exactly 1 point, got {len}");
         }
 
+        eprintln!("[groth16-load] proving data loaded: {:?}", t_load.elapsed());
         Ok(Self {
             domain_size,
             lg_domain_size,
@@ -281,10 +284,23 @@ impl Groth16WitnessData {
         // Montgomery magic header, the Fr values are used directly (zero
         // conversion cost). Otherwise falls back to canonical-to-Montgomery
         // conversion.
-        let wire_values = load_fr_elements_auto(&dir.join("wire_values.bin"))?;
-        let solution_a = load_fr_elements(&dir.join("solution_a.bin"))?;
-        let solution_b = load_fr_elements(&dir.join("solution_b.bin"))?;
-        let solution_c = load_fr_elements(&dir.join("solution_c.bin"))?;
+        // The four ~0.5 GB files are independent: read them at once.
+        let ((wire_values, solution_a), (solution_b, solution_c)) = rayon::join(
+            || {
+                rayon::join(
+                    || load_fr_elements_auto(&dir.join("wire_values.bin")),
+                    || load_fr_elements(&dir.join("solution_a.bin")),
+                )
+            },
+            || {
+                rayon::join(
+                    || load_fr_elements(&dir.join("solution_b.bin")),
+                    || load_fr_elements(&dir.join("solution_c.bin")),
+                )
+            },
+        );
+        let (wire_values, solution_a, solution_b, solution_c) =
+            (wire_values?, solution_a?, solution_b?, solution_c?);
 
         // H is computed on GPU; load if present (backward compat), else empty.
         let h_path = dir.join("h_coefficients.bin");
@@ -382,16 +398,16 @@ impl Drop for Groth16WitnessData {
         }
         unsafe {
             let _ = sp1_gpu_sys::runtime::cuda_host_unregister(
-                self.wire_values.as_ptr() as *const std::ffi::c_void,
+                self.wire_values.as_ptr() as *const std::ffi::c_void
             );
             let _ = sp1_gpu_sys::runtime::cuda_host_unregister(
-                self.solution_a.as_ptr() as *const std::ffi::c_void,
+                self.solution_a.as_ptr() as *const std::ffi::c_void
             );
             let _ = sp1_gpu_sys::runtime::cuda_host_unregister(
-                self.solution_b.as_ptr() as *const std::ffi::c_void,
+                self.solution_b.as_ptr() as *const std::ffi::c_void
             );
             let _ = sp1_gpu_sys::runtime::cuda_host_unregister(
-                self.solution_c.as_ptr() as *const std::ffi::c_void,
+                self.solution_c.as_ptr() as *const std::ffi::c_void
             );
         }
     }
@@ -416,29 +432,31 @@ fn load_g1_points(path: &std::path::Path) -> anyhow::Result<Vec<BN254G1Affine>> 
         path.display(),
         data.len()
     );
-    let n = data.len() / 64;
-    let mut points = Vec::with_capacity(n);
-    for i in 0..n {
-        let offset = i * 64;
-        // LE canonical bytes → BN254Fq (canonical) → Fq (Montgomery) → BN254Fq (Montgomery)
-        let mut canonical_x = crate::BN254Fq { limbs: [0; 8] };
-        let mut canonical_y = crate::BN254Fq { limbs: [0; 8] };
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                data[offset..].as_ptr(),
-                canonical_x.limbs.as_mut_ptr() as *mut u8,
-                32,
-            );
-            std::ptr::copy_nonoverlapping(
-                data[offset + 32..].as_ptr(),
-                canonical_y.limbs.as_mut_ptr() as *mut u8,
-                32,
-            );
-        }
-        let mont_x = Fq::from_bn254fq_canonical(&canonical_x);
-        let mont_y = Fq::from_bn254fq_canonical(&canonical_y);
-        points.push(BN254G1Affine { x: mont_x.to_bn254fq_raw(), y: mont_y.to_bn254fq_raw() });
-    }
+    // LE canonical bytes → BN254Fq (canonical) → Fq (Montgomery) → BN254Fq (Montgomery), in
+    // parallel: ~16M points per file, which a serial loop took seconds over.
+    let points = data
+        .par_chunks_exact(64)
+        .with_min_len(4096)
+        .map(|chunk| {
+            let mut canonical_x = crate::BN254Fq { limbs: [0; 8] };
+            let mut canonical_y = crate::BN254Fq { limbs: [0; 8] };
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    chunk.as_ptr(),
+                    canonical_x.limbs.as_mut_ptr() as *mut u8,
+                    32,
+                );
+                std::ptr::copy_nonoverlapping(
+                    chunk[32..].as_ptr(),
+                    canonical_y.limbs.as_mut_ptr() as *mut u8,
+                    32,
+                );
+            }
+            let mont_x = Fq::from_bn254fq_canonical(&canonical_x);
+            let mont_y = Fq::from_bn254fq_canonical(&canonical_y);
+            BN254G1Affine { x: mont_x.to_bn254fq_raw(), y: mont_y.to_bn254fq_raw() }
+        })
+        .collect();
     Ok(points)
 }
 
@@ -450,29 +468,30 @@ fn load_g2_points(path: &std::path::Path) -> anyhow::Result<Vec<G2Affine>> {
         path.display(),
         data.len()
     );
-    let n = data.len() / 128;
-    let mut points = Vec::with_capacity(n);
-    for i in 0..n {
-        let offset = i * 128;
-        // Each G2 point: [X.A1_LE, X.A0_LE, Y.A1_LE, Y.A0_LE] (A1 first), 32 bytes each
-        let load_fq = |off: usize| -> Fq {
-            let mut canonical = crate::BN254Fq { limbs: [0; 8] };
-            unsafe {
-                std::ptr::copy_nonoverlapping(
-                    data[off..].as_ptr(),
-                    canonical.limbs.as_mut_ptr() as *mut u8,
-                    32,
-                );
-            }
-            Fq::from_bn254fq_canonical(&canonical)
-        };
-        // gnark G2Affine.RawBytes() serializes as [X.A1, X.A0, Y.A1, Y.A0] (each 32 bytes).
-        // After reverseBytes: file layout is [X.A1_LE, X.A0_LE, Y.A1_LE, Y.A0_LE].
-        // Fq2 = c0 + c1*u, where c0 = A0 (real), c1 = A1 (imaginary).
-        let x = Fq2::new(load_fq(offset + 32), load_fq(offset)); // c0=A0, c1=A1
-        let y = Fq2::new(load_fq(offset + 96), load_fq(offset + 64)); // c0=A0, c1=A1
-        points.push(G2Affine { x, y });
-    }
+    let points = data
+        .par_chunks_exact(128)
+        .with_min_len(2048)
+        .map(|chunk| {
+            // Each G2 point: [X.A1_LE, X.A0_LE, Y.A1_LE, Y.A0_LE] (A1 first), 32 bytes each
+            let load_fq = |off: usize| -> Fq {
+                let mut canonical = crate::BN254Fq { limbs: [0; 8] };
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        chunk[off..].as_ptr(),
+                        canonical.limbs.as_mut_ptr() as *mut u8,
+                        32,
+                    );
+                }
+                Fq::from_bn254fq_canonical(&canonical)
+            };
+            // gnark G2Affine.RawBytes() serializes as [X.A1, X.A0, Y.A1, Y.A0] (each 32 bytes).
+            // After reverseBytes: file layout is [X.A1_LE, X.A0_LE, Y.A1_LE, Y.A0_LE].
+            // Fq2 = c0 + c1*u, where c0 = A0 (real), c1 = A1 (imaginary).
+            let x = Fq2::new(load_fq(32), load_fq(0)); // c0=A0, c1=A1
+            let y = Fq2::new(load_fq(96), load_fq(64)); // c0=A0, c1=A1
+            G2Affine { x, y }
+        })
+        .collect();
     Ok(points)
 }
 

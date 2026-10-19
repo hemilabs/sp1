@@ -168,7 +168,7 @@ impl<F: PrimeField32, M: TrustMode> MachineAir<F> for ShiftLeftChip<M> {
                 let cols: &mut ShiftLeftCols<F, M> = row.borrow_mut();
 
                 if idx < nb_rows {
-                    let mut blu = Vec::new();
+                    let mut blu = sp1_core_executor::events::DiscardByteRecord;
                     let event = &input.shift_left_events[idx];
                     cols.adapter.populate(&mut blu, event.1);
                     self.event_to_row(&event.0, &event.1, cols, &mut blu);
@@ -197,8 +197,10 @@ impl<F: PrimeField32, M: TrustMode> MachineAir<F> for ShiftLeftChip<M> {
             .par_chunks(chunk_size)
             .map(|events| {
                 let mut blu: HashMap<ByteLookupEvent, usize> = HashMap::new();
+                // One scratch row per chunk instead of an allocation per event.
+                let mut row = vec![F::zero(); width];
                 events.iter().for_each(|event| {
-                    let mut row = vec![F::zero(); width];
+                    row.fill(F::zero());
                     let cols: &mut ShiftLeftCols<F, M> = row.as_mut_slice().borrow_mut();
                     cols.adapter.populate(&mut blu, event.1);
                     self.event_to_row(&event.0, &event.1, cols, &mut blu);

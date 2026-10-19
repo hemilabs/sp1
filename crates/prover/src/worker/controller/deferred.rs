@@ -80,6 +80,11 @@ impl DeferredInputs {
         artifact_client: impl ArtifactClient,
         worker_client: W,
     ) -> Result<(), TaskError> {
+        if !self.inputs.is_empty() {
+            super::wait_for_common_input(&artifact_client, &common_input)
+                .await
+                .map_err(TaskError::Fatal)?;
+        }
         for input in self.inputs {
             // Calculate the range of the deferred proof.
             let prev_deferred_proof = input.deferred_proof_index.as_canonical_u32() as u64;

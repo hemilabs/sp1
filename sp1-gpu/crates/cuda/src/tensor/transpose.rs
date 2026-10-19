@@ -13,6 +13,13 @@ use crate::{args, DeviceCopy, DeviceTensor, TaskScope};
 /// # Safety
 pub unsafe trait DeviceTransposeKernel<T> {
     fn transpose_kernel() -> KernelPtr;
+
+    /// Block shape `(32, rows, 1)` for `transpose_kernel()`, launched on a grid of
+    /// `(ceil(dim_x / 32), ceil(dim_y / 32), dim_z)`: 32 for the one-element-per-thread kernels,
+    /// 8 for the shared-memory tiled kernel (a 32x8 block per 32x32 tile).
+    fn transpose_block_rows() -> u32 {
+        32
+    }
 }
 
 impl<T: DeviceCopy> DeviceTensor<T>
@@ -24,21 +31,29 @@ where
         let src = &self.raw;
         let mut dst_view = dst.raw.as_view_mut();
         let num_dims = src.sizes().len();
+        assert_eq!(src.sizes()[num_dims - 2], dst_view.sizes()[num_dims - 1]);
+        assert_eq!(src.sizes()[num_dims - 1], dst_view.sizes()[num_dims - 2]);
+        unsafe { self.transpose_into_ptr(dst_view.as_mut_ptr()) };
+    }
+
+    /// Transposes the last two dimensions of the tensor into `dst`, which receives the
+    /// transposed elements contiguously (the layout of [`Self::transpose`]'s output).
+    ///
+    /// # Safety
+    /// `dst` must be valid device memory for `self.total_len()` elements on this tensor's
+    /// stream, not overlapping the tensor.
+    pub unsafe fn transpose_into_ptr(&self, dst: *mut T) {
+        let src = &self.raw;
+        let num_dims = src.sizes().len();
 
         let dim_x = src.sizes()[num_dims - 2];
         let dim_y = src.sizes()[num_dims - 1];
         let dim_z: usize = src.sizes().iter().take(num_dims - 2).product();
-        assert_eq!(dim_x, dst_view.sizes()[num_dims - 1]);
-        assert_eq!(dim_y, dst_view.sizes()[num_dims - 2]);
 
-        let block_dim: Dim3 = (32u32, 32u32, 1u32).into();
-        let grid_dim: Dim3 = (
-            dim_x.div_ceil(block_dim.x as usize),
-            dim_y.div_ceil(block_dim.y as usize),
-            dim_z.div_ceil(block_dim.z as usize),
-        )
-            .into();
-        let args = args!(src.as_ptr(), dst_view.as_mut_ptr(), dim_x, dim_y, dim_z);
+        let block_dim: Dim3 =
+            (32u32, <TaskScope as DeviceTransposeKernel<T>>::transpose_block_rows(), 1u32).into();
+        let grid_dim: Dim3 = (dim_x.div_ceil(32), dim_y.div_ceil(32), dim_z).into();
+        let args = args!(src.as_ptr(), dst, dim_x, dim_y, dim_z);
         unsafe {
             src.backend()
                 .launch_kernel(TaskScope::transpose_kernel(), grid_dim, block_dim, &args, 0)
@@ -65,6 +80,10 @@ unsafe impl DeviceTransposeKernel<u32> for TaskScope {
     fn transpose_kernel() -> KernelPtr {
         unsafe { transpose_kernel_u32() }
     }
+
+    fn transpose_block_rows() -> u32 {
+        8
+    }
 }
 
 unsafe impl DeviceTransposeKernel<[u32; 8]> for TaskScope {
@@ -77,11 +96,19 @@ unsafe impl DeviceTransposeKernel<SP1Field> for TaskScope {
     fn transpose_kernel() -> KernelPtr {
         unsafe { transpose_kernel_koala_bear() }
     }
+
+    fn transpose_block_rows() -> u32 {
+        8
+    }
 }
 
 unsafe impl DeviceTransposeKernel<SP1ExtensionField> for TaskScope {
     fn transpose_kernel() -> KernelPtr {
         unsafe { transpose_kernel_koala_bear_extension() }
+    }
+
+    fn transpose_block_rows() -> u32 {
+        8
     }
 }
 

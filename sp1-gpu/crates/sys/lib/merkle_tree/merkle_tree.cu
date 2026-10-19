@@ -1,7 +1,9 @@
 #include <stdio.h>
+#include <stdlib.h>
 #include "poseidon2/poseidon2_kb31_16.cuh"
 #include "poseidon2/poseidon2.cuh"
 #include "poseidon2/poseidon2_bn254_3.cuh"
+#include "poseidon2/poseidon2_kb31_16_fast.cuh"
 
 template <typename Hasher_t, typename HashParams, typename HasherState_t>
 __global__ __launch_bounds__(256, 2) void leafHash(
@@ -69,7 +71,195 @@ __global__ void leafHashPacked(
     }
 }
 
+
+#ifndef __HIPCC__
+// ---- KoalaBear fast paths (CUDA only, bit-exact with the generic kernels; see poseidon2_kb31_16_fast.cuh) ----
+namespace kbfast = poseidon2_kb31_16_fast;
+
+// Same layout and semantics as leafHashPacked<KoalaBearHasher, KoalaBear>: overwrite-mode sponge, rate 8.
+__global__ __launch_bounds__(256) void leafHashKbFast(
+    poseidon2::KoalaBearHasher,
+    const kb31_t* __restrict__ input_,
+    kb31_t (*digests)[8],
+    size_t widths,
+    size_t tree_height) {
+    const uint32_t* input = reinterpret_cast<const uint32_t*>(input_);
+    const size_t H = (size_t)1 << tree_height;
+    for (size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x; idx < H;
+         idx += (size_t)blockDim.x * gridDim.x) {
+        uint32_t s[16];
+#pragma unroll
+        for (int i = 0; i < 16; i++) s[i] = 0;
+        const uint32_t* col = input + idx;
+        size_t j = 0;
+        for (; j + 8 <= widths; j += 8) {
+#pragma unroll
+            for (int k = 0; k < 8; k++) s[k] = __ldg(col + (j + k) * H);
+            kbfast::permute(s);
+        }
+        const size_t rem = widths - j;
+        if (rem != 0) {
+#pragma unroll
+            for (int k = 0; k < 8; k++) {
+                if ((size_t)k < rem) s[k] = __ldg(col + (j + k) * H);
+            }
+            kbfast::permute(s);
+        }
+        uint4* out = reinterpret_cast<uint4*>(digests[idx + (H - 1)]);
+        out[0] = make_uint4(s[0], s[1], s[2], s[3]);
+        out[1] = make_uint4(s[4], s[5], s[6], s[7]);
+    }
+}
+
+__device__ __forceinline__ void compressNodeKbFast(uint32_t (*d)[8], size_t idx) {
+    const uint4* a = reinterpret_cast<const uint4*>(d[2 * idx + 1]);  // left, right adjacent
+    uint4 a0 = a[0], a1 = a[1], b0 = a[2], b1 = a[3];
+    uint32_t s[16] = {a0.x, a0.y, a0.z, a0.w, a1.x, a1.y, a1.z, a1.w,
+                      b0.x, b0.y, b0.z, b0.w, b1.x, b1.y, b1.z, b1.w};
+    kbfast::permute(s);
+    uint4* o = reinterpret_cast<uint4*>(d[idx]);
+    o[0] = make_uint4(s[0], s[1], s[2], s[3]);
+    o[1] = make_uint4(s[4], s[5], s[6], s[7]);
+}
+
+// One thread per node (large layers).
+__global__ void compressKbFast(poseidon2::KoalaBearHasher, kb31_t (*digests)[8], size_t layer_height) {
+    uint32_t(*d)[8] = reinterpret_cast<uint32_t(*)[8]>(digests);
+    const size_t L = (size_t)1 << layer_height;
+    for (size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x; i < L;
+         i += (size_t)blockDim.x * gridDim.x) {
+        compressNodeKbFast(d, i + (L - 1));
+    }
+}
+
+#define KBQUAD_SETUP                                                                       \
+    __shared__ uint32_t s_rc[128];                                                         \
+    for (int i = threadIdx.x; i < 128; i += blockDim.x)                                    \
+        s_rc[i] = poseidon2_kb31_16::constants::EXTERNAL_ROUND_CONSTANTS[i].val;           \
+    __syncthreads();                                                                       \
+    kbfast::quad::QCtx C;                                                                  \
+    C.rc = s_rc;                                                                           \
+    C.j = threadIdx.x & 3;                                                                 \
+    C.mask = 0xffffffffu;
+
+// One aligned quad of lanes per node (small, latency-bound layers). Needs 2^layer_height >= 8 so that
+// every launched warp is fully active (shuffles), and blockDim a multiple of 32.
+__device__ __forceinline__ void compressNodeKbQuad(uint32_t (*d)[8], size_t idx, const kbfast::quad::QCtx& C) {
+    uint4 v = reinterpret_cast<const uint4*>(d[2 * idx + 1])[C.j];
+    uint32_t x[4] = {v.x, v.y, v.z, v.w};
+    kbfast::quad::permute(x, C);
+    if (C.j < 2) reinterpret_cast<uint4*>(d[idx])[C.j] = make_uint4(x[0], x[1], x[2], x[3]);
+}
+
+__global__ void compressKbQuad(poseidon2::KoalaBearHasher, kb31_t (*digests)[8], size_t layer_height) {
+    KBQUAD_SETUP
+    uint32_t(*d)[8] = reinterpret_cast<uint32_t(*)[8]>(digests);
+    const size_t L = (size_t)1 << layer_height;
+    const size_t stride = ((size_t)blockDim.x * gridDim.x) >> 2;
+    for (size_t q = ((size_t)blockIdx.x * blockDim.x + threadIdx.x) >> 2; q < L; q += stride) {
+        compressNodeKbQuad(d, q + (L - 1), C);
+    }
+}
+
+// Single block, layers start_layer..end_layer, one quad per node; blockDim >= 4 * 2^start_layer.
+__global__ void compressBatchedKbQuad(
+    poseidon2::KoalaBearHasher,
+    kb31_t (*digests)[8],
+    size_t start_layer,
+    size_t end_layer) {
+    KBQUAD_SETUP
+    uint32_t(*d)[8] = reinterpret_cast<uint32_t(*)[8]>(digests);
+    for (int k = (int)start_layer; k >= (int)end_layer; k--) {
+        const int L = 1 << k;
+        const int q = threadIdx.x >> 2;
+        // whole warps stay converged for the shuffles; spare quads of a partly used warp redo node 0
+        if (((int)(threadIdx.x & ~31u) >> 2) < L) {
+            const size_t idx = (size_t)(q < L ? q : 0) + (size_t)(L - 1);
+            uint4 v = reinterpret_cast<const uint4*>(d[2 * idx + 1])[C.j];
+            uint32_t x[4] = {v.x, v.y, v.z, v.w};
+            kbfast::quad::permute(x, C);
+            __syncwarp();
+            if (q < L && C.j < 2) reinterpret_cast<uint4*>(d[idx])[C.j] = make_uint4(x[0], x[1], x[2], x[3]);
+        }
+        __syncthreads();
+    }
+}
+
+// recomputeBottomPaths<KoalaBear> with the fast permutation (same semantics and launch shape).
+__global__ void recomputeBottomPathsKbFast(
+    poseidon2::KoalaBearHasher,
+    kb31_t* input_,
+    kb31_t (*paths)[8],
+    size_t* indices,
+    size_t numIndices,
+    size_t widths,
+    size_t tree_height,
+    size_t bottom_levels) {
+    extern __shared__ uint4 smemKb[];
+    uint32_t(*nodes)[8] = reinterpret_cast<uint32_t(*)[8]>(smemKb);
+    const uint32_t* input = reinterpret_cast<const uint32_t*>(input_);
+    const size_t H = (size_t)1 << tree_height;
+    const size_t subtreeLeaves = (size_t)1 << bottom_levels;
+    for (size_t q = blockIdx.x; q < numIndices; q += gridDim.x) {
+        const size_t leafIdx = indices[q];
+        const size_t base = (leafIdx >> bottom_levels) << bottom_levels;
+        const size_t local = leafIdx - base;
+        for (size_t t = threadIdx.x; t < subtreeLeaves; t += blockDim.x) {
+            uint32_t s[16];
+#pragma unroll
+            for (int i = 0; i < 16; i++) s[i] = 0;
+            const uint32_t* col = input + base + t;
+            size_t j = 0;
+            for (; j + 8 <= widths; j += 8) {
+#pragma unroll
+                for (int k = 0; k < 8; k++) s[k] = col[(j + k) * H];
+                kbfast::permute(s);
+            }
+            if (j < widths) {
+#pragma unroll
+                for (int k = 0; k < 8; k++) {
+                    if (j + k < widths) s[k] = col[(j + k) * H];
+                }
+                kbfast::permute(s);
+            }
+#pragma unroll
+            for (int i = 0; i < 8; i++) nodes[t][i] = s[i];
+        }
+        __syncthreads();
+        size_t levelBase = 0, levelLen = subtreeLeaves;
+        for (size_t k = 0; k < bottom_levels; k++) {
+            if (threadIdx.x == 0) {
+                const uint32_t* sib = nodes[levelBase + ((local >> k) ^ 1)];
+                uint32_t* pd = reinterpret_cast<uint32_t*>(paths[q * tree_height + k]);
+#pragma unroll
+                for (int i = 0; i < 8; i++) pd[i] = sib[i];
+            }
+            if (k + 1 == bottom_levels) break;
+            const size_t nextBase = levelBase + levelLen;
+            for (size_t t = threadIdx.x; t < (levelLen >> 1); t += blockDim.x) {
+                uint32_t s[16];
+#pragma unroll
+                for (int i = 0; i < 8; i++) {
+                    s[i] = nodes[levelBase + 2 * t][i];
+                    s[8 + i] = nodes[levelBase + 2 * t + 1][i];
+                }
+                kbfast::permute(s);
+#pragma unroll
+                for (int i = 0; i < 8; i++) nodes[nextBase + t][i] = s[i];
+            }
+            __syncthreads();
+            levelBase = nextBase;
+            levelLen >>= 1;
+        }
+        __syncthreads();
+    }
+}
+#endif  // __HIPCC__
+
 extern "C" void* leaf_hash_merkle_tree_koala_bear_16_kernel() {
+#ifndef __HIPCC__
+    if (!getenv("SP1_GPU_MERKLE_GENERIC")) return (void*)leafHashKbFast;
+#endif
     return (void*)leafHashPacked<poseidon2::KoalaBearHasher, poseidon2_kb31_16::KoalaBear>;
 }
 
@@ -101,6 +291,9 @@ void compress(
 }
 
 extern "C" void* compress_merkle_tree_koala_bear_16_kernel() {
+#ifndef __HIPCC__
+    if (!getenv("SP1_GPU_MERKLE_GENERIC")) return (void*)compressKbFast;
+#endif
     return (void*)compress<
         poseidon2::KoalaBearHasher,
         poseidon2_kb31_16::KoalaBear,
@@ -131,6 +324,22 @@ __global__ __launch_bounds__(128, 2) void compressBatched(
         }
         __syncthreads();
     }
+}
+
+// Quad-per-node kernels for small layers; nullptr on HIP or with SP1_GPU_MERKLE_GENERIC (the Rust side
+// then keeps the generic launch shapes).
+extern "C" void* compress_small_layer_merkle_tree_koala_bear_16_kernel() {
+#ifndef __HIPCC__
+    if (!getenv("SP1_GPU_MERKLE_GENERIC")) return (void*)compressKbQuad;
+#endif
+    return nullptr;
+}
+
+extern "C" void* compress_batched_small_merkle_tree_koala_bear_16_kernel() {
+#ifndef __HIPCC__
+    if (!getenv("SP1_GPU_MERKLE_GENERIC")) return (void*)compressBatchedKbQuad;
+#endif
+    return nullptr;
 }
 
 extern "C" void* compress_batched_merkle_tree_koala_bear_16_kernel() {
@@ -255,6 +464,9 @@ extern "C" void* compute_paths_merkle_tree_bn254_kernel() {
 }
 
 extern "C" void* recompute_bottom_paths_merkle_tree_koala_bear_16_kernel() {
+#ifndef __HIPCC__
+    if (!getenv("SP1_GPU_MERKLE_GENERIC")) return (void*)recomputeBottomPathsKbFast;
+#endif
     return (void*)recomputeBottomPaths<
         poseidon2::KoalaBearHasher,
         poseidon2_kb31_16::KoalaBear,

@@ -219,6 +219,17 @@ func ExportGroth16GpuWitness(dataDir *C.char, witnessPath *C.char, pkDir *C.char
 	return nil
 }
 
+//export PrefetchGroth16GpuWitnessCircuit
+func PrefetchGroth16GpuWitnessCircuit(dataDir *C.char, pkDir *C.char) (errStr *C.char) {
+	defer func() {
+		if r := recover(); r != nil {
+			errStr = C.CString(fmt.Sprintf("[groth16-witness] prefetch panic: %v", r))
+		}
+	}()
+	sp1.PrefetchGroth16GpuWitnessCircuit(C.GoString(dataDir), C.GoString(pkDir))
+	return nil
+}
+
 //export ExportPlonkGpuData
 func ExportPlonkGpuData(dataDir *C.char, outputDir *C.char) (errStr *C.char) {
 	defer func() {

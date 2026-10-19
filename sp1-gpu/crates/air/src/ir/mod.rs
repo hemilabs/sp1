@@ -19,7 +19,9 @@ pub mod var;
 
 pub use analysis::{analyze_constraints, ColumnLeaf, ConstraintInfo, ConstraintShape};
 pub use builder::{build_dag, DagBuilder};
-pub use bytecode::{lower_sequential, BcOp, ChunkBytecode, DagInstr, LeafRef};
+pub use bytecode::{
+    level_schedule, lower_sequential, BcOp, ChunkBytecode, DagInstr, LeafRef, LevelSchedule,
+};
 pub use chunker::{chunk_dag, Chunk, ChunkBudget};
 pub use column_tile_bytecode::{
     lower_column_tile, ColumnTermEntry, ColumnTileBytecode, COEFF_KIND_CONST, COEFF_KIND_MASK,

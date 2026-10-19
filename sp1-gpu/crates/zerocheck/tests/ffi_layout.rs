@@ -95,7 +95,7 @@ fn chunk_static_layout_matches() {
         "leaves" => std::mem::offset_of!(ChunkStaticC, leaves),
         "consts" => std::mem::offset_of!(ChunkStaticC, consts),
         "publics" => std::mem::offset_of!(ChunkStaticC, publics),
-        "assert_regs" => std::mem::offset_of!(ChunkStaticC, assert_regs),
+        "assert_pos" => std::mem::offset_of!(ChunkStaticC, assert_pos),
         "assert_alphas" => std::mem::offset_of!(ChunkStaticC, assert_alphas),
         "n_instrs" => std::mem::offset_of!(ChunkStaticC, n_instrs),
         "n_asserts" => std::mem::offset_of!(ChunkStaticC, n_asserts),
@@ -103,6 +103,11 @@ fn chunk_static_layout_matches() {
         "gkr_main_width" => std::mem::offset_of!(ChunkStaticC, gkr_main_width),
         "gkr_prep_width" => std::mem::offset_of!(ChunkStaticC, gkr_prep_width),
         "chip_alpha_offset" => std::mem::offset_of!(ChunkStaticC, chip_alpha_offset),
+        "coop_code" => std::mem::offset_of!(ChunkStaticC, coop_code),
+        "coop_level_starts" => std::mem::offset_of!(ChunkStaticC, coop_level_starts),
+        "coop_assert_slots" => std::mem::offset_of!(ChunkStaticC, coop_assert_slots),
+        "coop_n_levels" => std::mem::offset_of!(ChunkStaticC, coop_n_levels),
+        "coop_n_phys" => std::mem::offset_of!(ChunkStaticC, coop_n_phys),
     );
 }
 

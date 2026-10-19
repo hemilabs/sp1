@@ -125,7 +125,10 @@ __global__ void zerocheck_gkr_sweep(
 //
 // One block per (chip, quad-tile); grid is (n_blocks, 1, 1); output stride 4.
 // Runs for EVERY chip with non-zero width in the fused round — the inline
-// carrier-chunk sweep is disabled there.
+// carrier-chunk sweep is disabled there. Chips up to GKR_CORNER_NARROW_MAX
+// columns take the thread-per-quad path (the quads of a warp are adjacent,
+// so each column's loads coalesce, and no warp reductions are needed); only
+// wider chips take the warp-per-quad path.
 // ============================================================================
 
 // Accumulate `gkr_power · element` into the four per-corner sums for one
@@ -142,6 +145,28 @@ __device__ __forceinline__ void corner_accumulate(
     for (int c = 0; c < BIVARIATE_NUM_CORNERS; c++) {
         if ((elem0 | (uint32_t)c) < height) {
             acc[c] += power * K::load(trace_data, quad_base + c);
+        }
+    }
+}
+
+// Thread-per-quad form of `corner_accumulate` over `width` consecutive
+// columns starting at `base`. Heights are even, so only rows 2 and 3 of a
+// chip's last quadruple can be missing (`full_quad`).
+template <typename K>
+__device__ __forceinline__ void corner_accumulate_columns(
+    const K* trace_data, size_t base, uint32_t width, uint32_t height, uint32_t quad_idx,
+    bool full_quad, const ext_t* gkr_powers, uint32_t power_offset,
+    ext_t acc[BIVARIATE_NUM_CORNERS])
+{
+    const K* quad = trace_data + base + ((size_t)quad_idx << 2);
+    for (uint32_t i = 0; i < width; i++) {
+        const ext_t power = ext_t::load(gkr_powers, power_offset + i);
+        const K* col = quad + (size_t)i * (size_t)height;
+        acc[0] += power * K::load(col, 0);
+        acc[1] += power * K::load(col, 1);
+        if (full_quad) {
+            acc[2] += power * K::load(col, 2);
+            acc[3] += power * K::load(col, 3);
         }
     }
 }
@@ -174,7 +199,7 @@ __global__ void zerocheck_gkr_corner_sweep(
     const uint32_t total_width = gkr.main_width + gkr.prep_width;
     ext_t thread_acc[BIVARIATE_NUM_CORNERS] = {
         ext_t::zero(), ext_t::zero(), ext_t::zero(), ext_t::zero()};
-    if (total_width <= (uint32_t)WARP_SIZE) {
+    if (total_width <= GKR_CORNER_NARROW_MAX) {
         // ---- Narrow path: thread-per-quad, columns in inner loop ----
         for (uint32_t quad_idx = disp.row_offset + threadIdx.x;
              quad_idx < quad_end;
@@ -183,17 +208,14 @@ __global__ void zerocheck_gkr_corner_sweep(
             if (quad_idx >= quad_limit) {
                 continue;
             }
+            const bool full_quad = ((quad_idx << 2) | 3u) < lay.height;
             ext_t acc[BIVARIATE_NUM_CORNERS] = {
                 ext_t::zero(), ext_t::zero(), ext_t::zero(), ext_t::zero()};
-            for (uint32_t i = 0; i < gkr.main_width; i++) {
-                ext_t power = ext_t::load(gkr_powers, i);
-                corner_accumulate(trace_data, lay.main_ptr, i, lay.height, quad_idx, power, acc);
-            }
-            for (uint32_t i = 0; i < gkr.prep_width; i++) {
-                ext_t power = ext_t::load(gkr_powers, gkr.main_width + i);
-                corner_accumulate(
-                    trace_data, lay.preprocessed_ptr, i, lay.height, quad_idx, power, acc);
-            }
+            corner_accumulate_columns(trace_data, lay.main_ptr, gkr.main_width, lay.height,
+                                      quad_idx, full_quad, gkr_powers, 0, acc);
+            corner_accumulate_columns(trace_data, lay.preprocessed_ptr, gkr.prep_width,
+                                      lay.height, quad_idx, full_quad, gkr_powers,
+                                      gkr.main_width, acc);
             const ext_t w = ext_t::load(partial_lagrange, quad_idx) * lambda;
 #pragma unroll
             for (int c = 0; c < BIVARIATE_NUM_CORNERS; c++) {

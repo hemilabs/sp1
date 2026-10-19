@@ -41,6 +41,10 @@ var (
 // returns: a corrupt file can make gnark panic, the cgo export recovers that, and a lock left held
 // would make the next ReleaseCaches (run on the Rust side as the failed proof unwinds) wait for
 // ever.
+//
+// The proving key is read only when the circuit has BSB22 commitments, which need its
+// CommitmentKeys; the SP1 circuit has none, so its ~1.8 s read is skipped and the key returned is
+// nil.
 func gpuWitnessCircuit(dataDir string, pkDir string) (constraint.ConstraintSystem, groth16.ProvingKey) {
 	gpuWitnessMutex.Lock()
 	defer gpuWitnessMutex.Unlock()
@@ -74,6 +78,10 @@ func gpuWitnessCircuit(dataDir string, pkDir string) (constraint.ConstraintSyste
 		fmt.Printf("[groth16-witness] Using cached R1CS (saved ~20s)\n")
 	}
 
+	if !hasGroth16Commitments(gpuWitnessR1cs) {
+		fmt.Printf("[groth16-witness] No commitments: not reading the PK\n")
+		return gpuWitnessR1cs, nil
+	}
 	if gpuWitnessPk == nil || gpuWitnessPkDataDir != dataDir {
 		gpuWitnessPk, gpuWitnessPkDataDir = nil, ""
 		start := time.Now()
@@ -92,6 +100,19 @@ func gpuWitnessCircuit(dataDir string, pkDir string) (constraint.ConstraintSyste
 		fmt.Printf("[groth16-witness] Using cached PK (saved ~2s)\n")
 	}
 	return gpuWitnessR1cs, gpuWitnessPk
+}
+
+// hasGroth16Commitments reports whether the circuit has BSB22 commitments.
+func hasGroth16Commitments(r constraint.ConstraintSystem) bool {
+	return len(r.(*cs.R1CS).CommitmentInfo.(constraint.Groth16Commitments)) > 0
+}
+
+// PrefetchGroth16GpuWitnessCircuit reads the circuit that ExportGroth16GpuWitness solves into its
+// cache ahead of the proof, so that the solve does not wait ~2 s for it. Reading the circuit needs
+// none of the environment variables the solve sets, so this runs without touching the environment
+// (other threads read it concurrently).
+func PrefetchGroth16GpuWitnessCircuit(dataDir string, pkDir string) {
+	gpuWitnessCircuit(dataDir, pkDir)
 }
 
 // ExportGroth16GpuWitness solves the Groth16 R1CS and exports the solved
@@ -129,7 +150,10 @@ func ExportGroth16GpuWitness(dataDir string, witnessPath string, pkDir string, o
 	fmt.Printf("[groth16-witness] Witness creation took %s\n", time.Since(start))
 
 	// Get typed proving key and R1CS
-	_pk := pk.(*groth16_bn254.ProvingKey)
+	var _pk *groth16_bn254.ProvingKey
+	if pk != nil {
+		_pk = pk.(*groth16_bn254.ProvingKey)
+	}
 	_r1cs := r1cs.(*cs.R1CS)
 
 	// Prepare BSB22 commitment capture (matching gnark prove.go exactly)
@@ -215,10 +239,16 @@ func ExportGroth16GpuWitness(dataDir string, witnessPath string, pkDir string, o
 	// Write wire_values in raw Montgomery form (skips ~15M fromMont calls
 	// and the corresponding mont_mul calls in the Rust loader).
 	// Solution A/B/C stay canonical since they're smaller and consumed differently.
-	writeFrFileMontgomery(filepath.Join(outputDir, "wire_values.bin"), solution.W)
-	writeFrFile(filepath.Join(outputDir, "solution_a.bin"), solution.A)
-	writeFrFile(filepath.Join(outputDir, "solution_b.bin"), solution.B)
-	writeFrFile(filepath.Join(outputDir, "solution_c.bin"), solution.C)
+	// The four files are independent, ~0.5 GB each, and the canonical ones convert every element
+	// out of Montgomery form: write them at once. A writer panics on an I/O error; that is caught
+	// in its goroutine (a panic there would end the process, past the cgo export's recover) and
+	// raised again here.
+	runAll(
+		func() { writeFrFileMontgomery(filepath.Join(outputDir, "wire_values.bin"), solution.W) },
+		func() { writeFrFile(filepath.Join(outputDir, "solution_a.bin"), solution.A) },
+		func() { writeFrFile(filepath.Join(outputDir, "solution_b.bin"), solution.B) },
+		func() { writeFrFile(filepath.Join(outputDir, "solution_c.bin"), solution.C) },
+	)
 	writeG1File(filepath.Join(outputDir, "commitments.bin"), commitments)
 	writeG1File(filepath.Join(outputDir, "commitment_pok.bin"), []bn254.G1Affine{commitmentPok})
 
@@ -298,4 +328,28 @@ func localParallelize(n int, work func(start, end int)) {
 		}(start, end)
 	}
 	wg.Wait()
+}
+
+// runAll runs the jobs concurrently and waits for them. If any panics, it panics on the calling
+// goroutine with the first panic's value once all are done.
+func runAll(jobs ...func()) {
+	var wg sync.WaitGroup
+	var once sync.Once
+	var first interface{}
+	for _, job := range jobs {
+		wg.Add(1)
+		go func(job func()) {
+			defer wg.Done()
+			defer func() {
+				if r := recover(); r != nil {
+					once.Do(func() { first = r })
+				}
+			}()
+			job()
+		}(job)
+	}
+	wg.Wait()
+	if first != nil {
+		panic(first)
+	}
 }

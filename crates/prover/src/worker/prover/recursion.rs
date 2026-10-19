@@ -816,10 +816,26 @@ impl<A: ArtifactClient, C: SP1ProverComponents> SP1RecursionProver<A, C> {
             let use_gpu = {
                 use super::groth16_backend::{use_gpu, Groth16Inputs};
                 let override_env = std::env::var("SP1_GROTH16_GPU").ok();
+                let helper_available = Groth16Bn254Prover::gpu_helper_available();
+                // The shard prover's memory pool keeps freed memory reserved, which on a 32 GB
+                // card leaves the GPU helper only ~4 GB. Give the idle reserve back before
+                // measuring what the helper could get (on an RTX 5090: 4.4 -> 25.5 GB free).
+                if card_eligible
+                    && helper_available
+                    && !matches!(override_env.as_deref(), Some("0" | "false"))
+                {
+                    if let Some((before, after)) = sp1_recursion_gnark_ffi::gpu_trim_memory_pool() {
+                        tracing::info!(
+                            "Groth16: trimmed the GPU memory pool: {} -> {} MiB free",
+                            before >> 20,
+                            after >> 20
+                        );
+                    }
+                }
                 let (gpu, reason) = use_gpu(&Groth16Inputs {
                     override_env: override_env.as_deref(),
                     card_eligible,
-                    helper_available: Groth16Bn254Prover::gpu_helper_available(),
+                    helper_available,
                     vram_free: sp1_recursion_gnark_ffi::gpu_free_memory(),
                     gpu_reset: sp1_recursion_gnark_ffi::gpu_reset_requested(),
                     mem_available: sp1_recursion_gnark_ffi::host_memory::available(),
@@ -829,6 +845,13 @@ impl<A: ArtifactClient, C: SP1ProverComponents> SP1RecursionProver<A, C> {
                     "Groth16 prover: {} ({reason})",
                     if gpu { "GPU" } else { "gnark CPU" }
                 );
+                // A prestarted GPU helper uploads its key while this thread solves; with the CPU
+                // prover it is not needed, and gives its memory back.
+                if gpu {
+                    sp1_recursion_gnark_ffi::prestart::let_prestarted_gpu_helper_upload();
+                } else {
+                    sp1_recursion_gnark_ffi::prestart::cancel();
+                }
                 gpu
             };
 

@@ -48,6 +48,14 @@ class DuplexChallenger {
   public:
     static constexpr const size_t NUM_ELEMENTS = WIDTH + 2 * RATE;
 
+    // Raw device buffers (for the warp-cooperative challenger in challenger/warp_duplex.cuh).
+    __device__ __forceinline__ void raw(kb31_t*& sp, kb31_t*& in, size_t*& sz, kb31_t*& out) const {
+        sp = sponge_state;
+        in = input_buffer;
+        sz = buffer_sizes;
+        out = output_buffer;
+    }
+
     // Number of kb31 words / size_t words needed by stage() / unstage().
     static constexpr const int STAGE_ELEMENTS = 3 * WIDTH;
 
