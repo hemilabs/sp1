@@ -73,8 +73,11 @@ __global__ void leafHashPacked(
 }
 
 
-#ifndef SP1_PORTABLE
-// ---- KoalaBear fast paths (CUDA only, bit-exact with the generic kernels; see poseidon2_kb31_16_fast.cuh) ----
+#ifndef SP1_SYCL
+// ---- KoalaBear fast paths (bit-exact with the generic kernels; see poseidon2_kb31_16_fast.cuh) ----
+// The one-thread-per-state kernels run on CUDA and HIP (on a Radeon RX 9070 XT the Merkle commit
+// bench went from 38.3 to 34-36 ms); the quad kernels (warp shuffles) on CUDA only.
+// SP1_GPU_MERKLE_GENERIC selects the generic kernels.
 namespace kbfast = poseidon2_kb31_16_fast;
 
 // Same layout and semantics as leafHashPacked<KoalaBearHasher, KoalaBear>: overwrite-mode sponge, rate 8.
@@ -133,6 +136,7 @@ __global__ void compressKbFast(poseidon2::KoalaBearHasher, kb31_t (*digests)[8],
     }
 }
 
+#ifndef SP1_PORTABLE
 #define KBQUAD_SETUP                                                                       \
     SP1_SHARED_ARRAY(uint32_t, s_rc, [128]);                                                         \
     for (int i = threadIdx.x; i < 128; i += blockDim.x)                                    \
@@ -185,6 +189,7 @@ __global__ void compressBatchedKbQuad(
         __syncthreads();
     }
 }
+#endif  // SP1_PORTABLE
 
 // recomputeBottomPaths<KoalaBear> with the fast permutation (same semantics and launch shape).
 __global__ void recomputeBottomPathsKbFast(
@@ -255,10 +260,10 @@ __global__ void recomputeBottomPathsKbFast(
         __syncthreads();
     }
 }
-#endif  // SP1_PORTABLE
+#endif  // SP1_SYCL
 
 extern "C" void* leaf_hash_merkle_tree_koala_bear_16_kernel() {
-#ifndef SP1_PORTABLE
+#ifndef SP1_SYCL
     if (!getenv("SP1_GPU_MERKLE_GENERIC")) return SP1_KERNEL_PTR(leafHashKbFast);
 #endif
     return SP1_KERNEL_PTR(leafHashPacked<poseidon2::KoalaBearHasher, poseidon2_kb31_16::KoalaBear>);
@@ -291,7 +296,7 @@ void compress(
 }
 
 extern "C" void* compress_merkle_tree_koala_bear_16_kernel() {
-#ifndef SP1_PORTABLE
+#ifndef SP1_SYCL
     if (!getenv("SP1_GPU_MERKLE_GENERIC")) return SP1_KERNEL_PTR(compressKbFast);
 #endif
     return SP1_KERNEL_PTR(compress<
@@ -462,7 +467,7 @@ extern "C" void* compute_paths_merkle_tree_bn254_kernel() {
 }
 
 extern "C" void* recompute_bottom_paths_merkle_tree_koala_bear_16_kernel() {
-#ifndef SP1_PORTABLE
+#ifndef SP1_SYCL
     if (!getenv("SP1_GPU_MERKLE_GENERIC")) return SP1_KERNEL_PTR(recomputeBottomPathsKbFast);
 #endif
     return SP1_KERNEL_PTR(recomputeBottomPaths<
