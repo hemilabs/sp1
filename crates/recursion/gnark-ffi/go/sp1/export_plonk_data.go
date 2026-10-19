@@ -5,6 +5,9 @@ import (
 	"encoding/binary"
 	"fmt"
 	"os"
+	"runtime"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/consensys/gnark-crypto/ecc"
@@ -225,21 +228,10 @@ func writeG1File(path string, points []bn254.G1Affine) {
 }
 
 func writeFrFile(path string, elems []fr.Element) {
-	f, err := os.Create(path)
-	if err != nil {
-		panic(err)
-	}
-	defer f.Close()
-
-	w := bufio.NewWriterSize(f, 1024*1024)
-	defer w.Flush()
-
-	buf := make([]byte, 32)
-	for i := range elems {
+	writeElements(path, nil, len(elems), func(dst []byte, i int) {
 		raw := elems[i].Bytes() // big-endian canonical form
-		reverseBytes(buf, raw[:])
-		w.Write(buf)
-	}
+		reverseBytes(dst, raw[:])
+	})
 }
 
 // writeFrFileMontgomery writes Fr elements in raw Montgomery form (no fromMont
@@ -251,36 +243,72 @@ func writeFrFile(path string, elems []fr.Element) {
 // This saves ~79M fromMont calls in Go and ~31.7M mont_mul calls in Rust for
 // typical Groth16 witnesses (~2.5M wire values + ~1M H coefficients).
 func writeFrFileMontgomery(path string, elems []fr.Element) {
+	// Magic header: "MFr1" (Montgomery Fr format version 1), then the raw limbs as LE bytes,
+	// which matches the Rust Fr([u64; 4]) layout exactly.
+	writeElements(path, []byte("MFr1"), len(elems), func(dst []byte, i int) {
+		for j := 0; j < 4; j++ {
+			binary.LittleEndian.PutUint64(dst[j*8:], elems[i][j])
+		}
+	})
+}
+
+// writeElements writes header and then n 32-byte records to path, record i filled in by put.
+// Several goroutines each fill and write their own parts of the file: a Groth16 witness file is
+// ~0.5 GB of elements converted one at a time, written on the proof's critical path. An I/O error
+// panics on the calling goroutine.
+func writeElements(path string, header []byte, n int, put func(dst []byte, i int)) {
 	f, err := os.Create(path)
 	if err != nil {
 		panic(err)
 	}
 	defer f.Close()
-
-	w := bufio.NewWriterSize(f, 1024*1024)
-	defer w.Flush()
-
-	// Magic header: "MFr1" (Montgomery Fr format version 1)
-	w.Write([]byte("MFr1"))
-
-	// Write raw Montgomery limbs. fr.Element is [4]uint64; on little-endian
-	// x86, unsafe.Slice gives us the LE byte representation directly, which
-	// matches our Rust Fr([u64; 4]) layout exactly.
-	buf := make([]byte, 32)
-	for i := range elems {
-		// Access the [4]uint64 directly and write as LE bytes.
-		for j := 0; j < 4; j++ {
-			limb := elems[i][j]
-			buf[j*8+0] = byte(limb)
-			buf[j*8+1] = byte(limb >> 8)
-			buf[j*8+2] = byte(limb >> 16)
-			buf[j*8+3] = byte(limb >> 24)
-			buf[j*8+4] = byte(limb >> 32)
-			buf[j*8+5] = byte(limb >> 40)
-			buf[j*8+6] = byte(limb >> 48)
-			buf[j*8+7] = byte(limb >> 56)
+	if _, err := f.Write(header); err != nil {
+		panic(err)
+	}
+	const partLen = 1 << 16 // elements per part (2 MiB)
+	nbParts := (n + partLen - 1) / partLen
+	workers := runtime.GOMAXPROCS(0) / 4
+	if workers > 8 {
+		workers = 8
+	}
+	if workers > nbParts {
+		workers = nbParts
+	}
+	if workers < 1 {
+		workers = 1
+	}
+	var next atomic.Int64
+	errs := make([]error, workers)
+	var wg sync.WaitGroup
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func(w int) {
+			defer wg.Done()
+			buf := make([]byte, 32*partLen)
+			for {
+				part := int(next.Add(1)) - 1
+				if part >= nbParts {
+					return
+				}
+				lo, hi := part*partLen, (part+1)*partLen
+				if hi > n {
+					hi = n
+				}
+				for i := lo; i < hi; i++ {
+					put(buf[32*(i-lo):32*(i-lo+1)], i)
+				}
+				if _, err := f.WriteAt(buf[:32*(hi-lo)], int64(len(header)+32*lo)); err != nil {
+					errs[w] = err
+					return
+				}
+			}
+		}(w)
+	}
+	wg.Wait()
+	for _, err := range errs {
+		if err != nil {
+			panic(err)
 		}
-		w.Write(buf)
 	}
 }
 

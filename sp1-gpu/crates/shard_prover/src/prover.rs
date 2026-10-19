@@ -18,7 +18,9 @@ use sp1_gpu_cudart::PinnedBuffer;
 use sp1_gpu_cudart::{DeviceMle, DevicePoint, TaskScope};
 use sp1_gpu_jagged_assist::prove_jagged_evaluation_sync;
 use sp1_gpu_jagged_sumcheck::{generate_jagged_sumcheck_poly, jagged_sumcheck};
-use sp1_gpu_jagged_tracegen::{full_tracegen_permit, main_tracegen_permit, CudaShardProverData};
+use sp1_gpu_jagged_tracegen::{
+    full_tracegen_permit, main_tracegen_permit, CudaShardProverData, TracePrefetcher,
+};
 use sp1_gpu_logup_gkr::{prove_logup_gkr, CudaLogUpGkrOptions, Interactions};
 use sp1_gpu_merkle_tree::{CudaTcsProver, SingleLayerMerkleTreeProverError};
 use sp1_gpu_tracegen::CudaTracegenAir;
@@ -159,6 +161,7 @@ impl<GC: IopCtx<F = Felt, EF = Ext>, PC: CudaShardProverComponents<GC>> CudaShar
                 machine_bytecode,
                 recompute_first_layer,
                 drop_ldes,
+                trace_prefetcher: TracePrefetcher::new(),
                 _marker: PhantomData,
             }),
         }
@@ -215,6 +218,8 @@ pub(crate) struct CudaShardProverInner<GC: IopCtx, PC: CudaShardProverComponents
     pub machine_bytecode: Arc<MachineBytecode>,
     pub recompute_first_layer: bool,
     pub drop_ldes: bool,
+    /// Uploads the next shard's host traces while a shard is proved (`None` if disabled).
+    pub trace_prefetcher: Option<TracePrefetcher>,
     pub _marker: PhantomData<GC>,
 }
 
@@ -418,6 +423,7 @@ where
             &self.inner.backend,
             prover_permits,
             true,
+            self.inner.trace_prefetcher.as_ref(),
         )
         .instrument(tracing::debug_span!("generate main traces"))
         .await;
@@ -1029,6 +1035,7 @@ mod tests {
                     recompute_first_layer: false,
                     drop_ldes: false,
                     backend: scope.clone(),
+                    trace_prefetcher: None,
                     _marker: PhantomData,
                 };
             let shard_prover = CudaShardProver { inner: Arc::new(shard_prover_inner) };

@@ -1,10 +1,10 @@
 use std::{
-    collections::VecDeque,
+    collections::{HashMap, VecDeque},
     io::Write,
     path::PathBuf,
     sync::{
         atomic::{AtomicUsize, Ordering},
-        Arc, Mutex, Weak,
+        Arc, Mutex, OnceLock, Weak,
     },
 };
 
@@ -128,8 +128,15 @@ pub struct CoreProvingTask {
     pub metrics: ProverMetrics,
 }
 
+/// A normalize program, once compiled.
+type NormalizeProgramCell = Arc<OnceLock<Arc<RecursionProgram<SP1Field>>>>;
+
 struct NormalizeProgramCompiler {
     cache: SP1NormalizeCache,
+    /// The programs being compiled, so shards of the same shape wait for one compilation (about
+    /// 0.8 s of CPU at the start of a proof, when the CPU is the bottleneck) instead of each
+    /// compiling the program again.
+    in_flight: Mutex<HashMap<SP1NormalizeInputShape, NormalizeProgramCell>>,
     recursive_verifier: RecursiveShardVerifier<SP1GlobalContext, RiscvAir<SP1Field>, InnerConfig>,
     reduce_shape: SP1RecursionProofShape,
     verifier: MachineVerifier<SP1GlobalContext, CoreSC>,
@@ -147,7 +154,13 @@ impl NormalizeProgramCompiler {
         reduce_shape: SP1RecursionProofShape,
         machine_verifier: MachineVerifier<SP1GlobalContext, CoreSC>,
     ) -> Self {
-        Self { cache, recursive_verifier, reduce_shape, verifier: machine_verifier }
+        Self {
+            cache,
+            in_flight: Mutex::new(HashMap::new()),
+            recursive_verifier,
+            reduce_shape,
+            verifier: machine_verifier,
+        }
     }
 
     pub fn machine(&self) -> &Machine<SP1Field, RiscvAir<SP1Field>> {
@@ -159,14 +172,46 @@ impl NormalizeProgramCompiler {
         vk: SP1VerifyingKey,
         proof_shape: &CoreProofShape<SP1Field, RiscvAir<SP1Field>>,
     ) -> Arc<RecursionProgram<SP1Field>> {
-        get_normalize_program(
-            vk,
-            &self.verifier,
-            &self.recursive_verifier,
-            proof_shape,
-            &self.reduce_shape,
-            Some(&self.cache),
-        )
+        let shape = normalize_input_shape(&self.verifier, proof_shape);
+        if let Some(program) = self.cache.get(&shape) {
+            return program;
+        }
+        let cell = self
+            .in_flight
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(shape.clone())
+            .or_default()
+            .clone();
+        let program = cell
+            .get_or_init(|| {
+                let program = get_normalize_program(
+                    vk,
+                    &self.verifier,
+                    &self.recursive_verifier,
+                    proof_shape,
+                    &self.reduce_shape,
+                    None,
+                );
+                self.cache.push(shape.clone(), program.clone());
+                program
+            })
+            .clone();
+        self.in_flight.lock().unwrap_or_else(|e| e.into_inner()).remove(&shape);
+        program
+    }
+}
+
+/// The shape of the normalize program that verifies a core shard proof of this shape.
+fn normalize_input_shape(
+    verifier: &MachineVerifier<SP1GlobalContext, InnerSC<RiscvAir<SP1Field>>>,
+    proof_shape: &CoreProofShape<SP1Field, RiscvAir<SP1Field>>,
+) -> SP1NormalizeInputShape {
+    SP1NormalizeInputShape {
+        proof_shapes: vec![proof_shape.clone()],
+        max_log_row_count: verifier.max_log_row_count(),
+        log_blowup: verifier.fri_config().log_blowup,
+        log_stacking_height: verifier.log_stacking_height() as usize,
     }
 }
 
@@ -178,12 +223,7 @@ pub fn get_normalize_program(
     reduce_shape: &SP1RecursionProofShape,
     cache: Option<&SP1NormalizeCache>,
 ) -> Arc<RecursionProgram<SP1Field>> {
-    let shape = SP1NormalizeInputShape {
-        proof_shapes: vec![proof_shape.clone()],
-        max_log_row_count: verifier.max_log_row_count(),
-        log_blowup: verifier.fri_config().log_blowup,
-        log_stacking_height: verifier.log_stacking_height() as usize,
-    };
+    let shape = normalize_input_shape(verifier, proof_shape);
     if let Some(program) = cache.as_ref().and_then(|c| c.get(&shape)) {
         return program.clone();
     }
@@ -281,6 +321,31 @@ fn dependency_gate() -> &'static tokio::sync::Semaphore {
     })
 }
 
+/// Lets only a few shards trace their records at a time, in arrival order.
+///
+/// At the start of a proof every core worker receives a shard at once and their `into_record`s
+/// run together. Their records are fresh memory, so they mostly wait on page faults and slow each
+/// other down (the first shard took 0.7 s instead of 0.4 s), and they crowd out the first shard's
+/// trace generation, which the GPU waits for. In turns the oldest shards finish first; later in a
+/// proof few records are traced at once, so the gate rarely waits. The records are unchanged.
+/// `SP1_WORKER_RECORD_TURNS` sets how many shards run at once (default: one per 8 cores, at
+/// least 2; `0` lets them all run).
+fn record_gate() -> &'static tokio::sync::Semaphore {
+    static GATE: std::sync::OnceLock<tokio::sync::Semaphore> = std::sync::OnceLock::new();
+    GATE.get_or_init(|| {
+        let default = std::thread::available_parallelism().map_or(2, |n| (n.get() / 8).max(2));
+        let turns = std::env::var("SP1_WORKER_RECORD_TURNS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(default);
+        tokio::sync::Semaphore::new(if turns == 0 {
+            tokio::sync::Semaphore::MAX_PERMITS
+        } else {
+            turns
+        })
+    })
+}
+
 impl<A, W, C> AsyncWorker<CoreProvingTask, Result<TaskMetadata, TaskError>> for CoreWorker<A, W, C>
 where
     A: ArtifactClient,
@@ -317,6 +382,8 @@ where
         };
 
         let program = shared_program(&input.elf, &elf).await?;
+        // The shards take turns (see `record_gate`).
+        let record_turn = record_gate().acquire().await.expect("record gate closed");
         let span = tracing::debug_span!("into_record");
         let (program, mut record, deferred_record, is_precompile) = tokio::task::spawn_blocking({
             let artifact_client = self.artifact_client.clone();
@@ -513,6 +580,7 @@ where
         })
         .await
         .map_err(|e| TaskError::Fatal(e.into()))??;
+        drop(record_turn);
 
         // Asynchronously upload the deferred record
         let deferred_upload_handle = deferred_record.map(|deferred_record| {
