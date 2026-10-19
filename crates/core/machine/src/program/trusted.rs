@@ -33,6 +33,9 @@ pub struct ProgramMultiplicityCols<T> {
     pub multiplicity: T,
 }
 
+/// The most events one task of the program chip's parallel instruction count scans.
+const PROGRAM_COUNT_TASK_EVENTS: usize = 1 << 20;
+
 /// A chip that implements addition for the opcodes ADD and ADDI.
 #[derive(Default)]
 pub struct ProgramChip;
@@ -143,122 +146,92 @@ impl<F: PrimeField32> MachineAir<F> for ProgramChip {
         // ~10x less host time (this chip was the slowest host tracegen chip).
         let nb_instructions = input.program.instructions.len();
         let pc_base = input.program.pc_base;
+        // The vectors are counted in parallel: each task counts a range of one vector into its own
+        // counters, and the counters are summed. This chip's trace is often the last host trace a
+        // shard waits for.
+        macro_rules! with_cpu_event_vectors {
+            ($m:ident) => {
+                $m!(
+                    alu_x0_events,
+                    add_events,
+                    addw_events,
+                    addi_events,
+                    sub_events,
+                    subw_events,
+                    bitwise_events,
+                    mul_events,
+                    divrem_events,
+                    lt_events,
+                    shift_left_events,
+                    shift_right_events,
+                    branch_events,
+                    memory_load_byte_events,
+                    memory_load_half_events,
+                    memory_load_word_events,
+                    memory_load_x0_events,
+                    memory_load_double_events,
+                    memory_store_byte_events,
+                    memory_store_half_events,
+                    memory_store_word_events,
+                    memory_store_double_events,
+                    jal_events,
+                    jalr_events,
+                    utype_events,
+                    syscall_events,
+                    trap_load_store_events
+                )
+            };
+        }
+        macro_rules! lens {
+            ($($f:ident),*) => {
+                [$(input.$f.len()),*]
+            };
+        }
+        let tasks: Vec<(usize, usize, usize)> = with_cpu_event_vectors!(lens)
+            .into_iter()
+            .enumerate()
+            .flat_map(|(v, len)| {
+                (0..len)
+                    .step_by(PROGRAM_COUNT_TASK_EVENTS)
+                    .map(move |start| (v, start, (start + PROGRAM_COUNT_TASK_EVENTS).min(len)))
+            })
+            .collect();
+        let mut task_counts = vec![0u32; tasks.len() * nb_instructions];
+        if nb_instructions > 0 {
+            task_counts.par_chunks_mut(nb_instructions).enumerate().for_each(|(t, counts)| {
+                let (v, start, end) = tasks[t];
+                let mut count_pc = |pc: u64| {
+                    let off = pc.wrapping_sub(pc_base);
+                    if off.is_multiple_of(4) {
+                        if let Some(c) = counts.get_mut((off / 4) as usize) {
+                            *c += 1;
+                        }
+                    }
+                };
+                macro_rules! count {
+                    ($($f:ident),*) => {{
+                        let mut i = 0;
+                        $(
+                            if v == i {
+                                input.$f[start..end].iter().for_each(|event| count_pc(event.0.pc));
+                            }
+                            i += 1;
+                        )*
+                        let _ = i;
+                    }};
+                }
+                with_cpu_event_vectors!(count);
+            });
+        }
         let mut instruction_counts = vec![0u32; nb_instructions];
-        let mut count_pc = |pc: u64| {
-            let off = pc.wrapping_sub(pc_base);
-            if off.is_multiple_of(4) {
-                if let Some(c) = instruction_counts.get_mut((off / 4) as usize) {
-                    *c += 1;
+        let sum_chunk = std::cmp::max(nb_instructions.div_ceil(num_cpus::get()), 1);
+        instruction_counts.par_chunks_mut(sum_chunk).enumerate().for_each(|(i, out)| {
+            let range = i * sum_chunk..i * sum_chunk + out.len();
+            for counts in task_counts.chunks(nb_instructions) {
+                for (o, c) in out.iter_mut().zip(&counts[range.clone()]) {
+                    *o += c;
                 }
             }
-        };
-        input.alu_x0_events.iter().for_each(|event| {
-            let pc = event.0.pc;
-            count_pc(pc);
-        });
-        input.add_events.iter().for_each(|event| {
-            let pc = event.0.pc;
-            count_pc(pc);
-        });
-        input.addw_events.iter().for_each(|event| {
-            let pc = event.0.pc;
-            count_pc(pc);
-        });
-        input.addi_events.iter().for_each(|event| {
-            let pc = event.0.pc;
-            count_pc(pc);
-        });
-        input.sub_events.iter().for_each(|event| {
-            let pc = event.0.pc;
-            count_pc(pc);
-        });
-        input.subw_events.iter().for_each(|event| {
-            let pc = event.0.pc;
-            count_pc(pc);
-        });
-        input.bitwise_events.iter().for_each(|event| {
-            let pc = event.0.pc;
-            count_pc(pc);
-        });
-        input.mul_events.iter().for_each(|event| {
-            let pc = event.0.pc;
-            count_pc(pc);
-        });
-        input.divrem_events.iter().for_each(|event| {
-            let pc = event.0.pc;
-            count_pc(pc);
-        });
-        input.lt_events.iter().for_each(|event| {
-            let pc = event.0.pc;
-            count_pc(pc);
-        });
-        input.shift_left_events.iter().for_each(|event| {
-            let pc = event.0.pc;
-            count_pc(pc);
-        });
-        input.shift_right_events.iter().for_each(|event| {
-            let pc = event.0.pc;
-            count_pc(pc);
-        });
-        input.branch_events.iter().for_each(|event| {
-            let pc = event.0.pc;
-            count_pc(pc);
-        });
-        input.memory_load_byte_events.iter().for_each(|event| {
-            let pc = event.0.pc;
-            count_pc(pc);
-        });
-        input.memory_load_half_events.iter().for_each(|event| {
-            let pc = event.0.pc;
-            count_pc(pc);
-        });
-        input.memory_load_word_events.iter().for_each(|event| {
-            let pc = event.0.pc;
-            count_pc(pc);
-        });
-        input.memory_load_x0_events.iter().for_each(|event| {
-            let pc = event.0.pc;
-            count_pc(pc);
-        });
-        input.memory_load_double_events.iter().for_each(|event| {
-            let pc = event.0.pc;
-            count_pc(pc);
-        });
-        input.memory_store_byte_events.iter().for_each(|event| {
-            let pc = event.0.pc;
-            count_pc(pc);
-        });
-        input.memory_store_half_events.iter().for_each(|event| {
-            let pc = event.0.pc;
-            count_pc(pc);
-        });
-        input.memory_store_word_events.iter().for_each(|event| {
-            let pc = event.0.pc;
-            count_pc(pc);
-        });
-        input.memory_store_double_events.iter().for_each(|event| {
-            let pc = event.0.pc;
-            count_pc(pc);
-        });
-        input.jal_events.iter().for_each(|event| {
-            let pc = event.0.pc;
-            count_pc(pc);
-        });
-        input.jalr_events.iter().for_each(|event| {
-            let pc = event.0.pc;
-            count_pc(pc);
-        });
-        input.utype_events.iter().for_each(|event| {
-            let pc = event.0.pc;
-            count_pc(pc);
-        });
-        input.syscall_events.iter().for_each(|event| {
-            let pc = event.0.pc;
-            count_pc(pc);
-        });
-        input.trap_load_store_events.iter().for_each(|event| {
-            let pc = event.0.pc;
-            count_pc(pc);
         });
 
         // Note: The program table should only count trusted (i.e. not untrusted instructions.)
@@ -343,6 +316,8 @@ mod tests {
 
     use crate::program::ProgramChip;
 
+    use super::PROGRAM_COUNT_TASK_EVENTS;
+
     #[test]
     fn generate_trace() {
         // main:
@@ -386,7 +361,8 @@ mod tests {
             is_untrusted: false,
         };
         let mut events = Vec::new();
-        for _ in 0..200_000 {
+        // Enough events for several parallel counting tasks, over two event vectors.
+        for _ in 0..2 * PROGRAM_COUNT_TASK_EVENTS + 200_000 {
             let pc = match rng.gen_range(0..10) {
                 // in range, aligned
                 0..=6 => pc_base + 4 * rng.gen_range(0..n as u64),
@@ -404,9 +380,11 @@ mod tests {
         }
         let mut program = Program::new(instructions, pc_base, pc_base);
         program.pc_base = pc_base;
+        let sub_events = events.split_off(events.len() / 3);
         let shard = ExecutionRecord {
             program: Arc::new(program),
             add_events: events,
+            sub_events,
             ..Default::default()
         };
         let trace: RowMajorMatrix<SP1Field> =

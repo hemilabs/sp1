@@ -8,6 +8,8 @@ use sp1_hypercube::air::MachineAir;
 use crate::{CudaTracegenAir, F};
 
 impl CudaTracegenAir<F> for RiscvAir<F> {
+    const HOST_MAIN_TRACEGEN_IN_TURNS: bool = true;
+
     fn host_trace_generates_dependencies(&self, record: &Self::Record) -> bool {
         record.dependencies_in_trace && self.dependencies_in_trace()
     }

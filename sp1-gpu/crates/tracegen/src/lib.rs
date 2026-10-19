@@ -379,6 +379,11 @@ pub(crate) fn take_prep_or<T: 'static>(
 }
 
 pub trait CudaTracegenAir<F: Field>: MachineAir<F> {
+    /// Whether the shards of this machine take turns to generate their host main traces (see
+    /// `sp1_gpu_jagged_tracegen`): the large shards of the core machine do, the small recursion
+    /// shards, which a turn would hold up, do not.
+    const HOST_MAIN_TRACEGEN_IN_TURNS: bool = false;
+
     /// Whether this AIR supports preprocessed trace generation on the device.
     fn supports_device_preprocessed_tracegen(&self) -> bool {
         false
