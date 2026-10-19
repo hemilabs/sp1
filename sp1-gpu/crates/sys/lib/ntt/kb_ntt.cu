@@ -151,6 +151,66 @@ __global__ void kbNttDifPass(
     }
 }
 
+// The first global pass with the spread folded in: the K top stages (half-sizes 2^(lg_ext-1)
+// down to 2^(lg_ext-K)) of each column of 2^lg_ext evaluations, reading the column's 2^lg_n
+// coefficients from `in` times their coset powers, the zero padding implied (lg_ext - lg_n <= K:
+// a thread's element r is coefficient r 2^(lg_ext-K) + lo, which is below n for r < R >> lg_blowup).
+// Saves kbNttSpread's write and this pass's read of the padded columns.
+template <int K>
+__global__ void kbNttDifPassFirst(
+    kb31_t* out,
+    const kb31_t* in,
+    uint32_t lg_n,
+    uint32_t lg_ext,
+    uint64_t total,
+    Twiddles tw,
+    const kb31_t* pow_lo,
+    const kb31_t* pow_hi) {
+    constexpr int R = 1 << K;
+    const uint32_t lg_lo = lg_ext - K;
+    const uint32_t lo_mask = (1u << lg_lo) - 1;
+    const int r_in = R >> (lg_ext - lg_n);
+    const uint32_t s = lg_ext - 1;
+    for (uint64_t t = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x; t < total;
+         t += (uint64_t)gridDim.x * blockDim.x) {
+        const uint32_t lo = (uint32_t)t & lo_mask;
+        const uint64_t col = t >> lg_lo;
+        const kb31_t* src = in + (col << lg_n);
+        kb31_t* x = out + (col << lg_ext) + lo;
+        kb31_t v[R];
+#pragma unroll
+        for (int r = 0; r < R; r++) {
+            if (r < r_in) {
+                const uint32_t i = ((uint32_t)r << lg_lo) + lo;
+                kb31_t c = src[i];
+                c *= pow_lo[i & ((1u << LG_POW_LO) - 1)];
+                c *= pow_hi[i >> LG_POW_LO];
+                v[r] = c;
+            } else {
+                v[r] = kb31_t(0u);
+            }
+        }
+#pragma unroll
+        for (int st = 0; st < K; st++) {
+            const int half = R >> (st + 1);
+            const uint32_t m = s - st;
+#pragma unroll
+            for (int r = 0; r < R; r++) {
+                if (r & half) continue;
+                const kb31_t a = v[r];
+                const kb31_t b = v[r + half];
+                v[r] = a + b;
+                kb31_t d = a - b;
+                const uint32_t j = ((uint32_t)(r & (half - 1)) << lg_lo) + lo;
+                d *= twiddle(tw, m, j);
+                v[r + half] = d;
+            }
+        }
+#pragma unroll
+        for (int r = 0; r < R; r++) x[(uint64_t)r << lg_lo] = v[r];
+    }
+}
+
 // The DIF stages with half-sizes 2^(lg_top-1) down to 1 within each tile of 2^lg_top contiguous
 // elements, in shared memory.
 __global__ void kbNttDifTile(kb31_t* data, uint32_t lg_top, uint64_t tiles, Twiddles tw) {
@@ -299,6 +359,21 @@ void* dif_pass_kernel(int k) {
     }
 }
 
+void* dif_pass_first_kernel(int k) {
+    switch (k) {
+        case 1:
+            return SP1_KERNEL_PTR(kbNttDifPassFirst<1>);
+        case 2:
+            return SP1_KERNEL_PTR(kbNttDifPassFirst<2>);
+        case 3:
+            return SP1_KERNEL_PTR(kbNttDifPassFirst<3>);
+        case 4:
+            return SP1_KERNEL_PTR(kbNttDifPassFirst<4>);
+        default:
+            return SP1_KERNEL_PTR(kbNttDifPassFirst<5>);
+    }
+}
+
 }  // namespace kbntt
 
 // The field elements are Montgomery-form u32s: callers pass sppark's fr_t or our kb31_t.
@@ -344,7 +419,14 @@ extern "C" rustCudaError_t kb_ntt_coset_dft(
         e = launch(SP1_KERNEL_PTR(kbNttPowers), (count + BLOCK - 1) / BLOCK, BLOCK, args, stream);
         if (failed(e)) return e;
     }
-    {
+    // Global passes for the stages above the tile, KMAX at most each, as even as possible.
+    const uint32_t lg_top = lg_ext < (uint32_t)LG_TILE ? lg_ext : (uint32_t)LG_TILE;
+    const uint32_t global_stages = lg_ext - lg_top;
+    const uint32_t passes = (global_stages + KMAX - 1) / KMAX;
+    const uint32_t k_first = passes ? (global_stages + passes - 1) / passes : 0;
+    // The spread folds into the first global pass when that pass's stages cover the padding.
+    const bool fused = passes > 0 && lg_blowup <= k_first;
+    if (!fused) {
         const uint64_t total = (uint64_t)cols << lg_ext;
         const kb31_t* in = d_in;
         const kb31_t* plo = pow_lo;
@@ -353,23 +435,26 @@ extern "C" rustCudaError_t kb_ntt_coset_dft(
         e = launch(SP1_KERNEL_PTR(kbNttSpread), grid_for(total), BLOCK, args, stream);
         if (failed(e)) return e;
     }
-    e = cuda_free_async(d_pow, stream);
-    if (failed(e)) return e;
-
-    // Global passes for the stages above the tile, KMAX at most each, as even as possible.
-    const uint32_t lg_top = lg_ext < (uint32_t)LG_TILE ? lg_ext : (uint32_t)LG_TILE;
-    const uint32_t global_stages = lg_ext - lg_top;
-    const uint32_t passes = (global_stages + KMAX - 1) / KMAX;
     uint32_t s = lg_ext - 1;
     for (uint32_t p = 0; p < passes; p++) {
         const uint32_t remaining = global_stages - (lg_ext - 1 - s);
         const uint32_t k = (remaining + (passes - p) - 1) / (passes - p);
         const uint64_t total = (uint64_t)cols << (lg_ext - k);
-        void* args[] = {&d_out, (void*)&lg_ext, &s, (void*)&total, &tw};
-        e = launch(dif_pass_kernel((int)k), grid_for(total), BLOCK, args, stream);
+        if (p == 0 && fused) {
+            const kb31_t* in = d_in;
+            const kb31_t* plo = pow_lo;
+            const kb31_t* phi = pow_hi;
+            void* args[] = {&d_out, &in, &lg_n, (void*)&lg_ext, (void*)&total, &tw, &plo, &phi};
+            e = launch(dif_pass_first_kernel((int)k), grid_for(total), BLOCK, args, stream);
+        } else {
+            void* args[] = {&d_out, (void*)&lg_ext, &s, (void*)&total, &tw};
+            e = launch(dif_pass_kernel((int)k), grid_for(total), BLOCK, args, stream);
+        }
         if (failed(e)) return e;
         s -= k;
     }
+    e = cuda_free_async(d_pow, stream);
+    if (failed(e)) return e;
     {
         const uint64_t tiles = (uint64_t)cols << (lg_ext - lg_top);
         uint32_t lt = lg_top;
