@@ -29,10 +29,16 @@ pub struct Server {
     pub cuda_device_id: u32,
 }
 
+/// The prover every connection uses: one per process. Building one takes seconds and it keeps its
+/// caches (proving keys, compiled recursion programs, GPU memory pool) from proof to proof, so a
+/// client that reconnects does not pay for them again. One prover is also what the GPU has room
+/// for: a prover per concurrent connection would each claim its own GPU memory.
+type SharedProver = Arc<tokio::sync::OnceCell<Arc<SP1LocalNode>>>;
+
 /// The context for a single connection to the server.
 struct ConnectionCtx {
     pk_cache: HashMap<[u8; 32], CachedProgram>,
-    prover: tokio::sync::OnceCell<Arc<SP1LocalNode>>,
+    prover: SharedProver,
     task_scope: TaskScope,
 }
 
@@ -54,6 +60,7 @@ impl Server {
         let listener = UnixListener::bind(&socket_path).expect("Failed to bind to socket addr");
 
         tracing::info!("Server listening @ {}", socket_path.display());
+        let prover = SharedProver::default();
         loop {
             tokio::select! {
                 res = listener.accept() => {
@@ -61,11 +68,12 @@ impl Server {
                         tracing::info!("Connection accepted");
 
                         let task_scope = task_scope.clone();
+                        let prover = prover.clone();
 
                         tokio::spawn(async move {
                             let mut stream = stream;
 
-                            if let Err(e) = Self::handle_connection(task_scope, &mut stream).await {
+                            if let Err(e) = Self::handle_connection(task_scope, prover, &mut stream).await {
                                 if e.kind() == io::ErrorKind::UnexpectedEof
                                     || e.kind() == io::ErrorKind::BrokenPipe
                                 {
@@ -94,10 +102,10 @@ impl Server {
 
     async fn handle_connection(
         task_scope: TaskScope,
+        prover: SharedProver,
         stream: &mut UnixStream,
     ) -> Result<(), io::Error> {
-        let mut ctx =
-            ConnectionCtx { pk_cache: Default::default(), prover: Default::default(), task_scope };
+        let mut ctx = ConnectionCtx { pk_cache: Default::default(), prover, task_scope };
 
         loop {
             let mut len = [0_u8; 4];
