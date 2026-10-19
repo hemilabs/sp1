@@ -4,6 +4,7 @@ mod riscv;
 use core::future::{ready, Future};
 use core::pin::pin;
 use std::collections::BTreeSet;
+use std::mem::MaybeUninit;
 use std::{collections::BTreeMap, sync::Arc};
 
 use futures::stream::FuturesUnordered;
@@ -12,6 +13,7 @@ use rayon::prelude::*;
 use slop_air::BaseAir;
 use slop_algebra::Field;
 use slop_alloc::mem::CopyError;
+use slop_alloc::Buffer;
 use slop_multilinear::{Mle, PaddedMle};
 use sp1_gpu_cudart::{DeviceMle, DeviceTransposeKernel, TaskScope};
 use sp1_hypercube::prover::{MainTraceData, PreprocessedTraceData, ProverSemaphore, TraceData};
@@ -367,6 +369,53 @@ where
 /// Opaque output of [`CudaTracegenAir::prepare_preprocessed_device`].
 pub type PreprocessedPrep = Box<dyn std::any::Any + Send + Sync>;
 
+/// A device-tracegen input (events or instructions) that was copied into pinned host memory
+/// ahead of time, so its upload is an asynchronous DMA instead of a blocking pageable copy.
+#[derive(Clone, Copy, Debug)]
+pub struct StagedInput {
+    ptr: usize,
+    len: usize,
+}
+
+impl StagedInput {
+    /// # Safety
+    /// `ptr` must point to `len` bytes of pinned host memory holding a copy of the input. The
+    /// memory must stay valid and unchanged until the stream that uploads it has passed the copy.
+    pub unsafe fn new(ptr: *const u8, len: usize) -> Self {
+        Self { ptr: ptr as usize, len }
+    }
+}
+
+/// The bytes of a slice of events or instructions (which are uploaded as they are), for staging.
+pub(crate) fn input_bytes<T>(input: &[T]) -> &[MaybeUninit<u8>] {
+    // SAFETY: any `size_of_val(input)` bytes at `input` may be read as possibly uninit bytes.
+    unsafe { std::slice::from_raw_parts(input.as_ptr().cast(), std::mem::size_of_val(input)) }
+}
+
+/// The bytes of a [`PreprocessedPrep`] holding a `Vec<T>`.
+pub(crate) fn prep_bytes<T: 'static>(prep: &PreprocessedPrep) -> Option<&[MaybeUninit<u8>]> {
+    prep.downcast_ref::<Vec<T>>().map(|v| input_bytes(v))
+}
+
+/// Copies `input` into a new device buffer, from its pinned copy when `staged` is given.
+pub(crate) fn upload_input<T>(
+    input: &[T],
+    staged: Option<StagedInput>,
+    scope: &TaskScope,
+) -> Result<Buffer<T, TaskScope>, CopyError> {
+    let mut buf = Buffer::try_with_capacity_in(input.len(), scope.clone()).unwrap();
+    match staged {
+        Some(staged) if staged.len == std::mem::size_of_val(input) => {
+            // SAFETY: the staged copy holds the same `input.len()` elements, at an aligned
+            // address in pinned memory that outlives the copy (see `StagedInput::new`).
+            let src = unsafe { std::slice::from_raw_parts(staged.ptr as *const T, input.len()) };
+            buf.extend_from_host_slice(src)?;
+        }
+        _ => buf.extend_from_host_slice(input)?,
+    }
+    Ok(buf)
+}
+
 /// Use the prepared value if it has the expected type, else compute it now.
 pub(crate) fn take_prep_or<T: 'static>(
     prep: Option<PreprocessedPrep>,
@@ -413,13 +462,25 @@ pub trait CudaTracegenAir<F: Field>: MachineAir<F> {
         None
     }
 
+    /// The bytes that [`CudaTracegenAir::generate_preprocessed_trace_device_prepared`] uploads
+    /// for `prep`, so callers can stage them in pinned memory ahead of time.
+    fn preprocessed_device_input<'a>(
+        &self,
+        _prep: &'a PreprocessedPrep,
+    ) -> Option<&'a [MaybeUninit<u8>]> {
+        None
+    }
+
     /// Like [`CudaTracegenAir::generate_preprocessed_trace_device`], but reuses the output of
-    /// [`CudaTracegenAir::prepare_preprocessed_device`] when given. The trace is identical.
+    /// [`CudaTracegenAir::prepare_preprocessed_device`] when given, and uploads it from `staged`
+    /// (a pinned copy of [`CudaTracegenAir::preprocessed_device_input`]) when given. The trace
+    /// is identical.
     #[allow(unused_variables)]
     fn generate_preprocessed_trace_device_prepared(
         &self,
         program: &Self::Program,
         prep: Option<PreprocessedPrep>,
+        staged: Option<StagedInput>,
         scope: &TaskScope,
     ) -> impl Future<Output = Result<Option<DeviceMle<F>>, CopyError>> + Send {
         self.generate_preprocessed_trace_device(program, scope)
@@ -447,11 +508,32 @@ pub trait CudaTracegenAir<F: Field>: MachineAir<F> {
     ///
     /// # Panics
     /// Panics if unsupported. See [`CudaTracegenAir::supports_device_main_tracegen`].
-    #[allow(unused_variables)]
     fn generate_trace_device(
         &self,
         input: &Self::Record,
         output: &mut Self::Record,
+        scope: &TaskScope,
+    ) -> impl Future<Output = Result<DeviceMle<F>, CopyError>> + Send {
+        self.generate_trace_device_staged(input, output, None, scope)
+    }
+
+    /// The bytes that the device main tracegen uploads from `record` (its events), so callers
+    /// can stage them in pinned memory before taking the prover permit.
+    fn main_device_input<'a>(&self, _record: &'a Self::Record) -> Option<&'a [MaybeUninit<u8>]> {
+        None
+    }
+
+    /// Like [`CudaTracegenAir::generate_trace_device`], but uploads the input from `staged` (a
+    /// pinned copy of [`CudaTracegenAir::main_device_input`]) when given. The trace is identical.
+    ///
+    /// # Panics
+    /// Panics if unsupported. See [`CudaTracegenAir::supports_device_main_tracegen`].
+    #[allow(unused_variables)]
+    fn generate_trace_device_staged(
+        &self,
+        input: &Self::Record,
+        output: &mut Self::Record,
+        staged: Option<StagedInput>,
         scope: &TaskScope,
     ) -> impl Future<Output = Result<DeviceMle<F>, CopyError>> + Send {
         #[allow(unreachable_code)]
@@ -461,10 +543,10 @@ pub trait CudaTracegenAir<F: Field>: MachineAir<F> {
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use super::{CudaTracegenAir, F};
+    use super::{CudaTracegenAir, StagedInput, F};
     use rand::{rngs::StdRng, SeedableRng};
     use slop_tensor::Tensor;
-    use sp1_gpu_cudart::TaskScope;
+    use sp1_gpu_cudart::{PinnedBuffer, TaskScope};
     use sp1_hypercube::air::MachineAir;
     use std::collections::BTreeSet;
 
@@ -544,6 +626,23 @@ pub(crate) mod tests {
             .to_host()
             .expect("should copy trace to host successfully")
             .into_guts();
+
+        // The staged path (input first copied into pinned memory) must give the identical trace.
+        let input =
+            chip.main_device_input(&gpu_shard).expect("device chips should expose their input");
+        let mut pinned = PinnedBuffer::<u8>::with_capacity(input.len());
+        unsafe {
+            std::ptr::copy_nonoverlapping(input.as_ptr().cast(), pinned.as_mut_ptr(), input.len())
+        };
+        let staged = unsafe { StagedInput::new(pinned.as_ptr(), input.len()) };
+        let gpu_trace_staged = chip
+            .generate_trace_device_staged(&gpu_shard, &mut Record::default(), Some(staged), &scope)
+            .await
+            .expect("should copy events to device successfully")
+            .to_host()
+            .expect("should copy trace to host successfully")
+            .into_guts();
+        assert!(gpu_trace.as_slice() == gpu_trace_staged.as_slice(), "staged trace differs");
 
         crate::tests::test_traces_eq(&trace, &gpu_trace, &events);
     }
