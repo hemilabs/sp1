@@ -149,6 +149,7 @@ after a reboot, both builds alternating.
 | groth16, first | 30.3 → 26.7 | 26.4 → 23.9 |
 | groth16, steady | 16.0 → 15.5 | 14.3 → 12.9 |
 
-On the Arc Pro B70, some compressed proofs late in a process occasionally take 10-50 s instead
-of ~4.5 s, when the card's memory spills to shared system memory (more often with #16's trace
-prefetch). The medians above include one such proof; it is being investigated.
+The "after" Arc Pro B70 numbers were measured with #16's trace prefetch on. It is now off by
+default on HIP and SYCL: on the B70 it made a third of compressed proofs spill to shared system
+memory (10-50 s instead of ~4.3 s), and the compressed median above includes one such proof.
+With it off, 64 compressed proofs in a row took 4.2-4.4 s (4.7-4.9 s for each process's first).
