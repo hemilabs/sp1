@@ -84,14 +84,21 @@ pub fn local_gpu_opts() -> SP1CoreOpts {
 
     // Shard threshold tiers based on GPU memory. `gpu_memory_gb` = ceil(actual GiB) + 4, so a 16 GB
     // card reports 20 and a 24 GB card 28.
-    let tier_threshold = if gpu_memory_gb <= 20 {
-        // 16 GB cards (e.g. RTX 5080, RX 9070 XT): ~134M elements per shard to fit in VRAM.
-        ELEMENT_THRESHOLD - (1 << 28)
-    } else if !opts.full_size_shards && gpu_memory_gb <= 30 {
-        ELEMENT_THRESHOLD - (1 << 26) - (1 << 25) - (1 << 24)
-    } else {
-        ELEMENT_THRESHOLD
-    };
+    let tier_threshold =
+        if gpu_memory_gb <= 20 && cfg!(windows) && sp1_gpu_cudart::sys::BACKEND == "hip" {
+            // 16GB AMD GPUs on Windows: the video memory budget Windows grants a process is ~12.5 GB of
+            // the 16, and past it WDDM moves allocations into shared system memory rather than failing
+            // them, which slowed every kernel touching them (an RX 9070 XT proved a 144M-cycle program in
+            // 15-17 s at the tier below and 12.7-13.5 s at this one).
+            1 << 26
+        } else if gpu_memory_gb <= 20 {
+            // 16 GB cards (e.g. RTX 5080, RX 9070 XT): ~134M elements per shard to fit in VRAM.
+            ELEMENT_THRESHOLD - (1 << 28)
+        } else if !opts.full_size_shards && gpu_memory_gb <= 30 {
+            ELEMENT_THRESHOLD - (1 << 26) - (1 << 25) - (1 << 24)
+        } else {
+            ELEMENT_THRESHOLD
+        };
 
     // `SP1_GPU_ELEMENT_THRESHOLD` caps the tier's choice; it never replaces it.
     //
@@ -217,6 +224,24 @@ pub async fn cuda_worker_builder_with_machine(
     scope: TaskScope,
     machine: Machine<SP1Field, RiscvAir<SP1Field>>,
 ) -> SP1WorkerBuilder<SP1CudaProverComponents> {
+    // gnark's Groth16 prover runs its quotient polynomial and MSMs on this GPU where the build has
+    // them (HIP and SYCL; SP1_GROTH16_GPU=0 keeps them on the CPU).
+    if let Some((compute_h, msm_g1, msm_g2)) = sp1_gpu_cudart::sys::groth16_entry_points() {
+        sp1_recursion_gnark_ffi::ffi::set_groth16_gpu_hooks(compute_h, msm_g1, msm_g2);
+    }
+
+    // The wrap prover keeps its proving key between Groth16/PLONK proofs (sp1-prover's WrapProver)
+    // where the card has the memory for it: on a 32 GB Arc Pro B70 that saves ~3 s a proof, while
+    // on a 16 GB Radeon RX 9070 XT the key's memory slowed the rest of each proof by more (19 s ->
+    // 25 s). SP1_WRAP_PERSISTENT_PK set by the user decides either way.
+    if std::env::var_os("SP1_WRAP_PERSISTENT_PK").is_none() {
+        if let Ok((_, total)) = sp1_gpu_cudart::cuda_memory_info() {
+            if total < 24 << 30 {
+                std::env::set_var("SP1_WRAP_PERSISTENT_PK", "0");
+            }
+        }
+    }
+
     // #3: permit count = max in-flight shards. Default 1 = single-shard
     // (today's behaviour); env `SP1_PROVE_OVERLAP_TRACEGEN` ≥ 1 raises it
     // in lockstep with the per-PK trace-buffer pool size (see

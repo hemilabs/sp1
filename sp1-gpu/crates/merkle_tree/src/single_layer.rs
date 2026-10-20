@@ -568,6 +568,74 @@ mod tests {
     use super::*;
     use slop_merkle_tree::{ComputeTcsOpenings, TensorCsProver};
 
+    /// Commit throughput (leaf hashing and compression) for a tensor of 64 columns by 2^22 rows.
+    /// `cargo test --release -p sp1-gpu-merkle-tree bench_commit -- --ignored --nocapture`
+    #[tokio::test]
+    #[ignore]
+    async fn bench_commit_koala_bear_16() {
+        run_in_place(|scope| async move {
+            let (width, log_height) = (64usize, 22usize);
+            let n = width << log_height;
+            let host: Vec<SP1Field> = (0..n)
+                .map(|i| SP1Field::from_canonical_u32((i as u32).wrapping_mul(2654435761) >> 2))
+                .collect();
+            let host = Tensor::from(host).reshape([width, 1 << log_height]);
+            let tensor =
+                sp1_gpu_cudart::DeviceTensor::from_host(&host, &scope).unwrap().into_inner();
+            let prover = Poseidon2SP1Field16CudaProver::new(&scope);
+            // The GPU's clocks ramp up over the first iterations: the best of the last ten.
+            let mut best = f64::MAX;
+            for i in 0..20 {
+                scope.synchronize().await.unwrap();
+                let t = std::time::Instant::now();
+                let _ = prover.commit_tensors(&tensor).unwrap();
+                scope.synchronize().await.unwrap();
+                if i >= 10 {
+                    best = best.min(t.elapsed().as_secs_f64());
+                }
+            }
+            let perms = (n / 8 + (1 << log_height)) as f64;
+            println!(
+                "commit best: {:.2} ms, {:.2} G perms/s, {:.1} GB/s of trace",
+                best * 1e3,
+                perms / best / 1e9,
+                (n * 4) as f64 / best / 1e9
+            );
+        })
+        .await;
+    }
+
+    /// Commit throughput of the wrap's BN254 Poseidon2 Merkle tree, 64 columns by 2^20 rows.
+    /// `cargo test --release -p sp1-gpu-merkle-tree bench_commit_bn254 -- --ignored --nocapture`
+    #[tokio::test]
+    #[ignore]
+    async fn bench_commit_bn254() {
+        run_in_place(|scope| async move {
+            let (width, log_height) = (64usize, 20usize);
+            let n = width << log_height;
+            let host: Vec<SP1Field> = (0..n)
+                .map(|i| SP1Field::from_canonical_u32((i as u32).wrapping_mul(2654435761) >> 2))
+                .collect();
+            let host = Tensor::from(host).reshape([width, 1 << log_height]);
+            let tensor =
+                sp1_gpu_cudart::DeviceTensor::from_host(&host, &scope).unwrap().into_inner();
+            let prover = Poseidon2Bn254CudaProver::new(&scope);
+            // The GPU's clocks ramp up over the first iterations: the best of the last five.
+            let mut best = f64::MAX;
+            for i in 0..10 {
+                scope.synchronize().await.unwrap();
+                let t = std::time::Instant::now();
+                let _ = prover.commit_tensors(&tensor).unwrap();
+                scope.synchronize().await.unwrap();
+                if i >= 5 {
+                    best = best.min(t.elapsed().as_secs_f64());
+                }
+            }
+            println!("bn254 commit best: {:.2} ms", best * 1e3);
+        })
+        .await;
+    }
+
     #[tokio::test]
     async fn test_poseidon2_koala_bear_16() {
         let (machine, record, program) =

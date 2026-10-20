@@ -1,3 +1,4 @@
+#include "runtime/gpu_backend.cuh"
 #include "sp1-gpu-cbindgen.hpp"
 
 #include "fields/kb31_t.cuh"
@@ -176,8 +177,8 @@ __global__ void riscv_global_search_offsets_kernel(
     const sp1_gpu_sys::GlobalInteractionEvent* __restrict__ events,
     uintptr_t nb_events,
     GlobalSearchOut* __restrict__ out) {
-#ifdef __HIP_PLATFORM_AMD__
-    // Portable fallback (wave size may be 64): one event per thread.
+#if defined(__HIP_PLATFORM_AMD__) || defined(SP1_SYCL)
+    // Portable fallback (wave size may be 64; 16-wide sub-groups on SYCL): one event per thread.
     size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
     if (i >= nb_events) return;
     for (size_t e = i * GLOBAL_SEARCH_PER_LANE;
@@ -403,12 +404,12 @@ __global__ void riscv_global_generate_trace_finalize_kernel(
 
 namespace sp1_gpu_sys {
 extern KernelPtr riscv_global_generate_trace_decompress_kernel() {
-    return (KernelPtr)::riscv_global_generate_trace_decompress_kernel;
+    return (KernelPtr)SP1_KERNEL_PTR(::riscv_global_generate_trace_decompress_kernel);
 }
 extern KernelPtr riscv_global_search_offsets_kernel() {
-    return (KernelPtr)::riscv_global_search_offsets_kernel;
+    return (KernelPtr)SP1_KERNEL_PTR(::riscv_global_search_offsets_kernel);
 }
 extern KernelPtr riscv_global_generate_trace_finalize_kernel() {
-    return (KernelPtr)::riscv_global_generate_trace_finalize_kernel;
+    return (KernelPtr)SP1_KERNEL_PTR(::riscv_global_generate_trace_finalize_kernel);
 }
 } // namespace sp1_gpu_sys

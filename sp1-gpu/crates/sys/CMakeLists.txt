@@ -48,14 +48,17 @@ if(USE_HIP)
     # set(CMAKE_HIP_FLAGS "${CMAKE_HIP_FLAGS} -fgpu-rdc")
     set(CMAKE_HIP_FLAGS "${CMAKE_HIP_FLAGS} -ffast-math")
     set(CMAKE_HIP_FLAGS "${CMAKE_HIP_FLAGS} -munsafe-fp-atomics")
-    set(CMAKE_HIP_FLAGS "${CMAKE_HIP_FLAGS} -fopenmp")
-    set(CMAKE_HIP_FLAGS "${CMAKE_HIP_FLAGS} -fPIE")
+    if(NOT WIN32)
+        set(CMAKE_HIP_FLAGS "${CMAKE_HIP_FLAGS} -fPIE")
+    endif()
 
     # HIP's compiler handles CUDA API mapping natively in ROCm 7.2+.
     # No need for cuda2hip.hpp global include.
 
     # Release optimization. -Wno-c++11-narrowing for sppark's variadic constructors.
-    set(CMAKE_HIP_FLAGS_RELEASE "-O3 -Wno-c++11-narrowing")
+    # NDEBUG: device asserts cost a load or more each in hot kernels, and on Windows, which has no
+    # HIP trap handler, a failing one cannot report anyway. (Not for sppark's NTT: see lib/ntt.)
+    set(CMAKE_HIP_FLAGS_RELEASE "-O3 -DNDEBUG -Wno-c++11-narrowing")
     set(CMAKE_HIP_FLAGS_DEBUG "-O3 -Wno-c++11-narrowing")
 
     # Get the actual source directory
@@ -117,6 +120,7 @@ if(USE_HIP)
     add_subdirectory(lib/msm)
     add_subdirectory(lib/plonk)
     add_subdirectory(lib/r1cs)  # CUDA-only at the source-file level (HIP build is a no-op)
+    add_subdirectory(lib/groth16)
 
     # Sppark sources -- compile as HIP (they include cuda2hip.hpp via __HIPCC__ guard)
     add_library(sppark_objs OBJECT
@@ -141,7 +145,7 @@ if(USE_HIP)
         ntt_bn254_objs
         runtime_objs scan_objs sum_and_reduce_objs sumcheck_objs
         tracegen_objs transpose_objs zerocheck_objs
-        msm_objs
+        msm_objs groth16_objs
     )
     foreach(tgt ${_hip_targets})
         if(TARGET ${tgt})
@@ -181,6 +185,7 @@ if(USE_HIP)
         $<TARGET_OBJECTS:r1cs_objs>
         $<TARGET_OBJECTS:ntt_bn254_objs>
         $<TARGET_OBJECTS:sppark_objs>
+        $<TARGET_OBJECTS:groth16_objs>
     )
 
     # Create static library.
@@ -255,8 +260,12 @@ else()
     set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} --expt-relaxed-constexpr")
     set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} --use_fast_math")
     set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -lineinfo")
-    set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -Xcompiler -fopenmp")
-    set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -Xcompiler -fPIE")
+    # GCC host flags. MSVC rejects them, and needs neither: OpenMP is used only on the HIP path,
+    # and Windows code is position-independent as it stands.
+    if(NOT MSVC)
+        set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -Xcompiler -fopenmp")
+        set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -Xcompiler -fPIE")
+    endif()
 
     # Enable relocatable device code for cross-file device function calls
     set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -rdc=true")
@@ -367,7 +376,9 @@ else()
         CUDA_RESOLVE_DEVICE_SYMBOLS ON
     )
 
-    if(CMAKE_CUDA_COMPILER_VERSION VERSION_LESS 12.9)
+    # The sources use NVTX3 (<nvtx3/nvToolsExt.h>), which is header-only, so the v2 library is
+    # linked only where the toolkit has one: Windows toolkits ship NVTX3 headers alone.
+    if(CMAKE_CUDA_COMPILER_VERSION VERSION_LESS 12.9 AND TARGET CUDA::nvToolsExt)
         target_link_libraries(sys-cuda PRIVATE
             CUDA::cudart
             CUDA::nvToolsExt

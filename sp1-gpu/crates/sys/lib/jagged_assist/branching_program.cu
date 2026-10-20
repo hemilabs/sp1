@@ -1,3 +1,4 @@
+#include "runtime/gpu_backend.cuh"
 #include "jagged_assist/branching_program.cuh"
 #include "fields/kb31_extension_t.cuh"
 #include "fields/kb31_t.cuh"
@@ -148,10 +149,12 @@ __global__ void interpolateAndObserve(
     EF *sampled_value,
     int8_t round_num,
     EF *sum_values,
-    EF claim
+    const EF *claim_ptr
 ){
     if (blockIdx.x == 0 && threadIdx.x == 0 && blockIdx.y == 0 && threadIdx.y == 0) {
 
+    // The round's claim, from the previous round's results[0] on the device (no host round trip).
+    EF claim = *claim_ptr;
 
     EF y_0 = results[0];
     EF y_half = results[1];
@@ -488,29 +491,29 @@ __global__ void transition(
 
 extern "C" void *branching_program_kernel()
 {
-    return (void *)branchingProgram<kb31_t, kb31_extension_t>;
+    return SP1_KERNEL_PTR(branchingProgram<kb31_t, kb31_extension_t>);
 }
 
 
 extern "C" void *transition_kernel()
 {
-    return (void *)transition;
+    return SP1_KERNEL_PTR(transition);
 }
 
 
 extern "C" void *interpolateAndObserve_kernel_duplex()
 {
-    return (void *)interpolateAndObserve<kb31_t, kb31_extension_t, DuplexChallenger>;
+    return SP1_KERNEL_PTR(interpolateAndObserve<kb31_t, kb31_extension_t, DuplexChallenger>);
 }
 
 extern "C" void *interpolateAndObserve_kernel_multi_field_32()
 {
-    return (void *)interpolateAndObserve<kb31_t, kb31_extension_t, MultiField32Challenger>;
+    return SP1_KERNEL_PTR(interpolateAndObserve<kb31_t, kb31_extension_t, MultiField32Challenger>);
 }
 
 extern "C" void *fixLastVariable_kernel()
 {
-    return (void *)fixLastVariable<kb31_t, kb31_extension_t>;
+    return SP1_KERNEL_PTR(fixLastVariable<kb31_t, kb31_extension_t>);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -520,21 +523,21 @@ extern "C" void *fixLastVariable_kernel()
 #include "jagged_assist/bp_cached.cuh"
 
 extern "C" void* bp_cached_precompute_kernel() {
-    return (void*)bpCachedPrecompute<kb31_t, kb31_extension_t>;
+    return SP1_KERNEL_PTR(bpCachedPrecompute<kb31_t, kb31_extension_t>);
 }
 
 extern "C" void* bp_cached_round_kernel() {
-    return (void*)bpCachedRound<kb31_t, kb31_extension_t>;
+    return SP1_KERNEL_PTR(bpCachedRound<kb31_t, kb31_extension_t>);
 }
 
 extern "C" void* bp_cached_round2_kernel() {
-    return (void*)bpCachedRound2<kb31_t, kb31_extension_t>;
+    return SP1_KERNEL_PTR(bpCachedRound2<kb31_t, kb31_extension_t>);
 }
 
 extern "C" void* bp_cached_interpolate_kernel_duplex() {
-    return (void*)bpCachedInterpolateAndObserve<kb31_t, kb31_extension_t, DuplexChallenger>;
+    return SP1_KERNEL_PTR(bpCachedInterpolateAndObserve<kb31_t, kb31_extension_t, DuplexChallenger>);
 }
 
 extern "C" void* bp_cached_interpolate_kernel_multi_field_32() {
-    return (void*)bpCachedInterpolateAndObserve<kb31_t, kb31_extension_t, MultiField32Challenger>;
+    return SP1_KERNEL_PTR(bpCachedInterpolateAndObserve<kb31_t, kb31_extension_t, MultiField32Challenger>);
 }

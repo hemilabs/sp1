@@ -135,6 +135,80 @@ class KoalaBear {
         }
     }
 
+#ifdef SP1_PORTABLE
+    // Poseidon2::permute runs the partial rounds through partialRounds on HIP and SYCL.
+    static constexpr bool DEFERRED_PARTIAL_ROUNDS = true;
+#else
+    static constexpr bool DEFERRED_PARTIAL_ROUNDS = false;
+#endif
+
+    // v / 2^32 mod p, for v < p 2^32, as kb31_t's Montgomery multiplication reduces its product
+    // ((v + red p) / 2^32, red = lo(v) (-p^-1)), with shifts for the multiplications by
+    // M = 2^31 - 2^24 - 1 and MOD = 2^31 - 2^24 + 1 (32-bit multiplications are quarter rate on
+    // RDNA).
+    __device__ static __forceinline__ F_t montyReduce(uint64_t v) {
+        const uint32_t tl = static_cast<uint32_t>(v);
+        const uint32_t th = static_cast<uint32_t>(v >> 32);
+        const uint32_t red = (tl << 31) - (tl << 24) - tl;
+        const uint64_t wide = ((uint64_t)red << 31) - ((uint64_t)red << 24) + (uint64_t)red + tl;
+        uint32_t r = static_cast<uint32_t>(wide >> 32) + th;
+        r = r >= kb31_t::MOD ? r - kb31_t::MOD : r;
+        return F_t(r);
+    }
+
+    // The partial rounds, with the internal layer on the Montgomery words. The layer is
+    // x_i' = MONTY_INVERSE (d_i x_i + sum x), d = (-2, 1, 2, 4, ..., 2^13, 2^15) (the diagonal
+    // over MONTY_INVERSE), and MONTY_INVERSE is 2^-32: so x_i' is the Montgomery reduction of
+    // d_i X_i + sum X on the words X, a shift and a reduction per element instead of a
+    // multiplication (checked against internalLinearLayer in scratchpad opt/p2_partial.py).
+    __device__ static void partialRounds(F_t state[WIDTH]) {
+#ifdef SP1_SYCL
+        // 32-bit operations only (Intel GPUs emulate 64-bit integers): v = hi 2^32 + lo.
+        for (int r = 0; r < ROUNDS_P; r++) {
+            state[0] += constants::INTERNAL_ROUND_CONSTANTS[r];
+            state[0] ^= D;
+            uint32_t sum_lo = 0, sum_hi = 0;
+            for (int i = 0; i < WIDTH; i++) {
+                const uint32_t t = sum_lo + state[i].val;
+                sum_hi += t < sum_lo ? 1u : 0u;
+                sum_lo = t;
+            }
+            auto reduce = [&](uint32_t lo, uint32_t hi) {
+                const uint32_t l = lo + sum_lo;
+                const uint32_t h = hi + sum_hi + (l < lo ? 1u : 0u);
+                const uint32_t red = l * kb31_t::M;
+                uint32_t r2 = h + sycl::mul_hi(red, kb31_t::MOD) + (l != 0 ? 1u : 0u);
+                return F_t(r2 >= kb31_t::MOD ? r2 - kb31_t::MOD : r2);
+            };
+            // 2 (MOD - X_0) < 2^32.
+            state[0] = reduce(2 * (kb31_t::MOD - state[0].val), 0);
+            state[1] = reduce(state[1].val, 0);
+            for (int i = 2; i < WIDTH - 1; i++) {
+                const uint32_t x = state[i].val;
+                state[i] = reduce(x << (i - 1), x >> (33 - i));
+            }
+            const uint32_t x = state[WIDTH - 1].val;
+            state[WIDTH - 1] = reduce(x << 15, x >> 17);
+        }
+#else
+        for (int r = 0; r < ROUNDS_P; r++) {
+            state[0] += constants::INTERNAL_ROUND_CONSTANTS[r];
+            state[0] ^= D;
+            uint64_t sum = 0;
+            for (int i = 0; i < WIDTH; i++) {
+                sum += static_cast<uint64_t>(state[i].val);
+            }
+            // d_i X_i + sum X, below 2^47: d_0 = -2, d_i = 2^(i - 1) for i in 1..14, d_15 = 2^15.
+            state[0] = montyReduce(2 * static_cast<uint64_t>(kb31_t::MOD - state[0].val) + sum);
+            for (int i = 1; i < WIDTH - 1; i++) {
+                state[i] = montyReduce((static_cast<uint64_t>(state[i].val) << (i - 1)) + sum);
+            }
+            state[WIDTH - 1] =
+                montyReduce((static_cast<uint64_t>(state[WIDTH - 1].val) << 15) + sum);
+        }
+#endif
+    }
+
     __device__ static void externalLinearLayer(F_t state[WIDTH]) {
         for (int i = 0; i < WIDTH; i += 4) {
             mdsLightPermutation4x4(state + i);

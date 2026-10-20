@@ -1,3 +1,4 @@
+#include "runtime/gpu_backend.cuh"
 #include "jagged_sumcheck/jagged_sumcheck.cuh"
 #include "sum_and_reduce/reduce.cuh"
 #include "tracegen/jagged_tracegen/jagged.cuh"
@@ -62,7 +63,7 @@ SP1_KERNEL void jaggedTwoRoundSumAsPoly(
     }
 
     // Allocate shared memory
-    extern __shared__ unsigned char memory[];
+    SP1_EXTERN_SHARED(unsigned char, memory);
     ext_t* shared = reinterpret_cast<ext_t*>(memory);
 
     auto block = cg::this_thread_block();
@@ -130,7 +131,7 @@ SP1_KERNEL void jaggedTwoRoundFixAndSum(
     }
 
     // Allocate shared memory
-    extern __shared__ unsigned char memory[];
+    SP1_EXTERN_SHARED(unsigned char, memory);
     ext_t* shared = reinterpret_cast<ext_t*>(memory);
 
     auto block = cg::this_thread_block();
@@ -210,7 +211,7 @@ SP1_KERNEL void paddedHadamardFixAndSum(
     }
 
     // Allocate shared memory
-    extern __shared__ unsigned char memory[];
+    SP1_EXTERN_SHARED(unsigned char, memory);
     ext_t* shared = reinterpret_cast<ext_t*>(memory);
 
     auto reduce_tile = cg::tiled_partition<32>(block);
@@ -227,11 +228,11 @@ SP1_KERNEL void paddedHadamardFixAndSum(
 }
 
 
-extern "C" void* jagged_two_round_sum_as_poly() { return (void*)jaggedTwoRoundSumAsPoly; }
+extern "C" void* jagged_two_round_sum_as_poly() { return SP1_KERNEL_PTR(jaggedTwoRoundSumAsPoly); }
 
-extern "C" void* jagged_two_round_fix_and_sum() { return (void*)jaggedTwoRoundFixAndSum; }
+extern "C" void* jagged_two_round_fix_and_sum() { return SP1_KERNEL_PTR(jaggedTwoRoundFixAndSum); }
 
-extern "C" void* padded_hadamard_fix_and_sum() { return (void*)paddedHadamardFixAndSum; }
+extern "C" void* padded_hadamard_fix_and_sum() { return SP1_KERNEL_PTR(paddedHadamardFixAndSum); }
 
 // ---------------------------------------------------------------------------------------------
 // Multi-round hadamard tail: fold FOLDS (1 or 2) pending challenges and accumulate the round sums
@@ -318,7 +319,7 @@ SP1_KERNEL void hadamardFoldAndGrid(
         }
     }
 
-    extern __shared__ unsigned char memory[];
+    SP1_EXTERN_SHARED(unsigned char, memory);
     ext_t* shared = reinterpret_cast<ext_t*>(memory);
     auto block = cg::this_thread_block();
     auto tile = cg::tiled_partition<32>(block);
@@ -330,7 +331,7 @@ SP1_KERNEL void hadamardFoldAndGrid(
     }
 }
 
-extern "C" void* hadamard_fold1_grid1() { return (void*)hadamardFoldAndGrid<1, 1>; }
-extern "C" void* hadamard_fold2_grid1() { return (void*)hadamardFoldAndGrid<2, 1>; }
-extern "C" void* hadamard_fold1_grid2() { return (void*)hadamardFoldAndGrid<1, 2>; }
-extern "C" void* hadamard_fold2_grid2() { return (void*)hadamardFoldAndGrid<2, 2>; }
+extern "C" void* hadamard_fold1_grid1() { return SP1_KERNEL_PTR(hadamardFoldAndGrid<1, 1>); }
+extern "C" void* hadamard_fold2_grid1() { return SP1_KERNEL_PTR(hadamardFoldAndGrid<2, 1>); }
+extern "C" void* hadamard_fold1_grid2() { return SP1_KERNEL_PTR(hadamardFoldAndGrid<1, 2>); }
+extern "C" void* hadamard_fold2_grid2() { return SP1_KERNEL_PTR(hadamardFoldAndGrid<2, 2>); }

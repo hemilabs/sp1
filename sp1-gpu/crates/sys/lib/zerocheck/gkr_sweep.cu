@@ -1,3 +1,4 @@
+#include "runtime/gpu_backend.cuh"
 // Per-chip GKR column sweep — see gkr_sweep.cuh for the algorithm overview.
 //
 // Templated on K ∈ {felt_t, ext_t} so round 0 uses the base-field trace and
@@ -36,7 +37,7 @@ __global__ void zerocheck_gkr_sweep(
     const uint32_t row_end = disp.row_offset + disp.n_rows;
     const ext_t lambda = ext_t::load(powers_of_lambda, chip_idx);
 
-    constexpr int WARP_SIZE = 32;
+    constexpr int WARP_SIZE = SP1_WARP_SIZE;  // the sub-group on SYCL
     constexpr int WARPS_PER_BLOCK = GKR_SWEEP_BLOCK_SIZE / WARP_SIZE;
     auto block = cg::this_thread_block();
 
@@ -100,7 +101,7 @@ __global__ void zerocheck_gkr_sweep(
 
     // Block-reduce. Both paths leave non-trivial values in some threads and
     // zero in the rest, so the standard reduce just works.
-    extern __shared__ unsigned char smem[];
+    SP1_EXTERN_SHARED(unsigned char, smem);
     ext_t* shared = reinterpret_cast<ext_t*>(smem);
     auto tile_warp = cg::tiled_partition<32>(block);
     ext_t block_sum = partialBlockReduce(block, tile_warp, thread_acc, shared);
@@ -192,7 +193,7 @@ __global__ void zerocheck_gkr_corner_sweep(
     const uint32_t quad_end = disp.row_offset + disp.n_rows;
     const ext_t lambda = ext_t::load(powers_of_lambda, chip_idx);
 
-    constexpr int WARP_SIZE = 32;
+    constexpr int WARP_SIZE = SP1_WARP_SIZE;  // the sub-group on SYCL
     constexpr int WARPS_PER_BLOCK = GKR_SWEEP_BLOCK_SIZE / WARP_SIZE;
     auto block = cg::this_thread_block();
 
@@ -256,7 +257,7 @@ __global__ void zerocheck_gkr_corner_sweep(
         }
     }
 
-    extern __shared__ unsigned char smem[];
+    SP1_EXTERN_SHARED(unsigned char, smem);
     ext_t* shared = reinterpret_cast<ext_t*>(smem);
     auto tile_warp = cg::tiled_partition<32>(block);
     for (int c = 0; c < BIVARIATE_NUM_CORNERS; c++) {
@@ -271,11 +272,11 @@ __global__ void zerocheck_gkr_corner_sweep(
 }  // namespace
 
 extern "C" void* zerocheck_gkr_sweep_kb_kernel() {
-    return (void*)zerocheck_gkr_sweep<felt_t>;
+    return SP1_KERNEL_PTR(zerocheck_gkr_sweep<felt_t>);
 }
 extern "C" void* zerocheck_gkr_sweep_ext_kernel() {
-    return (void*)zerocheck_gkr_sweep<ext_t>;
+    return SP1_KERNEL_PTR(zerocheck_gkr_sweep<ext_t>);
 }
 extern "C" void* zerocheck_gkr_corner_sweep_kb_kernel() {
-    return (void*)zerocheck_gkr_corner_sweep<felt_t>;
+    return SP1_KERNEL_PTR(zerocheck_gkr_corner_sweep<felt_t>);
 }

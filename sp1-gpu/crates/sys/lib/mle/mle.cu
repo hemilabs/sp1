@@ -1,3 +1,4 @@
+#include "runtime/gpu_backend.cuh"
 #include "runtime/gpu_compat.cuh"
 
 #include "mle/mle.cuh"
@@ -44,7 +45,7 @@ __global__ void partial_lagrange_eval_step(
     size_t total_num_variables) {
     auto block = cg::this_thread_block();
 
-    extern __shared__ unsigned char shared_memory[];
+    SP1_EXTERN_SHARED(unsigned char, shared_memory);
     F* shared = reinterpret_cast<F*>(shared_memory);
 
     // Load the latest computed layer to shared memory.
@@ -115,11 +116,11 @@ partial_lagrange_naive(EF* __restrict__ output, EF* point, size_t total_num_vari
 }
 
 extern "C" void* partial_lagrange_koala_bear() {
-    return (void*)partial_lagrange_naive<kb31_t, kb31_t>;
+    return SP1_KERNEL_PTR(partial_lagrange_naive<kb31_t, kb31_t>);
 }
 
 extern "C" void* partial_lagrange_koala_bear_extension() {
-    return (void*)partial_lagrange_naive<kb31_t, kb31_extension_t>;
+    return SP1_KERNEL_PTR(partial_lagrange_naive<kb31_t, kb31_extension_t>);
 }
 
 
@@ -139,7 +140,7 @@ partial_geq_naive(F* __restrict__ output, size_t threshold, size_t total_num_var
     }
 }
 
-extern "C" void* partial_geq_koala_bear() { return (void*)partial_geq_naive<kb31_t>; }
+extern "C" void* partial_geq_koala_bear() { return SP1_KERNEL_PTR(partial_geq_naive<kb31_t>); }
 
 
 
@@ -162,11 +163,11 @@ __global__ void fixLastVariableInPlace(F* inout, F alpha, size_t outputHeight, s
 }
 
 extern "C" void* mle_fix_last_variable_in_place_koala_bear_base() {
-    return (void*)fixLastVariableInPlace<kb31_t>;
+    return SP1_KERNEL_PTR(fixLastVariableInPlace<kb31_t>);
 }
 
 extern "C" void* mle_fix_last_variable_in_place_koala_bear_extension() {
-    return (void*)fixLastVariableInPlace<kb31_extension_t>;
+    return SP1_KERNEL_PTR(fixLastVariableInPlace<kb31_extension_t>);
 }
 
 template <typename F, typename EF>
@@ -184,14 +185,14 @@ foldMle(const F* input, EF* __restrict__ output, EF beta, size_t outputHeight, s
     }
 }
 
-extern "C" void* mle_fold_koala_bear_base_base() { return (void*)foldMle<kb31_t, kb31_t>; }
+extern "C" void* mle_fold_koala_bear_base_base() { return SP1_KERNEL_PTR(foldMle<kb31_t, kb31_t>); }
 
 extern "C" void* mle_fold_koala_bear_base_extension() {
-    return (void*)foldMle<kb31_t, kb31_extension_t>;
+    return SP1_KERNEL_PTR(foldMle<kb31_t, kb31_extension_t>);
 }
 
 extern "C" void* mle_fold_koala_bear_ext_ext() {
-    return (void*)foldMle<kb31_extension_t, kb31_extension_t>;
+    return SP1_KERNEL_PTR(foldMle<kb31_extension_t, kb31_extension_t>);
 }
 
 // Tiled partial Lagrange (eq) table for dimension >= PLAG_LB: out[i] = prod_k (bit_k(i) ? z_k : 1 - z_k)
@@ -206,8 +207,8 @@ extern "C" void* mle_fold_koala_bear_ext_ext() {
 
 template <typename F, typename EF>
 __global__ void partial_lagrange_tiled(EF* __restrict__ output, const EF* __restrict__ point, size_t n) {
-    __shared__ EF low[PLAG_T];
-    __shared__ EF high[PLAG_T];
+    SP1_SHARED_ARRAY(EF, low, [PLAG_T]);
+    SP1_SHARED_ARRAY(EF, high, [PLAG_T]);
     const size_t nh = n - PLAG_LB;
     {
         size_t lo = threadIdx.x;
@@ -242,5 +243,5 @@ __global__ void partial_lagrange_tiled(EF* __restrict__ output, const EF* __rest
 }
 
 extern "C" void* partial_lagrange_tiled_koala_bear_extension() {
-    return (void*)partial_lagrange_tiled<kb31_t, kb31_extension_t>;
+    return SP1_KERNEL_PTR(partial_lagrange_tiled<kb31_t, kb31_extension_t>);
 }

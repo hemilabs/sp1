@@ -178,6 +178,7 @@ async fn run() {
         // segfault. All work is done here, so skip destructors and exit cleanly.
         println!("All {} measurements done", measurements.len());
         std::io::Write::flush(&mut std::io::stdout()).ok();
+        unsafe { sp1_gpu_cudart::sys::runtime::sp1_profile_flush() };
         std::process::exit(0);
         #[allow(unreachable_code)]
         measurements

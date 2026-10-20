@@ -2,6 +2,8 @@
 // Include this instead of <cuda_runtime.h> or <cooperative_groups.h>.
 #pragma once
 
+#include "runtime/gpu_backend.cuh"
+
 #ifdef __HIPCC__
 #include <hip/hip_runtime.h>
 // Don't include hip_cooperative_groups.h - it fails with custom field types.
@@ -12,8 +14,9 @@
 #include <cooperative_groups/reduce.h>
 #endif
 
-#ifdef __HIPCC__
-// Minimal cooperative_groups compatibility layer for HIP.
+#ifdef SP1_PORTABLE
+// Minimal cooperative_groups compatibility layer for HIP (and SYCL, whose shuffles
+// runtime/gpu_backend.cuh provides HIP-style).
 
 namespace cooperative_groups {
 
@@ -73,10 +76,20 @@ __device__ inline thread_block this_thread_block() {
     return thread_block::this_thread_block();
 }
 
+#ifdef SP1_SYCL
+// A tile wider than the sub-group is the sub-group: the shuffles cannot cross it. The kernels only
+// reduce over 32-wide tiles, and size their per-tile storage by the tile's size.
+template <unsigned int Size>
+__device__ inline thread_block_tile<(Size > SP1_SYCL_SUB_GROUP ? SP1_SYCL_SUB_GROUP : Size)>
+tiled_partition(const thread_block&) {
+    return thread_block_tile<(Size > SP1_SYCL_SUB_GROUP ? SP1_SYCL_SUB_GROUP : Size)>();
+}
+#else
 template <unsigned int Size>
 __device__ inline thread_block_tile<Size> tiled_partition(const thread_block&) {
     return thread_block_tile<Size>();
 }
+#endif
 
 template <typename T>
 struct plus {

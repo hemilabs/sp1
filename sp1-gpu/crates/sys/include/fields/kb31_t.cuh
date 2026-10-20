@@ -1,3 +1,4 @@
+#include "runtime/gpu_backend.cuh"
 // Modified by Succinct Labs
 // Copyright Supranational LLC
 // Licensed under the Apache License, Version 2.0, see LICENSE for details.
@@ -8,15 +9,15 @@
 #include <cassert>
 #include <cstdint>
 
-#ifdef __HIPCC__
+#ifdef SP1_PORTABLE
 #include "fields/ptx_portable.cuh"
 #else
 #include "fields/ptx.cuh"
 #endif
 
-#if defined(__CUDA_ARCH__) || defined(__HIPCC__)
+#if defined(__CUDA_ARCH__) || defined(SP1_PORTABLE)
 
-#ifdef __HIPCC__
+#ifdef SP1_PORTABLE
 // HIP: __forceinline__ is already a macro, can't redefine inline
 #define inline __device__ inline __attribute__((always_inline))
 #define asm __asm__ __volatile__
@@ -62,12 +63,12 @@ class kb31_t {
             unpack(tl, th, val);
 
             // M = 2^31 - 2^24 - 1: use shifts instead of quarter-rate mul on RDNA3
-#ifdef __HIPCC__
+#ifdef SP1_PORTABLE
             red = (tl << 31) - (tl << 24) - tl;
 #else
             mul_lo(red, tl, M);
 #endif
-#ifdef __HIPCC__
+#ifdef SP1_PORTABLE
             // Shift optimization: MOD = 2^31 - 2^24 + 1
             // red * MOD = (red<<31) - (red<<24) + red
             uint64_t wide = ((uint64_t)red << 31) - ((uint64_t)red << 24) + (uint64_t)red + tl;
@@ -147,7 +148,7 @@ class kb31_t {
     static inline uint32_t monty_reduce(uint64_t x) {
         uint32_t tl, th, red;
         unpack(tl, th, x);
-#ifdef __HIPCC__
+#ifdef SP1_PORTABLE
         // ptx_portable.cuh's mad_lo_cc/madc_hi drop the carry between the two halves, so do the
         // low half in 64 bits and carry explicitly, as accel_t's conversion does.
         red = (tl << 31) - (tl << 24) - tl;  // M = 2^31 - 2^24 - 1
@@ -178,7 +179,17 @@ class kb31_t {
 
     static inline kb31_t from_bool(bool x) { return kb31_t(x * one().val); }
 
-    inline uint32_t as_canonical_u32() const { return monty_reduce((uint64_t)val); }
+    inline uint32_t as_canonical_u32() const {
+#ifdef SP1_SYCL
+        // val * 2^-32 mod MOD in 32-bit operations: mul() with a high word of 0.
+        uint32_t red = val * M;
+        uint32_t r = sycl::mul_hi(red, MOD) + (val != 0 ? 1u : 0u);
+        final_sub(r);
+        return r;
+#else
+        return monty_reduce((uint64_t)val);
+#endif
+    }
 
     inline kb31_t exp_power_of_two(size_t log_power) {
         kb31_t ret = *this;
@@ -220,7 +231,7 @@ class kb31_t {
     friend inline kb31_t operator>>(kb31_t a, uint32_t r) { return a >>= r; }
 
     inline kb31_t& operator-=(const kb31_t b) {
-#ifdef __HIPCC__
+#ifdef SP1_PORTABLE
         bool brw = val < b.val;
         val -= b.val;
         if (brw) val += MOD;
@@ -239,7 +250,7 @@ class kb31_t {
     friend inline kb31_t operator-(kb31_t a, const kb31_t b) { return a -= b; }
 
     inline kb31_t cneg(bool flag) {
-#ifdef __HIPCC__
+#ifdef SP1_PORTABLE
         if (val != 0 && flag) {
             val = MOD - val;
         }
@@ -270,7 +281,7 @@ class kb31_t {
     friend inline kb31_t czero(const kb31_t a, int set_z) {
         kb31_t ret;
 
-#ifdef __HIPCC__
+#ifdef SP1_PORTABLE
         ret.val = set_z ? 0 : a.val;
 #else
         asm("{");
@@ -286,7 +297,7 @@ class kb31_t {
     static inline kb31_t csel(const kb31_t a, const kb31_t b, int sel_a) {
         kb31_t ret;
 
-#ifdef __HIPCC__
+#ifdef SP1_PORTABLE
         ret.val = sel_a ? a.val : b.val;
 #else
         asm("{");
@@ -305,17 +316,31 @@ class kb31_t {
     // Montgomery multiplication
 
     inline kb31_t& mul(const kb31_t b) {
+#ifdef SP1_SYCL
+        // 32-bit operations only. Intel GPUs emulate 64-bit integer arithmetic, and IGC
+        // miscompiled the emulation in SIMD32 kernels whose sub-group was partly masked off.
+        // (t + red * MOD) / 2^32 with t = val * b: the low words cancel, carrying 1 unless
+        // tl = 0, so the result is th + hi(red * MOD) + (tl != 0), below 2 * MOD.
+        {
+            uint32_t tl = val * b.val;
+            uint32_t th = sycl::mul_hi(val, b.val);
+            uint32_t red = tl * M;
+            val = th + sycl::mul_hi(red, MOD) + (tl != 0 ? 1u : 0u);
+            final_sub(val);
+            return *this;
+        }
+#endif
         uint64_t t;
         uint32_t tl, th, red;
 
         mul_wide(t, val, b.val);
         unpack(tl, th, t);
-#ifdef __HIPCC__
+#ifdef SP1_PORTABLE
         red = (tl << 31) - (tl << 24) - tl;  // M = 2^31 - 2^24 - 1
 #else
         mul_lo(red, tl, M);
 #endif
-#ifdef __HIPCC__
+#ifdef SP1_PORTABLE
         // Shift optimization: MOD = 2^31 - 2^24 + 1
         uint64_t wide = ((uint64_t)red << 31) - ((uint64_t)red << 24) + (uint64_t)red + tl;
         val = (uint32_t)(wide >> 32) + th;
@@ -332,7 +357,7 @@ class kb31_t {
     inline uint32_t mul_by_1() const {
         uint32_t tmp[2], red;
 
-#ifdef __HIPCC__
+#ifdef SP1_PORTABLE
         red = (val << 31) - (val << 24) - val;  // M = 2^31 - 2^24 - 1
         // Shift optimization: MOD = 2^31 - 2^24 + 1
         uint64_t wide = ((uint64_t)red << 31) - ((uint64_t)red << 24) + (uint64_t)red + val;
@@ -347,11 +372,20 @@ class kb31_t {
     }
 
   public:
+#ifdef SP1_SYCL
+    // The 32-bit multiply (see mul): the accel_t product below is 64-bit arithmetic, which Intel
+    // GPUs emulate. Nothing on SYCL keeps a product unreduced.
+    inline kb31_t operator*(const kb31_t b) const {
+        kb31_t t = *this;
+        return t.mul(b);
+    }
+#else
     inline accel_t operator*(const kb31_t b) const {
         uint64_t t;
         mul_wide(t, val, b.val);
         return accel_t(t);
     }
+#endif
 
     inline kb31_t& operator*=(const kb31_t a) { return mul(a); }
 
@@ -416,7 +450,7 @@ class kb31_t {
         uint32_t acc[2];
         size_t i = 1;
 
-#ifdef __HIPCC__
+#ifdef SP1_PORTABLE
         {
             uint64_t w = (uint64_t)(*a[0]) * (*b[0]);
             acc[0] = (uint32_t)w;
@@ -487,7 +521,7 @@ class kb31_t {
         uint32_t acc[2];
         size_t i = 0;
 
-#ifdef __HIPCC__
+#ifdef SP1_PORTABLE
         {
             uint64_t w = (uint64_t)(*a0) * (*b0);
             acc[0] = (uint32_t)w;
@@ -567,7 +601,7 @@ class kb31_t {
         while (n--) {
             uint32_t tmp[2], red;
 
-#ifdef __HIPCC__
+#ifdef SP1_PORTABLE
             {
                 uint64_t w = (uint64_t)s.val * s.val;
                 tmp[0] = (uint32_t)w;
@@ -633,14 +667,14 @@ class kb31_t {
 
     inline kb31_t& operator/=(const kb31_t a) { return *this *= a.reciprocal(); }
 
-#ifdef __HIPCC__
+#ifdef SP1_PORTABLE
     inline void shfl_bfly(uint32_t laneMask) { val = __shfl_xor(val, laneMask); }
 #else
     inline void shfl_bfly(uint32_t laneMask) { val = __shfl_xor_sync(0xFFFFFFFF, val, laneMask); }
 #endif
 
     __device__ __forceinline__ kb31_t interpolateLinear(const kb31_t one, const kb31_t zero) const {
-#ifdef __HIPCC__
+#ifdef SP1_PORTABLE
         // HIP-safe: use schoolbook multiply via kb31_t operators
         kb31_t diff = one - zero;
         kb31_t result = *this * diff;
@@ -681,6 +715,17 @@ __device__ __forceinline__ kb31_t::accel_t& kb31_t::accel_t::operator-=(const kb
     return *this;
 }
 
+#ifdef SP1_SYCL
+// kb31_t * kb31_t is reduced on SYCL; an accel_t of r << 32 converts back to exactly r.
+__device__ __forceinline__ kb31_t::accel_t kb31_t::accel_t::operator*(const kb31_t& b) const {
+    kb31_t t = kb31_t(*this) * b;
+    return accel_t((uint64_t)t.val << 32);
+}
+
+__device__ __forceinline__ kb31_t::accel_t& kb31_t::accel_t::operator*=(const kb31_t& b) {
+    return *this = *this * b;
+}
+#else
 __device__ __forceinline__ kb31_t::accel_t kb31_t::accel_t::operator*(const kb31_t& b) const {
     kb31_t t(*this);
     return t * b;
@@ -690,6 +735,7 @@ __device__ __forceinline__ kb31_t::accel_t& kb31_t::accel_t::operator*=(const kb
     kb31_t t(*this);
     return *this = t * b;
 }
+#endif
 
 __device__ __forceinline__ kb31_t::accel_t kb31_t::accel_t::operator+(const kb31_t& b) const {
     accel_t t(*this);

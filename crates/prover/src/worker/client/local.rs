@@ -106,6 +106,23 @@ impl LocalWorkerClient {
         (Self { inner: Arc::new(inner) }, channels)
     }
 
+    /// Queue a task that failed with a retryable error again, under its original id, so that
+    /// whoever waits on that id sees the retry's outcome.
+    pub async fn retry_task(
+        &self,
+        task_id: TaskId,
+        kind: TaskType,
+        task: RawTaskRequest,
+    ) -> anyhow::Result<()> {
+        if !self.inner.db.read().await.contains_key(&task_id) {
+            anyhow::bail!("task does not exist");
+        }
+        self.inner.input_task_queues[&kind]
+            .send((task_id, task))
+            .await
+            .map_err(|e| anyhow::anyhow!("failed to send task of kind {:?} to queue: {e}", kind))
+    }
+
     pub async fn update_task_status(
         &self,
         task_id: TaskId,
@@ -133,10 +150,12 @@ impl LocalWorkerClient {
         Ok(())
     }
 
-    /// Re-submits a retryable task, with bounded attempts per logical task. Returns
-    /// `Ok(None)` once the retry budget is exhausted.
+    /// Re-submits a retryable task under its original id (see [`retry_task`](Self::retry_task)),
+    /// with bounded attempts per logical task. Returns `Ok(None)` once the retry budget is
+    /// exhausted.
     pub async fn resubmit_task(
         &self,
+        task_id: TaskId,
         kind: TaskType,
         task: RawTaskRequest,
     ) -> anyhow::Result<Option<TaskId>> {
@@ -154,7 +173,7 @@ impl LocalWorkerClient {
             }
             *count += 1;
         }
-        self.submit_task(kind, task).await.map(Some)
+        self.retry_task(task_id.clone(), kind, task).await.map(|()| Some(task_id))
     }
 
     /// Delete the artifacts a completed proof leaked - whatever is still tracked

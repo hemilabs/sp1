@@ -6,6 +6,8 @@ use std::{env, fs};
 enum GpuBackend {
     Cuda,
     Hip,
+    /// Intel GPUs, through SYCL (oneAPI `icpx`): see `build_sycl`.
+    Sycl,
 }
 
 fn cbindgen_builder() -> cbindgen::Builder {
@@ -93,7 +95,11 @@ where
     fs::create_dir_all(target_dir).unwrap();
     let _ = fs::remove_file(&link);
     let relpath = pathdiff::diff_paths(original, target_dir).unwrap();
-    symlink(relpath, link).unwrap();
+    // These links are for IDEs only. Windows allows creating symlinks only with Developer Mode
+    // or as an administrator, so don't fail the build over one.
+    if let Err(e) = symlink(relpath, link.as_ref()) {
+        println!("cargo:warning=could not link {}: {e}", link.as_ref().display());
+    }
 }
 
 /// Check if CUDA is available on this system.
@@ -194,6 +200,7 @@ fn select_gpu_backend() -> Option<GpuBackend> {
     if let Ok(val) = env::var("SP1_GPU_BACKEND") {
         match val.to_lowercase().as_str() {
             "hip" | "rocm" | "amd" => return Some(GpuBackend::Hip),
+            "sycl" | "intel" | "oneapi" => return Some(GpuBackend::Sycl),
             "cuda" | "nvidia" => return Some(GpuBackend::Cuda),
             "none" | "off" => return None,
             _ => {} // Fall through
@@ -295,6 +302,8 @@ fn resolve_cuda_toolkit_path() -> String {
 }
 
 fn main() {
+    println!("cargo::rustc-check-cfg=cfg(hip_backend)");
+    println!("cargo::rustc-check-cfg=cfg(sycl_backend)");
     // Directives for tracking changes in folders
     println!("cargo:rerun-if-changed=include/");
     println!("cargo:rerun-if-changed=lib/");
@@ -359,6 +368,11 @@ fn main() {
         }
     };
 
+    if backend == GpuBackend::Sycl {
+        build_sycl(&crate_dir, &out_dir, &out_include_dir);
+        return;
+    }
+
     println!("cargo:rerun-if-env-changed=HIP_ARCHS");
     println!("cargo:rerun-if-env-changed=ROCM_PATH");
     println!("cargo:rerun-if-env-changed=HIP_PATH");
@@ -388,6 +402,7 @@ fn main() {
     println!("cargo:rustc-check-cfg=cfg(hip_backend)");
 
     match backend {
+        GpuBackend::Sycl => unreachable!("built by build_sycl"),
         GpuBackend::Hip => {
             println!("cargo:warning=Building with HIP/ROCm backend for AMD GPUs");
             println!("cargo:rustc-cfg=hip_backend");
@@ -395,28 +410,22 @@ fn main() {
             // Tell CMakeLists.txt to use the HIP path
             cmake_config.define("USE_HIP", "ON");
 
-            // Determine ROCm path
-            let rocm_path =
-                env::var("ROCM_PATH").or_else(|_| env::var("HIP_PATH")).unwrap_or_else(|_| {
-                    // Auto-detect: check versioned paths first, then generic
-                    for candidate in &["/opt/rocm-7.2.0", "/opt/rocm"] {
-                        if std::path::Path::new(candidate).join("bin/hipcc").exists() {
-                            return candidate.to_string();
-                        }
-                    }
-                    "/opt/rocm".to_string()
-                });
+            let rocm_path = rocm_path();
 
             // Point CMake at the ROCm installation
             cmake_config.define("CMAKE_PREFIX_PATH", &rocm_path);
 
-            // Use the AMD clang compiler directly (CMake 4.x rejects hipcc wrapper).
-            // The ROCm clang at lib/llvm/bin/clang++ handles HIP natively.
-            let clang_path = format!("{}/lib/llvm/bin/clang++", rocm_path);
-            if std::path::Path::new(&clang_path).exists() {
-                cmake_config.define("CMAKE_HIP_COMPILER", &clang_path);
+            if env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc") {
+                configure_msvc_hip(&mut cmake_config, &rocm_path);
+            } else {
+                // Use the AMD clang compiler directly (CMake 4.x rejects hipcc wrapper).
+                // The ROCm clang at lib/llvm/bin/clang++ handles HIP natively.
+                let clang_path = format!("{}/lib/llvm/bin/clang++", rocm_path);
+                if std::path::Path::new(&clang_path).exists() {
+                    cmake_config.define("CMAKE_HIP_COMPILER", &clang_path);
+                }
+                // If clang++ not found, let CMake auto-detect
             }
-            // If clang++ not found, let CMake auto-detect
 
             // Pass HIP architectures if explicitly set
             if let Ok(hip_archs) = env::var("HIP_ARCHS") {
@@ -443,6 +452,9 @@ fn main() {
             let nvcc_path = format!("{resolved}/bin/nvcc");
             if std::path::Path::new(&nvcc_path).exists() {
                 cmake_config.define("CMAKE_CUDA_COMPILER", &nvcc_path);
+            }
+            if env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc") {
+                configure_msvc_ninja(&mut cmake_config);
             }
         }
     }
@@ -484,18 +496,12 @@ fn main() {
         println!("cargo:rustc-link-lib=static=cupqc-ntt");
     }
 
+    let msvc = env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc");
     match backend {
+        GpuBackend::Sycl => unreachable!("built by build_sycl"),
         GpuBackend::Hip => {
             // ROCm / HIP library search paths
-            let rocm_path =
-                env::var("ROCM_PATH").or_else(|_| env::var("HIP_PATH")).unwrap_or_else(|_| {
-                    for candidate in &["/opt/rocm-7.2.0", "/opt/rocm"] {
-                        if std::path::Path::new(candidate).exists() {
-                            return candidate.to_string();
-                        }
-                    }
-                    "/opt/rocm".to_string()
-                });
+            let rocm_path = rocm_path();
 
             println!("cargo:rustc-link-search=native={}/lib", rocm_path);
             println!("cargo:rustc-link-search=native={}/lib64", rocm_path);
@@ -505,6 +511,20 @@ fn main() {
 
             // HIP device runtime for relocatable device code (GPU linking)
             println!("cargo:rustc-link-lib=hiprtc");
+
+            // The caching allocator's VRAM budget query (lib/runtime/stream.cu).
+            if msvc {
+                println!("cargo:rustc-link-lib=dxgi");
+            }
+        }
+        GpuBackend::Cuda if msvc => {
+            // A Windows toolkit keeps its libraries in lib\x64. The runtime is linked
+            // statically, so the server needs no cudart64_*.dll beside it.
+            if let Ok(cuda_path) = env::var("CUDA_PATH") {
+                println!("cargo:rustc-link-search=native={cuda_path}/lib/x64");
+            }
+            println!("cargo:rustc-link-lib=cudart_static");
+            println!("cargo:rustc-link-lib=cudadevrt");
         }
         GpuBackend::Cuda => {
             // Add CUDA library search paths.
@@ -524,23 +544,358 @@ fn main() {
         }
     }
 
+    // MSVC links its own C++ runtime, and has no libdl.
+    if msvc {
+        println!("cargo:include={}", out_include_dir.display());
+        return;
+    }
+
     // Link system libraries
     println!("cargo:rustc-link-lib=stdc++");
     println!("cargo:rustc-link-lib=dl");
-    match backend {
-        GpuBackend::Hip => {
-            // HIP uses LLVM's OpenMP runtime (libomp), not GNU's (libgomp)
-            let rocm_link = env::var("ROCM_PATH")
-                .or_else(|_| env::var("HIP_PATH"))
-                .unwrap_or_else(|_| "/opt/rocm-7.2.0".to_string());
-            println!("cargo:rustc-link-search=native={}/lib/llvm/lib", rocm_link);
-            println!("cargo:rustc-link-lib=omp");
-        }
-        GpuBackend::Cuda => {
-            println!("cargo:rustc-link-lib=gomp");
-        }
+    if backend == GpuBackend::Cuda {
+        println!("cargo:rustc-link-lib=gomp");
     }
 
     // Add include directories for compilation if needed
     println!("cargo:include={}", out_include_dir.display());
+}
+
+/// The ROCm installation: `ROCM_PATH`, then `HIP_PATH` (what the Windows HIP SDK sets), then the
+/// usual Linux locations.
+fn rocm_path() -> String {
+    env::var("ROCM_PATH").or_else(|_| env::var("HIP_PATH")).unwrap_or_else(|_| {
+        // Auto-detect: check versioned paths first, then generic
+        for candidate in &["/opt/rocm-7.2.0", "/opt/rocm"] {
+            if std::path::Path::new(candidate).join("bin/hipcc").exists() {
+                return candidate.to_string();
+            }
+        }
+        "/opt/rocm".to_string()
+    })
+}
+
+/// On MSVC, builds the HIP path with Ninja and the HIP SDK's clang for both C++ and HIP.
+///
+/// CMake refuses to mix clang with cl.exe in one project, and the Windows HIP SDK keeps its clang
+/// in `bin` (it has no `lib/llvm`). That clang targets MSVC and links the dynamic C runtime by
+/// default, as rustc does; cl.exe's environment (INCLUDE, LIB, PATH) is passed through for the
+/// MSVC headers and libraries.
+fn configure_msvc_hip(cmake_config: &mut cmake::Config, rocm_path: &str) {
+    let cl = cc::Build::new().cpp(true).get_compiler();
+    for (key, value) in cl.env() {
+        cmake_config.env(key, value);
+    }
+    let clang = PathBuf::from(rocm_path).join("bin").join("clang++.exe");
+    // The flags the cmake crate passes come from this: clang's, not cl.exe's (`-nologo`, ...).
+    cmake_config.init_cxx_cfg(cc::Build::new().cpp(true).compiler(&clang).to_owned());
+    let clang = clang.to_string_lossy().replace('\\', "/");
+    cmake_config.generator("Ninja");
+    cmake_config.define("CMAKE_CXX_COMPILER", &clang);
+    cmake_config.define("CMAKE_HIP_COMPILER", &clang);
+    if let Some(ninja) = bundled_ninja(&cl) {
+        cmake_config.define("CMAKE_MAKE_PROGRAM", ninja);
+    }
+}
+
+/// Visual Studio's ninja.exe, when there is no ninja on PATH.
+fn bundled_ninja(cl: &cc::Tool) -> Option<String> {
+    if std::process::Command::new("ninja").arg("--version").output().is_ok() {
+        return None;
+    }
+    // cl.exe is at <VS>\VC\Tools\MSVC\<version>\bin\Host<arch>\<arch>\cl.exe: eight up.
+    cl.path()
+        .ancestors()
+        .nth(8)
+        .map(|vs| vs.join(r"Common7\IDE\CommonExtensions\Microsoft\CMake\Ninja\ninja.exe"))
+        .filter(|ninja| ninja.is_file())
+        .map(|ninja| ninja.to_string_lossy().replace('\\', "/"))
+}
+
+/// On MSVC, builds with Ninja rather than CMake's default Visual Studio generator.
+///
+/// The Visual Studio generator does not perform the device link `CUDA_RESOLVE_DEVICE_SYMBOLS`
+/// asks for on a static library (the Ninja and Makefile generators do), so `sys-cuda.lib` would
+/// lack the `__cudaRegisterLinkedBinary_*` symbols its relocatable objects reference. It also
+/// compiles CUDA through Visual Studio's build customization for the newest toolkit installed,
+/// rather than the one `CUDA_PATH` names.
+///
+/// Ninja needs what a Developer shell provides: `cc` finds cl.exe and its environment (INCLUDE,
+/// LIB, PATH), and Visual Studio ships a ninja.exe when none is on PATH. The compilers are named
+/// explicitly, so CMake cannot pick up another on PATH (a MinGW gcc, say).
+fn configure_msvc_ninja(cmake_config: &mut cmake::Config) {
+    println!("cargo:rerun-if-env-changed=CUDA_PATH");
+    let cl = cc::Build::new().cpp(true).get_compiler();
+    for (key, value) in cl.env() {
+        cmake_config.env(key, value);
+    }
+    cmake_config.generator("Ninja");
+    cmake_config.define("CMAKE_C_COMPILER", cl.path());
+    cmake_config.define("CMAKE_CXX_COMPILER", cl.path());
+    if let Ok(cuda_path) = env::var("CUDA_PATH") {
+        let nvcc = PathBuf::from(cuda_path).join("bin").join("nvcc.exe");
+        cmake_config.define("CMAKE_CUDA_COMPILER", nvcc.to_string_lossy().replace('\\', "/"));
+    }
+    if let Some(ninja) = bundled_ninja(&cl) {
+        cmake_config.define("CMAKE_MAKE_PROGRAM", ninja);
+    }
+}
+
+/// The kernel sources of the SYCL build: those of the CUDA/HIP builds (`lib/<module>`) except the
+/// runtime and the NTT, which have SYCL implementations in `lib/sycl`, and the BN254 MSM, NTT and
+/// PLONK code, which only the GPU PLONK crate (not part of the workspace) uses.
+const SYCL_KERNEL_SOURCES: &[&str] = &[
+    "lib/algebra/algebra.cu",
+    "lib/basefold/basefold.cu",
+    "lib/challenger/challenger.cu",
+    "lib/jagged_assist/branching_program.cu",
+    "lib/jagged_assist/chip_layouts.cu",
+    "lib/jagged_assist/fold_metadata.cu",
+    "lib/jagged_sumcheck/hadamard.cu",
+    "lib/jagged_sumcheck/jagged_sumcheck.cu",
+    "lib/logup_gkr/execution.cu",
+    "lib/logup_gkr/first_layer.cu",
+    "lib/logup_gkr/lookahead.cu",
+    "lib/logup_gkr/round.cu",
+    "lib/logup_gkr/tracegen.cu",
+    "lib/merkle_tree/merkle_tree.cu",
+    "lib/mle/fixlastvariable.cu",
+    "lib/mle/mle.cu",
+    "lib/scan/scan.cu",
+    "lib/sum_and_reduce/dot.cu",
+    "lib/sum_and_reduce/reduce.cu",
+    "lib/sum_and_reduce/reduction.cu",
+    "lib/sum_and_reduce/sum.cu",
+    "lib/sumcheck/observe_and_sample.cu",
+    "lib/tracegen/jagged_tracegen/tracegen.cu",
+    "lib/tracegen/recursion/alu_base.cu",
+    "lib/tracegen/recursion/alu_ext.cu",
+    "lib/tracegen/recursion/convert.cu",
+    "lib/tracegen/recursion/linear_layer.cu",
+    "lib/tracegen/recursion/poseidon2_wide.cu",
+    "lib/tracegen/recursion/prefix_sum_checks.cu",
+    "lib/tracegen/recursion/sbox.cu",
+    "lib/tracegen/recursion/select.cu",
+    "lib/tracegen/riscv/global.cu",
+    "lib/transpose/transpose.cu",
+    "lib/zerocheck/aggregate.cu",
+    "lib/zerocheck/column_tile.cu",
+    "lib/zerocheck/geq_corrections.cu",
+    "lib/zerocheck/gkr_sweep.cu",
+    "lib/zerocheck/jagged_mle.cu",
+    "lib/zerocheck/layout_check.cu",
+    "lib/zerocheck/pad_adj.cu",
+    "lib/zerocheck/sequential.cu",
+    "lib/ntt/kb_ntt.cu",
+    "lib/groth16/groth16.cu",
+    "lib/sycl/runtime.cpp",
+    "lib/sycl/ntt.cpp",
+];
+
+/// The name of the SYCL build's library: `sp1_gpu_sycl.dll` (with its import library) on
+/// Windows, `libsp1_gpu_sycl.so` elsewhere.
+const SYCL_LIB: &str = "sp1_gpu_sycl";
+
+/// Builds the kernels for Intel GPUs with oneAPI's `icpx -fsycl` into a shared library.
+///
+/// The CUDA sources compile as SYCL with `runtime/gpu_backend.cuh` force-included and SP1_SYCL
+/// defined, against stand-ins for the CUDA headers (`include/sycl_stubs`). A shared library,
+/// because SYCL device code needs the device link that `icpx` performs when it links one. On
+/// Windows a DLL exports only what it is told to, so the objects' C functions are listed with
+/// `llvm-nm` into a module-definition file. Rust reads the runtime's error constants and default
+/// stream as data, which it cannot import from a DLL: `lib/sycl/sycl_errors.c` defines them in a
+/// static library instead.
+fn build_sycl(
+    crate_dir: &std::path::Path,
+    out_dir: &std::path::Path,
+    cbindgen_dir: &std::path::Path,
+) {
+    println!("cargo:warning=Building with SYCL (oneAPI) backend for Intel GPUs");
+    println!("cargo:rustc-cfg=sycl_backend");
+    println!("cargo:rerun-if-env-changed=ONEAPI_ROOT");
+    println!("cargo:rerun-if-env-changed=SP1_ICPX");
+    println!("cargo:rerun-if-env-changed=SP1_SYCL_TARGETS");
+
+    let icpx = find_icpx();
+    let include = crate_dir.join("include");
+    let mut args: Vec<std::ffi::OsString> = vec![
+        "-fsycl".into(),
+        "-O3".into(),
+        "-std=c++20".into(),
+        "-DSP1_SYCL".into(),
+        "-DSPPARK".into(),
+        "-DFEATURE_KOALA_BEAR".into(),
+        "-DNDEBUG".into(),
+        "-Wno-unused-command-line-argument".into(),
+        "-Wno-ignored-attributes".into(),
+        format!("-I{}", include.display()).into(),
+        format!("-I{}", include.join("sycl_stubs").display()).into(),
+        format!("-I{}", crate_dir.join("sppark").display()).into(),
+        format!("-I{}", cbindgen_dir.display()).into(),
+    ];
+    // Ahead-of-time device code, e.g. SP1_SYCL_TARGETS=spir64_gen with SP1_SYCL_DEVICE=bmg-g31;
+    // without it the kernels are SPIR-V that the driver compiles on first use.
+    if let Ok(targets) = env::var("SP1_SYCL_TARGETS") {
+        args.push(format!("-fsycl-targets={targets}").into());
+        println!("cargo:rerun-if-env-changed=SP1_SYCL_DEVICE");
+        if let Ok(device) = env::var("SP1_SYCL_DEVICE") {
+            args.push("-Xs".into());
+            args.push(format!("-device {device}").into());
+        }
+    }
+
+    let obj_dir = out_dir.join("sycl-objs");
+    let _ = fs::remove_dir_all(&obj_dir);
+    fs::create_dir_all(&obj_dir).unwrap();
+    let force_include = include.join("runtime").join("gpu_backend.cuh");
+
+    // Compile the sources in parallel, a few icpx processes at a time (each takes GBs).
+    let jobs = std::thread::available_parallelism().map(|n| n.get() / 4).unwrap_or(4).clamp(1, 8);
+    let queue = std::sync::Mutex::new(SYCL_KERNEL_SOURCES.iter().enumerate().collect::<Vec<_>>());
+    let failures = std::sync::Mutex::new(Vec::new());
+    std::thread::scope(|scope| {
+        for _ in 0..jobs {
+            scope.spawn(|| loop {
+                let Some((i, src)) = queue.lock().unwrap().pop() else { break };
+                let src_path = crate_dir.join(src);
+                let obj = obj_dir.join(format!(
+                    "{i:02}_{}.obj",
+                    src_path.file_stem().unwrap().to_string_lossy()
+                ));
+                let mut cmd = std::process::Command::new(&icpx);
+                cmd.arg("-c").args(&args);
+                if src.ends_with(".cu") {
+                    cmd.arg("-include").arg(&force_include).arg("-x").arg("c++");
+                }
+                cmd.arg(&src_path).arg("-o").arg(&obj);
+                let out = cmd
+                    .output()
+                    .unwrap_or_else(|e| panic!("failed to run {}: {e}", icpx.display()));
+                if !out.status.success() {
+                    failures.lock().unwrap().push(format!(
+                        "{src}:\n{}{}",
+                        String::from_utf8_lossy(&out.stdout),
+                        String::from_utf8_lossy(&out.stderr)
+                    ));
+                }
+            });
+        }
+    });
+    let failures = failures.into_inner().unwrap();
+    if !failures.is_empty() {
+        panic!("icpx failed for {} source(s):\n{}", failures.len(), failures.join("\n"));
+    }
+    let objs: Vec<PathBuf> = fs::read_dir(&obj_dir)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| p.extension().is_some_and(|e| e == "obj"))
+        .collect();
+
+    let msvc = env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc");
+    let lib = if msvc {
+        out_dir.join(format!("{SYCL_LIB}.dll"))
+    } else {
+        out_dir.join(format!("lib{SYCL_LIB}.so"))
+    };
+    let mut link = std::process::Command::new(&icpx);
+    link.arg("-shared").args(&args).args(&objs);
+    if msvc {
+        let def = obj_dir.join(format!("{SYCL_LIB}.def"));
+        fs::write(&def, sycl_def_file(&icpx, &objs)).unwrap();
+        // libmmd.lib and the SYCL runtime's import libraries, which oneAPI's `setvars` would
+        // otherwise have put on LIB.
+        if let Some(lib_dir) = icpx.parent().and_then(|b| b.parent()).map(|p| p.join("lib")) {
+            link.arg(format!("-L{}", lib_dir.display()));
+        }
+        link.arg(format!("-Wl,/DEF:{}", def.display()));
+        // DXGI's video memory budget (lib/sycl/runtime.cpp, device_headroom).
+        link.arg("-ldxgi");
+    } else {
+        link.arg("-fPIC");
+    }
+    link.arg("-o").arg(&lib);
+    let out = link.output().unwrap_or_else(|e| panic!("failed to run {}: {e}", icpx.display()));
+    assert!(
+        out.status.success(),
+        "linking {} failed:\n{}{}",
+        lib.display(),
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    println!("cargo:rustc-link-search=native={}", out_dir.display());
+    println!("cargo:rustc-link-lib=dylib={SYCL_LIB}");
+    if msvc {
+        // Next to the binaries being built (<target>/<profile> and its deps), where Windows
+        // looks for it when they run. OUT_DIR is <target>/<profile>/build/<crate>-<hash>/out.
+        if let Some(profile_dir) = out_dir.ancestors().nth(3) {
+            for dest in [profile_dir.to_path_buf(), profile_dir.join("deps")] {
+                if dest.is_dir() {
+                    if let Err(e) = fs::copy(&lib, dest.join(lib.file_name().unwrap())) {
+                        println!("cargo:warning=could not copy {}: {e}", lib.display());
+                    }
+                }
+            }
+        }
+    }
+
+    cc::Build::new().file(crate_dir.join("lib/sycl/sycl_errors.c")).compile("sp1_sycl_errors");
+    println!("cargo:include={}", cbindgen_dir.display());
+}
+
+/// `icpx`: `SP1_ICPX` if set, else the oneAPI installation's (`ONEAPI_ROOT`, or the default
+/// install location), else `icpx` on PATH.
+fn find_icpx() -> PathBuf {
+    if let Ok(icpx) = env::var("SP1_ICPX") {
+        return PathBuf::from(icpx);
+    }
+    let exe = if cfg!(windows) { "icpx.exe" } else { "icpx" };
+    let mut roots: Vec<PathBuf> =
+        env::var_os("ONEAPI_ROOT").map(PathBuf::from).into_iter().collect();
+    if cfg!(windows) {
+        let pf86 =
+            env::var("ProgramFiles(x86)").unwrap_or_else(|_| r"C:\Program Files (x86)".into());
+        roots.push(PathBuf::from(pf86).join("Intel").join("oneAPI"));
+    } else {
+        roots.push(PathBuf::from("/opt/intel/oneapi"));
+    }
+    roots
+        .into_iter()
+        .map(|root| root.join("compiler").join("latest").join("bin").join(exe))
+        .find(|p| p.is_file())
+        .unwrap_or_else(|| PathBuf::from(exe))
+}
+
+/// A module-definition file exporting the C functions (not C++-mangled `?...`, not compiler or
+/// CRT internals `_...`/`$...`) the objects define.
+fn sycl_def_file(icpx: &std::path::Path, objs: &[PathBuf]) -> String {
+    let nm = icpx
+        .parent()
+        .map(|bin| bin.join("compiler").join("llvm-nm.exe"))
+        .filter(|p| p.is_file())
+        .unwrap_or_else(|| PathBuf::from("llvm-nm"));
+    let mut exports = std::collections::BTreeSet::new();
+    for obj in objs {
+        let out = std::process::Command::new(&nm)
+            .args(["--extern-only", "--defined-only"])
+            .arg(obj)
+            .output()
+            .unwrap_or_else(|e| panic!("failed to run {}: {e}", nm.display()));
+        assert!(out.status.success(), "llvm-nm failed on {}", obj.display());
+        for line in String::from_utf8_lossy(&out.stdout).lines() {
+            let mut fields = line.split_whitespace();
+            if let (Some(_), Some("T"), Some(sym)) = (fields.next(), fields.next(), fields.next()) {
+                let internal = sym.starts_with(['?', '_', '$'])
+                    || ["printf", "printf_s", "scanf", "scanf_s"].iter().any(|s| sym.ends_with(s));
+                if !internal {
+                    exports.insert(sym.to_string());
+                }
+            }
+        }
+    }
+    let mut def = format!("LIBRARY {SYCL_LIB}\nEXPORTS\n");
+    for sym in exports {
+        def.push_str(&format!("    {sym}\n"));
+    }
+    def
 }

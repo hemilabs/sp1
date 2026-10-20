@@ -1,9 +1,11 @@
+#include "runtime/gpu_backend.cuh"
 // Per-chunk `padded_row_adjustment` kernel — see pad_adj.cuh.
 
 #include "zerocheck/pad_adj.cuh"
 #include "zerocheck/sequential.cuh"  // ChunkStatic, DagInstr, LeafRef, BcOp
 #include "config.cuh"
 #include "runtime/gpu_compat.cuh"
+#include "sum_and_reduce/reduce.cuh"
 
 #include <cstdint>
 
@@ -102,7 +104,7 @@ __global__ void zerocheck_pad_adj_coop(
     }
     ChunkStatic stc = chunk_static[chunk_idx];
     const felt_t* consts = reinterpret_cast<const felt_t*>(stc.consts);
-    extern __shared__ unsigned char smem[];
+    SP1_EXTERN_SHARED(unsigned char, smem);
     felt_t* slots = reinterpret_cast<felt_t*>(smem);
     const uint32_t lane = threadIdx.x;
     for (uint32_t l = 0; l < stc.coop_n_levels; l++) {
@@ -134,7 +136,14 @@ __global__ void zerocheck_pad_adj_coop(
     }
     auto block = cg::this_thread_block();
     auto warp = cg::tiled_partition<32>(block);
+#ifdef SP1_SYCL
+    // The 32-thread block is two 16-wide sub-groups on SYCL (a "32-wide" tile is the sub-group):
+    // reduce across the block, in the slots' memory, once every thread is done reading them.
+    __syncthreads();
+    acc = partialBlockReduce(block, warp, acc, reinterpret_cast<ext_t*>(smem));
+#else
     acc = cg::reduce(warp, acc, cg::plus<ext_t>());
+#endif
     if (lane == 0) {
         ext_t::store(output, chunk_idx, acc);
     }
@@ -143,24 +152,24 @@ __global__ void zerocheck_pad_adj_coop(
 }  // namespace
 
 extern "C" void* zerocheck_pad_adj_coop_kernel() {
-    return (void*)zerocheck_pad_adj_coop;
+    return SP1_KERNEL_PTR(zerocheck_pad_adj_coop);
 }
 
 extern "C" void* zerocheck_pad_adj_32_kernel() {
-    return (void*)zerocheck_pad_adj<32>;
+    return SP1_KERNEL_PTR(zerocheck_pad_adj<32>);
 }
 extern "C" void* zerocheck_pad_adj_64_kernel() {
-    return (void*)zerocheck_pad_adj<64>;
+    return SP1_KERNEL_PTR(zerocheck_pad_adj<64>);
 }
 extern "C" void* zerocheck_pad_adj_128_kernel() {
-    return (void*)zerocheck_pad_adj<128>;
+    return SP1_KERNEL_PTR(zerocheck_pad_adj<128>);
 }
 extern "C" void* zerocheck_pad_adj_256_kernel() {
-    return (void*)zerocheck_pad_adj<256>;
+    return SP1_KERNEL_PTR(zerocheck_pad_adj<256>);
 }
 extern "C" void* zerocheck_pad_adj_512_kernel() {
-    return (void*)zerocheck_pad_adj<512>;
+    return SP1_KERNEL_PTR(zerocheck_pad_adj<512>);
 }
 extern "C" void* zerocheck_pad_adj_1024_kernel() {
-    return (void*)zerocheck_pad_adj<1024>;
+    return SP1_KERNEL_PTR(zerocheck_pad_adj<1024>);
 }

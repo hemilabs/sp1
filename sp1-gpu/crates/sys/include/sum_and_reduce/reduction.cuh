@@ -1,5 +1,7 @@
 #pragma once
 
+#include "runtime/gpu_backend.cuh"
+
 #include "runtime/gpu_compat.cuh"
 #ifdef __HIPCC__
 #include <hip/hip_runtime.h>
@@ -90,7 +92,7 @@ struct AddOpFinalReduce<kb31_t> {
     template <typename TyGroup>
     __device__ __forceinline__ static void
     final_block_reduction_async(const TyGroup& group, kb31_t* dst, kb31_t val) {
-#ifdef __HIPCC__
+#ifdef SP1_PORTABLE
         // HIP: manual warp reduce + atomic CAS to accumulate
         val = cg::reduce(group, val, cg::plus<kb31_t>());
         if (group.thread_rank() == 0) {
@@ -121,7 +123,7 @@ struct AddOpFinalReduce<kb31_extension_t> {
 // Split the extension into a slice of base field elements and make a separate atomic update.
 #pragma unroll
         for (int j = 0; j < kb31_extension_t::D; j++) {
-#ifdef __HIPCC__
+#ifdef SP1_PORTABLE
             kb31_t reduced = cg::reduce(group, val.value[j], cg::plus<kb31_t>());
             if (group.thread_rank() == 0) {
                 uint32_t old_val = dst[0].value[j].val;

@@ -713,7 +713,7 @@ impl<GC: IopCtx<F = Felt, EF = Ext>, PC: CudaShardProverComponents<GC>>
             sp1_gpu_jagged_assist::BranchingProgramKernel<GC::F, GC::EF, PC::DeviceChallenger>,
     {
         let ShardData { main_trace_data } = data;
-        let MainTraceData { traces: pk, public_values, shard_chips, permit, trace_buffer } =
+        let MainTraceData { traces: pk, public_values, shard_chips, permit, mut trace_buffer } =
             main_trace_data;
 
         let shard_chips = self.machine().smallest_cluster(&shard_chips).unwrap();
@@ -900,6 +900,10 @@ impl<GC: IopCtx<F = Felt, EF = Ext>, PC: CudaShardProverComponents<GC>>
             peak_mib = peak_mib,
             "prove_shard_with_data done"
         );
+
+        // A proving key kept between proofs gives back the room its main traces took.
+        drop(main_data);
+        shared.release_main_traces(&mut trace_buffer);
 
         (proof, permit)
     }

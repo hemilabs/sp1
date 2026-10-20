@@ -46,6 +46,10 @@ cudaError_t nvidia_ntt_batch_coset(
 #include "runtime/exception.cuh"
 #include "ntt/lde_fused.cuh"
 
+#include <cstdlib>
+#include <cstring>
+#include "runtime/kernel_profile.hpp"
+
 #ifndef __CUDA_ARCH__
 
 #ifdef NVIDIA_NTT
@@ -165,6 +169,28 @@ extern "C" rustCudaError_t dft_init_twiddles(
     return CUDA_SUCCESS_CSL;
 }
 
+#ifdef __HIPCC__
+// The portable coset DFT (lib/ntt/kb_ntt.cu), much faster on AMD GPUs than the sppark path below,
+// which launches per column; SP1_LEGACY_NTT=1 selects sppark's.
+extern "C" rustCudaError_t kb_ntt_coset_dft(
+    void* out,
+    const void* in,
+    uint32_t lg_n,
+    uint32_t lg_blowup,
+    uint32_t shift_monty,
+    uint32_t cols,
+    bool bit_rev_output,
+    void* stream);
+
+static bool sp1_legacy_ntt() {
+    static const bool legacy = [] {
+        const char* v = std::getenv("SP1_LEGACY_NTT");
+        return v && v[0] == '1';
+    }();
+    return legacy;
+}
+#endif
+
 extern "C" rustCudaError_t batch_coset_dft(
     fr_t* d_out,
     fr_t* d_in,
@@ -174,9 +200,19 @@ extern "C" rustCudaError_t batch_coset_dft(
     uint32_t poly_count,
     bool bit_rev_output,
     const cudaStream_t stream) {
+    sp1prof::Scope prof_scope((void*)stream, "ntt: batch_coset_dft");
     if (lg_domain_size == 0) {
         return CUDA_SUCCESS_CSL;
     }
+#ifdef __HIPCC__
+    if (!sp1_legacy_ntt()) {
+        uint32_t shift_monty;
+        std::memcpy(&shift_monty, &shift, sizeof(shift_monty));
+        return kb_ntt_coset_dft(
+            d_out, d_in, lg_domain_size, lg_blowup, shift_monty, poly_count, bit_rev_output,
+            (void*)stream);
+    }
+#endif
 
     uint32_t domain_size = 1U << lg_domain_size;
     uint32_t ext_domain_size = domain_size << lg_blowup;
@@ -209,7 +245,7 @@ extern "C" rustCudaError_t batch_coset_dft(
             return CUDA_SUCCESS_CSL;
         }
 #endif
-#if !defined(NVIDIA_NTT) && !defined(__HIPCC__)
+#if !defined(NVIDIA_NTT) && !defined(SP1_PORTABLE)
         // Fused LDE + NTT (2 passes, no copy/memset) for the basefold encoder's shapes; the
         // output is bit-identical to the generic path below.
         if (!perform_shift && bit_rev_output && lde_fused::supported(lg_domain_size, lg_blowup)) {
@@ -297,6 +333,7 @@ extern "C" rustCudaError_t batch_coset_dft_in_place(
     uint32_t poly_count,
     bool bit_rev_output,
     const cudaStream_t stream) {
+    sp1prof::Scope prof_scope((void*)stream, "ntt: batch_coset_dft_in_place");
     if (lg_domain_size == 0) {
         return CUDA_SUCCESS_CSL;
     }
@@ -349,6 +386,7 @@ extern "C" rustCudaError_t batch_lde_shift_in_place(
     uint32_t poly_count,
     bool bit_rev_output,
     const cudaStream_t stream) {
+    sp1prof::Scope prof_scope((void*)stream, "ntt: batch_lde_shift_in_place");
     if (lg_domain_size == 0) {
         return CUDA_SUCCESS_CSL;
     }
@@ -399,6 +437,7 @@ extern "C" rustCudaError_t batch_lde_shift_in_place(
 
 extern "C" rustCudaError_t
 batch_NTT(fr_t* d_inout, uint32_t lg_domain_size, uint32_t poly_count, const cudaStream_t stream) {
+    sp1prof::Scope prof_scope((void*)stream, "ntt: batch_NTT");
     if (lg_domain_size == 0)
         return CUDA_SUCCESS_CSL;
 
@@ -422,6 +461,7 @@ extern "C" rustCudaError_t reverse_bits_batch(
     uint32_t lg_domain_size,
     uint32_t poly_count,
     const cudaStream_t stream) {
+    sp1prof::Scope prof_scope((void*)stream, "ntt: reverse_bits_batch");
     if (lg_domain_size == 0)
         return CUDA_SUCCESS_CSL;
 
@@ -439,6 +479,7 @@ extern "C" rustCudaError_t reverse_bits_batch(
 
 extern "C" rustCudaError_t
 batch_iNTT(fr_t* d_inout, uint32_t lg_domain_size, uint32_t poly_count, const cudaStream_t stream) {
+    sp1prof::Scope prof_scope((void*)stream, "ntt: batch_iNTT");
     if (lg_domain_size == 0)
         return CUDA_SUCCESS_CSL;
 

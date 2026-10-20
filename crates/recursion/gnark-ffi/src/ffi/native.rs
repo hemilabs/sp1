@@ -14,6 +14,23 @@ mod bind {
 }
 use bind::*;
 
+/// Registers the host's GPU entry points for the Groth16 prover (see `go/sp1/groth16_gpu.go`), as
+/// C function pointers: `compute_h` for gnark's quotient polynomial, `msm_g1` and `msm_g2` for its
+/// multi-scalar multiplications. Zeros unregister them; the prover then runs on the CPU, as it does
+/// when `SP1_GROTH16_GPU=0`.
+pub fn set_groth16_gpu_hooks(compute_h: usize, msm_g1: usize, msm_g2: usize) {
+    GROTH16_GPU_HOOKS.store(compute_h != 0, std::sync::atomic::Ordering::Relaxed);
+    unsafe { SetGroth16GpuHooks(compute_h as _, msm_g1 as _, msm_g2 as _) }
+}
+
+static GROTH16_GPU_HOOKS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether this process registered GPU entry points for the Groth16 prover. They exist only in this
+/// process, so `prove_isolated` then proves here rather than in a CPU helper.
+pub fn groth16_gpu_hooks_registered() -> bool {
+    GROTH16_GPU_HOOKS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 enum ProofSystem {
     Plonk,
     Groth16,

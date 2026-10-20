@@ -163,6 +163,15 @@ pub fn prestart_groth16_gpu(build_dir: &Path) -> Option<Prestart> {
 }
 
 fn start(id: u64, build_dir: &Path) -> Result<Prestarted> {
+    // The helper takes its go-ahead and witness through FIFOs.
+    #[cfg(not(unix))]
+    anyhow::bail!("prestarting the GPU helper needs Unix FIFOs");
+    #[cfg(unix)]
+    start_unix(id, build_dir)
+}
+
+#[cfg(unix)]
+fn start_unix(id: u64, build_dir: &Path) -> Result<Prestarted> {
     let vkey_hash_hex = hex::encode(crate::Groth16Bn254Prover::get_vkey_hash(build_dir));
     let helper = crate::groth16_bn254::find_gpu_helper().context("no groth16_gpu_helper")?;
     let pk = crate::groth16_bn254::gpu_pk(build_dir, &vkey_hash_hex);
@@ -233,6 +242,12 @@ fn prefetch_r1cs(id: u64, build_dir: &Path, pk_dir: &Path) {
 }
 
 /// Opens `fifo` for writing once its reader, `child`, has opened it, and writes `msg`.
+#[cfg(not(unix))]
+fn send(_fifo: &Path, _child: &mut Child, _msg: &[u8], _timeout: Duration) -> Result<()> {
+    anyhow::bail!("the GPU helper's FIFOs need Unix")
+}
+
+#[cfg(unix)]
 fn send(fifo: &Path, child: &mut Child, msg: &[u8], timeout: Duration) -> Result<()> {
     use std::os::unix::fs::OpenOptionsExt;
     let deadline = Instant::now() + timeout;

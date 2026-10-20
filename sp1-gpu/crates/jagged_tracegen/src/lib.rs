@@ -143,7 +143,60 @@ pub struct CudaShardProverShared<GC: IopCtx, Air: MachineAir<GC::F>> {
     /// Preprocessed table heights (derived once from any trace buffer; all
     /// pool buffers share identical preprocessed slots).
     pub preprocessed_table_heights: BTreeMap<String, usize>,
+    /// The dense capacity a proof needs: the preprocessed traces plus room for the main ones.
+    full_trace_size: usize,
+    /// Whether this is a proving key kept between proofs, whose trace buffers then hold only the
+    /// preprocessed traces while in the pool (see `CudaShardProverData::make_persistent`).
+    persistent: bool,
     phantom: PhantomData<Air>,
+}
+
+impl<GC: IopCtx, Air: MachineAir<GC::F>> CudaShardProverShared<GC, Air> {
+    /// Before a proof: a persistent key's trace buffer back at full size, the preprocessed traces
+    /// at its start.
+    pub fn grow_for_main(&self, traces: &mut JaggedTraceMle<Felt, TaskScope>) {
+        if !self.persistent {
+            return;
+        }
+        let full = self.full_trace_size;
+        let JaggedMle { dense_data, col_index, .. } = &mut **traces;
+        if dense_data.dense.capacity() >= full {
+            return;
+        }
+        let pre = dense_data.preprocessed_offset;
+        let backend = dense_data.dense.backend().clone();
+        let mut dense = Buffer::with_capacity_in(full, backend.clone());
+        dense.extend_from_device_slice(&dense_data.dense[..pre]).unwrap();
+        let mut cols = Buffer::with_capacity_in(full >> 1, backend);
+        cols.extend_from_device_slice(&col_index[..pre >> 1]).unwrap();
+        dense_data.dense = dense;
+        *col_index = cols;
+    }
+
+    /// After a proof: a persistent key's trace buffer drops its main traces and the room for them.
+    pub fn release_main_traces(&self, traces: &mut JaggedTraceMle<Felt, TaskScope>) {
+        if self.persistent {
+            shrink_to_preprocessed(traces);
+        }
+    }
+}
+
+/// A trace buffer reduced to its preprocessed traces.
+fn shrink_to_preprocessed(traces: &mut JaggedTraceMle<Felt, TaskScope>) {
+    let JaggedMle { dense_data, col_index, .. } = &mut **traces;
+    let pre = dense_data.preprocessed_offset;
+    if dense_data.dense.capacity() == pre {
+        return;
+    }
+    let backend = dense_data.dense.backend().clone();
+    let mut dense = Buffer::with_capacity_in(pre, backend.clone());
+    dense.extend_from_device_slice(&dense_data.dense[..pre]).unwrap();
+    let mut cols = Buffer::with_capacity_in(pre >> 1, backend);
+    cols.extend_from_device_slice(&col_index[..pre >> 1]).unwrap();
+    dense_data.dense = dense;
+    *col_index = cols;
+    dense_data.main_table_index.clear();
+    dense_data.main_padding = 0;
 }
 
 pub struct CudaShardProverData<GC: IopCtx, Air: MachineAir<GC::F>> {
@@ -174,9 +227,12 @@ impl<GC: IopCtx, Air: MachineAir<GC::F>> CudaShardProverData<GC, Air> {
             .iter()
             .map(|(name, offset)| (name.clone(), offset.poly_size))
             .collect();
+        let full_trace_size = trace_buffers[0].dense().dense.capacity();
         let shared = Arc::new(CudaShardProverShared {
             preprocessed_data,
             preprocessed_table_heights,
+            full_trace_size,
+            persistent: false,
             phantom: PhantomData,
         });
         let trace_buffer_pool = Arc::new(WorkerQueue::new(trace_buffers));
@@ -185,6 +241,26 @@ impl<GC: IopCtx, Air: MachineAir<GC::F>> CudaShardProverData<GC, Air> {
 
     pub fn preprocessed_table_heights(&self) -> &BTreeMap<String, usize> {
         &self.shared.preprocessed_table_heights
+    }
+
+    /// Makes this a key kept between proofs: its trace buffers shrink to the preprocessed traces
+    /// now and after each proof, and grow back to full size for the next.
+    ///
+    /// The full-size buffers are the bulk of a key's device memory (a recursion key's are 2^27
+    /// elements plus a column index, about 768 MiB), and several keys stay alive at once: without
+    /// this the recursion keys alone held several GB from startup, which on a 16 GB card under
+    /// Windows' video memory budget pushed proving into shared system memory.
+    pub fn make_persistent(&mut self) {
+        Arc::get_mut(&mut self.shared)
+            .expect("a new key's shared data is not shared yet")
+            .persistent = true;
+        let mut buffers = Vec::new();
+        while let Ok(buffer) = self.trace_buffer_pool.clone().try_pop() {
+            buffers.push(buffer);
+        }
+        for buffer in &mut buffers {
+            shrink_to_preprocessed(buffer);
+        }
     }
 }
 
@@ -1046,6 +1122,7 @@ pub async fn main_tracegen<GC: IopCtx<F = Felt>, A: CudaTracegenAir<Felt>>(
 
     let permit =
         prover_permit.acquire().instrument(tracing::debug_span!("acquire permit")).await.unwrap();
+    jagged_traces.lock().await.shared.grow_for_main(&mut trace_buffer);
 
     // Now that the permit is acquired, we can begin the following two tasks:
     // - Copying host traces to the device.

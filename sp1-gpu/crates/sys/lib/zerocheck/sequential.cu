@@ -1,3 +1,4 @@
+#include "runtime/gpu_backend.cuh"
 // Sequential lowering — DAG bytecode interpreter, dispatched block-per-tile.
 //
 // The launcher partitions each Sequential chunk into row tiles and builds a
@@ -192,7 +193,7 @@ __global__ void zerocheck_fused_sequential(
         }
     }
 
-    extern __shared__ unsigned char smem[];
+    SP1_EXTERN_SHARED(unsigned char, smem);
     ext_t* shared = reinterpret_cast<ext_t*>(smem);
 
     auto block = cg::this_thread_block();
@@ -292,7 +293,7 @@ __global__ void zerocheck_fused_sequential_bivariate(
         }
     }
 
-    extern __shared__ unsigned char smem[];
+    SP1_EXTERN_SHARED(unsigned char, smem);
     ext_t* shared = reinterpret_cast<ext_t*>(smem);
 
     auto block = cg::this_thread_block();
@@ -457,7 +458,7 @@ __global__ void __launch_bounds__(256, MIN_BLOCKS) zerocheck_fused_sequential_bi
         }
     }
 
-    extern __shared__ unsigned char smem[];
+    SP1_EXTERN_SHARED(unsigned char, smem);
     ext_t* shared = reinterpret_cast<ext_t*>(smem);
     auto block = cg::this_thread_block();
     auto tile_warp = cg::tiled_partition<32>(block);
@@ -512,7 +513,7 @@ __global__ void zerocheck_fused_sequential_coop(
     const uint32_t grp = threadIdx.x / G, gl = threadIdx.x % G;
     const uint32_t rows_per_pass = blockDim.x / G;
 
-    extern __shared__ unsigned char smem[];
+    SP1_EXTERN_SHARED(unsigned char, smem);
     ext_t* red = reinterpret_cast<ext_t*>(smem);
     uint2* code = reinterpret_cast<uint2*>(smem + 32 * sizeof(ext_t));
     uint16_t* lvl = reinterpret_cast<uint16_t*>(code + max_instrs);
@@ -600,8 +601,8 @@ __global__ void zerocheck_fused_sequential_coop(
 // The cooperative kernel may need more than the default 48 KB of dynamic
 // shared memory; raise its limit once when the launcher first asks for it.
 extern "C" uint32_t zerocheck_coop_smem_cap() {
-#ifdef __HIPCC__
-    return 64 * 1024;  // LDS per workgroup on AMD
+#if defined(__HIPCC__) || defined(SP1_SYCL)
+    return 64 * 1024;  // LDS per workgroup on AMD; shared local memory per work-group on Intel
 #else
     return 96 * 1024;
 #endif
@@ -610,7 +611,9 @@ extern "C" uint32_t zerocheck_coop_smem_cap() {
 template <typename K>
 static void* coop_kernel_with_smem_limit() {
     static const bool once = [] {
-#ifdef __HIPCC__
+#if defined(SP1_SYCL)
+        // Nothing to raise: a SYCL launch sizes its work-group scratch memory itself.
+#elif defined(__HIPCC__)
         hipFuncSetAttribute((const void*)zerocheck_fused_sequential_coop<K>,
                             hipFuncAttributeMaxDynamicSharedMemorySize,
                             (int)zerocheck_coop_smem_cap());
@@ -622,7 +625,7 @@ static void* coop_kernel_with_smem_limit() {
         return true;
     }();
     (void)once;
-    return (void*)zerocheck_fused_sequential_coop<K>;
+    return SP1_KERNEL_PTR(zerocheck_fused_sequential_coop<K>);
 }
 extern "C" void* zerocheck_fused_sequential_coop_kb_kernel() {
     return coop_kernel_with_smem_limit<felt_t>();
@@ -636,71 +639,71 @@ extern "C" void* zerocheck_fused_sequential_coop_ext_kernel() {
 // partitions chunks into tiers and launches one fused kernel per non-empty
 // tier (typically 1-2 launches per round on real workloads).
 extern "C" void* zerocheck_fused_sequential_kb_32_kernel() {
-    return (void*)zerocheck_fused_sequential<felt_t, 32>;
+    return SP1_KERNEL_PTR(zerocheck_fused_sequential<felt_t, 32>);
 }
 extern "C" void* zerocheck_fused_sequential_kb_64_kernel() {
-    return (void*)zerocheck_fused_sequential<felt_t, 64>;
+    return SP1_KERNEL_PTR(zerocheck_fused_sequential<felt_t, 64>);
 }
 extern "C" void* zerocheck_fused_sequential_kb_128_kernel() {
-    return (void*)zerocheck_fused_sequential<felt_t, 128>;
+    return SP1_KERNEL_PTR(zerocheck_fused_sequential<felt_t, 128>);
 }
 extern "C" void* zerocheck_fused_sequential_kb_256_kernel() {
-    return (void*)zerocheck_fused_sequential<felt_t, 256>;
+    return SP1_KERNEL_PTR(zerocheck_fused_sequential<felt_t, 256>);
 }
 extern "C" void* zerocheck_fused_sequential_kb_512_kernel() {
-    return (void*)zerocheck_fused_sequential<felt_t, 512>;
+    return SP1_KERNEL_PTR(zerocheck_fused_sequential<felt_t, 512>);
 }
 extern "C" void* zerocheck_fused_sequential_kb_1024_kernel() {
-    return (void*)zerocheck_fused_sequential<felt_t, 1024>;
+    return SP1_KERNEL_PTR(zerocheck_fused_sequential<felt_t, 1024>);
 }
 extern "C" void* zerocheck_fused_sequential_ext_32_kernel() {
-    return (void*)zerocheck_fused_sequential<ext_t, 32>;
+    return SP1_KERNEL_PTR(zerocheck_fused_sequential<ext_t, 32>);
 }
 extern "C" void* zerocheck_fused_sequential_ext_64_kernel() {
-    return (void*)zerocheck_fused_sequential<ext_t, 64>;
+    return SP1_KERNEL_PTR(zerocheck_fused_sequential<ext_t, 64>);
 }
 extern "C" void* zerocheck_fused_sequential_ext_128_kernel() {
-    return (void*)zerocheck_fused_sequential<ext_t, 128>;
+    return SP1_KERNEL_PTR(zerocheck_fused_sequential<ext_t, 128>);
 }
 extern "C" void* zerocheck_fused_sequential_ext_256_kernel() {
-    return (void*)zerocheck_fused_sequential<ext_t, 256>;
+    return SP1_KERNEL_PTR(zerocheck_fused_sequential<ext_t, 256>);
 }
 extern "C" void* zerocheck_fused_sequential_ext_512_kernel() {
-    return (void*)zerocheck_fused_sequential<ext_t, 512>;
+    return SP1_KERNEL_PTR(zerocheck_fused_sequential<ext_t, 512>);
 }
 extern "C" void* zerocheck_fused_sequential_ext_1024_kernel() {
-    return (void*)zerocheck_fused_sequential<ext_t, 1024>;
+    return SP1_KERNEL_PTR(zerocheck_fused_sequential<ext_t, 1024>);
 }
 
 // Bivariate (fused first-two-rounds) entry points. Round 0 only, so only the
 // base-field instantiations exist.
 extern "C" void* zerocheck_fused_sequential_bivariate_kb_32_kernel() {
-    return (void*)zerocheck_fused_sequential_bivariate<felt_t, 32>;
+    return SP1_KERNEL_PTR(zerocheck_fused_sequential_bivariate<felt_t, 32>);
 }
 extern "C" void* zerocheck_fused_sequential_bivariate_kb_64_kernel() {
-    return (void*)zerocheck_fused_sequential_bivariate<felt_t, 64>;
+    return SP1_KERNEL_PTR(zerocheck_fused_sequential_bivariate<felt_t, 64>);
 }
 extern "C" void* zerocheck_fused_sequential_bivariate_kb_128_kernel() {
-    return (void*)zerocheck_fused_sequential_bivariate<felt_t, 128>;
+    return SP1_KERNEL_PTR(zerocheck_fused_sequential_bivariate<felt_t, 128>);
 }
 extern "C" void* zerocheck_fused_sequential_bivariate_kb_256_kernel() {
-    return (void*)zerocheck_fused_sequential_bivariate<felt_t, 256>;
+    return SP1_KERNEL_PTR(zerocheck_fused_sequential_bivariate<felt_t, 256>);
 }
 extern "C" void* zerocheck_fused_sequential_bivariate_kb_512_kernel() {
-    return (void*)zerocheck_fused_sequential_bivariate<felt_t, 512>;
+    return SP1_KERNEL_PTR(zerocheck_fused_sequential_bivariate<felt_t, 512>);
 }
 extern "C" void* zerocheck_fused_sequential_bivariate_kb_1024_kernel() {
-    return (void*)zerocheck_fused_sequential_bivariate<felt_t, 1024>;
+    return SP1_KERNEL_PTR(zerocheck_fused_sequential_bivariate<felt_t, 1024>);
 }
 
 // Node-vectorised bivariate entry points (MAX_REGS = 128 tier). G = 2 and 4
 // are capped at 64 registers (4 blocks of 256 per SM); G = 12 needs ~120.
 extern "C" void* zerocheck_fused_sequential_bivariate_vec2_kb_128_kernel() {
-    return (void*)zerocheck_fused_sequential_bivariate_vec<2, 128, 4>;
+    return SP1_KERNEL_PTR(zerocheck_fused_sequential_bivariate_vec<2, 128, 4>);
 }
 extern "C" void* zerocheck_fused_sequential_bivariate_vec4_kb_128_kernel() {
-    return (void*)zerocheck_fused_sequential_bivariate_vec<4, 128, 4>;
+    return SP1_KERNEL_PTR(zerocheck_fused_sequential_bivariate_vec<4, 128, 4>);
 }
 extern "C" void* zerocheck_fused_sequential_bivariate_vec12_kb_128_kernel() {
-    return (void*)zerocheck_fused_sequential_bivariate_vec<12, 128, 1>;
+    return SP1_KERNEL_PTR(zerocheck_fused_sequential_bivariate_vec<12, 128, 1>);
 }

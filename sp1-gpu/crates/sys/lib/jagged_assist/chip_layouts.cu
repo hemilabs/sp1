@@ -1,3 +1,4 @@
+#include "runtime/gpu_backend.cuh"
 // Device-side `ChipLayoutC` derivation. See `chip_layouts.cuh` for the
 // design and contract.
 
@@ -53,5 +54,5 @@ __global__ void jaggedChipLayouts(
 }  // namespace
 
 extern "C" void* jagged_chip_layouts_kernel() {
-    return (void*)jaggedChipLayouts;
+    return SP1_KERNEL_PTR(jaggedChipLayouts);
 }

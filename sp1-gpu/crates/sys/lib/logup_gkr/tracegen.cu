@@ -1,3 +1,4 @@
+#include "runtime/gpu_backend.cuh"
 #include "logup_gkr/execution.cuh"
 #include "logup_gkr/first_layer.cuh"
 #include "logup_gkr/tracegen.cuh"
@@ -114,7 +115,7 @@ __global__ void populateLastCircuitLayer(
     const size_t colIdx = j + interactionOffset;
     const size_t startIdx = (size_t)startIndices[colIdx] << 1;
 
-    __shared__ PopStaged s;
+    SP1_SHARED_VAR(PopStaged, s);
     if (!is_padding) {
         if (threadIdx.x == 0) {
             size_t v0 = interactions.values_ptr[j], v1 = interactions.values_ptr[j + 1];
@@ -221,5 +222,5 @@ __global__ void populateLastCircuitLayer(
 }
 
 extern "C" void* logup_gkr_populate_last_circuit_layer() {
-    return (void*)populateLastCircuitLayer;
+    return SP1_KERNEL_PTR(populateLastCircuitLayer);
 }

@@ -6,5 +6,6 @@ add_library(jagged_assist_objs OBJECT
 target_link_libraries(jagged_assist_objs PRIVATE sp1_gpu_common)
 
 if(USE_HIP)
-    set_source_files_properties(branching_program.cu PROPERTIES LANGUAGE HIP)
+    set_source_files_properties(branching_program.cu fold_metadata.cu chip_layouts.cu
+        PROPERTIES LANGUAGE HIP)
 endif()

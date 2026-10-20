@@ -1422,7 +1422,9 @@ fn compute_padded_row_adjustment(
                         (n_chunks as u32, 1u32, 1u32),
                         (32u32, 1u32, 1u32),
                         &args,
-                        (max_phys as usize).max(1) * std::mem::size_of::<Felt>(),
+                        // At least two Ext: on SYCL the block's two sub-groups reduce in it.
+                        ((max_phys as usize) * std::mem::size_of::<Felt>())
+                            .max(2 * std::mem::size_of::<Ext>()),
                     )
                     .unwrap();
             }

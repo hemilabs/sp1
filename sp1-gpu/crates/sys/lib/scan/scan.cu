@@ -1,13 +1,14 @@
+#include "runtime/gpu_backend.cuh"
 #include "sp1-gpu-cbindgen.hpp"
 #include "scan/scan.cuh"
 #include "fields/kb31_septic_extension_t.cuh"
 
 namespace sp1_gpu_sys {
 extern KernelPtr single_block_scan_kernel_large_bb31_septic_curve() {
-    return (KernelPtr)scan_large::SingleBlockScan<bb31_septic_curve_t>;
+    return (KernelPtr)SP1_KERNEL_PTR(scan_large::SingleBlockScan<bb31_septic_curve_t>);
 }
 extern KernelPtr scan_kernel_large_bb31_septic_curve() {
-    return (KernelPtr)scan_large::Scan<bb31_septic_curve_t>;
+    return (KernelPtr)SP1_KERNEL_PTR(scan_large::Scan<bb31_septic_curve_t>);
 }
 } // namespace sp1_gpu_sys
 // Each thread scans two points; keep these in sync with tracegen/src/riscv/global.rs.
@@ -17,7 +18,17 @@ constexpr unsigned CURVE_SCAN_POINTS_PER_BLOCK = 2 * CURVE_SCAN_BLOCK_SIZE;
 // Independent local scans. Totals are recursively scanned before applying offsets.
 __global__ void curveScanLocal(bb31_septic_curve_t* output,
     const bb31_septic_curve_t* input, size_t n, bb31_septic_curve_t* totals) {
-    __shared__ bb31_septic_curve_t aux[CURVE_SCAN_POINTS_PER_BLOCK];
+    // Raw storage: bb31_septic_curve_t has a constructor, and HIP rejects initializing __shared__
+    // variables (SYCL's work-group memory takes no constructors either).
+#ifdef SP1_SYCL
+    SP1_SHARED_ARRAY(uint32_t, aux_words,
+                     [sizeof(bb31_septic_curve_t) / 4 * CURVE_SCAN_POINTS_PER_BLOCK]);
+    bb31_septic_curve_t* aux = reinterpret_cast<bb31_septic_curve_t*>(aux_words);
+#else
+    alignas(bb31_septic_curve_t) __shared__ char aux_raw[sizeof(bb31_septic_curve_t) *
+                                                        CURVE_SCAN_POINTS_PER_BLOCK];
+    bb31_septic_curve_t* aux = reinterpret_cast<bb31_septic_curve_t*>(aux_raw);
+#endif
     unsigned t = threadIdx.x;
     size_t base = blockIdx.x * CURVE_SCAN_POINTS_PER_BLOCK;
     aux[t] = base + t < n ? input[base + t] : bb31_septic_curve_t();
@@ -50,6 +61,6 @@ __global__ void curveScanOffsets(bb31_septic_curve_t* output,
 }
 
 namespace sp1_gpu_sys {
-extern KernelPtr curve_scan_local_kernel() { return (KernelPtr)curveScanLocal; }
-extern KernelPtr curve_scan_offsets_kernel() { return (KernelPtr)curveScanOffsets; }
+extern KernelPtr curve_scan_local_kernel() { return (KernelPtr)SP1_KERNEL_PTR(curveScanLocal); }
+extern KernelPtr curve_scan_offsets_kernel() { return (KernelPtr)SP1_KERNEL_PTR(curveScanOffsets); }
 }

@@ -447,7 +447,8 @@ impl Groth16Bn254Prover {
     /// `PATH`. With none of them it proves in this process, as upstream SP1 does, keeping Go's
     /// caches for the next proof, and warns once. `SP1_GROTH16_IN_PROCESS=1` (or `true`) does that
     /// on purpose, which suits a host with memory to spare, and so do builds with `groth16-cuda`,
-    /// whose in-process prover uses icicle.
+    /// whose in-process prover uses icicle, and processes that registered GPU hooks for gnark's
+    /// prover (`ffi::set_groth16_gpu_hooks`), which a helper would not have.
     ///
     /// Where less than ~18 GiB is available (the helper peaks at ~16 GiB), its Go heap is limited
     /// (`GOMEMLIMIT`, unless set already) to the available memory less 2 GiB, never below the
@@ -487,6 +488,7 @@ impl Groth16Bn254Prover {
         let _slot = crate::groth16_queue::acquire("Groth16 (CPU)");
 
         let in_process = cfg!(feature = "groth16-cuda")
+            || crate::ffi::groth16_gpu_hooks_registered()
             || std::env::var("SP1_GROTH16_IN_PROCESS").is_ok_and(|v| v == "1" || v == "true");
         let helper = if in_process { None } else { crate::cpu_helper::find()? };
         let Some(helper) = helper else {

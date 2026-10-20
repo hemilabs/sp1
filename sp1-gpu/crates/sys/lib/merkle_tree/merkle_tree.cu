@@ -1,3 +1,4 @@
+#include "runtime/gpu_backend.cuh"
 #include <stdio.h>
 #include <stdlib.h>
 #include "poseidon2/poseidon2_kb31_16.cuh"
@@ -72,8 +73,11 @@ __global__ void leafHashPacked(
 }
 
 
-#ifndef __HIPCC__
-// ---- KoalaBear fast paths (CUDA only, bit-exact with the generic kernels; see poseidon2_kb31_16_fast.cuh) ----
+#ifndef SP1_SYCL
+// ---- KoalaBear fast paths (bit-exact with the generic kernels; see poseidon2_kb31_16_fast.cuh) ----
+// The one-thread-per-state kernels run on CUDA and HIP (on a Radeon RX 9070 XT the Merkle commit
+// bench went from 38.3 to 34-36 ms); the quad kernels (warp shuffles) on CUDA only.
+// SP1_GPU_MERKLE_GENERIC selects the generic kernels.
 namespace kbfast = poseidon2_kb31_16_fast;
 
 // Same layout and semantics as leafHashPacked<KoalaBearHasher, KoalaBear>: overwrite-mode sponge, rate 8.
@@ -132,8 +136,9 @@ __global__ void compressKbFast(poseidon2::KoalaBearHasher, kb31_t (*digests)[8],
     }
 }
 
+#ifndef SP1_PORTABLE
 #define KBQUAD_SETUP                                                                       \
-    __shared__ uint32_t s_rc[128];                                                         \
+    SP1_SHARED_ARRAY(uint32_t, s_rc, [128]);                                                         \
     for (int i = threadIdx.x; i < 128; i += blockDim.x)                                    \
         s_rc[i] = poseidon2_kb31_16::constants::EXTERNAL_ROUND_CONSTANTS[i].val;           \
     __syncthreads();                                                                       \
@@ -184,6 +189,7 @@ __global__ void compressBatchedKbQuad(
         __syncthreads();
     }
 }
+#endif  // SP1_PORTABLE
 
 // recomputeBottomPaths<KoalaBear> with the fast permutation (same semantics and launch shape).
 __global__ void recomputeBottomPathsKbFast(
@@ -195,7 +201,7 @@ __global__ void recomputeBottomPathsKbFast(
     size_t widths,
     size_t tree_height,
     size_t bottom_levels) {
-    extern __shared__ uint4 smemKb[];
+    SP1_EXTERN_SHARED(uint4, smemKb);
     uint32_t(*nodes)[8] = reinterpret_cast<uint32_t(*)[8]>(smemKb);
     const uint32_t* input = reinterpret_cast<const uint32_t*>(input_);
     const size_t H = (size_t)1 << tree_height;
@@ -254,18 +260,17 @@ __global__ void recomputeBottomPathsKbFast(
         __syncthreads();
     }
 }
-#endif  // __HIPCC__
+#endif  // SP1_SYCL
 
 extern "C" void* leaf_hash_merkle_tree_koala_bear_16_kernel() {
-#ifndef __HIPCC__
-    if (!getenv("SP1_GPU_MERKLE_GENERIC")) return (void*)leafHashKbFast;
+#ifndef SP1_SYCL
+    if (!getenv("SP1_GPU_MERKLE_GENERIC")) return SP1_KERNEL_PTR(leafHashKbFast);
 #endif
-    return (void*)leafHashPacked<poseidon2::KoalaBearHasher, poseidon2_kb31_16::KoalaBear>;
+    return SP1_KERNEL_PTR(leafHashPacked<poseidon2::KoalaBearHasher, poseidon2_kb31_16::KoalaBear>);
 }
 
 extern "C" void* leaf_hash_merkle_tree_bn254_kernel() {
-    return (void*)
-        leafHash<poseidon2::Bn254Hasher, poseidon2_bn254_3::Bn254, poseidon2::Bn254HasherState>;
+    return SP1_KERNEL_PTR(leafHash<poseidon2::Bn254Hasher, poseidon2_bn254_3::Bn254, poseidon2::Bn254HasherState>);
 }
 
 // Launched with 512 threads per block on CUDA (upstream's tuning, #2893), so no launch bound
@@ -291,18 +296,17 @@ void compress(
 }
 
 extern "C" void* compress_merkle_tree_koala_bear_16_kernel() {
-#ifndef __HIPCC__
-    if (!getenv("SP1_GPU_MERKLE_GENERIC")) return (void*)compressKbFast;
+#ifndef SP1_SYCL
+    if (!getenv("SP1_GPU_MERKLE_GENERIC")) return SP1_KERNEL_PTR(compressKbFast);
 #endif
-    return (void*)compress<
+    return SP1_KERNEL_PTR(compress<
         poseidon2::KoalaBearHasher,
         poseidon2_kb31_16::KoalaBear,
-        poseidon2::KoalaBearHasherState>;
+        poseidon2::KoalaBearHasherState>);
 }
 
 extern "C" void* compress_merkle_tree_bn254_kernel() {
-    return (void*)
-        compress<poseidon2::Bn254Hasher, poseidon2_bn254_3::Bn254, poseidon2::Bn254HasherState>;
+    return SP1_KERNEL_PTR(compress<poseidon2::Bn254Hasher, poseidon2_bn254_3::Bn254, poseidon2::Bn254HasherState>);
 }
 
 // Batched compress: process multiple small tree layers in a single kernel launch.
@@ -329,29 +333,29 @@ __global__ __launch_bounds__(128, 2) void compressBatched(
 // Quad-per-node kernels for small layers; nullptr on HIP or with SP1_GPU_MERKLE_GENERIC (the Rust side
 // then keeps the generic launch shapes).
 extern "C" void* compress_small_layer_merkle_tree_koala_bear_16_kernel() {
-#ifndef __HIPCC__
-    if (!getenv("SP1_GPU_MERKLE_GENERIC")) return (void*)compressKbQuad;
+#ifndef SP1_PORTABLE
+    if (!getenv("SP1_GPU_MERKLE_GENERIC")) return SP1_KERNEL_PTR(compressKbQuad);
 #endif
     return nullptr;
 }
 
 extern "C" void* compress_batched_small_merkle_tree_koala_bear_16_kernel() {
-#ifndef __HIPCC__
-    if (!getenv("SP1_GPU_MERKLE_GENERIC")) return (void*)compressBatchedKbQuad;
+#ifndef SP1_PORTABLE
+    if (!getenv("SP1_GPU_MERKLE_GENERIC")) return SP1_KERNEL_PTR(compressBatchedKbQuad);
 #endif
     return nullptr;
 }
 
 extern "C" void* compress_batched_merkle_tree_koala_bear_16_kernel() {
-    return (void*)compressBatched<
+    return SP1_KERNEL_PTR(compressBatched<
         poseidon2::KoalaBearHasher,
         poseidon2_kb31_16::KoalaBear,
-        poseidon2::KoalaBearHasherState>;
+        poseidon2::KoalaBearHasherState>);
 }
 
 extern "C" void* compress_batched_merkle_tree_bn254_kernel() {
-    return (void*)compressBatched<
-        poseidon2::Bn254Hasher, poseidon2_bn254_3::Bn254, poseidon2::Bn254HasherState>;
+    return SP1_KERNEL_PTR(compressBatched<
+        poseidon2::Bn254Hasher, poseidon2_bn254_3::Bn254, poseidon2::Bn254HasherState>);
 }
 
 
@@ -402,7 +406,7 @@ __global__ void recomputeBottomPaths(
     static_assert(
         sizeof(FDW_t) == HashParams::DIGEST_WIDTH * sizeof(typename HashParams::F_t),
         "digest slots must be tightly packed");
-    extern __shared__ unsigned char smemRaw[];
+    SP1_EXTERN_SHARED(unsigned char, smemRaw);
     FDW_t* nodes = reinterpret_cast<FDW_t*>(smemRaw);
 
     size_t matrixHeight = (size_t)1 << tree_height;
@@ -452,32 +456,31 @@ __global__ void recomputeBottomPaths(
 
 
 extern "C" void* compute_paths_merkle_tree_koala_bear_16_kernel() {
-    return (void*)computePaths<
+    return SP1_KERNEL_PTR(computePaths<
         poseidon2::KoalaBearHasher,
         poseidon2_kb31_16::KoalaBear,
-        poseidon2::KoalaBearHasherState>;
+        poseidon2::KoalaBearHasherState>);
 }
 
 extern "C" void* compute_paths_merkle_tree_bn254_kernel() {
-    return (void*)
-        computePaths<poseidon2::Bn254Hasher, poseidon2_bn254_3::Bn254, poseidon2::Bn254HasherState>;
+    return SP1_KERNEL_PTR(computePaths<poseidon2::Bn254Hasher, poseidon2_bn254_3::Bn254, poseidon2::Bn254HasherState>);
 }
 
 extern "C" void* recompute_bottom_paths_merkle_tree_koala_bear_16_kernel() {
-#ifndef __HIPCC__
-    if (!getenv("SP1_GPU_MERKLE_GENERIC")) return (void*)recomputeBottomPathsKbFast;
+#ifndef SP1_SYCL
+    if (!getenv("SP1_GPU_MERKLE_GENERIC")) return SP1_KERNEL_PTR(recomputeBottomPathsKbFast);
 #endif
-    return (void*)recomputeBottomPaths<
+    return SP1_KERNEL_PTR(recomputeBottomPaths<
         poseidon2::KoalaBearHasher,
         poseidon2_kb31_16::KoalaBear,
-        poseidon2::KoalaBearHasherState>;
+        poseidon2::KoalaBearHasherState>);
 }
 
 extern "C" void* recompute_bottom_paths_merkle_tree_bn254_kernel() {
-    return (void*)recomputeBottomPaths<
+    return SP1_KERNEL_PTR(recomputeBottomPaths<
         poseidon2::Bn254Hasher,
         poseidon2_bn254_3::Bn254,
-        poseidon2::Bn254HasherState>;
+        poseidon2::Bn254HasherState>);
 }
 
 
@@ -509,15 +512,15 @@ __global__ void computeOpenings(
 }
 
 extern "C" void* compute_openings_merkle_tree_koala_bear_16_kernel() {
-    return (void*)computeOpenings<
+    return SP1_KERNEL_PTR(computeOpenings<
         poseidon2::KoalaBearHasher,
         poseidon2_kb31_16::KoalaBear,
-        poseidon2::KoalaBearHasherState>;
+        poseidon2::KoalaBearHasherState>);
 }
 
 extern "C" void* compute_openings_merkle_tree_bn254_kernel() {
-    return (void*)computeOpenings<
+    return SP1_KERNEL_PTR(computeOpenings<
         poseidon2::Bn254Hasher,
         poseidon2_bn254_3::Bn254,
-        poseidon2::Bn254HasherState>;
+        poseidon2::Bn254HasherState>);
 }

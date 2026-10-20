@@ -70,6 +70,9 @@ where
         .await
         .unwrap();
 
+        // A key kept for many proofs: it holds only its preprocessed traces between them.
+        let mut pk = pk;
+        pk.make_persistent();
         let pk = Mutex::new(pk);
 
         let pk = ProvingKey { vk: vk.clone(), preprocessed_data: pk };

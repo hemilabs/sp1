@@ -13,7 +13,9 @@
 //   latency-bound work, small Merkle layers and the warp-cooperative device challenger
 //   (challenger/warp_duplex.cuh): 3.1 us per permutation vs 6.7 us for permute() on one thread.
 #pragma once
-#ifndef __HIPCC__
+// Not on SYCL: Intel GPUs emulate the 64-bit arithmetic this is built on (the Merkle commit bench
+// on an Arc Pro B70 went from 51 to 61 ms with it).
+#ifndef SP1_SYCL
 #include <cstdint>
 #include "poseidon2/poseidon2_kb31_16.cuh"
 
@@ -62,6 +64,10 @@ __device__ __forceinline__ uint32_t addm(uint32_t a, uint32_t b) { return fsub(a
 
 // REDC of a 64-bit x < 2^63: returns x * 2^-32 mod p in [0, x/2^32 + p)
 __device__ __forceinline__ uint32_t redc(uint64_t x) {
+#ifdef SP1_PORTABLE
+    const uint32_t m = (uint32_t)x * MNEG;
+    return (uint32_t)((x + (uint64_t)m * P) >> 32);
+#else
     // IMAD + IMAD.HI.U32 with a 64-bit addend; the C form of the same expression makes ptxas add a
     // redundant IADD3 per reduction.
     uint32_t r;
@@ -69,6 +75,7 @@ __device__ __forceinline__ uint32_t redc(uint64_t x) {
         "mad.lo.cc.u32 t, m, 0x7f000001, tl;\n\tmadc.hi.u32 %0, m, 0x7f000001, th;\n\t}"
         : "=r"(r) : "l"(x));
     return r;
+#endif
 }
 // Montgomery product, lazy: a*b < 2^63 -> result < a*b/2^32 + p
 __device__ __forceinline__ uint32_t mmul_lazy(uint32_t a, uint32_t b) { return redc((uint64_t)a * b); }
@@ -105,6 +112,12 @@ __device__ __forceinline__ void ext_layer(uint32_t* s) {
 
 // 64-bit sum of 16 32-bit values via add-with-carry chain (lo in IADD3, carries into hi)
 __device__ __forceinline__ uint64_t sum16(const uint32_t* s) {
+#ifdef SP1_PORTABLE
+    uint64_t sum = 0;
+#pragma unroll
+    for (int i = 0; i < 16; i++) sum += s[i];
+    return sum;
+#else
     uint32_t lo, hi;
     asm("{\n\t"
         "add.cc.u32 %0, %2, %3;\n\t"
@@ -128,6 +141,7 @@ __device__ __forceinline__ uint64_t sum16(const uint32_t* s) {
         : "r"(s[0]), "r"(s[1]), "r"(s[2]), "r"(s[3]), "r"(s[4]), "r"(s[5]), "r"(s[6]), "r"(s[7]),
           "r"(s[8]), "r"(s[9]), "r"(s[10]), "r"(s[11]), "r"(s[12]), "r"(s[13]), "r"(s[14]), "r"(s[15]));
     return ((uint64_t)hi << 32) | lo;
+#endif
 }
 
 // shifted 64-bit add: S + (v << k)
@@ -188,6 +202,8 @@ __device__ __forceinline__ void permute(uint32_t* s) {
 }
 
 
+// The 4-lane permutation uses warp shuffles: CUDA only.
+#ifndef SP1_PORTABLE
 namespace quad {
 
 
@@ -262,5 +278,6 @@ __device__ __forceinline__ void permute(uint32_t (&x)[4], const QCtx& C) {
 }
 
 }  // namespace quad
+#endif  // SP1_PORTABLE
 }  // namespace poseidon2_kb31_16_fast
-#endif  // __HIPCC__
+#endif  // SP1_SYCL

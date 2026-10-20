@@ -126,7 +126,7 @@ __global__ void standard_ntt(
     const uint32_t stride,
     const uint32_t* twiddles,
     const uint32_t n_inv) {
-    extern __shared__ uint32_t shared[];
+    SP1_EXTERN_SHARED(uint32_t, shared);
     uint32_t* polynomial = data + blockIdx.x * stride;
     Ntt ntt;
     ntt.load(shared, polynomial);
@@ -146,7 +146,7 @@ __global__ void staged_ntt_first(
     const uint32_t stride,
     const uint32_t* twiddles) {
     data += blockIdx.y * stride;
-    extern __shared__ uint32_t shared[];
+    SP1_EXTERN_SHARED(uint32_t, shared);
     Ntt ntt;
     ntt.stage_1_load(shared, data, blockIdx.x);
     __syncthreads();
@@ -187,7 +187,7 @@ __global__ void staged_ntt_first_coset(
     const uint32_t* twiddles) {
     output += blockIdx.y * N;
     input += blockIdx.y * input_size;
-    extern __shared__ uint32_t shared[];
+    SP1_EXTERN_SHARED(uint32_t, shared);
     constexpr uint32_t chunk_size = N / M;
 
     // cuPQC uses this strided input layout for forward stage one.
@@ -217,7 +217,7 @@ __global__ void staged_ntt_second(
     const uint32_t* twiddles,
     const uint32_t n_inv) {
     data += blockIdx.y * stride;
-    extern __shared__ uint32_t shared[];
+    SP1_EXTERN_SHARED(uint32_t, shared);
     Ntt ntt;
     ntt.stage_2_load(shared, data, blockIdx.x);
     __syncthreads();

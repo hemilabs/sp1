@@ -3,7 +3,7 @@
 // Poseidon2 of poseidon2_kb31_16_fast.cuh. All 32 lanes of one warp must call every method (control
 // flow depends only on buffer sizes).
 #pragma once
-#ifndef __HIPCC__
+#ifndef SP1_PORTABLE
 #include "challenger/challenger.cuh"
 #include "poseidon2/poseidon2_kb31_16_fast.cuh"
 
@@ -103,4 +103,4 @@ __device__ __forceinline__ kb31_extension_t warpSumExt(kb31_extension_t v) {
     }
     return v;
 }
-#endif  // __HIPCC__
+#endif  // SP1_PORTABLE

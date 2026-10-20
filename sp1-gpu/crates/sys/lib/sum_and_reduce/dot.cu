@@ -1,3 +1,4 @@
+#include "runtime/gpu_backend.cuh"
 #include "sum_and_reduce/dot.cuh"
 #include "sum_and_reduce/reduction.cuh"
 
@@ -27,7 +28,7 @@ __global__ void partialBlockInnerProductKernel(
     }
 
     // Allocate shared memory
-    extern __shared__ unsigned char memory[];
+    SP1_EXTERN_SHARED(unsigned char, memory);
     F* shared = reinterpret_cast<F*>(memory);
 
     // // Warp-level reduction within tiles
@@ -40,15 +41,15 @@ __global__ void partialBlockInnerProductKernel(
 }
 
 extern "C" void* partial_inner_product_koala_bear_kernel() {
-    return (void*)partialBlockInnerProductKernel<kb31_t, kb31_t>;
+    return SP1_KERNEL_PTR(partialBlockInnerProductKernel<kb31_t, kb31_t>);
 }
 
 extern "C" void* partial_inner_product_koala_bear_extension_kernel() {
-    return (void*)partialBlockInnerProductKernel<kb31_extension_t, kb31_extension_t>;
+    return SP1_KERNEL_PTR(partialBlockInnerProductKernel<kb31_extension_t, kb31_extension_t>);
 }
 
 extern "C" void* partial_inner_product_koala_bear_base_extension_kernel() {
-    return (void*)partialBlockInnerProductKernel<kb31_extension_t, kb31_t>;
+    return SP1_KERNEL_PTR(partialBlockInnerProductKernel<kb31_extension_t, kb31_t>);
 }
 
 template <typename EF, typename F>
@@ -80,7 +81,7 @@ __global__ void partialBlockDotKernel(
     }
 
     // Allocate shared memory
-    extern __shared__ unsigned char memory[];
+    SP1_EXTERN_SHARED(unsigned char, memory);
     EF* shared = reinterpret_cast<EF*>(memory);
 
     // // Warp-level reduction within tiles
@@ -93,15 +94,15 @@ __global__ void partialBlockDotKernel(
 }
 
 extern "C" void* partial_dot_koala_bear_kernel() {
-    return (void*)partialBlockDotKernel<kb31_t, kb31_t>;
+    return SP1_KERNEL_PTR(partialBlockDotKernel<kb31_t, kb31_t>);
 }
 
 extern "C" void* partial_dot_koala_bear_extension_kernel() {
-    return (void*)partialBlockDotKernel<kb31_extension_t, kb31_extension_t>;
+    return SP1_KERNEL_PTR(partialBlockDotKernel<kb31_extension_t, kb31_extension_t>);
 }
 
 extern "C" void* partial_dot_koala_bear_base_extension_kernel() {
-    return (void*)partialBlockDotKernel<kb31_extension_t, kb31_t>;
+    return SP1_KERNEL_PTR(partialBlockDotKernel<kb31_extension_t, kb31_t>);
 }
 
 template <typename F, typename EF>
@@ -124,13 +125,13 @@ __global__ void dotAlongShortDimensionKernel(
 }
 
 extern "C" void* dot_along_short_dimension_kernel_koala_bear_base_base() {
-    return (void*)dotAlongShortDimensionKernel<kb31_t, kb31_t>;
+    return SP1_KERNEL_PTR(dotAlongShortDimensionKernel<kb31_t, kb31_t>);
 }
 
 extern "C" void* dot_along_short_dimension_kernel_koala_bear_base_extension() {
-    return (void*)dotAlongShortDimensionKernel<kb31_t, kb31_extension_t>;
+    return SP1_KERNEL_PTR(dotAlongShortDimensionKernel<kb31_t, kb31_extension_t>);
 }
 
 extern "C" void* dot_along_short_dimension_kernel_koala_bear_extension_extension() {
-    return (void*)dotAlongShortDimensionKernel<kb31_extension_t, kb31_extension_t>;
+    return SP1_KERNEL_PTR(dotAlongShortDimensionKernel<kb31_extension_t, kb31_extension_t>);
 }

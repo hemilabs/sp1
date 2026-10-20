@@ -1,7 +1,9 @@
 #pragma once
 
+#include "runtime/gpu_backend.cuh"
+
 #include "fields/kb31_t.cuh"
-#ifdef __HIPCC__
+#ifdef SP1_PORTABLE
 #include "fields/ptx_portable.cuh"
 #else
 #include "fields/ptx.cuh"
@@ -110,7 +112,7 @@ class kb31_extension_t {
     }
 
     __device__ __forceinline__ kb31_extension_t& operator*=(const kb31_extension_t b) {
-#ifdef __HIPCC__
+#ifdef SP1_PORTABLE
         // Karatsuba extension multiply for F[x]/(x^4 - W), W=3.
         // Uses 2-level Karatsuba: 9 base-field multiplies instead of 16.
         // Split: P = (a0+a1*x) + (a2+a3*x)*x^2 = P_lo + P_hi*y, y=x^2
@@ -120,6 +122,7 @@ class kb31_extension_t {
         kb31_t a0 = value[0], a1 = value[1], a2 = value[2], a3 = value[3];
         kb31_t b0 = b.value[0], b1 = b.value[1], b2 = b.value[2], b3 = b.value[3];
 
+        // Base-field products, reduced (on SYCL operator* is already the 32-bit multiply).
         #define MUL(x, y) (kb31_t)((x) * (y))
         // W-multiply: x*3 = x+x+x (2 full-rate adds vs 1 quarter-rate mul on RDNA3)
         #define MULW(x) ((x) + (x) + (x))
@@ -199,7 +202,7 @@ class kb31_extension_t {
         #undef MULW
         #undef MUL
         return *this;
-#else // !__HIPCC__ (CUDA optimized path)
+#else // !SP1_PORTABLE (CUDA optimized path)
         uint32_t x0 = value[0].val, x1 = value[1].val, x2 = value[2].val, x3 = value[3].val,
                  y0 = b.value[0].val, y1 = b.value[1].val, y2 = b.value[2].val, y3 = b.value[3].val;
 
@@ -398,7 +401,7 @@ class kb31_extension_t {
 
     __device__ __forceinline__ kb31_extension_t
     interpolateLinear(const kb31_extension_t one, const kb31_extension_t zero) const {
-#ifdef __HIPCC__
+#ifdef SP1_PORTABLE
         // HIP-safe: use schoolbook multiply via kb31_t operators
         kb31_extension_t diff = one - zero;
         kb31_extension_t result = *this * diff + zero;
@@ -536,7 +539,7 @@ class kb31_extension_t {
 
     __device__ __forceinline__ kb31_extension_t
     interpolateLinear(const kb31_t one, const kb31_t zero) const {
-#ifdef __HIPCC__
+#ifdef SP1_PORTABLE
         // HIP-safe: use schoolbook multiply via kb31_t operators
         kb31_t diff = one - zero;
         kb31_extension_t result = *this * diff;

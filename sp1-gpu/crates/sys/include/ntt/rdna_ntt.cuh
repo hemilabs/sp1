@@ -65,8 +65,8 @@ void rdna_stockham_lds_kernel(
     constexpr uint32_t THREADS = LDS_SIZE / ELTS_PER_THREAD;
     constexpr uint32_t PADDED_LDS = LDS_SIZE + (LDS_SIZE >> 5);
 
-    __shared__ uint32_t lds_a[PADDED_LDS];
-    __shared__ uint32_t lds_b[PADDED_LDS];
+    SP1_SHARED_ARRAY(uint32_t, lds_a, [PADDED_LDS]);
+    SP1_SHARED_ARRAY(uint32_t, lds_b, [PADDED_LDS]);
 
     const uint32_t tid = threadIdx.x;
     const uint32_t n = 1u << lg_n;

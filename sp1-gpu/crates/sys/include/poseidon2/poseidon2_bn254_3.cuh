@@ -793,18 +793,21 @@ class Bn254 {
     static constexpr const int ROUNDS_F = constants::ROUNDS_F;
     static constexpr const int ROUNDS_P = constants::ROUNDS_P;
     static constexpr const int D = constants::D;
+    // Plain partial rounds in Poseidon2::permute (see the KoalaBear parameters).
+    static constexpr bool DEFERRED_PARTIAL_ROUNDS = false;
 
     static constexpr pF_t* INTERNAL_ROUND_CONSTANTS = constants::INTERNAL_ROUND_CONSTANTS;
     static constexpr pF_t* EXTERNAL_ROUND_CONSTANTS = constants::EXTERNAL_ROUND_CONSTANTS;
     static constexpr pF_t* MAT_INTERNAL_DIAG_M1 = constants::MAT_INTERNAL_DIAG_M1;
     static constexpr pF_t MONTY_INVERSE = constants::MONTY_INVERSE;
 
+    // state[i] = state[i] * MAT_INTERNAL_DIAG_M1[i] + sum, with the diagonal (1, 1, 2) as additions:
+    // three Montgomery multiplications fewer in each of the 56 partial rounds, out of about 7.
     __device__ static void internalLinearLayer(F_t state[WIDTH], pF_t*, F_t _) {
         F_t s = state[0] + state[1] + state[2];
-        for (int i = 0; i < WIDTH; i++) {
-            state[i] *= MAT_INTERNAL_DIAG_M1[i];
-            state[i] += s;
-        }
+        state[0] += s;
+        state[1] += s;
+        state[2] = state[2].dbl() + s;
     }
 
     __device__ static void externalLinearLayer(F_t state[WIDTH]) {
@@ -815,99 +818,26 @@ class Bn254 {
     }
 };
 
-static __device__ __constant__ __align__(16) const uint32_t ALT_BN128_1ls31[8] = {
-    /* (1<<31) % P_bn254 */
-    0x8adc5ced,
-    0x49f3c432,
-    0x582f50aa,
-    0x8b6f9213,
-    0x98155c1c,
-    0x0938dba1,
-    0x76361137,
-    0x035e01bf,
-};
-
-template <int SIZE>
-__device__ void mul_u32_p(uint32_t v, const uint32_t p[SIZE], uint32_t result[SIZE + 1]) {
-    uint64_t carry = 0;
-    for (int ii = 0; ii < SIZE; ++ii) {
-        uint64_t temp = (uint64_t)(v)*p[ii] + carry;
-        result[ii] = temp & 0xFFFFFFFF;
-        carry = temp >> 32;
-    }
-    result[SIZE] = (uint32_t)carry;
-}
-
-template <int SIZE>
-__device__ void substract(uint32_t* a, const uint32_t* b) {
-    uint64_t borrow = 0;
-    for (int ii = 0; ii < SIZE; ++ii) {
-        uint64_t sub = (uint64_t)a[ii] - b[ii] - borrow;
-        a[ii] = (uint32_t)(sub & 0xFFFFFFFF);
-        borrow = (sub >> 32) & 1;
-    }
-}
-
-template <int SIZE>
-__device__ bool greaterThan(const uint32_t* a, uint32_t* b) {
-    for (int i = SIZE - 1; i >= 0; --i) {
-        if (a[i] > b[i]) {
-            return true;
-        }
-        if (a[i] < b[i]) {
-            return false;
-        }
-    }
-    return false;
-}
-
-template <int SIZE>
-__device__ void
-modulo_p(uint32_t v[SIZE + 1], const uint32_t p[SIZE], uint32_t left, uint32_t rigth) {
-    uint32_t prod[SIZE + 1] = {0};
-    while (left <= rigth) {
-        uint32_t mid = left + (rigth - left) / 2;
-        mul_u32_p<SIZE>(mid, p, prod);
-        if (greaterThan<SIZE + 1>(prod, v)) {
-            rigth = mid - 1;
-        } else {
-            if (left == mid)
-                break;
-            left = mid;
-        }
-    }
-    substract<SIZE + 1>(v, prod);
-}
-
 const size_t N = 8;
 
-__device__ inline bn254_t kb31_to_bn254(kb31_t in) {
-    // The hard-coded constant is the inverse of 1<<32 mod p.
-    uint32_t canonical = (0x3f010000ULL * in.val) % (uint64_t)kb31_t::MOD;
-    uint32_t v[N + 1] = {0};
-    mul_u32_p<N>(canonical, device::ALT_BN128_rone, v);
-    // NOTE: likely not the optimal modulo implementation
-    // Max 31 large (8 uint32) multiplications
-    modulo_p<N>(v, device::ALT_BN128_r, 0x00000000u, kb31_t::MOD);
-    return bn254_t(v);
-}
-
+// The BN254 element sum_k x_k 2^(31 k) of up to N KoalaBear values: x_0 .. x_{n1-1} from src1,
+// then the n2 of src2. With N = 8 values of 31 bits the sum is below 2^248 < r, so it is built as
+// an integer by shifts and put into Montgomery form with one multiplication (by R^2): the same
+// value as summing in the field by Horner's rule (res * 2^31 + x), as this did before, converting
+// every value to the field on its own (a 64-bit modulo and up to 31 wide multiplications) and
+// multiplying once more per value: a large part of the wrap's leaf hashing.
 __device__ inline bn254_t
 reduceKoalaBear(kb31_t* src1, kb31_t* src2, int n1, int n2, int stride1 = 1, int stride2 = 1) {
-    const bn254_t po2 = bn254_t(ALT_BN128_1ls31);
-    bn254_t res;
-    res.set_to_zero();
-    if (n2 > 0) {
-        for (int ii = (n2 - 1) * stride2; ii >= 0; ii -= stride2) {
-            res = res * po2 + kb31_to_bn254(src2[ii]);
-        }
+    uint32_t limbs[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+    const int n = n1 + n2;
+    for (int k = 0; k < n; k++) {
+        const uint32_t x = (k < n1 ? src1[k * stride1] : src2[(k - n1) * stride2]).as_canonical_u32();
+        const int bit = 31 * k;
+        const int limb = bit >> 5, shift = bit & 31;
+        limbs[limb] |= x << shift;
+        if (shift > 1) limbs[limb + 1] |= x >> (32 - shift);
     }
-    if (n1 > 0) {
-        for (int ii = (n1 - 1) * stride1; ii >= 0; ii -= stride1) {
-            res = res * po2 + kb31_to_bn254(src1[ii]);
-        }
-    }
-    return res;
+    return bn254_t(limbs) * bn254_t(device::ALT_BN128_rRR);
 }
 
 template <typename Hasher_t, typename HasherState_t>

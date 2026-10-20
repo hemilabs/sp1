@@ -1,3 +1,4 @@
+#include "runtime/gpu_backend.cuh"
 #include "config.cuh"
 #include "sum_and_reduce/sum.cuh"
 
@@ -17,10 +18,10 @@ __global__ void sumKernel(F* A, F* B, F* C, size_t N) {
 }
 
 // A pointer to the sum kernel for uint32_t.
-extern "C" void* sum_kernel_u32() { return (void*)sumKernel<uint32_t>; }
+extern "C" void* sum_kernel_u32() { return SP1_KERNEL_PTR(sumKernel<uint32_t>); }
 
 // A pointer to the sum kernel for felt_t.
-extern "C" void* sum_kernel_felt() { return (void*)sumKernel<felt_t>; }
+extern "C" void* sum_kernel_felt() { return SP1_KERNEL_PTR(sumKernel<felt_t>); }
 
 // A pointer to the sum kernel for ext_t.
-extern "C" void* sum_kernel_ext() { return (void*)sumKernel<ext_t>; }
+extern "C" void* sum_kernel_ext() { return SP1_KERNEL_PTR(sumKernel<ext_t>); }

@@ -1,3 +1,4 @@
+#include "runtime/gpu_backend.cuh"
 // Device-side fold-metadata derivation for JaggedMle. See
 // `fold_metadata.cuh` for the design and contract.
 //
@@ -14,6 +15,9 @@
 // flags[1..n_blocks+1] = 0` so the first block can proceed without
 // waiting.
 
+#ifdef __HIPCC__
+#include <hip/hip_runtime.h>
+#endif
 #include "jagged_assist/fold_metadata.cuh"
 #include <cstdint>
 
@@ -43,7 +47,7 @@ __global__ void jaggedFoldMetadata(
     // Claim a sequential block_id so blocks process the array left-to-right
     // (the decoupled-lookback chain needs strict ordering, the launch order
     // alone doesn't give us that).
-    __shared__ uint32_t bid_s;
+    SP1_SHARED_VAR(uint32_t, bid_s);
     if (threadIdx.x == 0) {
         bid_s = atomicAdd(block_counter, 1u);
     }
@@ -59,7 +63,7 @@ __global__ void jaggedFoldMetadata(
     // Phase 1 — load + transform (zero-pad out-of-range slots). The
     // transformed values are the inputs to the scan AND the output of
     // `new_column_heights`.
-    __shared__ uint32_t aux[SECTION_SIZE];
+    SP1_SHARED_ARRAY(uint32_t, aux, [SECTION_SIZE]);
     uint32_t h0 = (i0 < n_columns) ? fold_transform(column_heights[i0]) : 0u;
     uint32_t h1 = (i1 < n_columns) ? fold_transform(column_heights[i1]) : 0u;
     if (i0 < n_columns) {
@@ -92,14 +96,17 @@ __global__ void jaggedFoldMetadata(
     // for the previous block to publish its prefix sum. Once available,
     // read it, propagate our own updated tail, and let the next block
     // proceed.
-    __shared__ uint32_t previous_sum;
+    SP1_SHARED_VAR(uint32_t, previous_sum);
     if (tid == 0) {
         // Block 0 has no predecessor: it neither waits nor reads scan_values[0] (callers may
         // leave flags[0] / scan_values[0] zeroed).
         if (bid > 0u) {
             while (atomicAdd(&flags[bid], 0u) == 0u) {
             }
-            previous_sum = scan_values[bid];
+            // An atomic read, from the coherent level: a plain load may be served by this compute
+            // unit's L1, which on AMD is not coherent and can hold the line from before the
+            // previous block's store (another block on this unit read a neighbouring value).
+            previous_sum = atomicAdd(&scan_values[bid], 0u);
         } else {
             previous_sum = 0u;
         }
@@ -126,7 +133,7 @@ __global__ void jaggedFoldMetadata(
 }  // namespace
 
 extern "C" void* jagged_fold_metadata_kernel() {
-    return (void*)jaggedFoldMetadata;
+    return SP1_KERNEL_PTR(jaggedFoldMetadata);
 }
 
 extern "C" uint32_t jagged_fold_metadata_block_dim() {

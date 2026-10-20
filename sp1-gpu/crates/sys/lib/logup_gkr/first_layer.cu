@@ -1,3 +1,4 @@
+#include "runtime/gpu_backend.cuh"
 #include "logup_gkr/first_layer.cuh"
 #include "logup_gkr/execution.cuh"
 
@@ -65,7 +66,7 @@ SP1_KERNEL void fixAndSumFirstCircuitLayer(
     }
 
     // Allocate shared memory
-    extern __shared__ unsigned char memory[];
+    SP1_EXTERN_SHARED(unsigned char, memory);
     ext_t* shared = reinterpret_cast<ext_t*>(memory);
 
     auto block = cg::this_thread_block();
@@ -137,7 +138,7 @@ SP1_KERNEL void logupGkrSumAsPolyFirstCircuitLayer(
     }
 
     // Allocate shared memory
-    extern __shared__ unsigned char memory[];
+    SP1_EXTERN_SHARED(unsigned char, memory);
     ext_t* shared = reinterpret_cast<ext_t*>(memory);
 
     auto block = cg::this_thread_block();
@@ -167,17 +168,17 @@ SP1_KERNEL void LogUpFirstLayerTransitionKernel(
 }
 
 extern "C" void* logup_gkr_fix_and_sum_first_layer() {
-    return (void*)fixAndSumFirstCircuitLayer;
+    return SP1_KERNEL_PTR(fixAndSumFirstCircuitLayer);
 }
 
 extern "C" void* logup_gkr_fix_last_variable_first_layer() {
-    return (void*)logupGkrFixLastVariableFirstCircuitLayer;
+    return SP1_KERNEL_PTR(logupGkrFixLastVariableFirstCircuitLayer);
 }
 
 extern "C" void* logup_gkr_sum_as_poly_first_layer() {
-    return (void*)logupGkrSumAsPolyFirstCircuitLayer;
+    return SP1_KERNEL_PTR(logupGkrSumAsPolyFirstCircuitLayer);
 }
 
 extern "C" void* logup_gkr_first_layer_transition() {
-    return (void*)LogUpFirstLayerTransitionKernel;
+    return SP1_KERNEL_PTR(LogUpFirstLayerTransitionKernel);
 }
