@@ -1,5 +1,3 @@
-use hashbrown::HashMap;
-use itertools::Itertools;
 use slop_algebra::PrimeField32;
 use slop_maybe_rayon::prelude::{
     IndexedParallelIterator, ParallelIterator, ParallelSlice, ParallelSliceMut,
@@ -68,14 +66,12 @@ impl<F: PrimeField32> MachineAir<F> for ShaExtendChip {
         });
     }
 
-    fn generate_dependencies(&self, input: &Self::Record, output: &mut Self::Record) {
+    fn generate_dependencies(&self, input: &Self::Record, _output: &mut Self::Record) {
         let events = input.get_precompile_events(SyscallCode::SHA_EXTEND);
         let chunk_size = std::cmp::max(events.len() / num_cpus::get(), 1);
 
-        let blu_batches = events
-            .par_chunks(chunk_size)
-            .map(|events| {
-                let mut blu: HashMap<ByteLookupEvent, usize> = HashMap::new();
+        events.par_chunks(chunk_size).for_each(|events| {
+            input.byte_lookup_counts.count(|blu| {
                 let mut row = vec![F::zero(); NUM_SHA_EXTEND_COLS * 48];
                 events.iter().for_each(|(syscall_event, event)| {
                     let event = if let PrecompileEvent::ShaExtend(event) = event {
@@ -83,13 +79,10 @@ impl<F: PrimeField32> MachineAir<F> for ShaExtendChip {
                     } else {
                         unreachable!()
                     };
-                    self.event_to_rows::<F>(event, &syscall_event.trap_error, &mut row, &mut blu);
+                    self.event_to_rows::<F>(event, &syscall_event.trap_error, &mut row, blu);
                 });
-                blu
-            })
-            .collect::<Vec<_>>();
-
-        output.add_byte_lookup_events_from_maps(blu_batches.iter().collect_vec());
+            });
+        });
     }
 
     fn included(&self, shard: &Self::Record) -> bool {

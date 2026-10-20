@@ -430,7 +430,7 @@ impl ArtifactClient for InMemoryArtifactClient {
         data: Vec<u8>,
     ) -> Result<()> {
         let mut artifacts = self.artifacts.write().await;
-        artifacts.insert(artifact.id().to_string(), data.clone());
+        artifacts.insert(artifact.id().to_string(), data);
         Ok(())
     }
 

@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"sync"
 	"time"
 
@@ -112,6 +113,15 @@ func hasGroth16Commitments(r constraint.ConstraintSystem) bool {
 // none of the environment variables the solve sets, so this runs without touching the environment
 // (other threads read it concurrently).
 func PrefetchGroth16GpuWitnessCircuit(dataDir string, pkDir string) {
+	// The prover runs meanwhile, so the read gets 2 threads (SP1_GROTH16_PREFETCH_PROCS, 0 for
+	// all); it decodes in 4 goroutines, and was no slower for it.
+	procs := 2
+	if n, err := strconv.Atoi(os.Getenv("SP1_GROTH16_PREFETCH_PROCS")); err == nil && n >= 0 {
+		procs = n
+	}
+	if procs > 0 {
+		defer runtime.GOMAXPROCS(runtime.GOMAXPROCS(procs))
+	}
 	gpuWitnessCircuit(dataDir, pkDir)
 }
 

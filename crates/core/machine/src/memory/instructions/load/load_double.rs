@@ -20,14 +20,12 @@ use crate::{
     utils::next_multiple_of_32,
     SupervisorMode, TrustMode, UserMode,
 };
-use hashbrown::HashMap;
-use itertools::Itertools;
 use slop_algebra::{AbstractField, PrimeField32};
 use slop_maybe_rayon::prelude::{
     IndexedParallelIterator, ParallelIterator, ParallelSlice, ParallelSliceMut,
 };
 use sp1_core_executor::{
-    events::{ByteLookupEvent, ByteRecord, MemInstrEvent, MemoryAccessPosition},
+    events::{ByteRecord, MemInstrEvent, MemoryAccessPosition},
     ExecutionRecord, Opcode, Program, CLK_INC, PC_INC,
 };
 
@@ -106,13 +104,25 @@ impl<F: PrimeField32, M: TrustMode> MachineAir<F> for LoadDoubleChip<M> {
         _output: &mut ExecutionRecord,
         buffer: &mut [MaybeUninit<F>],
     ) {
-        // The byte lookups are collected by `generate_dependencies`.
-        self.generate_trace_into_with::<F, sp1_core_executor::events::DiscardByteRecord>(
-            input, buffer,
-        );
+        // The byte lookups are collected by `generate_dependencies` (or, with the trace, by
+        // `generate_trace_into_with_dependencies`).
+        self.generate_trace_into_with::<F>(input, buffer, false);
     }
 
-    fn generate_dependencies(&self, input: &ExecutionRecord, output: &mut ExecutionRecord) {
+    fn dependencies_in_trace(&self) -> bool {
+        true
+    }
+
+    fn generate_trace_into_with_dependencies(
+        &self,
+        input: &ExecutionRecord,
+        _output: &mut ExecutionRecord,
+        buffer: &mut [MaybeUninit<F>],
+    ) {
+        self.generate_trace_into_with::<F>(input, buffer, true);
+    }
+
+    fn generate_dependencies(&self, input: &ExecutionRecord, _output: &mut ExecutionRecord) {
         if input.program.enable_untrusted_programs == M::IS_TRUSTED {
             return;
         }
@@ -121,27 +131,23 @@ impl<F: PrimeField32, M: TrustMode> MachineAir<F> for LoadDoubleChip<M> {
         let events = &input.memory_load_double_events;
         let chunk_size = std::cmp::max(events.len() / num_cpus::get(), 1);
         let width = <Self as BaseAir<F>>::width(self);
-        let blu_events = events
-            .par_chunks(chunk_size)
-            .map(|chunk| {
-                let mut blu: HashMap<ByteLookupEvent, usize> = HashMap::new();
+        events.par_chunks(chunk_size).for_each(|chunk| {
+            input.byte_lookup_counts.count(|blu| {
                 let mut scratch = vec![F::zero(); width];
                 for event in chunk {
                     scratch.fill(F::zero());
                     let row: &mut [F] = &mut scratch;
                     let cols: &mut LoadDoubleColumns<F, M> = row.borrow_mut();
-                    self.event_to_row(&event.0, cols, &mut blu);
-                    cols.state.populate(&mut blu, event.0.clk, event.0.pc);
-                    cols.adapter.populate(&mut blu, event.1);
+                    self.event_to_row(&event.0, cols, blu);
+                    cols.state.populate(blu, event.0.clk, event.0.pc);
+                    cols.adapter.populate(blu, event.1);
                     if !M::IS_TRUSTED {
                         let cols: &mut LoadDoubleColumns<F, UserMode> = row.borrow_mut();
                         cols.adapter_cols.is_trusted = F::from_bool(!event.1.is_untrusted);
                     }
                 }
-                blu
-            })
-            .collect::<Vec<_>>();
-        output.add_byte_lookup_events_from_maps(blu_events.iter().collect_vec());
+            });
+        });
     }
 
     fn included(&self, shard: &Self::Record) -> bool {
@@ -161,13 +167,14 @@ impl<F: PrimeField32, M: TrustMode> MachineAir<F> for LoadDoubleChip<M> {
 impl<M: TrustMode> LoadDoubleChip<M> {
     /// Writes the trace into `buffer` and returns the byte lookups of each parallel chunk,
     /// collected into `R`.
-    fn generate_trace_into_with<F: PrimeField32, R: ByteRecord + Default + Send>(
+    fn generate_trace_into_with<F: PrimeField32>(
         &self,
         input: &ExecutionRecord,
         buffer: &mut [MaybeUninit<F>],
-    ) -> Vec<R> {
+        count: bool,
+    ) {
         if input.program.enable_untrusted_programs == M::IS_TRUSTED {
-            return Vec::new();
+            return;
         }
         let chunk_size =
             std::cmp::max((input.memory_load_double_events.len()) / num_cpus::get(), 1);
@@ -186,31 +193,25 @@ impl<M: TrustMode> LoadDoubleChip<M> {
         let buffer_ptr = buffer.as_mut_ptr() as *mut F;
         let values = unsafe { core::slice::from_raw_parts_mut(buffer_ptr, padded_nb_rows * width) };
 
-        let blu_events = values
-            .par_chunks_mut(chunk_size * width)
-            .enumerate()
-            .map(|(i, rows)| {
-                let mut blu = R::default();
+        values.par_chunks_mut(chunk_size * width).enumerate().for_each(|(i, rows)| {
+            input.byte_lookup_counts.count_if(count, |blu| {
                 rows.chunks_mut(width).enumerate().for_each(|(j, row)| {
                     let idx = i * chunk_size + j;
                     let cols: &mut LoadDoubleColumns<F, M> = row.borrow_mut();
 
                     if idx < input.memory_load_double_events.len() {
                         let event = &input.memory_load_double_events[idx];
-                        self.event_to_row(&event.0, cols, &mut blu);
-                        cols.state.populate(&mut blu, event.0.clk, event.0.pc);
-                        cols.adapter.populate(&mut blu, event.1);
+                        self.event_to_row(&event.0, cols, blu);
+                        cols.state.populate(blu, event.0.clk, event.0.pc);
+                        cols.adapter.populate(blu, event.1);
                         if !M::IS_TRUSTED {
                             let cols: &mut LoadDoubleColumns<F, UserMode> = row.borrow_mut();
                             cols.adapter_cols.is_trusted = F::from_bool(!event.1.is_untrusted);
                         }
                     }
                 });
-                blu
-            })
-            .collect::<Vec<_>>();
-
-        blu_events
+            });
+        });
     }
 }
 

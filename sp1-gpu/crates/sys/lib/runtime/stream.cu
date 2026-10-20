@@ -563,7 +563,13 @@ extern "C" rustCudaError_t cuda_stream_wait_event(cudaStream_t stream, cudaEvent
 // Async memory operations.
 
 extern "C" rustCudaError_t cuda_malloc_async(void** devPtr, size_t size, cudaStream_t stream) {
-    CUDA_OK(cudaMallocAsync(devPtr, size, stream));
+    cudaError_t code = cudaMallocAsync(devPtr, size, stream);
+    if (code != cudaSuccess) {
+        // An allocation failure can be recovered from (the caller may free memory and retry), so
+        // do not leave it as the thread's last error for a later `cudaGetLastError` check.
+        (void)cudaGetLastError();
+        return rustCudaError_t{.message = cudaGetErrorString(code)};
+    }
     return CUDA_SUCCESS_CSL;
 }
 

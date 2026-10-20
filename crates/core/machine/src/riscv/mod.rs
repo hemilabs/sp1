@@ -1899,6 +1899,82 @@ pub mod tests {
 
     use crate::{io::SP1Stdin, utils::run_test};
 
+    /// The traces of the chips whose trace generates their dependencies, and the byte and range
+    /// traces, are the same as with `generate_dependencies` for every chip.
+    #[test]
+    fn test_dependencies_in_trace_match_generate_dependencies() {
+        use sp1_core_executor::{events::ByteRecord, ExecutionRecord, SP1CoreOpts};
+
+        let machine = RiscvAir::<SP1Field>::machine();
+        let trace = |air: &RiscvAir<SP1Field>, record: &ExecutionRecord, fused: bool| {
+            let n = air.num_rows(record).unwrap()
+                * <RiscvAir<SP1Field> as BaseAir<SP1Field>>::width(air);
+            let mut values = Vec::<SP1Field>::with_capacity(n);
+            if fused {
+                air.generate_trace_into_with_dependencies(
+                    record,
+                    &mut ExecutionRecord::default(),
+                    &mut values.spare_capacity_mut()[..n],
+                );
+            } else {
+                air.generate_trace_into(
+                    record,
+                    &mut ExecutionRecord::default(),
+                    &mut values.spare_capacity_mut()[..n],
+                );
+            }
+            unsafe { values.set_len(n) };
+            values
+        };
+        for program in
+            [ssz_withdrawals_program(), keccak_permute_program(), secp256r1_add_program()]
+        {
+            let (records, _) = crate::utils::generate_records::<SP1Field>(
+                Arc::new(program),
+                SP1Stdin::new(),
+                SP1CoreOpts::default(),
+                [0; 4],
+            )
+            .unwrap();
+            for record in records {
+                let included = machine
+                    .chips()
+                    .iter()
+                    .filter(|chip| chip.name() != "Global" && chip.included(&record))
+                    .collect::<Vec<_>>();
+                let is_lookup_table = |name: &str| name == "Byte" || name == "Range";
+                let reference = included
+                    .iter()
+                    .map(|chip| (chip.name(), trace(&chip.air, &record, false)))
+                    .collect::<BTreeMap<_, _>>();
+
+                // Regenerate the byte lookups with the fused chips counting them in their traces.
+                let mut fused = record.clone();
+                fused.byte_lookups.clear();
+                fused.byte_lookup_counts.clear();
+                fused.dependencies_in_trace = true;
+                for chip in machine.chips().iter().filter(|chip| !chip.dependencies_in_trace()) {
+                    let mut output = ExecutionRecord::default();
+                    chip.generate_dependencies(&fused, &mut output);
+                    fused.add_byte_lookup_events_from_maps(vec![&output.byte_lookups]);
+                }
+                let mut traces = BTreeMap::new();
+                for chip in included.iter().filter(|chip| !is_lookup_table(chip.name())) {
+                    traces.insert(
+                        chip.name(),
+                        trace(&chip.air, &fused, chip.dependencies_in_trace()),
+                    );
+                }
+                for chip in included.iter().filter(|chip| is_lookup_table(chip.name())) {
+                    traces.insert(chip.name(), trace(&chip.air, &fused, false));
+                }
+                for (name, values) in &reference {
+                    assert!(&traces[name] == values, "{name} trace differs");
+                }
+            }
+        }
+    }
+
     #[tokio::test]
     async fn test_simple_prove() {
         setup_logger();

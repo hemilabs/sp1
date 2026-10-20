@@ -18,7 +18,9 @@ use sp1_gpu_cudart::PinnedBuffer;
 use sp1_gpu_cudart::{DeviceMle, DevicePoint, TaskScope};
 use sp1_gpu_jagged_assist::prove_jagged_evaluation_sync;
 use sp1_gpu_jagged_sumcheck::{generate_jagged_sumcheck_poly, jagged_sumcheck};
-use sp1_gpu_jagged_tracegen::{full_tracegen_permit, main_tracegen_permit, CudaShardProverData};
+use sp1_gpu_jagged_tracegen::{
+    full_tracegen_permit, main_tracegen_permit, CudaShardProverData, TracePrefetcher,
+};
 use sp1_gpu_logup_gkr::{prove_logup_gkr, CudaLogUpGkrOptions, Interactions};
 use sp1_gpu_merkle_tree::{CudaTcsProver, SingleLayerMerkleTreeProverError};
 use sp1_gpu_tracegen::CudaTracegenAir;
@@ -71,6 +73,33 @@ fn under_permit<R: Send>(f: impl FnOnce() -> R + Send) -> R {
     }
 }
 
+/// Lowers the scheduling priority of the global rayon pool's threads, once per process.
+///
+/// The global pool runs the bulk host work: trace and dependency generation for the shards
+/// queued for the GPU. The stages that feed it run on other threads: shard tracing
+/// (`into_record`, one thread per shard), the executor and splicing, and the permit pool (see
+/// [`under_permit`]). At equal priority the 32 pool threads time-slice with them (about 0.8 M
+/// involuntary context switches per rsp proof), stretching the chain the GPU waits on. With a
+/// higher nice value those threads run first, and the pool still gets every core they leave
+/// idle. `SP1_GPU_GLOBAL_POOL_NICE` sets the nice value (default 10); `0` leaves the pool alone.
+fn lower_global_pool_priority() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let nice = std::env::var("SP1_GPU_GLOBAL_POOL_NICE")
+            .ok()
+            .and_then(|v| v.parse::<i32>().ok())
+            .unwrap_or(10);
+        if nice <= 0 {
+            return;
+        }
+        // Nice values are per thread on Linux; raising one needs no privileges.
+        #[cfg(target_os = "linux")]
+        rayon::broadcast(|_| unsafe {
+            libc::setpriority(libc::PRIO_PROCESS, libc::gettid() as libc::id_t, nice);
+        });
+    });
+}
+
 pub trait CudaShardProverComponents<GC: IopCtx>: Send + Sync + 'static {
     type P: CudaTcsProver<GC>;
     type Air: CudaTracegenAir<GC::F>
@@ -109,6 +138,7 @@ impl<GC: IopCtx<F = Felt, EF = Ext>, PC: CudaShardProverComponents<GC>> CudaShar
         recompute_first_layer: bool,
         drop_ldes: bool,
     ) -> Self {
+        lower_global_pool_priority();
         let max_ntt_log_size =
             basefold_prover.log_height + basefold_prover.config.log_blowup() as u32;
         CudaB31Kernels::initialize_twiddles(max_ntt_log_size, &backend).unwrap();
@@ -131,6 +161,7 @@ impl<GC: IopCtx<F = Felt, EF = Ext>, PC: CudaShardProverComponents<GC>> CudaShar
                 machine_bytecode,
                 recompute_first_layer,
                 drop_ldes,
+                trace_prefetcher: TracePrefetcher::new(),
                 _marker: PhantomData,
             }),
         }
@@ -187,6 +218,8 @@ pub(crate) struct CudaShardProverInner<GC: IopCtx, PC: CudaShardProverComponents
     pub machine_bytecode: Arc<MachineBytecode>,
     pub recompute_first_layer: bool,
     pub drop_ldes: bool,
+    /// Uploads the next shard's host traces while a shard is proved (`None` if disabled).
+    pub trace_prefetcher: Option<TracePrefetcher>,
     pub _marker: PhantomData<GC>,
 }
 
@@ -390,6 +423,7 @@ where
             &self.inner.backend,
             prover_permits,
             true,
+            self.inner.trace_prefetcher.as_ref(),
         )
         .instrument(tracing::debug_span!("generate main traces"))
         .await;
@@ -1005,6 +1039,7 @@ mod tests {
                     recompute_first_layer: false,
                     drop_ldes: false,
                     backend: scope.clone(),
+                    trace_prefetcher: None,
                     _marker: PhantomData,
                 };
             let shard_prover = CudaShardProver { inner: Arc::new(shard_prover_inner) };

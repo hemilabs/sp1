@@ -145,6 +145,11 @@ func ReleaseGroth16Caches() {
 	sp1.ReleaseCaches()
 }
 
+//export TrimGroth16Caches
+func TrimGroth16Caches() {
+	sp1.TrimCaches()
+}
+
 //export ExportGroth16StrippedR1cs
 func ExportGroth16StrippedR1cs(dataDir *C.char, outputPath *C.char) (errStr *C.char) {
 	// The full circuit read below is ~9 GB of garbage afterwards, whether or not the export

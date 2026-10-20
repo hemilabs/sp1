@@ -134,3 +134,15 @@ func ReleaseCaches() {
 	runtime.GC()
 	debug.FreeOSMemory()
 }
+
+// TrimCaches is ReleaseCaches except that it keeps the circuit ExportGroth16GpuWitness solves
+// (~3 GB, ~5 s of CPU to read again), for a process that will make another GPU Groth16 proof.
+func TrimCaches() {
+	releaseProverCache()
+	gpuWitnessMutex.Lock()
+	gpuWitnessPk = nil
+	gpuWitnessPkDataDir = ""
+	gpuWitnessMutex.Unlock()
+	runtime.GC()
+	debug.FreeOSMemory()
+}

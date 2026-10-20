@@ -170,6 +170,13 @@ pub trait SP1ProverComponents: Send + Sync + 'static + Sized {
     fn wrap_verifier() -> MachineVerifier<SP1OuterGlobalContext, WrapSC> {
         <Self::WrapProver as WrapProver>::wrap_verifier()
     }
+
+    /// Whether the core prover's trace generation generates the dependencies of the chips whose
+    /// `dependencies_in_trace` holds (for records with `dependencies_in_trace` set), so that the
+    /// workers generate the dependencies without them.
+    fn dependencies_in_trace() -> bool {
+        false
+    }
 }
 
 pub struct CpuSP1ProverComponents;
