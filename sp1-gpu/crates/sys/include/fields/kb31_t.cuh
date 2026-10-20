@@ -949,6 +949,9 @@ class kb31_t {
 
     inline kb31_t& sqr() { return *this; }
 
+    // To Montgomery form, as the device class does (kernels call it; nvcc parses them here too).
+    inline void to() { val = (uint32_t)(((uint64_t)val << 32) % MOD); }
+
     inline void set_to_zero() { val = 0; }
 
     inline bool is_zero() const { return val == 0; }
