@@ -91,14 +91,13 @@ fn lower_global_pool_priority() {
             .ok()
             .and_then(|v| v.parse::<i32>().ok())
             .unwrap_or(10);
-        if nice <= 0 {
-            return;
+        if nice > 0 {
+            // Nice values are per thread on Linux; raising one needs no privileges.
+            #[cfg(target_os = "linux")]
+            rayon::broadcast(|_| unsafe {
+                libc::setpriority(libc::PRIO_PROCESS, libc::gettid() as libc::id_t, nice);
+            });
         }
-        // Nice values are per thread on Linux; raising one needs no privileges.
-        #[cfg(target_os = "linux")]
-        rayon::broadcast(|_| unsafe {
-            libc::setpriority(libc::PRIO_PROCESS, libc::gettid() as libc::id_t, nice);
-        });
     });
 }
 
