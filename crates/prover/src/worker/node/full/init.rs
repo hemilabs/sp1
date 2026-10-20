@@ -240,7 +240,13 @@ impl<C: SP1ProverComponents> SP1LocalNodeBuilder<C> {
                         }
 
                         Some(output) = task_rx.recv() => {
-                            output.handle_task_output(&worker_client).await;
+                            // Not awaited here: a retry goes back into this handler's own
+                            // input queue (capacity 1), which only this loop drains, so with the
+                            // queue full the loop waited on itself.
+                            let worker_client = worker_client.clone();
+                            tokio::spawn(async move {
+                                output.handle_task_output(&worker_client).await
+                            });
                         }
                         else => {
                             break;
@@ -378,7 +384,13 @@ impl<C: SP1ProverComponents> SP1LocalNodeBuilder<C> {
                         }
 
                         Some(output) = task_rx.recv() => {
-                            output.handle_task_output(&worker_client).await;
+                            // Not awaited here: a retry goes back into this handler's own
+                            // input queue (capacity 1), which only this loop drains, so with the
+                            // queue full the loop waited on itself.
+                            let worker_client = worker_client.clone();
+                            tokio::spawn(async move {
+                                output.handle_task_output(&worker_client).await
+                            });
                         }
                         else => {
                             break;
@@ -426,7 +438,13 @@ impl<C: SP1ProverComponents> SP1LocalNodeBuilder<C> {
                         }
 
                         Some(output) = task_rx.recv() => {
-                            output.handle_task_output(&worker_client).await;
+                            // Not awaited here: a retry goes back into this handler's own
+                            // input queue (capacity 1), which only this loop drains, so with the
+                            // queue full the loop waited on itself.
+                            let worker_client = worker_client.clone();
+                            tokio::spawn(async move {
+                                output.handle_task_output(&worker_client).await
+                            });
                         }
                         else => {
                             break;
@@ -464,7 +482,13 @@ impl<C: SP1ProverComponents> SP1LocalNodeBuilder<C> {
                           );
                         }
                         Some(output) = task_rx.recv() => {
-                            output.handle_task_output(&worker_client).await;
+                            // Not awaited here: a retry goes back into this handler's own
+                            // input queue (capacity 1), which only this loop drains, so with the
+                            // queue full the loop waited on itself.
+                            let worker_client = worker_client.clone();
+                            tokio::spawn(async move {
+                                output.handle_task_output(&worker_client).await
+                            });
                         }
                         else => {
                             break;
@@ -505,7 +529,13 @@ impl<C: SP1ProverComponents> SP1LocalNodeBuilder<C> {
                             TaskOutput::handle_worker_result(Ok(result), &task_tx, proof_id, id, request, TaskType::ShrinkWrap);
                         }
                         Some(output) = task_rx.recv() => {
-                            output.handle_task_output(&worker_client).await;
+                            // Not awaited here: a retry goes back into this handler's own
+                            // input queue (capacity 1), which only this loop drains, so with the
+                            // queue full the loop waited on itself.
+                            let worker_client = worker_client.clone();
+                            tokio::spawn(async move {
+                                output.handle_task_output(&worker_client).await
+                            });
                         }
                         else => {
                             break;
@@ -539,7 +569,13 @@ impl<C: SP1ProverComponents> SP1LocalNodeBuilder<C> {
                             TaskOutput::handle_worker_result(Ok(result), &task_tx, proof_id, id, request, TaskType::PlonkWrap);
                         }
                         Some(output) = task_rx.recv() => {
-                            output.handle_task_output(&worker_client).await;
+                            // Not awaited here: a retry goes back into this handler's own
+                            // input queue (capacity 1), which only this loop drains, so with the
+                            // queue full the loop waited on itself.
+                            let worker_client = worker_client.clone();
+                            tokio::spawn(async move {
+                                output.handle_task_output(&worker_client).await
+                            });
                         }
                         else => {
                             break;
@@ -573,7 +609,12 @@ impl<C: SP1ProverComponents> SP1LocalNodeBuilder<C> {
                             TaskOutput::handle_worker_result(Ok(result), &task_tx, proof_id, id, request, TaskType::Groth16Wrap);
                         }
                         Some(output) = task_rx.recv() => {
-                            output.handle_task_output(worker.worker_client()).await;
+                            // Not awaited here, as in the other handlers (a retry re-enters
+                            // this handler's own input queue).
+                            let worker_client = worker.worker_client().clone();
+                            tokio::spawn(async move {
+                                output.handle_task_output(&worker_client).await
+                            });
                         }
                         else => {
                             break;
