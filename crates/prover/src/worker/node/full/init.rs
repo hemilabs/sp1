@@ -122,20 +122,22 @@ impl<C: SP1ProverComponents> SP1LocalNodeBuilder<C> {
                 while let Some((task_id, request)) = controller_rx.recv().await {
                     let span = tracing::debug_span!("Controller", proof_id = %request.context.proof_id, task_id = %task_id);
                     // Run the controller task
-                    if let Err(e) = worker.controller().run(request.clone()).instrument(span).await
-                    {
-                        tracing::error!("Controller: task failed: {e:?}");
-                    }
-
-                    // Complete the task
-                    if let Err(e) = worker
-                        .worker_client()
-                        .complete_task(
-                            request.context.proof_id,
-                            task_id,
-                            TaskMetadata { gpu_ms: None },
-                        )
+                    let status = match worker
+                        .controller()
+                        .run(request.clone())
+                        .instrument(span)
                         .await
+                    {
+                        Ok(_) => TaskStatus::Succeeded,
+                        Err(e) => {
+                            tracing::error!("Controller: task failed: {e:?}");
+                            TaskStatus::FailedFatal
+                        }
+                    };
+
+                    // Complete the task, as failed if it failed: whoever waits on it must not
+                    // go on to read outputs that were never written.
+                    if let Err(e) = worker.worker_client().update_task_status(task_id, status).await
                     {
                         tracing::error!("Controller: marking task as complete failed: {e:?}");
                     }
@@ -166,24 +168,30 @@ impl<C: SP1ProverComponents> SP1LocalNodeBuilder<C> {
             async move {
                 while let Some((task_id, request)) = execute_rx.recv().await {
                     let span = tracing::debug_span!("CoreExecute", proof_id = %request.context.proof_id, task_id = %task_id);
-                    let proof_id = request.context.proof_id.clone();
-                    match crate::worker::CoreExecuteTaskRequest::from_raw(request.clone()) {
-                        Ok(req) => {
-                            if let Err(e) =
-                                worker.controller().execute(task_id.clone(), req).instrument(span).await
+                    let status =
+                        match crate::worker::CoreExecuteTaskRequest::from_raw(request.clone()) {
+                            Ok(req) => match worker
+                                .controller()
+                                .execute(task_id.clone(), req)
+                                .instrument(span)
+                                .await
                             {
-                                tracing::error!("CoreExecute: task failed: {e:?}");
+                                Ok(_) => TaskStatus::Succeeded,
+                                Err(e) => {
+                                    tracing::error!("CoreExecute: task failed: {e:?}");
+                                    TaskStatus::FailedFatal
+                                }
+                            },
+                            Err(e) => {
+                                tracing::error!("CoreExecute: failed to parse request: {e:?}");
+                                TaskStatus::FailedFatal
                             }
-                        }
-                        Err(e) => {
-                            tracing::error!("CoreExecute: failed to parse request: {e:?}");
-                        }
-                    }
+                        };
 
-                    if let Err(e) = worker
-                        .worker_client()
-                        .complete_task(proof_id, task_id, TaskMetadata { gpu_ms: None })
-                        .await
+                    // A failed execution must fail the task: marked complete, the controller
+                    // waited forever for core proofs that would never come (compressed and
+                    // wrapped modes), or failed later on a missing artifact (core mode).
+                    if let Err(e) = worker.worker_client().update_task_status(task_id, status).await
                     {
                         tracing::error!("CoreExecute: marking task as complete failed: {e:?}");
                     }
@@ -240,21 +248,20 @@ impl<C: SP1ProverComponents> SP1LocalNodeBuilder<C> {
             async move {
                 while let Some((task_id, request)) = controller_rx.recv().await {
                     // Run the controller task
-                    if let Err(e) =
-                        worker.controller().run_sp1_util_vkey_map_controller(request.clone()).await
-                    {
-                        tracing::error!("Controller: task failed: {e:?}");
-                    }
-
-                    // Complete the task
-                    if let Err(e) = worker
-                        .worker_client()
-                        .complete_task(
-                            request.context.proof_id,
-                            task_id,
-                            TaskMetadata { gpu_ms: None },
-                        )
+                    let status = match worker
+                        .controller()
+                        .run_sp1_util_vkey_map_controller(request.clone())
                         .await
+                    {
+                        Ok(_) => TaskStatus::Succeeded,
+                        Err(e) => {
+                            tracing::error!("Controller: task failed: {e:?}");
+                            TaskStatus::FailedFatal
+                        }
+                    };
+
+                    // Complete the task, as failed if it failed.
+                    if let Err(e) = worker.worker_client().update_task_status(task_id, status).await
                     {
                         tracing::error!("Controller: marking task as complete failed: {e:?}");
                     }
@@ -300,16 +307,17 @@ impl<C: SP1ProverComponents> SP1LocalNodeBuilder<C> {
                                     }
                                     Err(e) => {
                                         tracing::error!("Failed to generate vk chunk: {:?}", e);
+                                        // Failed, not left pending: its waiter would hang.
+                                        tx.send((proof_id, task_id, TaskStatus::FailedFatal)).ok();
                                     }
                                 }
                             });
                         }
 
-                        Some((proof_id, task_id , status)) = task_rx.recv() => {
-                            assert_eq!(status, TaskStatus::Succeeded);
-                         if let Err(e) = worker_client.complete_task(proof_id, task_id, TaskMetadata { gpu_ms: None }).await {
-                             tracing::error!("Failed to complete vk chunk task: {:?}", e);
-                         }
+                        Some((_proof_id, task_id, status)) = task_rx.recv() => {
+                            if let Err(e) = worker_client.update_task_status(task_id, status).await {
+                                tracing::error!("Failed to complete vk chunk task: {:?}", e);
+                            }
                         }
                         else => {
                             break;
