@@ -635,19 +635,30 @@ impl<A: ArtifactClient, C: SP1ProverComponents> SP1RecursionProver<A, C> {
         .unwrap()
     }
 
-    /// Builds the wrap prover now, as the worker starts, rather than in the first Groth16 or PLONK
-    /// proof: ~0.35 s of CPU for the wrap program on an idle host, over 1 s on a busy one. It needs
-    /// no GPU, as the wrap vk is known when vk verification is on. `SP1_PREWARM_WRAP=0` leaves it
-    /// to the first proof that needs it.
+    /// Builds the wrap prover now, as the worker starts, if `SP1_PREWARM_WRAP=1`. By default the
+    /// first Groth16 or PLONK proof builds it while its earlier stages run (see
+    /// [`Self::start_building_wrap_prover`] and [`Self::run_shrink_wrap`]): built here, every
+    /// process paid for it at start-up (~0.5 s on an RTX 5090 host, where a kept wrap proving key
+    /// also sets the wrap program up on the GPU), including those that never wrap.
     pub async fn prewarm_wrap_prover(&self) {
         if !self.prover_data.vk_verification()
-            || std::env::var("SP1_PREWARM_WRAP").ok().as_deref() == Some("0")
+            || std::env::var("SP1_PREWARM_WRAP").ok().as_deref() != Some("1")
         {
             return;
         }
         if let Err(e) = self.wrap_prover().await {
             tracing::warn!("building the wrap prover ahead of time failed: {e}");
         }
+    }
+
+    /// Starts building the wrap prover in the background, for a Groth16 or PLONK proof that has
+    /// just begun, so it is ready when the proof's wrap step needs it. If the build fails, that
+    /// step builds it again and reports the error.
+    pub fn start_building_wrap_prover(&self) {
+        let this = self.clone();
+        tokio::spawn(async move {
+            let _ = this.wrap_prover().await;
+        });
     }
 
     pub fn recursion_prover_pipeline(&self) -> &Arc<RecursionProvePipeline<A, C>> {
@@ -746,16 +757,19 @@ impl<A: ArtifactClient, C: SP1ProverComponents> SP1RecursionProver<A, C> {
             .instrument(tracing::debug_span!("download compress proof"))
             .await?;
 
-        let shrink_proof = self
-            .shrink_prover
-            .prove(compress_proof, &metrics)
-            .instrument(tracing::info_span!("prove shrink"))
-            .await?;
+        // The wrap prover (built once, mostly on the CPU) is built while the shrink proof runs.
+        let (shrink_proof, wrap_prover) = tokio::join!(
+            self.shrink_prover
+                .prove(compress_proof, &metrics)
+                .instrument(tracing::info_span!("prove shrink")),
+            self.wrap_prover(),
+        );
+        let shrink_proof = shrink_proof?;
 
         tracing::debug_span!("verify shrink proof")
             .in_scope(|| self.shrink_prover.verify(&shrink_proof))?;
 
-        let wrap_prover = self.wrap_prover().await?;
+        let wrap_prover = wrap_prover?;
         let wrap_proof = wrap_prover
             .prove(shrink_proof, &metrics)
             .instrument(tracing::info_span!("prove wrap"))

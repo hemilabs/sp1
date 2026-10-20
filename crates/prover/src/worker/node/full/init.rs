@@ -5,7 +5,8 @@ use sp1_core_machine::riscv::RiscvAir;
 use sp1_hypercube::{prover::ProverSemaphore, Machine};
 use sp1_primitives::SP1Field;
 use sp1_prover_types::{
-    ArtifactClient, ArtifactType, InMemoryArtifactClient, ProofArtifacts, TaskStatus, TaskType,
+    network_base_types::ProofMode, ArtifactClient, ArtifactType, InMemoryArtifactClient,
+    ProofArtifacts, TaskStatus, TaskType,
 };
 use tokio::{sync::mpsc, task::JoinSet};
 use tracing::Instrument;
@@ -121,6 +122,15 @@ impl<C: SP1ProverComponents> SP1LocalNodeBuilder<C> {
             async move {
                 while let Some((task_id, request)) = controller_rx.recv().await {
                     let span = tracing::debug_span!("Controller", proof_id = %request.context.proof_id, task_id = %task_id);
+                    // A proof that ends in a Groth16 or PLONK wrap gets its wrap prover built
+                    // while it executes and proves its core shards.
+                    if let Ok(inputs) =
+                        crate::worker::ControllerInputs::try_from(request.inputs.as_slice())
+                    {
+                        if matches!(inputs.mode, ProofMode::Groth16 | ProofMode::Plonk) {
+                            worker.prover_engine().recursion_prover.start_building_wrap_prover();
+                        }
+                    }
                     // Run the controller task
                     let status = match worker
                         .controller()
