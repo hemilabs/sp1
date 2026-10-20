@@ -5164,9 +5164,8 @@ impl PlonkProver {
                         * (l_evals[i] + beta_val * s1_evals[i] + gamma_val)
                         * (r_evals[i] + beta_val * s2_evals[i] + gamma_val)
                         * (o_evals[i] + beta_val * s3_evals[i] + gamma_val);
-                    // PLONK permutation identity: α·(Z·num - Z(ωX)·den).
-                    // Restored to commit a32120e7c convention; flipping does not
-                    // fix gnark verify (see note in quotient.cu).
+                    // PLONK permutation identity with gnark's sign: α·(Z(ωX)·den - Z·num)
+                    // (`orderingConstraint` in gnark's PLONK prover), as in quotient.cu.
                     let perm = alpha_val * (perm_den - perm_num);
 
                     let l1_x = zh_values[i] * x_minus_one_n_inv[i];
@@ -7034,8 +7033,9 @@ mod tests {
     /// This test constructs a circuit with a non-identity permutation (swap two
     /// wire positions) so that Z is NOT all ones. The permutation contribution
     /// to the quotient becomes non-trivial, and we verify:
-    ///   h(x) * Z_H(x) == gate(x) + alpha*(perm_num - perm_den) + alpha^2*(Z-1)*L1(x)
-    /// at random evaluation points (matches the kernel's current sign).
+    ///   h(x) * Z_H(x) == gate(x) + alpha*(perm_den - perm_num) + alpha^2*(Z-1)*L1(x)
+    /// at random evaluation points: gnark's sign (`orderingConstraint` in its PLONK prover
+    /// computes Z(ωx)·den - Z(x)·num), which the quotient kernel and the CPU path use.
     #[test]
     fn test_constraint_satisfaction_nonidentity_permutation() {
         let n: usize = 8;
@@ -7246,8 +7246,8 @@ mod tests {
                 * (l_x + beta * s1_x + gamma)
                 * (r_x + beta * s2_x + gamma)
                 * (o_x + beta * s3_x + gamma);
-            // SP1 convention: α·(num - den). Matches the kernel.
-            let perm = alpha * (perm_num - perm_den);
+            // gnark's convention: α·(den - num), as the kernel computes it.
+            let perm = alpha * (perm_den - perm_num);
 
             // Boundary: alpha^2 * (Z - 1) * L_1(x)
             let l1_x = zh_x * ((*x - Fr::ONE) * n_fr).inv();
@@ -7283,8 +7283,8 @@ mod tests {
                 * (l_x + beta * s1_x + gamma)
                 * (r_x + beta * s2_x + gamma)
                 * (o_x + beta * s3_x + gamma);
-            // WRONG sign: (den - num) instead of (num - den)
-            let perm = alpha * (perm_den - perm_num);
+            // WRONG sign: (num - den) instead of (den - num)
+            let perm = alpha * (perm_num - perm_den);
 
             let l1_x = zh_x * ((*x - Fr::ONE) * n_fr).inv();
             let boundary = alpha.square() * (z_x - Fr::ONE) * l1_x;
@@ -7303,7 +7303,7 @@ mod tests {
             // Correct sign MUST match
             assert_eq!(
                 lhs, rhs_correct,
-                "CRITICAL: h(x)*Z_H(x) != numerator(x) with (perm_num - perm_den) sign.\n\
+                "CRITICAL: h(x)*Z_H(x) != numerator(x) with (perm_den - perm_num) sign.\n\
                  This means the quotient computation or the sign convention is wrong.\n\
                  h(x)*Z_H(x)  = {:?}\n\
                  numerator(x) = {:?}",
@@ -7313,7 +7313,7 @@ mod tests {
             // Wrong sign MUST NOT match (proving the test is discriminating)
             assert_ne!(
                 lhs, rhs_wrong,
-                "BUG: h(x)*Z_H(x) matches with WRONG sign (perm_den - perm_num)!\n\
+                "BUG: h(x)*Z_H(x) matches with WRONG sign (perm_num - perm_den)!\n\
                  This can only happen if the permutation contribution is zero,\n\
                  meaning the test is not exercising the sign. Z[1] = {:?}",
                 z_lagrange[1],
