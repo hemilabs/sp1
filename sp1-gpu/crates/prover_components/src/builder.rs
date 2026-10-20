@@ -31,12 +31,21 @@ pub const GPU_NORMALIZE_PROGRAM_CACHE_MIN_AVAILABLE_RAM: u64 = 64 << 30;
 
 /// Whether the compress prover gets its own CUDA stream and permit (see
 /// `cuda_worker_builder_with_machine`). On by default above the 30 GB tier, where a core shard and
-/// a compress proof fit on the card together; `SP1_GPU_RECURSION_STREAM=0|1` overrides.
+/// a compress proof fit on the card together, except with SYCL on Linux; `SP1_GPU_RECURSION_STREAM=0|1`
+/// overrides.
+///
+/// On an Arc Pro B70 under Linux (xe driver, compute runtime 26.09, Level Zero's legacy adapter),
+/// driving the two streams from two threads crashed about one proof in nine inside the driver
+/// (a segfault in a copy's enqueue, or a fatal device error), and the crashed process left the
+/// copy engine faulted for the next. With one stream, 32 of 32 keccak-compressed proofs passed.
 fn separate_recursion_stream() -> bool {
     match std::env::var("SP1_GPU_RECURSION_STREAM").as_deref() {
         Ok("0") | Ok("false") => false,
         Ok("1") | Ok("true") => true,
-        _ => gpu_memory_gb() > 30,
+        _ => {
+            gpu_memory_gb() > 30
+                && !(cfg!(target_os = "linux") && sp1_gpu_cudart::sys::BACKEND == "sycl")
+        }
     }
 }
 

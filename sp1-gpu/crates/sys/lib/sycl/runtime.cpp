@@ -10,12 +10,14 @@
 
 #include <sycl/sycl.hpp>
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <map>
 #include <mutex>
+#include <new>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -209,6 +211,54 @@ struct GpuProfiler {
 
 bool is_usm(const void* ptr) {
     return sycl::get_pointer_type(ptr, rt().context) != sycl::usm::alloc::unknown;
+}
+
+// On Linux, copies between the device and pageable (non-USM) host memory go through a pinned
+// staging buffer instead of the driver's import of the pageable range for the copy engine. On an
+// Arc Pro B70 (xe driver, compute runtime 26.09) that import was slow and crash-prone: the copy
+// it crashed in (a segfault inside libze_intel_gpu enqueueing a device-to-host copy into a Rust
+// Vec) went away, and keccak-compressed proofs took 44 s instead of 50 s. The buffer is per thread
+// (no lock on the copy path) and grows to at most kStageChunk; larger copies go in chunks. These
+// copies wait for completion anyway, as CUDA's do for pageable memory. Windows' driver stages
+// pageable copies itself.
+#ifdef _WIN32
+constexpr bool kStagePageable = false;
+#else
+constexpr bool kStagePageable = true;
+#endif
+constexpr size_t kStageChunk = size_t(16) << 20;
+
+char* stage_buffer(size_t size) {
+    thread_local char* buf = nullptr;  // kept for the thread's lifetime (pool threads)
+    thread_local size_t cap = 0;
+    if (size > cap) {
+        if (buf) sycl::free(buf, rt().context);
+        cap = std::max(size, std::min(cap * 2, kStageChunk));
+        buf = static_cast<char*>(sycl::malloc_host(cap, rt().context));
+        if (!buf) {
+            cap = 0;
+            throw std::bad_alloc();
+        }
+    }
+    return buf;
+}
+
+void copy_from_pageable(sycl::queue& q, void* dst, const void* src, size_t count) {
+    for (size_t off = 0; off < count; off += kStageChunk) {
+        const size_t n = std::min(kStageChunk, count - off);
+        char* stage = stage_buffer(n);
+        std::memcpy(stage, static_cast<const char*>(src) + off, n);
+        q.memcpy(static_cast<char*>(dst) + off, stage, n).wait_and_throw();
+    }
+}
+
+void copy_to_pageable(sycl::queue& q, void* dst, const void* src, size_t count) {
+    for (size_t off = 0; off < count; off += kStageChunk) {
+        const size_t n = std::min(kStageChunk, count - off);
+        char* stage = stage_buffer(n);
+        q.memcpy(stage, static_cast<const char*>(src) + off, n).wait_and_throw();
+        std::memcpy(static_cast<char*>(dst) + off, stage, n);
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -580,6 +630,10 @@ rustCudaError_t cuda_mem_set(void* dst, uint8_t value, size_t count) {
 
 rustCudaError_t cuda_mem_copy_host_to_device(void* dst, const void* src, size_t count) {
     SP1_TRY({
+        if (kStagePageable && !is_usm(src)) {
+            copy_from_pageable(*rt().default_queue, dst, src, count);
+            return SP1_SUCCESS;
+        }
         rt().default_queue->memcpy(dst, src, count).wait_and_throw();
         return SP1_SUCCESS;
     })
@@ -587,6 +641,10 @@ rustCudaError_t cuda_mem_copy_host_to_device(void* dst, const void* src, size_t 
 
 rustCudaError_t cuda_mem_copy_device_to_host(void* dst, const void* src, size_t count) {
     SP1_TRY({
+        if (kStagePageable && !is_usm(dst)) {
+            copy_to_pageable(*rt().default_queue, dst, src, count);
+            return SP1_SUCCESS;
+        }
         rt().default_queue->memcpy(dst, src, count).wait_and_throw();
         return SP1_SUCCESS;
     })
@@ -728,6 +786,10 @@ cuda_mem_copy_host_to_device_async(void* dst, const void* src, size_t count, voi
     SP1_TRY({
         auto& q = queue_of(stream);
         const bool pinned = is_usm(src);
+        if (kStagePageable && !pinned) {
+            copy_from_pageable(q, dst, src, count);
+            return SP1_SUCCESS;
+        }
         auto e = q.memcpy(dst, src, count);
         if (sp1prof::enabled()) {
             GpuProfiler::get().add(
@@ -743,8 +805,12 @@ rustCudaError_t
 cuda_mem_copy_device_to_host_async(void* dst, const void* src, size_t count, void* stream) {
     SP1_TRY({
         auto& q = queue_of(stream);
-        auto e = q.memcpy(dst, src, count);
         const bool pinned = is_usm(dst);
+        if (kStagePageable && !pinned) {
+            copy_to_pageable(q, dst, src, count);
+            return SP1_SUCCESS;
+        }
+        auto e = q.memcpy(dst, src, count);
         if (sp1prof::enabled()) {
             GpuProfiler::get().add(
                 pinned ? "copy: device to host" : "copy: device to host (pageable)",
