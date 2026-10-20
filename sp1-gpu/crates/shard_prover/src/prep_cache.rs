@@ -18,14 +18,17 @@ use sp1_hypercube::{air::MachineAir, septic_digest::SepticDigest, MachineVerifyi
 
 /// The device memory all [`PrepCache`]s may hold together, in bytes.
 ///
-/// `SP1_GPU_PREP_CACHE_MIB` sets it (`0` disables the caches). The default is 2048 MiB on cards
-/// with more than 24 GiB, else 0. Under memory pressure the caches are emptied (see
-/// [`DeviceCache`]), so the budget only bounds what they hold between shards.
+/// `SP1_GPU_PREP_CACHE_MIB` sets it (`0` disables the caches). The default is 2048 MiB on CUDA
+/// cards with more than 24 GiB, else 0. Under memory pressure the caches are emptied (see
+/// [`DeviceCache`]), so the budget only bounds what they hold between shards. It is off by default
+/// on HIP and SYCL, like the trace prefetch: their device memory caches hold freed blocks outside
+/// the live count that pressure is measured by, and on Windows a card over its video memory
+/// budget spills to shared system memory.
 pub(crate) fn prep_cache_budget() -> u64 {
     static BUDGET: OnceLock<u64> = OnceLock::new();
     *BUDGET.get_or_init(|| {
         let default_mib = match sp1_gpu_cudart::cuda_memory_info() {
-            Ok((_, total)) if total > 24 << 30 => 2048,
+            Ok((_, total)) if sp1_gpu_cudart::sys::BACKEND == "cuda" && total > 24 << 30 => 2048,
             _ => 0,
         };
         let mib = std::env::var("SP1_GPU_PREP_CACHE_MIB")

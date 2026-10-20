@@ -555,6 +555,11 @@ rustCudaError_t cuda_free_host(void* ptr) {
     })
 }
 
+// No transparent-huge-page variant on SYCL: plain host memory.
+rustCudaError_t cuda_malloc_host_huge(void** ptr, size_t size) { return cuda_malloc_host(ptr, size); }
+
+rustCudaError_t cuda_free_host_huge(void* ptr, size_t) { return cuda_free_host(ptr); }
+
 // Pinning existing host memory: SYCL copies from it without registration, staging through the
 // runtime's own buffers, so these only need to succeed.
 rustCudaError_t cuda_host_register(void*, size_t) { return SP1_SUCCESS; }

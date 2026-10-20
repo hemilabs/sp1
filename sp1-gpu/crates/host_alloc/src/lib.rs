@@ -32,7 +32,37 @@
 //! static GLOBAL: sp1_gpu_host_alloc::HostAlloc = sp1_gpu_host_alloc::HostAlloc;
 //! ```
 
+#[cfg(target_os = "linux")]
 mod large;
+
+/// The large-block cache maps its blocks with Linux's `mmap` and `mremap`; elsewhere blocks of
+/// every size go to the chosen allocator.
+#[cfg(not(target_os = "linux"))]
+mod large {
+    use std::sync::atomic::AtomicUsize;
+
+    pub(crate) static MIN_SIZE: AtomicUsize = AtomicUsize::new(0);
+    pub(crate) static CACHE_LIMIT: AtomicUsize = AtomicUsize::new(0);
+
+    #[inline]
+    pub(crate) fn handles(_size: usize, _align: usize) -> bool {
+        false
+    }
+
+    pub(crate) unsafe fn alloc(_size: usize, _zeroed: bool) -> *mut u8 {
+        unreachable!("no large-block cache on this platform")
+    }
+
+    pub(crate) unsafe fn dealloc(_ptr: *mut u8) {
+        unreachable!("no large-block cache on this platform")
+    }
+
+    pub(crate) unsafe fn realloc(_ptr: *mut u8, _new_size: usize) -> *mut u8 {
+        unreachable!("no large-block cache on this platform")
+    }
+
+    pub(crate) fn release() {}
+}
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::ffi::c_void;
@@ -84,14 +114,15 @@ pub const KEEP_WARM_MIN_HOST_RAM: u64 = 128 << 30;
 /// Whether a long-running prover keeps its large-block cache (and, by the callers, its event
 /// buffers) between proofs, so the next proof writes its first shards into memory that is already
 /// mapped instead of faulting tens of GB in again. Bounded by the cache size; on by default with
-/// mimalloc on hosts with [`KEEP_WARM_MIN_HOST_RAM`], `SP1_HOST_KEEP_WARM=0`/`1` forces it.
+/// mimalloc on Linux hosts with [`KEEP_WARM_MIN_HOST_RAM`], `SP1_HOST_KEEP_WARM=0`/`1` forces it.
 pub fn keep_warm() -> bool {
     if choice(false) != MIMALLOC {
         return false;
     }
     match env_usize(c"SP1_HOST_KEEP_WARM") {
         Some(v) => v != 0,
-        None => host_ram_bytes() >= KEEP_WARM_MIN_HOST_RAM,
+        // Measured only with the large-block cache, which is Linux-only.
+        None => cfg!(target_os = "linux") && host_ram_bytes() >= KEEP_WARM_MIN_HOST_RAM,
     }
 }
 
@@ -315,6 +346,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
     fn large_blocks_are_reused_and_resized() {
         let a = HostAlloc;
         assert!(matches!(host_allocator_name(), "mimalloc" | "system"));

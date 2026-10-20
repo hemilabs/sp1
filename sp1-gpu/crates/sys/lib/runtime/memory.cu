@@ -22,7 +22,9 @@
 #endif
 
 #include "runtime/exception.cuh"
+#ifndef _WIN32
 #include <sys/mman.h>
+#endif
 #include <cstdint>
 #include <cstdio>
 
@@ -41,6 +43,7 @@ extern "C" rustCudaError_t cuda_host_register(void* hostPtr, size_t size) {
     return CUDA_SUCCESS_CSL;
 }
 
+#ifndef _WIN32
 namespace {
 constexpr size_t kHugePage = size_t(2) << 20;
 constexpr size_t kPage = 4096;
@@ -105,6 +108,18 @@ extern "C" rustCudaError_t cuda_free_host_huge(void* hostPtr, size_t size) {
     munmap(hostPtr, huge_host_len(size));
     return CUDA_SUCCESS_CSL;
 }
+#else
+// Windows: no transparent huge pages to map; plain pinned memory.
+extern "C" rustCudaError_t cuda_malloc_host_huge(void** hostPtr, size_t size) {
+    CUDA_OK(cudaMallocHost(hostPtr, size));
+    return CUDA_SUCCESS_CSL;
+}
+
+extern "C" rustCudaError_t cuda_free_host_huge(void* hostPtr, size_t) {
+    CUDA_OK(cudaFreeHost(hostPtr));
+    return CUDA_SUCCESS_CSL;
+}
+#endif
 
 extern "C" rustCudaError_t cuda_free(void* devPtr) {
     CUDA_OK(cudaFree(devPtr));
