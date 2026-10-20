@@ -133,6 +133,12 @@ Runtime& rt() {
         if (!std::getenv("ZES_ENABLE_SYSMAN")) _putenv_s("ZES_ENABLE_SYSMAN", "1");
 #else
         setenv("ZES_ENABLE_SYSMAN", "1", 0);
+        // Level Zero's V2 adapter, the default on Linux, intermittently left proofs waiting forever
+        // on an Arc Pro B70 (oneAPI 2025.3 and 2026.0 adapters, kernel 7.0 xe, compute runtime
+        // 26.09): a copy's event never completed, until the kill reset the copy engine. That was
+        // 11 of 14 fibonacci-compressed proofs (main also hung); with the legacy adapter, 20 of 20
+        // passed. SYCL_UR_USE_LEVEL_ZERO_V2=1 still picks V2.
+        setenv("SYCL_UR_USE_LEVEL_ZERO_V2", "0", 0);
 #endif
         return true;
     }();
