@@ -138,18 +138,20 @@ Variance and pitfalls:
 
 ## Reference results
 
-Medians, seconds. "Before" is `main` at `2d7834532` (the AMD/Intel port, #18); "after" adds the
-CPU-side rounds #15 and #16 (`perf/windows-gpu-cpu`, `1ec2f0b7b`). Windows 11, measured just
-after a reboot, both builds alternating.
+`bench-fib.sh` with default settings, medians in seconds. "Before" is `main` at `2d7834532` (the
+AMD/Intel port, #18); "after" is `perf/windows-gpu-cpu` at `55e711618` (#15 and #16 merged on top,
+with the trace prefetch off on HIP and SYCL). Windows 11, both builds alternating in one run; every
+proof verified, no shard retried.
 
 | Mode | RX 9070 XT (16 GB, HIP), before → after | Arc Pro B70 (32 GB, SYCL), before → after |
 |---|---|---|
-| core, steady | 5.83 → 4.74 | 3.29 → 2.89 |
-| compressed, steady | 11.40 → 9.50 | 4.64 → 4.43 |
-| groth16, first | 30.3 → 26.7 | 26.4 → 23.9 |
-| groth16, steady | 16.0 → 15.5 | 14.3 → 12.9 |
+| core, first | 6.23 → 5.03 (−19%) | 3.68 → 3.45 (−6%) |
+| core, steady | 6.13 → 4.90 (−20%) | 3.34 → 2.93 (−12%) |
+| compressed, first | 12.13 → 10.08 (−17%) | 5.13 → 4.93 (−4%) |
+| compressed, steady | 12.06 → 9.89 (−18%) | 4.71 → 4.31 (−8%) |
+| groth16, first | 28.65 → 26.68 (−7%) | 26.90 → 24.97 (−7%) |
+| groth16, steady | 16.21 → 15.91 (−2%) | 13.35 → 13.08 (−2%) |
 
-The "after" Arc Pro B70 numbers were measured with #16's trace prefetch on. It is now off by
-default on HIP and SYCL: on the B70 it made a third of compressed proofs spill to shared system
-memory (10-50 s instead of ~4.3 s), and the compressed median above includes one such proof.
-With it off, 64 compressed proofs in a row took 4.2-4.4 s (4.7-4.9 s for each process's first).
+The RX 9070 XT's absolute times vary with the machine's state: just after a reboot the same
+`main` build took 5.83 s per steady core proof, against 6.13 s here. The changes between the two
+builds were similar across three runs (core −15 to −20%, compressed −13 to −18%).
