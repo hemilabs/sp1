@@ -45,6 +45,22 @@ pub struct PlonkProver {
     /// fold call when `SP1_PLONK_R5_GPU` is enabled. ~4-5 GiB depending on
     /// circuit. Lifetime tied to `PlonkProver` (per-PK).
     pub(crate) canonical_cache: crate::static_cache::PlonkCanonicalCache,
+    /// The host arrays of `cached` registered with the driver, unregistered on drop: their memory
+    /// goes back to the allocator, and registering it again (a later prover's arrays) would fail.
+    #[cfg(feature = "cuda")]
+    pinned_host: Vec<usize>,
+}
+
+#[cfg(feature = "cuda")]
+impl Drop for PlonkProver {
+    fn drop(&mut self) {
+        // Before `cached` (whose arrays these are) is dropped.
+        for &ptr in &self.pinned_host {
+            unsafe {
+                let _ = sp1_gpu_sys::runtime::cuda_host_unregister(ptr as *const std::ffi::c_void);
+            }
+        }
+    }
 }
 
 /// Cached verifying key commitments (static per circuit).
@@ -115,7 +131,7 @@ pub(crate) struct CachedFrData {
     zh_invs_4: [Fr; 4],
     /// Two-level omega lookup tables for on-the-fly coset point computation in GPU kernel.
     /// lo_table[k] = omega_4N^k for k = 0..2^14-1
-    /// hi_table[k] = omega_4N^(k*2^14) for k = 0..big_n/2^14-1
+    /// hi_table[k] = omega_4N^(k*2^14) for k = 0..max(big_n/2^14, 1)-1
     /// Total ~768 KB pinned memory, replaces 4.3 GiB coset_points PCIe transfer.
     omega_lo_table: Vec<Fr>,
     omega_hi_table: Vec<Fr>,
@@ -474,7 +490,8 @@ impl PlonkProver {
 
         // Two-level omega lookup tables for on-the-fly coset point computation.
         // lo_table[k] = omega_4N^k for k = 0..2^14-1
-        // hi_table[k] = omega_4N^(k*2^14) for k = 0..big_n/2^14-1
+        // hi_table[k] = omega_4N^(k*2^14) for k = 0..max(big_n/2^14, 1)-1 (a domain under 2^14
+        // still reads hi_table[0])
         let omega_lo_table: Vec<Fr> = {
             let mut t = vec![Fr::ONE; 1 << 14];
             for i in 1..t.len() {
@@ -484,7 +501,7 @@ impl PlonkProver {
         };
         let omega_hi_table: Vec<Fr> = {
             let omega_step = omega_4n.pow(&[1u64 << 14, 0, 0, 0]);
-            let hi_len = big_n >> 14;
+            let hi_len = (big_n >> 14).max(1);
             let mut t = vec![Fr::ONE; hi_len];
             for i in 1..t.len() {
                 t[i] = t[i - 1] * omega_step;
@@ -574,15 +591,24 @@ impl PlonkProver {
         // The quotient kernel uploads these in chunks via cudaMemcpyAsync.
         // Pinning enables direct DMA at full PCIe bandwidth (~25 GB/s vs ~1.7 GB/s unpinned).
         #[cfg(feature = "cuda")]
+        let mut pinned_host = Vec::new();
+        #[cfg(feature = "cuda")]
         {
             use std::ffi::c_void;
             let mut pin_failures = 0u32;
-            let pin = |name: &str, v: &[Fr], failures: &mut u32| unsafe {
+            let mut pin = |name: &str, v: &[Fr], failures: &mut u32| unsafe {
+                // Nothing to pin, and registering 0 bytes fails with an error the runtime keeps
+                // pending: the next kernel launch check (sppark's NTT) would then report it.
+                if v.is_empty() {
+                    return;
+                }
                 let err = sp1_gpu_sys::runtime::cuda_host_register(
                     v.as_ptr() as *const c_void,
                     std::mem::size_of_val(v),
                 );
-                if err != sp1_gpu_sys::runtime::CUDA_SUCCESS_CSL {
+                if err == sp1_gpu_sys::runtime::CUDA_SUCCESS_CSL {
+                    pinned_host.push(v.as_ptr() as usize);
+                } else {
                     *failures += 1;
                     eprintln!(
                         "[WARN] cuda_host_register failed for {} ({} bytes)",
@@ -619,6 +645,8 @@ impl PlonkProver {
             cached,
             static_cache: crate::static_cache::PlonkStaticCache::new(),
             canonical_cache: crate::static_cache::PlonkCanonicalCache::new(),
+            #[cfg(feature = "cuda")]
+            pinned_host,
         }
     }
 

@@ -261,15 +261,21 @@ rustCudaError_t sp1_plonk_quotient_eval_fused(
     size_t free_mem = 0, total_mem = 0;
     CUDA_OK(cudaMemGetInfo(&free_mem, &total_mem));
     // Use 90% of free memory for chunk buffer (divided among NUM_STATIC arrays)
-    size_t chunk_size = (free_mem * 9 / 10) / (NUM_STATIC * elem_sz);
+    const size_t fits = (free_mem * 9 / 10) / (NUM_STATIC * elem_sz);
+    size_t chunk_size = fits;
     if (chunk_size > big_n) chunk_size = big_n;
     chunk_size = (chunk_size / 256) * 256;
-    if (chunk_size == 0) return rustCudaError_t{.message = "Not enough GPU memory for fused quotient"};
 
     // Double-buffered chunk allocation: overlap upload(i+1) with kernel(i)
     chunk_size = chunk_size / 2;
     chunk_size = (chunk_size / 256) * 256;
-    if (chunk_size == 0) return rustCudaError_t{.message = "Not enough GPU memory for fused quotient"};
+    // A domain under 512 rounds to no chunk at all: it is one chunk, if it fits.
+    if (chunk_size == 0 && big_n <= fits) chunk_size = big_n;
+    if (chunk_size == 0) {
+        cudaFree(d_lo_table);
+        cudaFree(d_hi_table);
+        return rustCudaError_t{.message = "Not enough GPU memory for fused quotient"};
+    }
 
     fr_t* d_chunk[2] = {nullptr, nullptr};
     CUDA_OK(cudaMalloc(&d_chunk[0], NUM_STATIC * chunk_size * elem_sz));
