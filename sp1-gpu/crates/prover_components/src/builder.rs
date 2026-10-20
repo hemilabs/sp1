@@ -240,6 +240,12 @@ pub async fn cuda_worker_builder_with_machine(
         sp1_recursion_gnark_ffi::ffi::set_groth16_gpu_hooks(compute_h, msm_g1, msm_g2);
     }
 
+    // A final-wrap GPU helper needs the memory of the shard prover's device caches too, which a
+    // pool trim or a device reset does not return: rsp's PLONK helper otherwise ran out of memory.
+    sp1_recursion_gnark_ffi::device_caches::set_releaser(|| {
+        sp1_gpu_cudart::release_device_caches(true);
+    });
+
     // The wrap prover keeps its proving key between Groth16/PLONK proofs (sp1-prover's WrapProver)
     // where the card has the memory for it: on a 32 GB Arc Pro B70 that saves ~3 s a proof, while
     // on a 16 GB Radeon RX 9070 XT the key's memory slowed the rest of each proof by more (19 s ->

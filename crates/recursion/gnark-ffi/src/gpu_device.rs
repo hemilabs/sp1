@@ -138,6 +138,7 @@ pub fn free_memory() -> Option<u64> {
 pub fn trim_memory_pool() -> Option<(u64, u64)> {
     let (library, runtime) = loaded()?;
     let before = free_memory()?;
+    crate::device_caches::release();
     let (get_device, synchronize, get_pool, trim) = match runtime.name {
         "CUDA" => (
             "cudaGetDevice",
@@ -197,6 +198,7 @@ pub(crate) fn reset_if_requested(what: &str) {
     if !reset_requested() {
         return;
     }
+    crate::device_caches::release();
     let Some((library, runtime)) = loaded() else {
         tracing::warn!(
             "{what}: SP1_GPU_RESET_BEFORE_WRAP is set, but this process has no CUDA or HIP runtime \

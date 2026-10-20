@@ -2,6 +2,7 @@ mod koalabear;
 
 #[cfg(feature = "native")]
 mod cpu_helper;
+pub mod device_caches;
 pub mod ffi;
 #[cfg(feature = "native")]
 mod gpu_cache;

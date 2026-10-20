@@ -218,8 +218,10 @@ pub fn sub_device_cache_bytes(bytes: u64) {
     CACHED_BYTES.fetch_sub(bytes, Ordering::Relaxed);
 }
 
-/// Empties the registered caches. Returns whether anything was dropped.
-pub(crate) fn release_device_caches(wait: bool) -> bool {
+/// Empties the registered caches. Returns whether anything was dropped. Also for a process
+/// handing the device to another one (the final wrap's GPU helpers), which would otherwise not get
+/// the memory the caches hold.
+pub fn release_device_caches(wait: bool) -> bool {
     let caches: Vec<Arc<dyn DeviceCache>> = {
         let caches = CACHES.lock().unwrap_or_else(|e| e.into_inner());
         caches.iter().filter_map(Weak::upgrade).collect()
