@@ -245,6 +245,20 @@ pub async fn cuda_worker_builder_with_machine(
     sp1_recursion_gnark_ffi::device_caches::set_releaser(|| {
         sp1_gpu_cudart::release_device_caches(true);
     });
+    // Measuring and trimming GPU memory for that helper. On Linux the wrap paths find the CUDA
+    // runtime library themselves; on Windows it is linked statically, and without these the GPU
+    // Groth16 prover was never chosen ("free GPU memory is unknown").
+    if sp1_gpu_cudart::sys::BACKEND == "cuda" {
+        sp1_recursion_gnark_ffi::device_caches::set_runtime(
+            sp1_recursion_gnark_ffi::device_caches::Runtime {
+                mem_get_info: || {
+                    let (free, total) = sp1_gpu_cudart::cuda_memory_info().ok()?;
+                    Some((free as u64, total as u64))
+                },
+                trim_memory_pool: || sp1_gpu_cudart::trim_default_mem_pool().is_ok(),
+            },
+        );
+    }
 
     // The wrap prover keeps its proving key between Groth16/PLONK proofs (sp1-prover's WrapProver)
     // where the card has the memory for it: on a 32 GB Arc Pro B70 that saves ~3 s a proof, while

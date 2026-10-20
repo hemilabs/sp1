@@ -12,7 +12,9 @@
 //!   wrap can afford it, so it happens only with `SP1_GPU_RESET_BEFORE_WRAP=1` (or `true`).
 //!
 //! Both use only a runtime library this process has already loaded. Loading one here would start
-//! a second runtime, and on a host with both toolkits installed it could be the wrong one.
+//! a second runtime, and on a host with both toolkits installed it could be the wrong one. Off
+//! Linux the runtime is linked statically, and measuring and trimming use the calls the GPU prover
+//! registers instead (`device_caches::set_runtime`); there is no reset.
 
 /// A GPU runtime library and the two calls used from it.
 struct Runtime {
@@ -96,9 +98,11 @@ pub fn total_memory() -> Option<u64> {
     mem_get_info().map(|(_, total)| total)
 }
 
+/// Elsewhere the runtime is linked statically (Windows), so the GPU prover's registered calls
+/// (`device_caches::set_runtime`) stand in for the library lookup.
 #[cfg(not(target_os = "linux"))]
 pub fn total_memory() -> Option<u64> {
-    None
+    (crate::device_caches::runtime()?.mem_get_info)().map(|(_, total)| total)
 }
 
 /// `(free, total)` memory of this process's current GPU, in bytes.
@@ -121,7 +125,7 @@ fn mem_get_info() -> Option<(u64, u64)> {
 
 #[cfg(not(target_os = "linux"))]
 pub fn free_memory() -> Option<u64> {
-    None
+    (crate::device_caches::runtime()?.mem_get_info)().map(|(free, _)| free)
 }
 
 /// Gives the unused reserve of the default memory pool on this process's current GPU back to the
@@ -183,7 +187,13 @@ pub fn trim_memory_pool() -> Option<(u64, u64)> {
 
 #[cfg(not(target_os = "linux"))]
 pub fn trim_memory_pool() -> Option<(u64, u64)> {
-    None
+    let runtime = crate::device_caches::runtime()?;
+    let before = free_memory()?;
+    crate::device_caches::release();
+    if !(runtime.trim_memory_pool)() {
+        return None;
+    }
+    Some((before, free_memory()?))
 }
 
 /// Whether `SP1_GPU_RESET_BEFORE_WRAP` asks for [`reset_if_requested`] to reset the GPU.

@@ -18,3 +18,27 @@ pub fn release() {
         release();
     }
 }
+
+/// What the GPU prover registers so that the wrap paths can measure and trim this process's GPU
+/// memory where `gpu_device` cannot find the runtime library itself: on Windows it is linked
+/// statically.
+#[derive(Clone, Copy)]
+pub struct Runtime {
+    /// `(free, total)` memory of this process's GPU, in bytes.
+    pub mem_get_info: fn() -> Option<(u64, u64)>,
+    /// Waits for the GPU and gives its memory pool's unused reserve back to the driver; whether
+    /// that succeeded.
+    pub trim_memory_pool: fn() -> bool,
+}
+
+static RUNTIME: OnceLock<Runtime> = OnceLock::new();
+
+/// Registers this process's GPU runtime calls. Only the first registration counts.
+pub fn set_runtime(runtime: Runtime) {
+    let _ = RUNTIME.set(runtime);
+}
+
+/// The registered GPU runtime calls, if any.
+pub(crate) fn runtime() -> Option<Runtime> {
+    RUNTIME.get().copied()
+}

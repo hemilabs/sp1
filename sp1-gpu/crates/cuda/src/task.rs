@@ -7,7 +7,7 @@ use std::{
     pin::Pin,
     ptr::{self, NonNull},
     sync::{
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicU64, AtomicUsize, Ordering},
         Arc, OnceLock, Weak,
     },
     task::{Context, Poll},
@@ -22,8 +22,8 @@ use slop_alloc::{
 };
 use slop_futures::queue::{AcquireWorkerError, TryAcquireWorkerError, Worker, WorkerQueue};
 use sp1_gpu_sys::runtime::{
-    cuda_device_get_default_mem_pool, cuda_mem_pool_set_release_threshold, CudaDevice, CudaMemPool,
-    CudaStreamHandle, Dim3, KernelPtr,
+    cuda_device_get_default_mem_pool, cuda_device_synchronize, cuda_mem_pool_set_release_threshold,
+    CudaDevice, CudaMemPool, CudaStreamHandle, Dim3, KernelPtr,
 };
 use thiserror::Error;
 use tokio::{sync::oneshot, task::JoinHandle};
@@ -56,6 +56,30 @@ pub struct TaskPoolBuilder {
 /// `cudaMalloc` syscall latency over per-shard / per-round allocations.
 const MEM_RELEASE_24GIB_CUTOFF: u64 = 24 * 1024 * 1024 * 1024;
 const MEM_RELEASE_HIGH_VRAM_DEFAULT: u64 = 8 * 1024 * 1024 * 1024;
+
+/// The release threshold the last task pool gave the default memory pool, which
+/// [`trim_default_mem_pool`] restores.
+static MEM_RELEASE_THRESHOLD: AtomicU64 = AtomicU64::new(0);
+
+/// Gives the unused reserve of device 0's default memory pool back to the driver: waits for the
+/// device with the pool's release threshold at zero, then restores the threshold. Live allocations
+/// are untouched. For a process handing the GPU to another one (the final wrap's GPU helpers).
+pub fn trim_default_mem_pool() -> Result<(), CudaError> {
+    unsafe {
+        let mut mem_pool = CudaMemPool(ptr::null_mut());
+        CudaError::result_from_ffi(cuda_device_get_default_mem_pool(&mut mem_pool, CudaDevice(0)))?;
+        CudaError::result_from_ffi(cuda_mem_pool_set_release_threshold(
+            CudaMemPool(mem_pool.0),
+            0,
+        ))?;
+        let synchronized = CudaError::result_from_ffi(cuda_device_synchronize());
+        CudaError::result_from_ffi(cuda_mem_pool_set_release_threshold(
+            mem_pool,
+            MEM_RELEASE_THRESHOLD.load(Ordering::Relaxed),
+        ))?;
+        synchronized
+    }
+}
 
 pub(crate) fn global_task_pool() -> &'static Arc<TaskPool> {
     GLOBAL_TASK_POOL.get_or_init(|| Arc::new(TaskPoolBuilder::new().build().unwrap()))
@@ -243,6 +267,7 @@ impl TaskPoolBuilder {
             ))
             .unwrap();
         };
+        MEM_RELEASE_THRESHOLD.store(mem_release_threshold, Ordering::Relaxed);
 
         let mut tasks = Vec::with_capacity(num_tasks);
         for (i, _) in (0..num_tasks).enumerate() {
