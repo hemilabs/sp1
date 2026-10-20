@@ -653,6 +653,17 @@ impl TaskOutput {
             }
             Err(e) => {
                 tracing::error!("task panicked: {:?}", e);
+                // Failed, not left pending: the proof waiting on it would hang (a worker that ran
+                // out of memory panics).
+                let task_output = TaskOutput {
+                    proof_id,
+                    task_id,
+                    status: TaskStatus::FailedFatal,
+                    task_metadata: TaskMetadata::default(),
+                    task_data: None,
+                    task_type,
+                };
+                tx.send(task_output).ok();
             }
         }
     }
