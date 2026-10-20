@@ -317,7 +317,7 @@ mod tests {
 
     use super::*;
 
-    use rand::{rngs::StdRng, SeedableRng};
+    use rand::{rngs::StdRng, Rng, SeedableRng};
 
     #[test]
     #[serial]
@@ -625,6 +625,85 @@ mod tests {
             // Assert the prover and verifier have the same challenger state.
             let verifier_challenge: Ext = verifier_challenger.sample_ext_element();
             assert_eq!(verifier_challenge, prover_challenge);
+        })
+        .unwrap();
+    }
+
+    /// The first layer `recompute_first_layer` regenerates at the end of the proof is the one the
+    /// circuit was generated from (the round proofs themselves vary with the grinding witness).
+    #[test]
+    #[serial]
+    fn test_logup_gkr_recomputed_first_layer_identical() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let (machine, record, program) =
+            rt.block_on(tracegen_setup::setup(&test_artifacts::FIBONACCI_ELF, SP1Stdin::new()));
+
+        run_sync_in_place(|scope| {
+            let buffer = PinnedBuffer::<Felt>::with_capacity(CORE_MAX_TRACE_SIZE as usize);
+            let queue = Arc::new(WorkerQueue::new(vec![buffer]));
+            let buffer = rt.block_on(queue.pop()).unwrap();
+            let (_, jagged_trace_data, shard_chips, _permit) = rt.block_on(full_tracegen(
+                &machine,
+                program.clone(),
+                Arc::new(record),
+                &buffer,
+                CORE_MAX_TRACE_SIZE as usize,
+                LOG_STACKING_HEIGHT,
+                CORE_MAX_LOG_ROW_COUNT,
+                &scope,
+                ProverSemaphore::new(1),
+                true,
+            ));
+            let shard_chips = machine.smallest_cluster(&shard_chips).unwrap();
+            let mut all_interactions = BTreeMap::new();
+            for chip in shard_chips.iter() {
+                let interactions = Interactions::new(chip.sends(), chip.receives());
+                let device_interactions = interactions.copy_to_device(&scope).unwrap();
+                all_interactions.insert(chip.name().to_string(), Arc::new(device_interactions));
+            }
+
+            let mut rng = StdRng::seed_from_u64(7);
+            let alpha: Ext = rng.gen();
+            let max_arity = shard_chips
+                .iter()
+                .flat_map(|c| c.sends().iter().chain(c.receives().iter()))
+                .map(|i| i.values.len() + 1)
+                .max()
+                .unwrap();
+            // Sized like `prove_logup_gkr` does: the widest interaction needs a beta per value.
+            let beta_dim = max_arity.next_power_of_two().ilog2();
+            let beta_seed = (0..beta_dim).map(|_| rng.gen::<Ext>()).collect::<Point<_>>();
+            let (_, circuit) = crate::tracegen::generate_gkr_circuit(
+                shard_chips,
+                all_interactions,
+                &jagged_trace_data,
+                alpha,
+                beta_seed,
+                CudaLogUpGkrOptions {
+                    recompute_first_layer: false,
+                    num_row_variables: CORE_MAX_LOG_ROW_COUNT,
+                },
+                scope.clone(),
+            );
+            let GkrCircuitLayer::FirstLayer(kept) = &circuit.materialized_layers[0] else {
+                panic!("first layer not kept");
+            };
+            let recomputed = crate::tracegen::generate_first_layer(&circuit.input_data, &scope);
+            let host = |layer: &crate::utils::FirstGkrLayer| unsafe {
+                let mle = &layer.jagged_mle;
+                (
+                    mle.dense_data.numerator.storage.copy_into_host_vec(),
+                    mle.dense_data.denominator.storage.copy_into_host_vec(),
+                    mle.col_index.copy_into_host_vec(),
+                    mle.start_indices.copy_into_host_vec(),
+                    mle.column_heights.copy_into_host_vec(),
+                    layer.num_row_variables,
+                    layer.num_interaction_variables,
+                )
+            };
+            let (kept, recomputed) = (host(kept), host(&recomputed));
+            assert!(!kept.0.is_empty());
+            assert!(kept == recomputed);
         })
         .unwrap();
     }

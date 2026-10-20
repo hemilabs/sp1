@@ -28,6 +28,8 @@ extern "C" {
     pub fn sp1_profile_flush();
 
     pub fn cuda_malloc_host(ptr: *mut *mut c_void, count: usize) -> CudaRustError;
+    pub fn cuda_malloc_host_huge(ptr: *mut *mut c_void, count: usize) -> CudaRustError;
+    pub fn cuda_free_host_huge(ptr: *const c_void, count: usize) -> CudaRustError;
     pub fn cuda_host_register(ptr: *const c_void, count: usize) -> CudaRustError;
     pub fn cuda_free_host(ptr: *const c_void) -> CudaRustError;
     pub fn cuda_host_unregister(ptr: *const c_void) -> CudaRustError;
