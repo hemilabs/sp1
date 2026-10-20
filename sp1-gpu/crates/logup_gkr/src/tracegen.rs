@@ -195,6 +195,19 @@ pub fn generate_gkr_circuit<'a, A: MachineAir<Felt>>(
     backend: TaskScope,
 ) -> (DeviceLogUpGkrOutput<Ext>, LogUpCudaCircuit<'a, TaskScope>) {
     let CudaLogUpGkrOptions { recompute_first_layer, num_row_variables } = options;
+    // The first-layer kernel indexes `partial_lagrange(beta_seed)` by value position without
+    // bounds checks, so a seed too short for the widest interaction reads past the buffer.
+    let max_interaction_arity = chips
+        .iter()
+        .flat_map(|c| c.sends().iter().chain(c.receives().iter()))
+        .map(|i| i.values.len() + 1)
+        .max()
+        .unwrap_or(1);
+    assert!(
+        1usize << beta_seed.dimension() >= max_interaction_arity,
+        "beta_seed has {} variables, too few for interaction arity {max_interaction_arity}",
+        beta_seed.dimension()
+    );
     let input_data = GkrInputData {
         chip_set: chips.iter().map(|chip| chip.name().to_string()).collect(),
         all_interactions,

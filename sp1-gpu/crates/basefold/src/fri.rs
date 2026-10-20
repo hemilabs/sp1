@@ -334,14 +334,21 @@ where
         // commit_phase, query}. See sp1_gpu_cudart::vram_snapshot_mib doc.
         sp1_gpu_cudart::vram_reset_peak();
         let mut codewords: Vec<Arc<Tensor<Felt, TaskScope>>> = Vec::new();
-        for data in prover_data.iter() {
+        let num_rounds = prover_data.len();
+        for (round, data) in prover_data.iter().enumerate() {
             if let Some(ref codeword) = data.codeword_mle {
                 codewords.push(codeword.clone());
             } else {
-                // Codeword was dropped - this is always a main trace.
+                // Codeword was dropped: a main trace's (`drop_ldes`), or, in the first of two
+                // rounds, the preprocessed traces' (kept without it by the shard prover's cache).
+                let virtual_tensor = if round == 0 && num_rounds > 1 {
+                    mles.preprocessed_virtual_tensor(self.log_height)
+                } else {
+                    mles.main_virtual_tensor(self.log_height)
+                };
                 let mut dst = Tensor::<Felt, TaskScope>::with_sizes_in(
                     [
-                        mles.dense().main_size() >> self.log_height,
+                        virtual_tensor.sizes()[0],
                         1 << (self.log_height as usize + self.config.log_blowup()),
                     ],
                     scope.clone(),
@@ -351,13 +358,8 @@ where
                 }
 
                 let encoder = CudaDftKoalaBear::default();
-                encode_batch(
-                    encoder,
-                    self.config.log_blowup as u32,
-                    mles.main_virtual_tensor(self.log_height),
-                    &mut dst,
-                )
-                .unwrap();
+                encode_batch(encoder, self.config.log_blowup as u32, virtual_tensor, &mut dst)
+                    .unwrap();
 
                 codewords.push(Arc::new(dst));
             }
