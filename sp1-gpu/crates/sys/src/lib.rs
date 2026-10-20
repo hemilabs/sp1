@@ -35,9 +35,9 @@ pub fn groth16_entry_points() -> Option<(usize, usize, usize)> {
     #[cfg(any(hip_backend, sycl_backend))]
     {
         Some((
-            groth16::sp1_groth16_compute_h as usize,
-            groth16::sp1_groth16_msm_g1 as usize,
-            groth16::sp1_groth16_msm_g2 as usize,
+            groth16::sp1_groth16_compute_h as *const () as usize,
+            groth16::sp1_groth16_msm_g1 as *const () as usize,
+            groth16::sp1_groth16_msm_g2 as *const () as usize,
         ))
     }
     #[cfg(not(any(hip_backend, sycl_backend)))]
