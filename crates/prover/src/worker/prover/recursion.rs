@@ -369,7 +369,8 @@ impl<A: ArtifactClient, C: SP1ProverComponents> RecursionProverWorker<A, C> {
                     .await
                     .map_err(|e| TaskError::Fatal(e.into()))??;
                 }
-                let vk_merkle_proof = self.prover_data.recursion_vks.open(&vk)?.1;
+                let vk_merkle_proof =
+                    retry_if_fresh_vk_not_allowed(self.prover_data.recursion_vks.open(&vk))?.1;
                 SP1RecursionProof { vk, proof, vk_merkle_proof }
             }
         };
@@ -431,10 +432,15 @@ pub type RecursionProveSubmitHandle<A, C> = SubmitHandle<RecursionProvePipeline<
 
 pub type ReduceSubmitHandle<A, C> = SubmitHandle<ReducePipeline<A, C>>;
 
+/// The wrap prover, once built.
+type WrapProverCell<C> = Arc<OnceCell<Arc<WrapProver<C>>>>;
+
 pub struct SP1RecursionProver<A, C: SP1ProverComponents> {
     reduce_pipeline: Arc<ReducePipeline<A, C>>,
     pub shrink_prover: Arc<ShrinkProver<C>>,
-    wrap_prover: Arc<OnceCell<Arc<WrapProver<C>>>>,
+    /// The wrap prover, built once; the cell is replaced to build it again (see
+    /// [`Self::forget_wrap_prover`]).
+    wrap_prover: Arc<std::sync::Mutex<WrapProverCell<C>>>,
     wrap_prover_init: Arc<WrapProverInit<C>>,
     pub prover_data: Arc<RecursionProverData<C>>,
     artifact_client: A,
@@ -526,17 +532,22 @@ impl<A: ArtifactClient, C: SP1ProverComponents> SP1RecursionProver<A, C> {
             // Now do key generation sequentially (requires tokio runtime for GPU setup)
             let mut deferred_program = None;
             for (arity, program) in all_programs {
-                let (tx, rx) = oneshot::channel();
-                tokio::task::spawn({
-                    let program = program.clone();
-                    let air_prover = compress_prover.clone();
-                    async move {
-                        let permits = ProverSemaphore::new(1);
-                        let (pk, vk) = air_prover.setup(program, permits).await;
-                        tx.send((pk, vk)).ok();
-                    }
-                });
-                let (pk, vk) = rx.blocking_recv().unwrap();
+                let setup = || {
+                    let (tx, rx) = oneshot::channel();
+                    tokio::task::spawn({
+                        let program = program.clone();
+                        let air_prover = compress_prover.clone();
+                        async move {
+                            let permits = ProverSemaphore::new(1);
+                            let (pk, vk) = air_prover.setup(program, permits).await;
+                            tx.send((pk, vk)).ok();
+                        }
+                    });
+                    rx.blocking_recv().unwrap()
+                };
+                // These keys serve every proof of the process: a key set up wrong on the device
+                // would fail them all. With vk verification on, its vk must be in the vk map.
+                let (pk, vk) = setup_until_allowed(&recursion_vks, setup);
                 let pk = unsafe { pk.into_inner() };
                 if arity == 0 {
                     // Deferred
@@ -625,7 +636,7 @@ impl<A: ArtifactClient, C: SP1ProverComponents> SP1RecursionProver<A, C> {
             Self {
                 reduce_pipeline,
                 shrink_prover,
-                wrap_prover: Arc::new(OnceCell::new()),
+                wrap_prover: Arc::new(std::sync::Mutex::new(Arc::new(OnceCell::new()))),
                 wrap_prover_init: Arc::new(wrap_prover_init),
                 prover_data,
                 artifact_client,
@@ -692,12 +703,26 @@ impl<A: ArtifactClient, C: SP1ProverComponents> SP1RecursionProver<A, C> {
         Ok(handle)
     }
 
+    /// Makes the next wrap build the wrap prover again, if it is still `used`: when a wrap proof
+    /// made with a kept proving key fails verification, the key's data on the device may be what
+    /// went wrong, and every later wrap proof would fail the same way.
+    fn forget_wrap_prover(&self, used: &Arc<WrapProver<C>>) {
+        if used.proving_key.is_none() {
+            return;
+        }
+        let mut cell = self.wrap_prover.lock().unwrap_or_else(|e| e.into_inner());
+        if cell.get().is_some_and(|current| Arc::ptr_eq(current, used)) {
+            tracing::warn!("rebuilding the wrap prover after a failed wrap proof verification");
+            *cell = Arc::new(OnceCell::new());
+        }
+    }
+
     async fn wrap_prover(&self) -> Result<Arc<WrapProver<C>>, TaskError> {
         let wrap_prover_init = self.wrap_prover_init.clone();
         let prover_data = self.prover_data.clone();
 
-        let wrap_prover = self
-            .wrap_prover
+        let cell = self.wrap_prover.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let wrap_prover = cell
             .get_or_try_init(|| async move {
                 let wrap_prover_init = wrap_prover_init.clone();
                 let prover_data = prover_data.clone();
@@ -719,12 +744,14 @@ impl<A: ArtifactClient, C: SP1ProverComponents> SP1RecursionProver<A, C> {
                         wrap_prover_init.config.clone(),
                         wrap_prover_init.shrink_shape.clone(),
                         known_vk,
-                    );
+                    )?;
 
+                    // The vk comes from a setup on the GPU: a mismatch is retried (the build runs
+                    // again) rather than failing the proof.
                     if wrap_prover.prover_data.recursion_vks.vk_verification()
                         && wrap_prover.verifying_key != expected_wrap_vk
                     {
-                        return Err(TaskError::Fatal(anyhow::anyhow!(
+                        return Err(TaskError::Retryable(anyhow::anyhow!(
                             "Wrap vk mismatch, expected: {:?}, got: {:?}",
                             expected_wrap_vk,
                             wrap_prover.verifying_key
@@ -775,7 +802,9 @@ impl<A: ArtifactClient, C: SP1ProverComponents> SP1RecursionProver<A, C> {
             .instrument(tracing::info_span!("prove wrap"))
             .await?;
 
-        tracing::debug_span!("verify wrap proof").in_scope(|| wrap_prover.verify(&wrap_proof))?;
+        tracing::debug_span!("verify wrap proof")
+            .in_scope(|| wrap_prover.verify(&wrap_proof))
+            .inspect_err(|_| self.forget_wrap_prover(&wrap_prover))?;
 
         self.artifact_client
             .upload(&wrap_proof_artifact, wrap_proof)
@@ -1257,6 +1286,38 @@ fn dummy_compose_input<C: SP1ProverComponents>(
     )
 }
 
+/// Runs `setup` (a recursion program's setup on the GPU) until its vk is in the vk map, at most four
+/// times, for keys set up once and used by every proof of the process. Without vk verification
+/// there is nothing to check against, and the first setup is kept. If no setup's vk is allowed, the
+/// last one is kept and the proofs that use it fail their vk checks.
+fn setup_until_allowed<K>(
+    recursion_vks: &RecursionVks,
+    setup: impl Fn() -> (K, MachineVerifyingKey<SP1GlobalContext>),
+) -> (K, MachineVerifyingKey<SP1GlobalContext>) {
+    let mut keys = setup();
+    for _ in 0..3 {
+        if !recursion_vks.vk_verification() || recursion_vks.open(&keys.1).is_ok() {
+            break;
+        }
+        tracing::warn!(
+            "a recursion program's setup gave a vk outside the vk map: setting up again"
+        );
+        keys = setup();
+    }
+    keys
+}
+
+/// The vk-map lookup of a vk that a setup just computed on the GPU. A vk outside the allowed set
+/// then fails the task as retryable: the setup may have gone wrong on the device, and the retry
+/// sets the program up again (persistent configuration errors still fail once the retries run
+/// out).
+fn retry_if_fresh_vk_not_allowed<T>(opened: Result<T, TaskError>) -> Result<T, TaskError> {
+    opened.map_err(|e| match e {
+        TaskError::Fatal(e) => TaskError::Retryable(e.context("vk of a setup just run on the GPU")),
+        e => e,
+    })
+}
+
 pub struct ShrinkProver<C: SP1ProverComponents> {
     prover: Arc<C::RecursionProver>,
     permits: ProverSemaphore,
@@ -1289,14 +1350,15 @@ impl<C: SP1ProverComponents> ShrinkProver<C> {
             &input,
         ));
 
-        let (pk, vk) = {
+        // The shrink vk serves every proof of the process (see `setup_until_allowed`).
+        let (pk, vk) = setup_until_allowed(&prover_data.recursion_vks, || {
             let (prover, program, permits) = (prover.clone(), program.clone(), permits.clone());
             let (tx, rx) = oneshot::channel();
             tokio::task::spawn(async move {
                 tx.send(prover.setup(program.clone(), permits.clone()).await).ok()
             });
             rx.blocking_recv().unwrap()
-        };
+        });
         let shrink_shape = {
             let (tx, rx) = oneshot::channel();
             tokio::task::spawn(async move {
@@ -1373,7 +1435,8 @@ impl<C: SP1ProverComponents> ShrinkProver<C> {
         let duration = permit.release();
         metrics.increment_permit_time(duration);
 
-        let vk_merkle_proof = self.prover_data.recursion_vks.open(&vk)?.1;
+        let vk_merkle_proof =
+            retry_if_fresh_vk_not_allowed(self.prover_data.recursion_vks.open(&vk))?.1;
         Ok(SP1RecursionProof { vk: self.verifying_key.clone(), proof, vk_merkle_proof })
     }
 
@@ -1386,7 +1449,7 @@ impl<C: SP1ProverComponents> ShrinkProver<C> {
         vk.observe_into(&mut challenger);
         C::shrink_verifier()
             .verify_shard(vk, proof, &mut challenger)
-            .map_err(|e| TaskError::Fatal(e.into()))?;
+            .map_err(|e| TaskError::Retryable(anyhow::anyhow!("shrink verify failed: {e}")))?;
 
         self.prover_data.recursion_vks.verify(vk_merkle_proof, vk)
     }
@@ -1419,7 +1482,7 @@ impl<C: SP1ProverComponents> WrapProver<C> {
         config: SP1RecursionProverConfig,
         shrink_shape: BTreeMap<String, usize>,
         known_vk: Option<MachineVerifyingKey<SP1OuterGlobalContext>>,
-    ) -> Self {
+    ) -> Result<Self, TaskError> {
         let verifier = C::shrink_verifier();
         let shrink_proof_shape =
             SP1RecursionProofShape { shape: RecursionShape::new(shrink_shape) };
@@ -1451,10 +1514,11 @@ impl<C: SP1ProverComponents> WrapProver<C> {
             // The setup computed the vk of the wrap program; it must be the one proofs are checked
             // against.
             if let Some(known_vk) = &known_vk {
-                assert!(
-                    *known_vk == verifying_key,
-                    "Wrap vk mismatch, expected: {known_vk:?}, got: {verifying_key:?}"
-                );
+                if *known_vk != verifying_key {
+                    return Err(TaskError::Retryable(anyhow::anyhow!(
+                        "Wrap vk mismatch, expected: {known_vk:?}, got: {verifying_key:?}"
+                    )));
+                }
             }
             // The setup's permit is released here, as when the key was dropped: proving takes its
             // own.
@@ -1463,7 +1527,7 @@ impl<C: SP1ProverComponents> WrapProver<C> {
             (known_vk.unwrap_or_else(|| setup().1), None)
         };
 
-        Self { prover, permits, program, verifying_key, proving_key, prover_data }
+        Ok(Self { prover, permits, program, verifying_key, proving_key, prover_data })
     }
 
     pub async fn prove(
@@ -1507,7 +1571,7 @@ impl<C: SP1ProverComponents> WrapProver<C> {
                 // The setup above computed the vk of the wrap program; it must be the one proofs
                 // are checked against.
                 if vk != self.verifying_key {
-                    return Err(TaskError::Fatal(anyhow::anyhow!(
+                    return Err(TaskError::Retryable(anyhow::anyhow!(
                         "Wrap vk mismatch, expected: {:?}, got: {:?}",
                         self.verifying_key,
                         vk
@@ -1531,6 +1595,6 @@ impl<C: SP1ProverComponents> WrapProver<C> {
         vk.observe_into(&mut challenger);
         C::wrap_verifier()
             .verify_shard(vk, proof, &mut challenger)
-            .map_err(|e| TaskError::Fatal(e.into()))
+            .map_err(|e| TaskError::Retryable(anyhow::anyhow!("wrap verify failed: {e}")))
     }
 }
