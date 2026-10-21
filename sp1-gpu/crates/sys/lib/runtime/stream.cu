@@ -327,23 +327,6 @@ static void rawFree(void* p, size_t size) {
     }
 }
 
-// Gives the arena's allocations that are entirely free back to the driver. The caller holds
-// g_alloc_mutex and has waited for the device.
-static void arenaShrink() {
-    for (size_t i = g_arena_chunks.size(); i-- > 0;) {
-        auto [base, size] = g_arena_chunks[i];
-        auto it = g_arena_free.find(base);
-        if (it == g_arena_free.end() || it->second.length != size) continue;
-        arenaEraseLength(size, base);
-        g_arena_free.erase(it);
-        g_arena_free_bytes -= size;
-        hipFree(base);
-        g_arena_chunks.erase(g_arena_chunks.begin() + i);
-    }
-    // Re-created by the next allocation.
-    if (g_arena_chunks.empty()) g_arena_on = false;
-}
-
 // Wait for the device, then free every cached block. The caller holds g_alloc_mutex.
 static void releaseCachedBlocks() {
     sp1prof::HostTimer timer("host: release cached blocks (wait + free)");
@@ -515,12 +498,13 @@ static hipError_t cachedHipFree(void* p, hipStream_t stream) {
 #endif // __HIPCC__
 
 // Frees the allocator's cached blocks (after waiting for the device), for work that needs the
-// memory back, such as the Groth16 prover (lib/groth16) after a proof's SP1 stages.
+// memory back, such as the Groth16 prover (lib/groth16) after a proof's SP1 stages. With the
+// arena they go back to it, and the arena stays: the Groth16 prover runs in this process and
+// allocates from it too, and the next proofs need it.
 extern "C" void cuda_release_cached_memory() {
 #ifdef __HIPCC__
     std::lock_guard<std::mutex> lock(g_alloc_mutex);
     releaseCachedBlocks();
-    arenaShrink();
 #endif
 }
 

@@ -127,6 +127,9 @@ binary in the directory.
 - The runtime selects Level Zero's legacy adapter (`SYCL_UR_USE_LEVEL_ZERO_V2=0`, unless set):
   with V2 most proofs hung on an Arc Pro B70. It copies to and from pageable host memory through
   pinned buffers.
+- Run one prover process per card. A proof can use nearly all of a B70's 32 GB (30.7 GB for a
+  20M-cycle fibonacci Groth16 proof); with three processes sharing the card (kernel 7.0.0-38),
+  `xe` moved device memory out from under a copy, the copy engine faulted and the processes hung.
 - The first proof JIT-compiles the kernels, about 50 s, and the compiled kernels are cached
   (`~/.cache/libsycl_cache`, `~/.cache/neo_compiler_cache`). An ahead-of-time build has no such
   first proof (5.8 s instead of 72 s for a cold first fibonacci proof; proofs as fast): build with
