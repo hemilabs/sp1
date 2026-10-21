@@ -35,9 +35,12 @@ pub const GPU_NORMALIZE_PROGRAM_CACHE_MIN_AVAILABLE_RAM: u64 = 64 << 30;
 /// overrides.
 ///
 /// On an Arc Pro B70 under Linux (xe driver, compute runtime 26.09, Level Zero's legacy adapter),
-/// driving the two streams from two threads crashed about one proof in nine inside the driver
-/// (a segfault in a copy's enqueue, or a fatal device error), and the crashed process left the
-/// copy engine faulted for the next. With one stream, 32 of 32 keccak-compressed proofs passed.
+/// two streams first crashed about one proof in nine inside the driver; with pageable copies
+/// staged and evictions draining every queue (lib/sycl/runtime.cpp) they no longer crash, but they
+/// do not fit: a 20M-cycle fibonacci Groth16 proof then reaches the card's 32 GB as compression
+/// starts (the kernels' scratch memory comes on top of the allocator's), and two of four such
+/// runs died out of device memory. One stream peaks at 30.7 GB and is under 1% slower (rsp
+/// compressed 77.0 s against 76.4 s, keccak 43.6 s against 43.3 s).
 fn separate_recursion_stream() -> bool {
     match std::env::var("SP1_GPU_RECURSION_STREAM").as_deref() {
         Ok("0") | Ok("false") => false,
