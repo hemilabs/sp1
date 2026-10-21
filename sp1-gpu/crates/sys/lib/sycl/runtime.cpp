@@ -411,11 +411,23 @@ void release_cached_blocks() {
     g_cached_bytes = 0;
 }
 
-// Free cached blocks, largest first, until `need` bytes fit in `headroom`. The caller holds
-// g_alloc_mutex.
+// Free cached blocks, largest first, until `need` bytes fit in `headroom`, once every queue is
+// idle. The caller holds g_alloc_mutex.
+//
+// A block's `freed` barrier only covers the queue that freed it, and a block can also have been
+// used on another queue (the compress prover's and a core shard's): sycl::free then unmapped it
+// under a copy still running there. On an Arc Pro B70 under Linux, with two streams, that was a
+// copy-engine page fault ("Fault response: Unsuccessful -EINVAL") and a fatal device error in 3
+// of 20 keccak-compressed proofs; waiting for every queue first, 20 of 20 passed. Evicting is
+// rare (an allocation that would not fit), so the wait costs little.
 void evict_until_fits(size_t need, size_t headroom) {
     sp1prof::HostTimer timer("host: evict cached blocks");
+    bool drained = false;
     while (g_cached_bytes > 0 && need + FIT_MARGIN_BYTES > headroom) {
+        if (!drained) {
+            rt().wait_all();
+            drained = true;
+        }
         auto it = std::prev(g_free_pool.end());
         if (it->second.empty()) {
             g_free_pool.erase(it);
@@ -425,7 +437,6 @@ void evict_until_fits(size_t need, size_t headroom) {
         it->second.pop_back();
         const size_t size = it->first;
         if (it->second.empty()) g_free_pool.erase(it);
-        block.freed.wait();
         sycl::free(block.ptr, rt().context);
         g_alloc_sizes.erase(block.ptr);
         g_cached_bytes -= size;
