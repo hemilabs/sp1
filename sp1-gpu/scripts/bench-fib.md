@@ -99,6 +99,37 @@ binary in the directory.
 - The first proof after a build JIT-compiles the kernels (about 50 s), so run the benchmark
   once before measuring a new build.
 
+### AMD (HIP, Linux)
+
+- ROCm 7.2 or newer (6.4.1 is the first with RDNA 4, `gfx1201`). Without root, AMD's
+  `rocm/dev-ubuntu-24.04:7.2.4-complete` image works: run the build and `node` in it with
+  `--device=/dev/kfd --device=/dev/dri`, the `video` and `render` groups and this checkout mounted
+  at the same path; binaries built there also run on a host with the same ROCm version installed.
+  The image needs `LIBCLANG_PATH=/opt/rocm/llvm/lib`,
+  `BINDGEN_EXTRA_CLANG_ARGS="-isystem /opt/rocm/llvm/lib/clang/22/include"` and a `protoc`.
+- `SP1_GPU_BACKEND=hip`, `HIP_ARCHS` and `HIP_VISIBLE_DEVICES` as on Windows (`rocminfo` lists an
+  integrated Ryzen GPU too). A kill timeout for a containerised run belongs inside the container:
+  killing the `docker` client leaves the proof running.
+- The GPU Groth16 prover runs in process; `bench-fib.sh` takes a directory whose `node` is a
+  script that runs the real one in the container.
+
+### Intel (SYCL, Linux)
+
+- oneAPI 2025.3 or newer and Level Zero (the `xe` kernel driver; tested with compute runtime
+  26.09 on kernel 7.0). `SP1_GPU_BACKEND=sycl`; the kernels go into `libsp1_gpu_sycl.so`, which
+  `node` finds through `LD_LIBRARY_PATH` (with oneAPI's `setvars.sh` sourced for its runtime).
+- The runtime selects Level Zero's legacy adapter (`SYCL_UR_USE_LEVEL_ZERO_V2=0`, unless set):
+  with V2 most proofs hung on an Arc Pro B70. It copies to and from pageable host memory through
+  pinned buffers.
+- The first proof JIT-compiles the kernels, about 50 s, and the compiled kernels are cached
+  (`~/.cache/libsycl_cache`, `~/.cache/neo_compiler_cache`). An ahead-of-time build has no such
+  first proof (5.8 s instead of 72 s for a cold first fibonacci proof; proofs as fast): build with
+  `SP1_SYCL_TARGETS=spir64_gen SP1_SYCL_DEVICE=bmg-g31` (an Arc Pro B70; `bmg-g21` for a B580,
+  comma-separated for several). The kernels then run only on the devices named, and the
+  library is about 35 MB instead of 12.
+- Build only `node`: the GPU Groth16 and PLONK helpers use the CUDA/HIP MSM kernels and do not link
+  on SYCL. The Groth16 prover runs in process with its MSMs and computeH on the GPU.
+
 ## Run it
 
 From the repo root (Git Bash on Windows):
@@ -173,3 +204,14 @@ proof verified, no shard retried.
 The RX 9070 XT's absolute times vary with the machine's state: just after a reboot the same
 `main` build took 5.83 s per steady core proof, against 6.13 s here. The changes between the two
 builds were similar across three runs (core −15 to −20%, compressed −13 to −18%).
+
+On Linux (Ryzen 9 9950X; HIP with ROCm 7.2.4, SYCL with oneAPI 2025.3), `main` against
+`perf/windows-gpu-cpu` at `8f640739f`, steady medians in seconds. Every proof verified, none failed
+or was retried. On the B70 both sides ran with the legacy adapter and one stream, the least `main`
+needs there.
+
+| Mode | RX 9070 XT (16 GB, HIP), main → after | Arc Pro B70 (32 GB, SYCL), main → after |
+|---|---|---|
+| core, steady | 3.68 → 3.11 (−15%) | 3.77 → 2.92 (−22%) |
+| compressed, steady | 6.27 → 5.47 (−13%) | 5.48 → 4.21 (−23%) |
+| groth16, steady | 15.25 → 15.37 (+1%) | 13.90 → 13.11 (−6%) |
