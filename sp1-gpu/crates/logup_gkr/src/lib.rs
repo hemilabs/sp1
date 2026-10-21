@@ -707,4 +707,384 @@ mod tests {
         })
         .unwrap();
     }
+
+    /// Stress (not run by default): proves and verifies a shard's LogUp-GKR on several tasks
+    /// (streams) at once, many times. SP1_GKR_STRESS_THREADS (2), SP1_GKR_STRESS_ITERS (100),
+    /// SP1_GKR_STRESS_RECOMPUTE (0), and SP1_GKR_STRESS_ELF: the small fibonacci test program by
+    /// default, `keccak`, `secp`, `sha2` or `ed25519` test programs, or full-size shards of the
+    /// benchmark programs `bigfib` / `bigkeccak` with input SP1_GKR_STRESS_PARAM.
+    #[test]
+    #[ignore]
+    fn stress_logup_gkr_concurrent() {
+        let env = |k: &str, d: usize| {
+            std::env::var(k).ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(d)
+        };
+        let threads = env("SP1_GKR_STRESS_THREADS", 2);
+        let iters = env("SP1_GKR_STRESS_ITERS", 100);
+        let recompute = env("SP1_GKR_STRESS_RECOMPUTE", 0) != 0;
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let param = env("SP1_GKR_STRESS_PARAM", 0);
+        let mut stdin = SP1Stdin::new();
+        let elf: &[u8] = match std::env::var("SP1_GKR_STRESS_ELF").as_deref() {
+            Ok("bigfib") => {
+                stdin.write(&param);
+                include_bytes!(
+                    "../../prover_components/programs/fibonacci/riscv64im-succinct-zkvm-elf"
+                )
+            }
+            Ok("bigkeccak") => {
+                stdin.write_vec(vec![0u8; param]);
+                include_bytes!(
+                    "../../prover_components/programs/keccak/riscv64im-succinct-zkvm-elf"
+                )
+            }
+            Ok("keccak") => &test_artifacts::KECCAK256_ELF,
+            Ok("secp") => &test_artifacts::SECP256K1_BENCH_ELF,
+            Ok("sha2") => &test_artifacts::SHA2_ELF,
+            Ok("ed25519") => &test_artifacts::ED25519_ELF,
+            _ => &test_artifacts::FIBONACCI_ELF,
+        };
+        let (machine, record, program) = rt.block_on(tracegen_setup::setup(elf, stdin));
+        eprintln!("stress: record cpu events {}", record.cpu_event_count);
+        let record = Arc::new(record);
+        let failures = std::sync::atomic::AtomicUsize::new(0);
+        let done = std::sync::atomic::AtomicUsize::new(0);
+        std::thread::scope(|s| {
+            for t in 0..threads {
+                let (machine, program, record, rt, failures, done) =
+                    (&machine, program.clone(), record.clone(), &rt, &failures, &done);
+                s.spawn(move || {
+                    run_sync_in_place(|scope| {
+                        let capacity = CORE_MAX_TRACE_SIZE as usize;
+                        let buffer = PinnedBuffer::<Felt>::with_capacity(capacity);
+                        let queue = Arc::new(WorkerQueue::new(vec![buffer]));
+                        let buffer = rt.block_on(queue.pop()).unwrap();
+                        let (public_values, jagged_trace_data, shard_chips, _permit) =
+                            rt.block_on(full_tracegen(
+                                machine,
+                                program.clone(),
+                                record.clone(),
+                                &buffer,
+                                CORE_MAX_TRACE_SIZE as usize,
+                                LOG_STACKING_HEIGHT,
+                                CORE_MAX_LOG_ROW_COUNT,
+                                &scope,
+                                ProverSemaphore::new(1),
+                                true,
+                            ));
+                        let shard_chips = machine.smallest_cluster(&shard_chips).unwrap();
+                        let degrees: BTreeMap<String, Point<Felt>> = shard_chips
+                            .iter()
+                            .map(|c| {
+                                let poly_size =
+                                    jagged_trace_data.main_poly_height(c.name()).unwrap();
+                                let threshold_point = Point::<Felt>::from_usize(
+                                    poly_size,
+                                    CORE_MAX_LOG_ROW_COUNT as usize + 1,
+                                );
+                                (c.name().to_string(), threshold_point)
+                            })
+                            .collect();
+                        for i in 0..iters {
+                            let mut all_interactions = BTreeMap::new();
+                            for chip in shard_chips.iter() {
+                                let interactions = Interactions::new(chip.sends(), chip.receives());
+                                let device_interactions =
+                                    interactions.copy_to_device(&scope).unwrap();
+                                all_interactions
+                                    .insert(chip.name().to_string(), Arc::new(device_interactions));
+                            }
+                            let mut challenger = TestGC::default_challenger();
+                            challenger.observe(Felt::from_canonical_usize(t * 1_000_000 + i));
+                            let mut prover_challenger = challenger.clone();
+                            let proof = super::prove_logup_gkr::<TestGC, RiscvAir<Felt>>(
+                                shard_chips,
+                                all_interactions,
+                                &jagged_trace_data,
+                                CudaLogUpGkrOptions {
+                                    recompute_first_layer: recompute,
+                                    num_row_variables: CORE_MAX_LOG_ROW_COUNT,
+                                },
+                                &mut prover_challenger,
+                            );
+                            let mut verifier_challenger = challenger.clone();
+                            let res = sp1_hypercube::LogUpGkrVerifier::<
+                                TestGC,
+                                SP1SC<TestGC, RiscvAir<Felt>>,
+                            >::verify_logup_gkr(
+                                shard_chips,
+                                &degrees,
+                                CORE_MAX_LOG_ROW_COUNT as usize,
+                                &proof,
+                                &public_values,
+                                &mut verifier_challenger,
+                            );
+                            let n = done.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                            if let Err(e) = res {
+                                failures.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                eprintln!(
+                                    "STRESS FAIL thread {t} iter {i} at {}: {e}",
+                                    std::time::SystemTime::now()
+                                        .duration_since(std::time::UNIX_EPOCH)
+                                        .unwrap()
+                                        .as_secs()
+                                );
+                            }
+                            if n % 100 == 0 {
+                                eprintln!(
+                                    "stress: {n} proofs, {} failures",
+                                    failures.load(std::sync::atomic::Ordering::Relaxed)
+                                );
+                            }
+                        }
+                    })
+                    .unwrap();
+                });
+            }
+        });
+        let f = failures.load(std::sync::atomic::Ordering::Relaxed);
+        eprintln!("STRESS DONE: {} proofs, {f} failures", threads * iters);
+        assert_eq!(f, 0);
+    }
+
+    /// Determinism stress (not run by default): regenerates the LogUp-GKR circuit of one shard
+    /// with fixed challenges SP1_GKR_STRESS_ITERS times and compares its output, and on a
+    /// mismatch every layer, with the first run's. SP1_GKR_STRESS_ELF (`bigfib`, `bigkeccak`) and
+    /// SP1_GKR_STRESS_PARAM (2000000) as above.
+    ///
+    /// On an RX 9070 XT (kernel 7.0, ROCm 7.2.4) with the allocator's caches and arena off
+    /// (`SP1_GPU_ALLOC_CACHE_MB=0 SP1_GPU_SMALL_ALLOC_CACHE=0 SP1_GPU_ARENA=0`, so device memory
+    /// is mapped and unmapped all the time) and SP1_GKR_STRESS_PARAM=500000, about 1 run in 300
+    /// differed (see the arena in `lib/runtime/stream.cu`).
+    #[test]
+    #[ignore]
+    fn stress_logup_gkr_circuit_determinism() {
+        let env = |k: &str, d: usize| {
+            std::env::var(k).ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(d)
+        };
+        let iters = env("SP1_GKR_STRESS_ITERS", 100);
+        let param = env("SP1_GKR_STRESS_PARAM", 2_000_000);
+        let mut stdin = SP1Stdin::new();
+        let elf: &[u8] = match std::env::var("SP1_GKR_STRESS_ELF").as_deref() {
+            Ok("bigkeccak") => {
+                stdin.write_vec(vec![0u8; param]);
+                include_bytes!(
+                    "../../prover_components/programs/keccak/riscv64im-succinct-zkvm-elf"
+                )
+            }
+            _ => {
+                stdin.write(&param);
+                include_bytes!(
+                    "../../prover_components/programs/fibonacci/riscv64im-succinct-zkvm-elf"
+                )
+            }
+        };
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let (machine, record, program) = rt.block_on(tracegen_setup::setup(elf, stdin));
+        run_sync_in_place(|scope| {
+            let buffer = PinnedBuffer::<Felt>::with_capacity(CORE_MAX_TRACE_SIZE as usize);
+            let queue = Arc::new(WorkerQueue::new(vec![buffer]));
+            let buffer = rt.block_on(queue.pop()).unwrap();
+            let (_, jagged_trace_data, shard_chips, _permit) = rt.block_on(full_tracegen(
+                &machine,
+                program.clone(),
+                Arc::new(record),
+                &buffer,
+                CORE_MAX_TRACE_SIZE as usize,
+                LOG_STACKING_HEIGHT,
+                CORE_MAX_LOG_ROW_COUNT,
+                &scope,
+                ProverSemaphore::new(1),
+                true,
+            ));
+            let shard_chips = machine.smallest_cluster(&shard_chips).unwrap();
+            let mut all_interactions = BTreeMap::new();
+            for chip in shard_chips.iter() {
+                let interactions = Interactions::new(chip.sends(), chip.receives());
+                let device_interactions = interactions.copy_to_device(&scope).unwrap();
+                all_interactions.insert(chip.name().to_string(), Arc::new(device_interactions));
+            }
+            let mut rng = StdRng::seed_from_u64(7);
+            let alpha: Ext = rng.gen();
+            let max_arity = shard_chips
+                .iter()
+                .flat_map(|c| c.sends().iter().chain(c.receives().iter()))
+                .map(|i| i.values.len() + 1)
+                .max()
+                .unwrap();
+            let beta_dim = max_arity.next_power_of_two().ilog2();
+            let beta_seed = (0..beta_dim).map(|_| rng.gen::<Ext>()).collect::<Point<_>>();
+
+            // Each layer's values on the host: the first layer's numerator lifted to Ext.
+            type HostLayers = Vec<(Vec<Ext>, Vec<Ext>)>;
+            let layers_to_host =
+                |circuit: &crate::utils::LogUpCudaCircuit<'_, TaskScope>| -> HostLayers {
+                    circuit
+                        .materialized_layers
+                        .iter()
+                        .map(|l| unsafe {
+                            match l {
+                                GkrCircuitLayer::FirstLayer(f) => {
+                                    let mle = &f.jagged_mle;
+                                    (
+                                        mle.dense_data
+                                            .numerator
+                                            .storage
+                                            .copy_into_host_vec()
+                                            .into_iter()
+                                            .map(Ext::from)
+                                            .collect(),
+                                        mle.dense_data.denominator.storage.copy_into_host_vec(),
+                                    )
+                                }
+                                GkrCircuitLayer::Materialized(m) => (
+                                    m.jagged_mle.dense_data.layer.storage.copy_into_host_vec(),
+                                    Vec::new(),
+                                ),
+                                GkrCircuitLayer::FirstLayerVirtual(_) => (Vec::new(), Vec::new()),
+                            }
+                        })
+                        .collect()
+                };
+            let run = || {
+                crate::tracegen::generate_gkr_circuit(
+                    shard_chips,
+                    all_interactions.clone(),
+                    &jagged_trace_data,
+                    alpha,
+                    beta_seed.clone(),
+                    CudaLogUpGkrOptions {
+                        recompute_first_layer: false,
+                        num_row_variables: CORE_MAX_LOG_ROW_COUNT,
+                    },
+                    scope.clone(),
+                )
+            };
+            let output_to_host = |o: &DeviceLogUpGkrOutput<Ext>| {
+                (
+                    o.numerator.to_host().unwrap().guts().as_slice().to_vec(),
+                    o.denominator.to_host().unwrap().guts().as_slice().to_vec(),
+                )
+            };
+            let (ref_output, ref_circuit) = run();
+            let ref_out = output_to_host(&ref_output);
+            let ref_layers = layers_to_host(&ref_circuit);
+            drop((ref_output, ref_circuit));
+            eprintln!(
+                "determinism: {} layers, first layer {} + {} values",
+                ref_layers.len(),
+                ref_layers[0].0.len(),
+                ref_layers[0].1.len()
+            );
+            let mut failures = 0;
+            let now_us = || {
+                let d = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap();
+                format!("{}.{:06}", d.as_secs(), d.subsec_micros())
+            };
+            for i in 0..iters {
+                let started = now_us();
+                let (output, circuit) = run();
+                if output_to_host(&output) == ref_out {
+                    continue;
+                }
+                eprintln!("DETECT iter {i} started {started} detected {}", now_us());
+                failures += 1;
+                let layers = layers_to_host(&circuit);
+                let mut report = String::new();
+                for (k, (a, b)) in layers.iter().zip(ref_layers.iter()).enumerate() {
+                    let diff = |x: &Vec<Ext>, y: &Vec<Ext>| {
+                        let idx: Vec<usize> =
+                            (0..x.len().min(y.len())).filter(|&j| x[j] != y[j]).collect();
+                        let shown = idx
+                            .iter()
+                            .take(8)
+                            .map(|&j| {
+                                let raw: [u32; 4] = unsafe { std::mem::transmute(x[j]) };
+                                format!("{j}: got {} (raw {raw:08x?}) want {}", x[j], y[j])
+                            })
+                            .collect::<Vec<_>>();
+                        (idx.len(), shown)
+                    };
+                    let (n0, i0) = diff(&a.0, &b.0);
+                    let (n1, i1) = diff(&a.1, &b.1);
+                    if n0 + n1 > 0 {
+                        report += &format!(
+                            " layer {k} (len {}): {n0} diffs {i0:?}, {n1} diffs {i1:?};",
+                            a.0.len()
+                        );
+                    }
+                }
+                // Where else the first wrong value appears, in this run's and the reference's
+                // layers: a copy of another region rather than a miscomputed value.
+                for (k, (a, b)) in layers.iter().zip(ref_layers.iter()).enumerate() {
+                    if let Some(j) = (0..a.0.len().min(b.0.len())).find(|&j| a.0[j] != b.0[j]) {
+                        let v = a.0[j];
+                        for (kk, (ra, _)) in ref_layers.iter().enumerate() {
+                            let hits: Vec<usize> =
+                                (0..ra.len()).filter(|&x| ra[x] == v).take(4).collect();
+                            if !hits.is_empty() {
+                                report += &format!(" wrong value of layer {k}[{j}] found in ref layer {kk} at {hits:?};");
+                            }
+                        }
+                        for (kk, (la, _)) in layers.iter().enumerate() {
+                            let hits: Vec<usize> = (0..la.len())
+                                .filter(|&x| la[x] == v && !(kk == k && x == j))
+                                .take(4)
+                                .collect();
+                            if !hits.is_empty() {
+                                report += &format!(" ... and in this run's layer {kk} at {hits:?};");
+                            }
+                        }
+                        break;
+                    }
+                }
+                eprintln!(
+                    "DETERMINISM FAIL iter {i} at {}:{}",
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_secs(),
+                    if report.is_empty() { " only the output differs".to_string() } else { report }
+                );
+            }
+            eprintln!("DETERMINISM DONE: {iters} circuits, {failures} failures");
+            assert_eq!(failures, 0);
+        })
+        .unwrap();
+    }
+
+    /// Memory-ordering stress (not run by default), no GKR code: each round fills a fresh buffer
+    /// from the allocator with a byte that changes every round (a memset), sums it with the
+    /// reduction kernels, and checks the sum. A read of the buffer's previous contents changes
+    /// it. SP1_GKR_STRESS_ITERS rounds of SP1_MEM_STRESS_MIB (1024) MiB.
+    #[test]
+    #[ignore]
+    fn stress_memory_ordering() {
+        let env = |k: &str, d: usize| {
+            std::env::var(k).ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(d)
+        };
+        let iters = env("SP1_GKR_STRESS_ITERS", 1000);
+        let n = env("SP1_MEM_STRESS_MIB", 1024) << 18;
+        run_sync_in_place(|scope| {
+            let mut failures = 0;
+            for i in 0..iters {
+                // 0x01..=0x78 repeated is below the KoalaBear modulus, so a valid Montgomery value.
+                let b = 1 + (i % 120) as u8;
+                let mut t =
+                    slop_tensor::Tensor::<Felt, TaskScope>::with_sizes_in([1, n], scope.clone());
+                t.storage.write_bytes(b, n * 4).unwrap();
+                let sum = sp1_gpu_cudart::DeviceTensor::from_raw(t).sum_dim(1).to_host().unwrap();
+                let x: Felt =
+                    unsafe { std::mem::transmute::<u32, Felt>(u32::from_le_bytes([b; 4])) };
+                let want = x * Felt::from_canonical_usize(n);
+                if *sum[[0]] != want {
+                    failures += 1;
+                    eprintln!("MEMORY FAIL iter {i}: sum {} want {want}", *sum[[0]]);
+                }
+            }
+            eprintln!("MEMORY DONE: {iters} rounds, {failures} failures");
+            assert_eq!(failures, 0);
+        })
+        .unwrap();
+    }
 }
