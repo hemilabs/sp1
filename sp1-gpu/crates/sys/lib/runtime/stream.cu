@@ -202,9 +202,10 @@ static bool deviceHeadroom(size_t* headroom) {
 //
 // The first allocation reserves the card's free memory less SP1_GPU_ARENA_HEADROOM_MB (2048) for
 // the driver and kernel scratch, or SP1_GPU_ARENA_MB; a block that doesn't fit after the cached
-// blocks are returned grows it by another allocation. SP1_GPU_ARENA=0 turns it off, and it is off
-// with the GPU PLONK helper (SP1_PLONK_GPU) unless SP1_GPU_ARENA=1. The memory the arena holds free
-// counts as free for this process (cuda_mem_get_info), not for helper processes.
+// blocks are returned grows it by another allocation, reported on stderr. SP1_GPU_ARENA=0 turns it
+// off, and it is off with the GPU PLONK helper (SP1_PLONK_GPU) unless SP1_GPU_ARENA=1. The memory
+// the arena holds free counts as free for this process (cuda_mem_get_info), not for helper
+// processes.
 struct ArenaRange {
     size_t length;
     char* chunk;  // the allocation the range belongs to: ranges never merge across allocations
@@ -285,6 +286,24 @@ static bool arenaGrow(size_t size) {
     g_arena_chunks.emplace_back(static_cast<char*>(base), size);
     arenaRelease(static_cast<char*>(base), size, static_cast<char*>(base));
     return true;
+}
+
+// Reports a block the arena had no room for (the first 10, then every 100th), with the arena as it
+// was. Growing it maps device memory while proving, which the arena is there to avoid (see above),
+// and so does a separate allocation that succeeds: the report lets an invalid shard be matched to
+// one. (When the card has no memory left either, the Rust allocator frees its caches and tries
+// again.)
+static void arenaReportMiss(size_t s, size_t free_b, size_t largest, size_t grown) {
+    static size_t misses = 0;
+    if (++misses > 10 && misses % 100 != 0) return;
+    size_t total = 0;
+    for (auto& chunk : g_arena_chunks) total += chunk.second;
+    if (grown) total -= grown;
+    fprintf(stderr,
+            "sp1-gpu: no room in the device memory arena for a %zu MiB block (%zu of %zu MiB free, "
+            "at most %zu MiB in one range; miss %zu): %s %zu MiB\n",
+            s >> 20, free_b >> 20, total >> 20, largest >> 20, misses,
+            grown ? "grew it by" : "trying a separate allocation of", (grown ? grown : s) >> 20);
 }
 
 // Creates the arena on the first allocation (Linux; see above).
@@ -404,8 +423,13 @@ static hipError_t cachedHipMalloc(void** p, size_t s, hipStream_t stream) {
             releaseCachedBlocks();
             q = arenaTake(s);
         }
-        if (!q && arenaGrow(std::max(s, size_t(1) << 30))) {
-            q = arenaTake(s);
+        if (!q) {
+            const size_t free_b = g_arena_free_bytes;
+            const size_t largest = g_arena_by_len.empty() ? 0 : g_arena_by_len.rbegin()->first;
+            const size_t grow = std::max(s, size_t(1) << 30);
+            const bool grew = arenaGrow(grow);
+            arenaReportMiss(s, free_b, largest, grew ? grow : 0);
+            if (grew) q = arenaTake(s);
         }
         if (q) {
             *p = q;
