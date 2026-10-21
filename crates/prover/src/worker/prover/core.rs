@@ -19,7 +19,7 @@ use sp1_core_machine::riscv::RiscvAir;
 use sp1_hypercube::{
     air::MachineAir,
     prover::{shape_from_record, CoreProofShape, ProverSemaphore, ProvingKey},
-    InnerSC, Machine, MachineProof, MachineVerifier, SP1VerifyingKey,
+    InnerSC, Machine, MachineProof, MachineVerifier, MachineVerifyingKey, SP1VerifyingKey,
 };
 use sp1_jit::TraceChunk;
 use sp1_primitives::{SP1Field, SP1GlobalContext};
@@ -697,19 +697,23 @@ where
             (None, Some(per_proof)) => Some(per_proof.get_or_insert(&pk_key)),
             (None, None) => None,
         };
+        // The per-proof cache and the cell this shard uses, to drop the key if the shard's proof
+        // fails verification.
+        let per_proof_pk = match (&self.pk, &self.pk_by_elf, &pk_cache) {
+            (None, Some(per_proof), Some(cell)) => Some((per_proof.clone(), cell.clone())),
+            _ => None,
+        };
         let (proof, permit) = if let Some(pk_cache) = &pk_cache {
             // We have a fixed PK cache - use get_or_init to ensure only one worker does setup
             let pk = pk_cache
-                .get_or_init(|| async {
+                .get_or_try_init(|| async {
                     tracing::info!("Initializing fixed PK cache");
-                    let (pk, _vk) = self
-                        .core_prover
-                        .setup(program.clone(), permits.clone())
+                    checked_core_setup::<C>(&self.core_prover, program.clone(), permits.clone())
                         .instrument(tracing::debug_span!("core setup"))
-                        .await;
-                    pk
+                        .await
+                        .map(|(pk, _)| pk)
                 })
-                .await;
+                .await?;
 
             tracing::debug!("Using fixed PK");
             self.core_prover
@@ -781,13 +785,17 @@ where
             // A verification failure takes precedence (it is retryable, and it explains a
             // normalize failure caused by a bad shard proof).
             if let Some(handle) = verify_handle {
-                handle.await.map_err(|e| TaskError::Fatal(e.into()))??;
+                let verified = handle.await.map_err(|e| TaskError::Fatal(e.into()))?;
+                forget_pk_if_failed::<C>(&verified, per_proof_pk.as_ref(), &pk_key);
+                verified?;
             }
             normalize_result?;
         } else {
             // Core mode: the shard proof is the output, so verify it before uploading.
             if let Some(handle) = verify_handle {
-                handle.await.map_err(|e| TaskError::Fatal(e.into()))??;
+                let verified = handle.await.map_err(|e| TaskError::Fatal(e.into()))?;
+                forget_pk_if_failed::<C>(&verified, per_proof_pk.as_ref(), &pk_key);
+                verified?;
             }
             // Upload the proof
             self.artifact_client.upload(&output, proof).await?;
@@ -831,6 +839,74 @@ pub type CoreProvingKey<C> =
 /// The Core Proving Key cache is initialized once and shared across all CoreAndNormalizeWorkers.
 pub type CoreProvingKeyCache<C> = Arc<OnceCell<Arc<CoreProvingKey<C>>>>;
 
+/// Drops a shard's cached proving key when the shard's proof failed verification, so the retry
+/// sets it up again instead of proving with the same key: a key whose data went wrong on the
+/// device would otherwise fail every retry, and every later shard of the proof.
+fn forget_pk_if_failed<C: SP1ProverComponents>(
+    verified: &Result<(), TaskError>,
+    per_proof_pk: Option<&(Arc<PerProofProvingKeyCache<C>>, CoreProvingKeyCache<C>)>,
+    pk_key: &str,
+) {
+    if let (Err(_), Some((cache, cell))) = (verified, per_proof_pk) {
+        tracing::warn!("dropping the cached core proving key after a failed shard verification");
+        cache.invalidate(pk_key, cell);
+    }
+}
+
+/// How many core setups must agree on the verifying key before a proof uses it
+/// (`SP1_CORE_SETUP_CHECKS`, default 2; 1 sets up once).
+fn core_setup_checks() -> usize {
+    static CHECKS: OnceLock<usize> = OnceLock::new();
+    *CHECKS.get_or_init(|| {
+        std::env::var("SP1_CORE_SETUP_CHECKS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(2)
+            .max(1)
+    })
+}
+
+/// Sets the program up until [`core_setup_checks`] setups agree on the verifying key, and returns
+/// the first of them (with at most four extra setups).
+///
+/// The proof's shards are proved with this key and verified against its vk, so a setup that went
+/// wrong on the device (a GPU fault, a driver bug) would give a wrong key that every shard still
+/// verifies with, and a proof only a verifier holding the program's real vk would reject. Two
+/// independent setups agreeing rules that out; a setup costs tens to hundreds of milliseconds.
+async fn checked_core_setup<C: SP1ProverComponents>(
+    core_prover: &C::CoreProver,
+    program: Arc<Program>,
+    permits: ProverSemaphore,
+) -> Result<(Arc<CoreProvingKey<C>>, MachineVerifyingKey<SP1GlobalContext>), TaskError> {
+    let needed = core_setup_checks();
+    let mut setups: Vec<(Arc<CoreProvingKey<C>>, MachineVerifyingKey<SP1GlobalContext>, usize)> =
+        Vec::new();
+    for _ in 0..needed + 4 {
+        let (pk, vk) = core_prover.setup(program.clone(), permits.clone()).await;
+        let index = match setups.iter().position(|(_, seen, _)| *seen == vk) {
+            Some(index) => {
+                setups[index].2 += 1;
+                index
+            }
+            None => {
+                if !setups.is_empty() {
+                    tracing::warn!("a core setup gave a different verifying key: setting up again");
+                }
+                setups.push((pk, vk, 1));
+                setups.len() - 1
+            }
+        };
+        if setups[index].2 >= needed {
+            let (pk, vk, _) = setups.swap_remove(index);
+            return Ok((pk, vk));
+        }
+    }
+    Err(TaskError::Retryable(anyhow!(
+        "no {needed} of {} core setups agreed on the verifying key",
+        needed + 4
+    )))
+}
+
 /// Core proving keys of the proofs in flight, keyed by the ELF artifact id (which is fresh for
 /// every proof), so the preprocessed setup runs once per proof instead of once per shard.
 pub type PerProofProvingKeyCache<C> = PerProofCache<Arc<CoreProvingKey<C>>>;
@@ -863,6 +939,14 @@ impl<V: Send + Sync + 'static> PerProofCache<V> {
     fn get(&self, elf: &str) -> Option<Arc<OnceCell<V>>> {
         let entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
         entries.iter().find(|(key, _)| key == elf).map(|(_, cell)| cell.clone())
+    }
+
+    /// Drops this ELF's entry if it is still `cell`, so the next task sets it up again.
+    fn invalidate(&self, elf: &str, cell: &Arc<OnceCell<V>>) {
+        self.entries
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|(key, c)| !(key == elf && Arc::ptr_eq(c, cell)));
     }
 
     /// The cache cell for this ELF, inserting an empty one if needed.
@@ -1009,14 +1093,16 @@ impl<A: ArtifactClient, C: SP1ProverComponents>
             // The proof's core shards use this proving key (or this task uses theirs, if one of
             // them got there first): the same setup either way.
             let pk = cell
-                .get_or_init(|| async {
+                .get_or_try_init(|| async {
                     tracing::debug!("keeping the core proving key for the proof's shards");
-                    self.core_prover.setup(program, permits).await.0
+                    checked_core_setup::<C>(&self.core_prover, program, permits)
+                        .await
+                        .map(|(pk, _)| pk)
                 })
-                .await;
+                .await?;
             pk.vk.clone()
         } else {
-            self.core_prover.setup(program, permits).await.1
+            checked_core_setup::<C>(&self.core_prover, program, permits).await?.1
         };
         tracing::debug!("setup completed for task {}", id);
 
