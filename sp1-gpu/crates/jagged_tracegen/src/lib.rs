@@ -255,7 +255,10 @@ type HostTraceRef = (String, usize, usize, usize);
 /// One shard uploads at a time, and the next one starts once this one's traces are in place, so
 /// the extra device memory is at most one shard's host traces. The prefetch is skipped for a
 /// shard whose host traces exceed `SP1_GPU_TRACE_PREFETCH_MIB` (default 4096 on CUDA cards with
-/// more than 24 GiB, else 0; `0` disables the prefetch). It is off by default on HIP and SYCL:
+/// more than 24 GiB off Windows, else 0; `0` disables the prefetch). On Windows CUDA it spilled
+/// too: on an RTX 5090 most proofs of a 1.44B-cycle program took 35-69 s instead of ~8.7 s, the
+/// memory pool's reserve (outside this limit) pushing the card past its memory, and with it
+/// 144M-cycle proofs were no faster. It is off by default on HIP and SYCL:
 /// their device memory caches hold freed blocks this limit doesn't see, and on an Arc Pro B70
 /// (32 GB, Windows) a third of compressed proofs then spilled to shared system memory (4.3 s ->
 /// 10-26 s), with an occasional device loss, while proofs that didn't spill were no faster than
@@ -278,7 +281,11 @@ impl TracePrefetcher {
         let env_mib = |name: &str| std::env::var(name).ok().and_then(|v| v.parse::<usize>().ok());
         let (free, total) = sp1_gpu_cudart::cuda_memory_info().ok()?;
         let max_mib = env_mib("SP1_GPU_TRACE_PREFETCH_MIB").unwrap_or(
-            if sp1_gpu_cudart::sys::BACKEND == "cuda" && total > 24 << 30 { 4096 } else { 0 },
+            if sp1_gpu_cudart::sys::BACKEND == "cuda" && !cfg!(windows) && total > 24 << 30 {
+                4096
+            } else {
+                0
+            },
         );
         if max_mib == 0 {
             return None;
