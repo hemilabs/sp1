@@ -54,14 +54,18 @@ fn init() {
                 }
             }
             if handle.is_null() {
-                eprintln!("[profile] SP1_GPU_PROFILE=1 but libroctx64 not loadable; markers disabled");
+                eprintln!(
+                    "[profile] SP1_GPU_PROFILE=1 but libroctx64 not loadable; markers disabled"
+                );
                 return;
             }
             let push = dlsym(handle, b"roctxRangePushA\0".as_ptr() as *const c_char);
             let pop = dlsym(handle, b"roctxRangePop\0".as_ptr() as *const c_char);
             let mark = dlsym(handle, b"roctxMarkA\0".as_ptr() as *const c_char);
             if push.is_null() || pop.is_null() {
-                eprintln!("[profile] libroctx64 loaded but roctxRangePushA/Pop missing; markers disabled");
+                eprintln!(
+                    "[profile] libroctx64 loaded but roctxRangePushA/Pop missing; markers disabled"
+                );
                 return;
             }
             PUSH_FN.store(push as *mut (), Ordering::Release);

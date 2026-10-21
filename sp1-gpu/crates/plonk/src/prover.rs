@@ -1022,9 +1022,7 @@ impl PlonkProver {
                 let msg = if err.message.is_null() {
                     "unknown error".to_string()
                 } else {
-                    unsafe { std::ffi::CStr::from_ptr(err.message) }
-                        .to_string_lossy()
-                        .into_owned()
+                    unsafe { std::ffi::CStr::from_ptr(err.message) }.to_string_lossy().into_owned()
                 };
                 panic!("GPU grand product kernel failed: {msg}");
             }
@@ -2668,8 +2666,7 @@ impl PlonkProver {
         // saving the 4 GiB host upload that re-uploads h_coeffs from CPU).
         // Otherwise drop immediately to free ~4 GiB before R4 finishes.
         #[cfg(feature = "cuda")]
-        let r5_gpu_keep_d_h =
-            std::env::var("SP1_PLONK_R5_GPU").ok().as_deref() == Some("1");
+        let r5_gpu_keep_d_h = std::env::var("SP1_PLONK_R5_GPU").ok().as_deref() == Some("1");
         #[cfg(feature = "cuda")]
         let d_h_for_r5: Option<crate::domain::gpu_ntt::DeviceBuffer> = if r5_gpu_keep_d_h {
             d_h_coeffs
@@ -3172,8 +3169,8 @@ impl PlonkProver {
                     };
                     gpu_polys.push(match d_h_base_ptr {
                         Some(base) => {
-                            let ptr = (base + offset_polys * stride_bytes)
-                                as *const std::ffi::c_void;
+                            let ptr =
+                                (base + offset_polys * stride_bytes) as *const std::ffi::c_void;
                             PolyInput::Device { ptr, len: n + 2 }
                         }
                         None => PolyInput::Host(host_fallback),
@@ -3185,8 +3182,7 @@ impl PlonkProver {
                 gpu_polys.push(PolyInput::Host(&l_coeffs));
                 gpu_polys.push(PolyInput::Host(&r_coeffs));
                 gpu_polys.push(PolyInput::Host(&o_coeffs));
-                let s12_slots: [(CS, &[Fr]); 2] =
-                    [(CS::S1, s1_coeffs), (CS::S2, s2_coeffs)];
+                let s12_slots: [(CS, &[Fr]); 2] = [(CS::S1, s1_coeffs), (CS::S2, s2_coeffs)];
                 for (slot, fallback) in s12_slots.iter() {
                     gpu_polys.push(match self.canonical_cache.get(*slot) {
                         Some((ptr, len)) => PolyInput::Device { ptr, len },
@@ -3200,10 +3196,8 @@ impl PlonkProver {
                     });
                 }
                 debug_assert_eq!(gpu_polys.len(), fused_polys.len());
-                let n_device = gpu_polys
-                    .iter()
-                    .filter(|p| matches!(p, PolyInput::Device { .. }))
-                    .count();
+                let n_device =
+                    gpu_polys.iter().filter(|p| matches!(p, PolyInput::Device { .. })).count();
                 gpu_linear_combination_mixed(&mut result, &gpu_polys, &fused_scalars);
                 eprintln!(
                     "[T] 10a. GPU R5 lincomb (mixed; {n_device}/{} device-resident): {:?}",
@@ -4904,9 +4898,8 @@ impl PlonkProver {
         // the multi-invoke leak that wedges PlonkProver server-mode.
         if pin_err == unsafe { sp1_gpu_sys::runtime::CUDA_SUCCESS_CSL } {
             unsafe {
-                let _ = sp1_gpu_sys::runtime::cuda_host_unregister(
-                    h_coeffs.as_ptr() as *const c_void,
-                );
+                let _ =
+                    sp1_gpu_sys::runtime::cuda_host_unregister(h_coeffs.as_ptr() as *const c_void);
             }
         }
         eprintln!("[T] 7c. D2H download: {:?}", _t_d2h.elapsed());
@@ -5405,11 +5398,7 @@ pub(crate) enum PolyInput<'a> {
 }
 
 #[cfg(feature = "cuda")]
-fn gpu_linear_combination_mixed(
-    result: &mut [Fr],
-    polys: &[PolyInput<'_>],
-    scalars: &[Fr],
-) {
+fn gpu_linear_combination_mixed(result: &mut [Fr], polys: &[PolyInput<'_>], scalars: &[Fr]) {
     use std::ffi::c_void;
     assert_eq!(polys.len(), scalars.len());
     let n_polys = polys.len() as u32;
@@ -5430,8 +5419,7 @@ fn gpu_linear_combination_mixed(
             PolyInput::Host(slice) => {
                 let bytes = slice.len() * elem_sz;
                 let mut ptr: *mut c_void = std::ptr::null_mut();
-                let err =
-                    unsafe { sp1_gpu_sys::runtime::cuda_malloc(&mut ptr as *mut _, bytes) };
+                let err = unsafe { sp1_gpu_sys::runtime::cuda_malloc(&mut ptr as *mut _, bytes) };
                 if err != unsafe { sp1_gpu_sys::runtime::CUDA_SUCCESS_CSL } {
                     panic!("gpu_linear_combination_mixed: cuda_malloc failed");
                 }
