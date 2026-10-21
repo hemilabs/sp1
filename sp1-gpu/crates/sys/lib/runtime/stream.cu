@@ -64,10 +64,12 @@ typedef void* nvtxDomainHandle_t;
 #include <windows.h>
 #include <dxgi1_4.h>
 #endif
+#include <cstdio>
 #include <cstring>
 #include <unordered_map>
 #include <map>
 #include <vector>
+#include <algorithm>
 #include <cstdlib>
 #include <mutex>
 
@@ -183,13 +185,172 @@ static bool deviceHeadroom(size_t* headroom) {
     return true;
 }
 
+// The device memory arena (Linux): the cache below carves its blocks out of a few large
+// allocations, best fit, and merges freed ranges back, instead of calling hipMalloc and hipFree.
+// While proving, no device memory is then mapped or unmapped, except when the arena has to grow.
+//
+// On a Radeon RX 9070 XT (gfx1201, kernel 7.0, ROCm 7.2.4, MES firmware 0x81), mapping and
+// unmapping device memory while kernels run corrupts other memory now and then: with this cache
+// off (every block a new hipMalloc, every free a hipFree), about 1 in 300 rebuilds of a shard's
+// LogUp-GKR circuit came out with a few 32-128-byte chunks wrong, and some runs page-faulted on
+// mapped memory. Waiting for the device before or after each hipMalloc, writing each new block,
+// or serializing every kernel didn't help; with the same allocation churn inside an arena, 12000
+// rebuilds were all right. An Arc Pro B70 is clean either way. The matching amdgpu issues are
+// stale GPU TLB entries after mapping changes on gfx12, fixed in later kernels and MES firmware.
+// With the cache warm the prover rarely maps memory, but it still does when shards change shape
+// on a card whose memory is tight, and invalid shards turned up there about once in 30 proofs.
+//
+// The first allocation reserves the card's free memory less SP1_GPU_ARENA_HEADROOM_MB (2048) for
+// the driver and kernel scratch, or SP1_GPU_ARENA_MB; a block that doesn't fit after the cached
+// blocks are returned grows it by another allocation. SP1_GPU_ARENA=0 turns it off, and it is off
+// with the GPU PLONK helper (SP1_PLONK_GPU) unless SP1_GPU_ARENA=1. The memory the arena holds free
+// counts as free for this process (cuda_mem_get_info), not for helper processes.
+struct ArenaRange {
+    size_t length;
+    char* chunk;  // the allocation the range belongs to: ranges never merge across allocations
+};
+static std::vector<std::pair<char*, size_t>> g_arena_chunks;
+static std::map<char*, ArenaRange> g_arena_free;     // free ranges by address
+static std::multimap<size_t, char*> g_arena_by_len;  // free ranges by length
+static size_t g_arena_free_bytes = 0;
+static bool g_arena_on = false;
+
+static void arenaEraseLength(size_t length, char* at) {
+    auto range = g_arena_by_len.equal_range(length);
+    for (auto it = range.first; it != range.second; ++it) {
+        if (it->second == at) {
+            g_arena_by_len.erase(it);
+            return;
+        }
+    }
+}
+
+// Returns [at, at + length) of `chunk` to the free ranges, merged with free neighbours.
+static void arenaRelease(char* at, size_t length, char* chunk) {
+    g_arena_free_bytes += length;
+    auto next = g_arena_free.lower_bound(at);
+    if (next != g_arena_free.begin()) {
+        auto prev = std::prev(next);
+        if (prev->second.chunk == chunk && prev->first + prev->second.length == at) {
+            at = prev->first;
+            length += prev->second.length;
+            arenaEraseLength(prev->second.length, prev->first);
+            g_arena_free.erase(prev);
+        }
+    }
+    if (next != g_arena_free.end() && next->second.chunk == chunk && at + length == next->first) {
+        length += next->second.length;
+        arenaEraseLength(next->second.length, next->first);
+        g_arena_free.erase(next);
+    }
+    g_arena_free[at] = ArenaRange{length, chunk};
+    g_arena_by_len.emplace(length, at);
+}
+
+// The chunk `p` lies in, or null.
+static char* arenaChunkOf(const void* p) {
+    for (auto& [base, size] : g_arena_chunks) {
+        if (p >= base && p < base + size) return base;
+    }
+    return nullptr;
+}
+
+// The smallest free range that fits `s` bytes (a multiple of 4 KiB), or null.
+static void* arenaTake(size_t s) {
+    auto it = g_arena_by_len.lower_bound(s);
+    if (it == g_arena_by_len.end()) return nullptr;
+    const size_t length = it->first;
+    char* at = it->second;
+    char* chunk = g_arena_free[at].chunk;
+    g_arena_by_len.erase(it);
+    g_arena_free.erase(at);
+    g_arena_free_bytes -= length;
+    if (length > s) arenaRelease(at + s, length - s, chunk);
+    return at;
+}
+
+// Adds an allocation of `size` bytes to the arena, with the device idle, then written once and
+// waited for before any block of it is handed out. A growth is still a mapping change (see above),
+// which is why the first allocation takes nearly all of the card's free memory. False if the
+// driver has no memory for it.
+static bool arenaGrow(size_t size) {
+    hipDeviceSynchronize();
+    void* base = nullptr;
+    if (hipMalloc(&base, size) != hipSuccess) {
+        (void)hipGetLastError();
+        return false;
+    }
+    hipMemset(base, 0, size);
+    hipDeviceSynchronize();
+    g_arena_chunks.emplace_back(static_cast<char*>(base), size);
+    arenaRelease(static_cast<char*>(base), size, static_cast<char*>(base));
+    return true;
+}
+
+// Creates the arena on the first allocation (Linux; see above).
+static void arenaInit() {
+    static bool tried = false;
+    if (tried) return;
+    tried = true;
+#ifdef _WIN32
+    return;
+#endif
+    const char* on = std::getenv("SP1_GPU_ARENA");
+    if (on && std::strcmp(on, "0") == 0) return;
+    // The GPU PLONK helper (SP1_PLONK_GPU) is another process that needs most of the card, which
+    // the arena would hold.
+    const char* plonk_gpu = std::getenv("SP1_PLONK_GPU");
+    if (!on && plonk_gpu && (std::strcmp(plonk_gpu, "1") == 0 || std::strcmp(plonk_gpu, "true") == 0)) {
+        return;
+    }
+    size_t want = envMib("SP1_GPU_ARENA_MB", 0);
+    if (want == 0) {
+        size_t free_b = 0, total_b = 0;
+        if (hipMemGetInfo(&free_b, &total_b) != hipSuccess) {
+            (void)hipGetLastError();
+            return;
+        }
+        const size_t headroom = envMib("SP1_GPU_ARENA_HEADROOM_MB", 2048ULL << 20);
+        if (free_b < headroom + (size_t(1) << 30)) return;
+        want = (free_b - headroom) & ~((size_t(2) << 20) - 1);
+    }
+    g_arena_on = arenaGrow(want);
+    if (!g_arena_on) fprintf(stderr, "sp1-gpu: no %zu MiB device memory arena\n", want >> 20);
+}
+
+// Frees a block of `size` bytes: back to the arena if it came from there, else to the driver.
+static void rawFree(void* p, size_t size) {
+    if (char* chunk = arenaChunkOf(p)) {
+        arenaRelease(static_cast<char*>(p), size, chunk);
+    } else {
+        hipFree(p);
+    }
+}
+
+// Gives the arena's allocations that are entirely free back to the driver. The caller holds
+// g_alloc_mutex and has waited for the device.
+static void arenaShrink() {
+    for (size_t i = g_arena_chunks.size(); i-- > 0;) {
+        auto [base, size] = g_arena_chunks[i];
+        auto it = g_arena_free.find(base);
+        if (it == g_arena_free.end() || it->second.length != size) continue;
+        arenaEraseLength(size, base);
+        g_arena_free.erase(it);
+        g_arena_free_bytes -= size;
+        hipFree(base);
+        g_arena_chunks.erase(g_arena_chunks.begin() + i);
+    }
+    // Re-created by the next allocation.
+    if (g_arena_chunks.empty()) g_arena_on = false;
+}
+
 // Wait for the device, then free every cached block. The caller holds g_alloc_mutex.
 static void releaseCachedBlocks() {
     sp1prof::HostTimer timer("host: release cached blocks (wait + free)");
     hipDeviceSynchronize();
     for (auto& [sz, blocks] : g_free_pool) {
         for (auto& block : blocks) {
-            hipFree(block.ptr);
+            rawFree(block.ptr, sz);
             g_alloc_sizes.erase(block.ptr);
             g_spare_events.push_back(block.freed);
         }
@@ -214,7 +375,7 @@ static void evictUntilFits(size_t need, size_t headroom) {
         const size_t size = it->first;
         if (it->second.empty()) g_free_pool.erase(it);
         hipEventSynchronize(block.freed);
-        hipFree(block.ptr);
+        rawFree(block.ptr, size);
         g_alloc_sizes.erase(block.ptr);
         g_spare_events.push_back(block.freed);
         g_cached_bytes -= size;
@@ -251,11 +412,29 @@ static hipError_t cachedHipMalloc(void** p, size_t s, hipStream_t stream) {
         }
         break; // lower_bound found nothing in range
     }
+    // From the arena, if there is one: when it can't fit the block, the cached blocks go back to
+    // it (once the device is idle), and then it grows by an allocation of at least 1 GiB.
+    arenaInit();
+    if (g_arena_on) {
+        void* q = arenaTake(s);
+        if (!q && g_cached_bytes > 0) {
+            releaseCachedBlocks();
+            q = arenaTake(s);
+        }
+        if (!q && arenaGrow(std::max(s, size_t(1) << 30))) {
+            q = arenaTake(s);
+        }
+        if (q) {
+            *p = q;
+            g_alloc_sizes[q] = s;
+            return hipSuccess;
+        }
+    }
     // On Windows an allocation beyond the card's free memory doesn't fail: the driver backs it
     // with shared system memory, which is much slower. So give the cached blocks back before an
     // allocation that would not fit, rather than only after a failed one.
     // Allocations under 16 MiB skip this: the margin covers them.
-    if (g_cached_bytes > 0 && s >= (size_t(16) << 20)) {
+    if (!g_arena_on && g_cached_bytes > 0 && s >= (size_t(16) << 20)) {
         size_t headroom = 0;
         if (deviceHeadroom(&headroom) && s + FIT_MARGIN_BYTES > headroom) {
             // A cached block of any larger size serves the allocation without the device memory
@@ -316,9 +495,15 @@ static hipError_t cachedHipFree(void* p, hipStream_t stream) {
             return hipSuccess;
         }
         g_alloc_sizes.erase(it);
+        // Not cached: let the work queued on the freeing stream, which may still use the block,
+        // finish before the block goes back to the arena or the driver.
+        sp1prof::HostTimer timer("host: uncached free (wait + free)");
+        hipError_t err = hipStreamSynchronize(stream);
+        if (err != hipSuccess) return err;
+        rawFree(p, s);
+        return hipSuccess;
     }
-    // Not cached: let the work queued on the freeing stream, which may still use the block,
-    // finish before the block goes back to the driver.
+    // Not from this allocator.
     sp1prof::HostTimer timer("host: uncached free (wait + free)");
     hipError_t err = hipStreamSynchronize(stream);
     if (err != hipSuccess) return err;
@@ -335,6 +520,17 @@ extern "C" void cuda_release_cached_memory() {
 #ifdef __HIPCC__
     std::lock_guard<std::mutex> lock(g_alloc_mutex);
     releaseCachedBlocks();
+    arenaShrink();
+#endif
+}
+
+// The device memory the arena still has free (HIP), which `cuda_mem_get_info` counts as free.
+extern "C" size_t sp1_hip_arena_free_bytes() {
+#ifdef __HIPCC__
+    std::lock_guard<std::mutex> lock(g_alloc_mutex);
+    return g_arena_free_bytes;
+#else
+    return 0;
 #endif
 }
 

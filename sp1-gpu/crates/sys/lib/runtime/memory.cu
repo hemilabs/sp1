@@ -136,8 +136,12 @@ extern "C" rustCudaError_t cuda_host_unregister(void* hostPtr) {
     return CUDA_SUCCESS_CSL;
 }
 
+extern "C" size_t sp1_hip_arena_free_bytes();
+
 extern "C" rustCudaError_t cuda_mem_get_info(size_t* free, size_t* total) {
     CUDA_OK(cudaMemGetInfo(free, total));
+    // The HIP allocator's arena (runtime/stream.cu) holds memory it can still hand out.
+    *free += sp1_hip_arena_free_bytes();
     return CUDA_SUCCESS_CSL;
 }
 

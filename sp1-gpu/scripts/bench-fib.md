@@ -112,6 +112,12 @@ binary in the directory.
   killing the `docker` client leaves the proof running.
 - The GPU Groth16 prover runs in process; `bench-fib.sh` takes a directory whose `node` is a
   script that runs the real one in the container.
+- Device memory comes from an arena that takes the card's free memory less 2 GB at the first
+  allocation (`SP1_GPU_ARENA=0` turns it off, `SP1_GPU_ARENA_MB` and
+  `SP1_GPU_ARENA_HEADROOM_MB` size it; off with `SP1_PLONK_GPU=1`). On an RX 9070 XT with kernel
+  7.0, ROCm 7.2.4 and MES firmware 0x81, mapping device memory while proving corrupted results now
+  and then (invalid shards, retried); with the arena nothing is mapped while proving, and proofs
+  are 1.5-5% faster. GPU memory use then reads about 14 GB from the first proof on.
 
 ### Intel (SYCL, Linux)
 
