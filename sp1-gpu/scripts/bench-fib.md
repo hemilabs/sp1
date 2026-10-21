@@ -58,6 +58,24 @@ binary in the directory.
 
   Without it the wrap silently uses gnark's CPU prover. It is chosen on cards of 32 GB or more.
 
+### NVIDIA (CUDA, Windows)
+
+- CUDA 12.8 (the version tested), plus the MSVC, LLVM, `protoc` and Go setup of the AMD section
+  below.
+- `groth16_gpu_helper.exe` next to `node.exe`, built as above.
+- The helper solves the witness on the GPU with `r1cs_solve_plan.exe` next to `node.exe` (else
+  gnark solves it on the CPU, ~3.5 s more per proof on an RTX 5090). It is a Go program that
+  needs cgo:
+
+  ```bash
+  cd crates/recursion/gnark-ffi/go
+  CGO_ENABLED=1 CC=<path>/x86_64-w64-mingw32-clang.exe \
+      go build -o ../../../../bench/main/r1cs_solve_plan.exe ./sp1/r1cs_solve_plan
+  ```
+
+  The first Groth16 proof then prepares its circuit data (about 35 s, cached in the temp
+  directory).
+
 ### AMD (HIP, Windows)
 
 - The AMD HIP SDK (ROCm 7.2) at `HIP_PATH`, Visual Studio 2022 Build Tools (MSVC and its
