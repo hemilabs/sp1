@@ -173,6 +173,10 @@ impl LocalWorkerClient {
             }
             *count += 1;
         }
+        // The GPU prover caches programs' setups (vk, commitment, preprocessed traces) before
+        // anything checks them: a retry must set the program up again, not get a setup that went
+        // wrong on the device back from the cache.
+        tokio::task::spawn_blocking(sp1_recursion_gnark_ffi::device_caches::release).await?;
         self.retry_task(task_id.clone(), kind, task).await.map(|()| Some(task_id))
     }
 

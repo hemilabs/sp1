@@ -347,7 +347,7 @@ impl<A: ArtifactClient, C: SP1ProverComponents> RecursionProverWorker<A, C> {
             RecursionKeys::Program(program) => {
                 let (vk, proof, permit) = self
                     .recursion_prover
-                    .setup_and_prove_shard(program, record, None, self.permits.clone())
+                    .setup_and_prove_shard(program.clone(), record, None, self.permits.clone())
                     .await;
                 let duration = permit.release();
                 metrics.increment_permit_time(duration);
@@ -369,8 +369,14 @@ impl<A: ArtifactClient, C: SP1ProverComponents> RecursionProverWorker<A, C> {
                     .await
                     .map_err(|e| TaskError::Fatal(e.into()))??;
                 }
-                let vk_merkle_proof =
-                    retry_if_fresh_vk_not_allowed(self.prover_data.recursion_vks.open(&vk))?.1;
+                let vk_merkle_proof = open_fresh_vk::<C>(
+                    &self.prover_data.recursion_vks,
+                    &self.recursion_prover,
+                    program,
+                    self.permits.clone(),
+                    &vk,
+                )
+                .await?;
                 SP1RecursionProof { vk, proof, vk_merkle_proof }
             }
         };
@@ -1317,34 +1323,66 @@ fn dummy_compose_input<C: SP1ProverComponents>(
 
 /// Runs `setup` (a recursion program's setup on the GPU) until its vk is in the vk map, at most four
 /// times, for keys set up once and used by every proof of the process. Without vk verification
-/// there is nothing to check against, and the first setup is kept. If no setup's vk is allowed, the
-/// last one is kept and the proofs that use it fail their vk checks.
+/// there is nothing to check against, and the first setup is kept.
+///
+/// # Panics
+///
+/// If no setup's vk is allowed: the device keeps setting the program up wrong, or the vk map does
+/// not match this build, and every proof that uses the key would fail its vk check.
 fn setup_until_allowed<K>(
     recursion_vks: &RecursionVks,
     setup: impl Fn() -> (K, MachineVerifyingKey<SP1GlobalContext>),
 ) -> (K, MachineVerifyingKey<SP1GlobalContext>) {
-    let mut keys = setup();
-    for _ in 0..3 {
+    const SETUPS: usize = 4;
+    for attempt in 1..=SETUPS {
+        let keys = setup();
         if !recursion_vks.vk_verification() || recursion_vks.open(&keys.1).is_ok() {
-            break;
+            return keys;
         }
         tracing::warn!(
-            "a recursion program's setup gave a vk outside the vk map: setting up again"
+            "a recursion program's setup gave a vk outside the vk map (setup {attempt} of \
+             {SETUPS})"
         );
-        keys = setup();
+        // The keys go before the next setup: they hold a prover permit, which that setup may need
+        // (the shrink setup takes one from the provers' shared pool).
+        drop(keys);
     }
-    keys
+    panic!(
+        "a recursion program's setup gave a vk outside the vk map {SETUPS} times: the device sets \
+         it up wrong, or the vk map does not match this build"
+    );
 }
 
-/// The vk-map lookup of a vk that a setup just computed on the GPU. A vk outside the allowed set
-/// then fails the task as retryable: the setup may have gone wrong on the device, and the retry
-/// sets the program up again (persistent configuration errors still fail once the retries run
-/// out).
-fn retry_if_fresh_vk_not_allowed<T>(opened: Result<T, TaskError>) -> Result<T, TaskError> {
-    opened.map_err(|e| match e {
-        TaskError::Fatal(e) => TaskError::Retryable(e.context("vk of a setup just run on the GPU")),
-        e => e,
-    })
+/// The vk-map lookup of `vk`, which a setup of `program` just computed on the GPU. A vk outside
+/// the vk map fails the task. Where setting the program up again gives the same vk, it is the
+/// program's own vk, which the vk map does not have, and no retry can change that: the task fails
+/// at once. Otherwise the first setup went wrong on the device and the task is retried, with the
+/// device caches emptied first, so that the retry sets the program up again rather than getting
+/// the cached setup back.
+async fn open_fresh_vk<C: SP1ProverComponents>(
+    recursion_vks: &RecursionVks,
+    prover: &C::RecursionProver,
+    program: Arc<RecursionProgram<SP1Field>>,
+    permits: ProverSemaphore,
+    vk: &MachineVerifyingKey<SP1GlobalContext>,
+) -> Result<MerkleProof<SP1GlobalContext>, TaskError> {
+    let e = match recursion_vks.open(vk) {
+        Ok((_, vk_merkle_proof)) => return Ok(vk_merkle_proof),
+        Err(TaskError::Fatal(e)) => e,
+        Err(e) => return Err(e),
+    };
+    tokio::task::spawn_blocking(sp1_recursion_gnark_ffi::device_caches::release)
+        .await
+        .map_err(|e| TaskError::Fatal(e.into()))?;
+    let (_keys, again) = prover.setup(program, permits).await;
+    if again.hash_koalabear() == vk.hash_koalabear() {
+        return Err(TaskError::Fatal(e.context("vk of a setup run twice on the GPU")));
+    }
+    tracing::warn!(
+        "a recursion program's setup on the GPU gave a vk outside the vk map, and setting it up \
+         again gave another vk: retrying the task"
+    );
+    Err(TaskError::Retryable(e.context("vk of a setup just run on the GPU")))
 }
 
 pub struct ShrinkProver<C: SP1ProverComponents> {
@@ -1464,8 +1502,14 @@ impl<C: SP1ProverComponents> ShrinkProver<C> {
         let duration = permit.release();
         metrics.increment_permit_time(duration);
 
-        let vk_merkle_proof =
-            retry_if_fresh_vk_not_allowed(self.prover_data.recursion_vks.open(&vk))?.1;
+        let vk_merkle_proof = open_fresh_vk::<C>(
+            &self.prover_data.recursion_vks,
+            &self.prover,
+            self.program.clone(),
+            self.permits.clone(),
+            &vk,
+        )
+        .await?;
         Ok(SP1RecursionProof { vk: self.verifying_key.clone(), proof, vk_merkle_proof })
     }
 
@@ -1625,5 +1669,37 @@ impl<C: SP1ProverComponents> WrapProver<C> {
         C::wrap_verifier()
             .verify_shard(vk, proof, &mut challenger)
             .map_err(|e| TaskError::Retryable(anyhow::anyhow!("wrap verify failed: {e}")))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use sp1_recursion_circuit::dummy::dummy_vk;
+
+    use super::*;
+
+    /// Keys that count how many of them are alive, like a setup's keys holding a prover permit.
+    struct Keys<'a>(&'a AtomicUsize);
+
+    impl Drop for Keys<'_> {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
+    /// A setup whose vk is not allowed is run again only once its keys are gone: with a one-permit
+    /// pool (the shrink setup's), the next setup would otherwise wait for their permit forever.
+    /// After the last setup, start-up fails.
+    #[test]
+    #[should_panic(expected = "outside the vk map 4 times")]
+    fn a_setup_is_run_again_without_the_keys_of_the_last() {
+        let alive = AtomicUsize::new(0);
+        let recursion_vks = RecursionVks::new(None, 4, true);
+        let _ = setup_until_allowed(&recursion_vks, || {
+            assert_eq!(alive.fetch_add(1, Ordering::SeqCst), 0, "the last setup's keys are alive");
+            (Keys(&alive), dummy_vk())
+        });
     }
 }
