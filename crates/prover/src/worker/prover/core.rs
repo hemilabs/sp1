@@ -652,7 +652,7 @@ where
             std::fs::create_dir_all(&path).ok();
 
             if idx.is_multiple_of(*frequency) {
-                let record_bytes = bincode::serialize(&record).expect("failed to serialize record");
+                let record_bytes = record.to_dump_bytes().expect("failed to serialize record");
                 std::fs::write(path.join(format!("record_{idx:04}.bin")), &record_bytes)
                     .expect("failed to write record");
 

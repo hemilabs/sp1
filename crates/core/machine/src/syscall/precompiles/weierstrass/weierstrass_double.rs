@@ -255,7 +255,6 @@ impl<F: PrimeField32, E: EllipticCurve + WeierstrassParameters, M: TrustMode> Ma
     fn generate_trace_into_with_dependencies(
         &self,
         input: &ExecutionRecord,
-        _output: &mut ExecutionRecord,
         buffer: &mut [MaybeUninit<F>],
     ) {
         self.generate_trace_into_with::<F>(input, buffer, true);

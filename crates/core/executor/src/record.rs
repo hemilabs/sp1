@@ -887,6 +887,10 @@ impl MachineRecord for ExecutionRecord {
         ExecutionRecord::recycle(self);
     }
 
+    fn dependencies_in_trace(&self) -> bool {
+        self.dependencies_in_trace
+    }
+
     fn stats(&self) -> HashMap<String, usize> {
         let mut stats = HashMap::new();
         stats.insert("cpu_events".to_string(), self.cpu_event_count as usize);
@@ -1060,6 +1064,40 @@ impl ByteRecord for ExecutionRecord {
                 *self.byte_lookups.entry(*blu_event).or_insert(0) += count;
             }
         }
+    }
+}
+
+/// The tag a record dump starts with ([`ExecutionRecord::to_dump_bytes`]). Bincode is
+/// positional, so a dump reads back only into a build with the same record layout: change the
+/// version whenever a serialized field is added, removed or reordered. Version 2 added
+/// `byte_lookup_counts` and `dependencies_in_trace`; untagged dumps are older.
+const RECORD_DUMP_TAG: &[u8; 12] = b"sp1-record\x00\x02";
+
+impl ExecutionRecord {
+    /// The record as a dump file's bytes (`SP1_RECORD_WRITE_DIR`): the format tag, then the
+    /// record.
+    pub fn to_dump_bytes(&self) -> bincode::Result<Vec<u8>> {
+        let mut bytes = RECORD_DUMP_TAG.to_vec();
+        bincode::serialize_into(&mut bytes, self)?;
+        Ok(bytes)
+    }
+
+    /// Reads a record dump ([`Self::to_dump_bytes`]). A dump of another record layout (another
+    /// build's) is an error saying so, not a misread record.
+    pub fn from_dump_bytes(bytes: &[u8]) -> Result<Self, String> {
+        let Some(record) = bytes.strip_prefix(RECORD_DUMP_TAG.as_slice()) else {
+            return Err(match bytes.strip_prefix(&RECORD_DUMP_TAG[..11]) {
+                Some([version, ..]) => format!(
+                    "the record dump has format version {version}, this build reads version {}: \
+                     dump it again with this build",
+                    RECORD_DUMP_TAG[11]
+                ),
+                _ => "the record dump has no format tag: it is from a build before record dumps \
+                      had one, so dump it again with this build"
+                    .to_string(),
+            });
+        };
+        bincode::deserialize(record).map_err(|e| format!("failed to deserialize the record: {e}"))
     }
 }
 
@@ -1765,5 +1803,24 @@ impl ExecutionRecord {
             .as_canonical_u32();
         }
         state.is_first_execution_shard = (state.initial_timestamp == 1) as u32;
+    }
+}
+
+#[cfg(test)]
+mod dump_tests {
+    use super::*;
+
+    #[test]
+    fn a_record_dump_reads_back_and_an_untagged_one_says_why_not() {
+        let record = ExecutionRecord::default();
+        let bytes = record.to_dump_bytes().unwrap();
+        assert!(ExecutionRecord::from_dump_bytes(&bytes).is_ok());
+        let untagged = bincode::serialize(&record).unwrap();
+        let e = ExecutionRecord::from_dump_bytes(&untagged).unwrap_err();
+        assert!(e.contains("no format tag"), "{e}");
+        let mut other_version = bytes.clone();
+        other_version[11] = 1;
+        let e = ExecutionRecord::from_dump_bytes(&other_version).unwrap_err();
+        assert!(e.contains("format version 1"), "{e}");
     }
 }

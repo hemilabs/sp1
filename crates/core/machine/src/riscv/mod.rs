@@ -1979,7 +1979,6 @@ pub mod tests {
             if fused {
                 air.generate_trace_into_with_dependencies(
                     record,
-                    &mut ExecutionRecord::default(),
                     &mut values.spare_capacity_mut()[..n],
                 );
             } else {

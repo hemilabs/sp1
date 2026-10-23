@@ -410,13 +410,14 @@ unsafe impl Allocator for CudaStream {
                 };
                 match malloc(&mut ptr) {
                     Ok(()) => {}
-                    // Give the cached small blocks back to the pool, drop the prefetched uploads
-                    // not yet in use (their owners copy again) and the device caches (their
-                    // owners rebuild them), and try once more.
+                    // Drop the prefetched uploads not yet in use (their owners copy again) and
+                    // the device caches (their owners rebuild them), then give the cached small
+                    // blocks back to the pool (last: the first two free small blocks into it
+                    // too), and try once more.
                     Err(CudaError::OutOfMemory) => {
-                        small_blocks::release_all();
                         crate::upload::reclaim_staged_uploads(true);
                         crate::upload::release_device_caches(true);
+                        small_blocks::release_all();
                         malloc(&mut ptr).map_err(|_| AllocError)?
                     }
                     Err(_) => return Err(AllocError),

@@ -236,7 +236,9 @@ impl CudaTracegenAir<F> for GlobalChip {
         // Wrap the trace so we can use it in concurrent tasks.
         let trace = Arc::new(trace);
 
-        let global_sum = if height == 0 {
+        // No events (the padded height is never zero): nothing accumulated, and no last event row
+        // to read the sum from.
+        let global_sum = if height == 0 || events_len == 0 {
             SepticDigest(SepticCurve::convert(SepticDigest::<F>::zero().0, |x| {
                 F::as_canonical_u32(&x)
             }))

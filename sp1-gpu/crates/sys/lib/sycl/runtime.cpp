@@ -127,24 +127,28 @@ struct Runtime {
     }
 };
 
-Runtime& rt() {
-    // The free-memory query (sycl::ext::intel::info::device::free_memory) needs Sysman, which
-    // Level Zero enables only if ZES_ENABLE_SYSMAN is set before it initializes.
-    static bool sysman = [] {
+// The environment Level Zero reads when it initializes (in rt()), set while the library loads,
+// before any thread runs: setenv while another thread reads the environment is undefined
+// behaviour in glibc.
+// - The free-memory query (sycl::ext::intel::info::device::free_memory) needs Sysman, which Level
+//   Zero enables only if ZES_ENABLE_SYSMAN is set before it initializes.
+// - Level Zero's V2 adapter, the default on Linux, intermittently left proofs waiting forever on an
+//   Arc Pro B70 (oneAPI 2025.3 and 2026.0 adapters, kernel 7.0 xe, compute runtime 26.09): a copy's
+//   event never completed, until the kill reset the copy engine. That was 11 of 14
+//   fibonacci-compressed proofs (main also hung); with the legacy adapter, 20 of 20 passed.
+//   SYCL_UR_USE_LEVEL_ZERO_V2=1 still picks V2.
+const bool kLevelZeroEnv = [] {
 #ifdef _WIN32
-        if (!std::getenv("ZES_ENABLE_SYSMAN")) _putenv_s("ZES_ENABLE_SYSMAN", "1");
+    if (!std::getenv("ZES_ENABLE_SYSMAN")) _putenv_s("ZES_ENABLE_SYSMAN", "1");
 #else
-        setenv("ZES_ENABLE_SYSMAN", "1", 0);
-        // Level Zero's V2 adapter, the default on Linux, intermittently left proofs waiting forever
-        // on an Arc Pro B70 (oneAPI 2025.3 and 2026.0 adapters, kernel 7.0 xe, compute runtime
-        // 26.09): a copy's event never completed, until the kill reset the copy engine. That was
-        // 11 of 14 fibonacci-compressed proofs (main also hung); with the legacy adapter, 20 of 20
-        // passed. SYCL_UR_USE_LEVEL_ZERO_V2=1 still picks V2.
-        setenv("SYCL_UR_USE_LEVEL_ZERO_V2", "0", 0);
+    setenv("ZES_ENABLE_SYSMAN", "1", 0);
+    setenv("SYCL_UR_USE_LEVEL_ZERO_V2", "0", 0);
 #endif
-        return true;
-    }();
-    (void)sysman;
+    return true;
+}();
+
+Runtime& rt() {
+    (void)kLevelZeroEnv;
     static Runtime* runtime = new Runtime();  // never destroyed: queues outlive static teardown
     return *runtime;
 }
@@ -228,19 +232,29 @@ constexpr bool kStagePageable = true;
 #endif
 constexpr size_t kStageChunk = size_t(16) << 20;
 
-char* stage_buffer(size_t size) {
-    thread_local char* buf = nullptr;  // kept for the thread's lifetime (pool threads)
-    thread_local size_t cap = 0;
-    if (size > cap) {
+// A thread's staging buffer, freed when the thread exits: the copies run on tokio's blocking-pool
+// threads, which exit after 10 s idle, and each new one would otherwise pin another buffer.
+struct StageBuffer {
+    char* buf = nullptr;
+    size_t cap = 0;
+    ~StageBuffer() {
         if (buf) sycl::free(buf, rt().context);
-        cap = std::max(size, std::min(cap * 2, kStageChunk));
-        buf = static_cast<char*>(sycl::malloc_host(cap, rt().context));
-        if (!buf) {
-            cap = 0;
+    }
+};
+
+char* stage_buffer(size_t size) {
+    thread_local StageBuffer stage;
+    if (size > stage.cap) {
+        if (stage.buf) sycl::free(stage.buf, rt().context);
+        stage.buf = nullptr;
+        stage.cap = std::max(size, std::min(stage.cap * 2, kStageChunk));
+        stage.buf = static_cast<char*>(sycl::malloc_host(stage.cap, rt().context));
+        if (!stage.buf) {
+            stage.cap = 0;
             throw std::bad_alloc();
         }
     }
-    return buf;
+    return stage.buf;
 }
 
 void copy_from_pageable(sycl::queue& q, void* dst, const void* src, size_t count) {
@@ -520,9 +534,11 @@ rustCudaError_t cached_free(void* p, sycl::queue* q) {
         }
         g_alloc_sizes.erase(it);
     }
-    // Not cached: let the freeing stream's work, which may still use it, finish first.
+    // Not cached: let the work that may still use it finish first. All queues', as for an
+    // eviction (evict_until_fits): a block can also have been used on another queue than the one
+    // freeing it, and sycl::free unmaps it under whatever still runs there.
     sp1prof::HostTimer timer("host: uncached free (wait + free)");
-    q->wait_and_throw();
+    rt().wait_all();
     sycl::free(p, rt().context);
     return SP1_SUCCESS;
 }

@@ -164,6 +164,9 @@ where
             .map(|chip| chip.air.clone())
             .partition(|c| c.supports_device_main_tracegen());
 
+        // This generator runs no chip before the byte and range chips: a record whose
+        // dependencies leave out chips' would get short byte and range traces.
+        debug_assert!(!record.dependencies_in_trace(), "record needs dependencies in traces");
         // Spawn a rayon task to generate the traces on the CPU.
         // `host_traces` is a futures Stream that will immediately begin buffering traces.
         let (host_traces_tx, host_traces) = futures::channel::mpsc::unbounded();

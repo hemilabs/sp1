@@ -220,7 +220,7 @@ pub fn machine_air_derive(input: TokenStream) -> TokenStream {
             let generate_trace_into_with_dependencies_arms = variants.iter().map(|(variant_name, field)| {
                 let field_ty = &field.ty;
                 quote! {
-                    #name::#variant_name(x) => <#field_ty as sp1_hypercube::air::MachineAir<F>>::generate_trace_into_with_dependencies(x, input, output, buffer)
+                    #name::#variant_name(x) => <#field_ty as sp1_hypercube::air::MachineAir<F>>::generate_trace_into_with_dependencies(x, input, buffer)
                 }
             });
 
@@ -327,7 +327,6 @@ pub fn machine_air_derive(input: TokenStream) -> TokenStream {
                     fn generate_trace_into_with_dependencies(
                         &self,
                         input: &#execution_record_path,
-                        output: &mut #execution_record_path,
                         buffer: &mut [MaybeUninit<F>],
                     ) {
                         match self {

@@ -112,7 +112,6 @@ impl<F: PrimeField32, M: TrustMode> MachineAir<F> for AluX0Chip<M> {
     fn generate_trace_into_with_dependencies(
         &self,
         input: &ExecutionRecord,
-        _output: &mut ExecutionRecord,
         buffer: &mut [MaybeUninit<F>],
     ) {
         self.generate_trace_into_with::<F>(input, buffer, true);

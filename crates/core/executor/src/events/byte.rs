@@ -223,24 +223,50 @@ impl ByteRecord for MaybeByteLookupCounter<'_, '_> {
 ///
 /// `generate_dependencies` of most chips counts its byte lookups here (through a shared reference
 /// to the record), one dense array per concurrent writer, so neither per-chunk hash maps nor
-/// their serial merges are needed. The byte and range chips sum the arrays. Cloning and
-/// serializing keep the summed counts.
+/// their serial merges are needed. The byte and range chips sum the arrays, once every writer is
+/// done: a sum only sees the arrays no writer holds. Cloning and serializing keep the summed counts.
 #[derive(Default)]
 pub struct ByteLookupCounts {
     /// Arrays of [`BYTE_LOOKUP_SLOTS`] counts not in use by a writer: all of them once the
-    /// writers are done.
-    free: std::sync::Mutex<Vec<Box<[u32]>>>,
+    /// writers are done. Summed concurrently (the byte and range chips sum slot ranges in
+    /// parallel), hence the read-write lock.
+    free: std::sync::RwLock<Vec<Box<[u32]>>>,
+    /// Writers holding an array ([`Self::count`]), whose counts a sum would miss.
+    writers: std::sync::atomic::AtomicUsize,
+}
+
+/// A writer of [`ByteLookupCounts`], counted while alive.
+struct Writer<'a>(&'a std::sync::atomic::AtomicUsize);
+
+impl Drop for Writer<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::Release);
+    }
 }
 
 impl ByteLookupCounts {
     /// Runs `f` with a dense counter of this record's byte lookups. Concurrent callers get
     /// different arrays.
     pub fn count<R>(&self, f: impl FnOnce(&mut ByteLookupCounter) -> R) -> R {
-        let taken = self.free.lock().unwrap().pop();
+        self.writers.fetch_add(1, std::sync::atomic::Ordering::Acquire);
+        let _writer = Writer(&self.writers);
+        let taken = self.free.write().unwrap().pop();
         let mut counts = taken.unwrap_or_else(|| vec![0u32; BYTE_LOOKUP_SLOTS].into_boxed_slice());
         let result = f(&mut ByteLookupCounter(&mut counts));
-        self.free.lock().unwrap().push(counts);
+        self.free.write().unwrap().push(counts);
         result
+    }
+
+    /// The arrays to sum. With a writer still counting, its counts would be missing from the sum:
+    /// the chips that count must all be done first.
+    fn done(&self) -> std::sync::RwLockReadGuard<'_, Vec<Box<[u32]>>> {
+        let free = self.free.read().unwrap();
+        debug_assert_eq!(
+            self.writers.load(std::sync::atomic::Ordering::Acquire),
+            0,
+            "byte lookups read while a chip is still counting them"
+        );
+        free
     }
 
     /// Runs `f` with a counter of this record's byte lookups if `count`, and with a counter that
@@ -256,13 +282,14 @@ impl ByteLookupCounts {
     /// Whether no byte lookups were counted.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.free.lock().unwrap().is_empty()
+        self.done().is_empty()
     }
 
-    /// Writes the summed counts of `slots` into `out` (of the same length).
+    /// Writes the summed counts of `slots` into `out` (of the same length). Callers may sum
+    /// different slot ranges concurrently.
     pub fn sum_into(&self, slots: std::ops::Range<usize>, out: &mut [u32]) {
         out.fill(0);
-        for counts in self.free.lock().unwrap().iter() {
+        for counts in self.done().iter() {
             for (o, c) in out.iter_mut().zip(&counts[slots.clone()]) {
                 *o += *c;
             }
@@ -294,21 +321,21 @@ impl ByteLookupCounts {
 impl Clone for ByteLookupCounts {
     fn clone(&self) -> Self {
         let free = if self.is_empty() { Vec::new() } else { vec![self.sum().into_boxed_slice()] };
-        Self { free: std::sync::Mutex::new(free) }
+        Self { free: std::sync::RwLock::new(free), writers: Default::default() }
     }
 }
 
 impl std::fmt::Debug for ByteLookupCounts {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ByteLookupCounts")
-            .field("arrays", &self.free.lock().unwrap().len())
+            .field("arrays", &self.free.read().unwrap().len())
             .finish()
     }
 }
 
 impl DeepSizeOf for ByteLookupCounts {
     fn deep_size_of_children(&self, _context: &mut deepsize2::Context) -> usize {
-        self.free.lock().unwrap().len() * BYTE_LOOKUP_SLOTS * std::mem::size_of::<u32>()
+        self.free.read().unwrap().len() * BYTE_LOOKUP_SLOTS * std::mem::size_of::<u32>()
     }
 }
 
@@ -332,11 +359,17 @@ impl Serialize for ByteLookupCounts {
 impl<'de> Deserialize<'de> for ByteLookupCounts {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let pairs = Vec::<(u32, u32)>::deserialize(deserializer)?;
+        if let Some((slot, _)) = pairs.iter().find(|(slot, _)| *slot as usize >= BYTE_LOOKUP_SLOTS)
+        {
+            return Err(serde::de::Error::custom(format!(
+                "byte lookup slot {slot} is out of range (there are {BYTE_LOOKUP_SLOTS})"
+            )));
+        }
         let counts = Self::default();
         if !pairs.is_empty() {
             counts.count(|counter| {
-                for (i, c) in pairs {
-                    counter.0[i as usize] = c;
+                for (slot, c) in pairs {
+                    counter.0[slot as usize] += c;
                 }
             });
         }
@@ -393,5 +426,28 @@ impl ByteOpcode {
     #[must_use]
     pub fn as_field<F: Field>(self) -> F {
         F::from_canonical_u8(self as u8)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn counts_round_trip_and_reject_slots_out_of_range() {
+        let counts = ByteLookupCounts::default();
+        counts.count(|counter| {
+            counter.0[3] = 2;
+            counter.0[BYTE_LOOKUP_SLOTS - 1] = 5;
+        });
+        let bytes = bincode::serialize(&counts).unwrap();
+        let back: ByteLookupCounts = bincode::deserialize(&bytes).unwrap();
+        assert_eq!(back.sum(), counts.sum());
+
+        // A slot past the table is a serde error, not a panic; a repeated slot adds up.
+        let out_of_range = bincode::serialize(&vec![(BYTE_LOOKUP_SLOTS as u32, 1u32)]).unwrap();
+        assert!(bincode::deserialize::<ByteLookupCounts>(&out_of_range).is_err());
+        let repeated = bincode::serialize(&vec![(7u32, 1u32), (7, 2)]).unwrap();
+        assert_eq!(bincode::deserialize::<ByteLookupCounts>(&repeated).unwrap().sum()[7], 3);
     }
 }

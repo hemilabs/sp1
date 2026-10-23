@@ -1232,11 +1232,10 @@ impl<A: CudaTracegenAir<Felt>> HostMainTracegenJob<A> {
                 let trace_len = height * width;
                 let slice: &mut [MaybeUninit<Felt>] =
                     unsafe { std::slice::from_raw_parts_mut(base_ptr.add(offset), trace_len) };
-                let mut output = A::Record::default();
                 if air.host_trace_generates_dependencies(record) {
-                    air.generate_trace_into_with_dependencies(record, &mut output, slice);
+                    air.generate_trace_into_with_dependencies(record, slice);
                 } else {
-                    air.generate_trace_into(record, &mut output, slice);
+                    air.generate_trace_into(record, &mut A::Record::default(), slice);
                 }
                 let start_pointer = unsafe { base_ptr.add(offset) as usize };
                 // If the receiver dropped (task cancelled), exit gracefully instead of panicking.

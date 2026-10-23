@@ -127,7 +127,6 @@ impl<F: PrimeField32, M: TrustMode> MachineAir<F> for LoadWordChip<M> {
     fn generate_trace_into_with_dependencies(
         &self,
         input: &ExecutionRecord,
-        _output: &mut ExecutionRecord,
         buffer: &mut [MaybeUninit<F>],
     ) {
         self.generate_trace_into_with::<F>(input, buffer, true);
@@ -176,8 +175,8 @@ impl<F: PrimeField32, M: TrustMode> MachineAir<F> for LoadWordChip<M> {
 }
 
 impl<M: TrustMode> LoadWordChip<M> {
-    /// Writes the trace into `buffer` and returns the byte lookups of each parallel chunk,
-    /// collected into `R`.
+    /// Writes the trace into `buffer`. With `count`, the byte lookups of the rows are counted
+    /// into `input.byte_lookup_counts`, as `generate_dependencies` does.
     fn generate_trace_into_with<F: PrimeField32>(
         &self,
         input: &ExecutionRecord,

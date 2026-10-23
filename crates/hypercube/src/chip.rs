@@ -236,10 +236,9 @@ where
     fn generate_trace_into_with_dependencies(
         &self,
         input: &A::Record,
-        output: &mut A::Record,
         buffer: &mut [std::mem::MaybeUninit<F>],
     ) {
-        self.air.generate_trace_into_with_dependencies(input, output, buffer);
+        self.air.generate_trace_into_with_dependencies(input, buffer);
     }
 
     fn included(&self, shard: &Self::Record) -> bool {

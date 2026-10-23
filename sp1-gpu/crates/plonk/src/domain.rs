@@ -53,9 +53,12 @@ pub(crate) mod gpu_ntt {
         // so a poisoned lock is still usable.
         let mut buf = BUFFER_CACHE.lock().unwrap_or_else(|e| e.into_inner());
         if needed_bytes > buf.capacity_bytes {
-            // Free old buffer if exists
+            // Free old buffer if exists, and forget it before the allocation that may fail: a
+            // panic there must not leave a freed pointer for the next locker to use or free again.
             if !buf.ptr.is_null() {
                 unsafe { sp1_gpu_sys::runtime::cuda_free(buf.ptr) };
+                buf.ptr = std::ptr::null_mut();
+                buf.capacity_bytes = 0;
             }
             // Round up to 256 MiB granularity (not power-of-two which wastes up to
             // 50% and can cause OOM on 24 GiB GPUs with multiple device buffers).

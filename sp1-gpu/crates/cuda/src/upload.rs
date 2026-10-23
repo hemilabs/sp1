@@ -137,16 +137,19 @@ impl StagedUpload {
         scope: &TaskScope,
     ) -> Result<Option<Buffer<T, TaskScope>>, CudaError> {
         let mut allocation = self.allocation.lock().unwrap_or_else(|e| e.into_inner());
-        let Some(DevicePtr(ptr, layout)) = allocation.take() else {
+        if allocation.is_none() {
             return Ok(None);
-        };
-        STAGED_BYTES.fetch_sub(layout.size() as u64, Ordering::Relaxed);
+        }
+        // Before the allocation is taken: if the wait fails, it stays here, for `free` (on drop)
+        // to give back.
         CudaError::result_from_ffi(unsafe {
             sp1_gpu_sys::runtime::cuda_stream_wait_event(
                 scope.stream.0,
                 self.uploaded.as_ref().unwrap().0,
             )
         })?;
+        let Some(DevicePtr(ptr, layout)) = allocation.take() else { unreachable!() };
+        STAGED_BYTES.fetch_sub(layout.size() as u64, Ordering::Relaxed);
         let len = layout.size() / std::mem::size_of::<T>();
         // SAFETY: the memory was allocated from the device's memory pool for `len` elements of
         // `T`, and the primary stream now waits for the copy, so freeing it there is ordered

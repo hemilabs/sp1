@@ -25,6 +25,48 @@ namespace { __device__ __forceinline__ fr_t fr_zero() { return fr_t::zero(); } }
 // 9 data arrays + 1 reserved slot = 10.
 static constexpr int NUM_STATIC = 10;
 
+// What one quotient evaluation allocates on the device, freed on every return, an error's too
+// (each CUDA_OK returns early): the omega tables, the two chunk buffers and their streams, whose
+// work is waited for first.
+struct QuotientScratch {
+    fr_t* lo_table = nullptr;
+    fr_t* hi_table = nullptr;
+    fr_t* chunk[2] = {nullptr, nullptr};
+    cudaStream_t stream[2] = {nullptr, nullptr};
+
+    QuotientScratch() = default;
+    QuotientScratch(const QuotientScratch&) = delete;
+    QuotientScratch& operator=(const QuotientScratch&) = delete;
+    ~QuotientScratch() {
+        for (cudaStream_t s : stream) {
+            if (s) {
+                cudaStreamSynchronize(s);
+                cudaStreamDestroy(s);
+            }
+        }
+        for (fr_t* c : chunk) {
+            if (c) cudaFree(c);
+        }
+        if (lo_table) cudaFree(lo_table);
+        if (hi_table) cudaFree(hi_table);
+        // An error here, or the one being returned, must not stay the thread's last error.
+        (void)cudaGetLastError();
+    }
+};
+
+// The chunk length of a double-buffered quotient upload of `n_arrays` arrays of `big_n` elements,
+// in `free_mem` bytes: a multiple of 256, two chunks of which fit in 90% of it; or the whole domain,
+// when it is under 512 elements (which rounds to no chunk) and two copies of it fit. 0 when
+// nothing fits.
+static size_t quotient_chunk_size(size_t free_mem, size_t big_n, size_t n_arrays, size_t elem_sz) {
+    const size_t fits = (free_mem * 9 / 10) / (n_arrays * elem_sz);
+    size_t chunk_size = fits < big_n ? fits : big_n;
+    chunk_size = (chunk_size / 256) * 256;
+    chunk_size = (chunk_size / 2 / 256) * 256;
+    if (chunk_size == 0 && 2 * big_n <= fits) chunk_size = big_n;
+    return chunk_size;
+}
+
 // Two-level omega lookup table parameters for on-the-fly coset point computation.
 // coset_pt = coset_shift * lo_table[global_idx & LO_MASK] * hi_table[global_idx >> LO_BITS]
 static constexpr int LO_BITS = 14;
@@ -249,8 +291,9 @@ rustCudaError_t sp1_plonk_quotient_eval_fused(
     const size_t elem_sz = sizeof(fr_t);
 
     // Upload omega lookup tables to GPU (lo ~512 KB, hi ~256 KB -- uploaded once)
-    fr_t* d_lo_table = nullptr;
-    fr_t* d_hi_table = nullptr;
+    QuotientScratch scratch;
+    fr_t*& d_lo_table = scratch.lo_table;
+    fr_t*& d_hi_table = scratch.hi_table;
     CUDA_OK(cudaMalloc(&d_lo_table, lo_len * elem_sz));
     CUDA_OK(cudaMalloc(&d_hi_table, hi_len * elem_sz));
     CUDA_OK(cudaMemcpy(d_lo_table, h_lo_table, lo_len * elem_sz, cudaMemcpyHostToDevice));
@@ -260,28 +303,17 @@ rustCudaError_t sp1_plonk_quotient_eval_fused(
     // NUM_STATIC=10 arrays per chunk (9 used + 1 reserved).
     size_t free_mem = 0, total_mem = 0;
     CUDA_OK(cudaMemGetInfo(&free_mem, &total_mem));
-    // Use 90% of free memory for chunk buffer (divided among NUM_STATIC arrays)
-    const size_t fits = (free_mem * 9 / 10) / (NUM_STATIC * elem_sz);
-    size_t chunk_size = fits;
-    if (chunk_size > big_n) chunk_size = big_n;
-    chunk_size = (chunk_size / 256) * 256;
-
     // Double-buffered chunk allocation: overlap upload(i+1) with kernel(i)
-    chunk_size = chunk_size / 2;
-    chunk_size = (chunk_size / 256) * 256;
-    // A domain under 512 rounds to no chunk at all: it is one chunk, if it fits.
-    if (chunk_size == 0 && big_n <= fits) chunk_size = big_n;
+    const size_t chunk_size = quotient_chunk_size(free_mem, big_n, NUM_STATIC, elem_sz);
     if (chunk_size == 0) {
-        cudaFree(d_lo_table);
-        cudaFree(d_hi_table);
         return rustCudaError_t{.message = "Not enough GPU memory for fused quotient"};
     }
 
-    fr_t* d_chunk[2] = {nullptr, nullptr};
+    fr_t** d_chunk = scratch.chunk;
     CUDA_OK(cudaMalloc(&d_chunk[0], NUM_STATIC * chunk_size * elem_sz));
     CUDA_OK(cudaMalloc(&d_chunk[1], NUM_STATIC * chunk_size * elem_sz));
 
-    cudaStream_t stream[2];
+    cudaStream_t* stream = scratch.stream;
     CUDA_OK(cudaStreamCreateWithFlags(&stream[0], cudaStreamNonBlocking));
     CUDA_OK(cudaStreamCreateWithFlags(&stream[1], cudaStreamNonBlocking));
 
@@ -421,13 +453,6 @@ rustCudaError_t sp1_plonk_quotient_eval_fused(
 
     CUDA_OK(cudaStreamSynchronize(stream[0]));
     CUDA_OK(cudaStreamSynchronize(stream[1]));
-
-    cudaStreamDestroy(stream[0]);
-    cudaStreamDestroy(stream[1]);
-    cudaFree(d_chunk[0]);
-    cudaFree(d_chunk[1]);
-    cudaFree(d_lo_table);
-    cudaFree(d_hi_table);
     return CUDA_SUCCESS_CSL;
 }
 
@@ -596,8 +621,9 @@ rustCudaError_t sp1_plonk_quotient_eval_streamed(
     const size_t elem_sz = sizeof(fr_t);
 
     // Upload omega lookup tables to GPU (lo ~512 KB, hi ~256 KB -- uploaded once)
-    fr_t* d_lo_table = nullptr;
-    fr_t* d_hi_table = nullptr;
+    QuotientScratch scratch;
+    fr_t*& d_lo_table = scratch.lo_table;
+    fr_t*& d_hi_table = scratch.hi_table;
     CUDA_OK(cudaMalloc(&d_lo_table, lo_len * elem_sz));
     CUDA_OK(cudaMalloc(&d_hi_table, hi_len * elem_sz));
     CUDA_OK(cudaMemcpy(d_lo_table, h_lo_table, lo_len * elem_sz, cudaMemcpyHostToDevice));
@@ -606,29 +632,17 @@ rustCudaError_t sp1_plonk_quotient_eval_streamed(
     // Determine chunk size for all 15 arrays (14 data + 1 reserved).
     size_t free_mem = 0, total_mem = 0;
     CUDA_OK(cudaMemGetInfo(&free_mem, &total_mem));
-    // Use 90% of free memory for chunk buffers (divided among NUM_STREAMED arrays)
-    const size_t fits = (free_mem * 9 / 10) / (NUM_STREAMED * elem_sz);
-    size_t chunk_size = fits;
-    if (chunk_size > big_n) chunk_size = big_n;
-    chunk_size = (chunk_size / 256) * 256;
-
-    // Double-buffered: split chunk in half
-    chunk_size = chunk_size / 2;
-    chunk_size = (chunk_size / 256) * 256;
-    // A domain under 512 rounds to no chunk at all: it is one chunk, if it fits.
-    if (chunk_size == 0 && big_n <= fits) chunk_size = big_n;
+    // Double-buffered: two chunks
+    const size_t chunk_size = quotient_chunk_size(free_mem, big_n, NUM_STREAMED, elem_sz);
     if (chunk_size == 0) {
-        cudaFree(d_lo_table);
-        cudaFree(d_hi_table);
         return rustCudaError_t{.message = "Not enough GPU memory for streamed quotient"};
     }
 
-
-    fr_t* d_chunk[2] = {nullptr, nullptr};
+    fr_t** d_chunk = scratch.chunk;
     CUDA_OK(cudaMalloc(&d_chunk[0], NUM_STREAMED * chunk_size * elem_sz));
     CUDA_OK(cudaMalloc(&d_chunk[1], NUM_STREAMED * chunk_size * elem_sz));
 
-    cudaStream_t stream[2];
+    cudaStream_t* stream = scratch.stream;
     CUDA_OK(cudaStreamCreateWithFlags(&stream[0], cudaStreamNonBlocking));
     CUDA_OK(cudaStreamCreateWithFlags(&stream[1], cudaStreamNonBlocking));
 
@@ -732,13 +746,6 @@ rustCudaError_t sp1_plonk_quotient_eval_streamed(
 
     CUDA_OK(cudaStreamSynchronize(stream[0]));
     CUDA_OK(cudaStreamSynchronize(stream[1]));
-
-    cudaStreamDestroy(stream[0]);
-    cudaStreamDestroy(stream[1]);
-    cudaFree(d_chunk[0]);
-    cudaFree(d_chunk[1]);
-    cudaFree(d_lo_table);
-    cudaFree(d_hi_table);
     return CUDA_SUCCESS_CSL;
 }
 
@@ -950,8 +957,9 @@ rustCudaError_t sp1_plonk_quotient_eval_streamed_blinded(
 ) {
     const size_t elem_sz = sizeof(fr_t);
 
-    fr_t* d_lo_table = nullptr;
-    fr_t* d_hi_table = nullptr;
+    QuotientScratch scratch;
+    fr_t*& d_lo_table = scratch.lo_table;
+    fr_t*& d_hi_table = scratch.hi_table;
     CUDA_OK(cudaMalloc(&d_lo_table, lo_len * elem_sz));
     CUDA_OK(cudaMalloc(&d_hi_table, hi_len * elem_sz));
     CUDA_OK(cudaMemcpy(d_lo_table, h_lo_table, lo_len * elem_sz, cudaMemcpyHostToDevice));
@@ -959,25 +967,16 @@ rustCudaError_t sp1_plonk_quotient_eval_streamed_blinded(
 
     size_t free_mem = 0, total_mem = 0;
     CUDA_OK(cudaMemGetInfo(&free_mem, &total_mem));
-    const size_t fits = (free_mem * 9 / 10) / (NUM_STREAMED * elem_sz);
-    size_t chunk_size = fits;
-    if (chunk_size > big_n) chunk_size = big_n;
-    chunk_size = (chunk_size / 256) * 256;
-    chunk_size = chunk_size / 2;
-    chunk_size = (chunk_size / 256) * 256;
-    // A domain under 512 rounds to no chunk at all: it is one chunk, if it fits.
-    if (chunk_size == 0 && big_n <= fits) chunk_size = big_n;
+    const size_t chunk_size = quotient_chunk_size(free_mem, big_n, NUM_STREAMED, elem_sz);
     if (chunk_size == 0) {
-        cudaFree(d_lo_table);
-        cudaFree(d_hi_table);
         return rustCudaError_t{.message = "Not enough GPU memory for streamed quotient (blinded)"};
     }
 
-    fr_t* d_chunk[2] = {nullptr, nullptr};
+    fr_t** d_chunk = scratch.chunk;
     CUDA_OK(cudaMalloc(&d_chunk[0], NUM_STREAMED * chunk_size * elem_sz));
     CUDA_OK(cudaMalloc(&d_chunk[1], NUM_STREAMED * chunk_size * elem_sz));
 
-    cudaStream_t stream[2];
+    cudaStream_t* stream = scratch.stream;
     CUDA_OK(cudaStreamCreateWithFlags(&stream[0], cudaStreamNonBlocking));
     CUDA_OK(cudaStreamCreateWithFlags(&stream[1], cudaStreamNonBlocking));
 
@@ -1102,13 +1101,6 @@ rustCudaError_t sp1_plonk_quotient_eval_streamed_blinded(
 
     CUDA_OK(cudaStreamSynchronize(stream[0]));
     CUDA_OK(cudaStreamSynchronize(stream[1]));
-
-    cudaStreamDestroy(stream[0]);
-    cudaStreamDestroy(stream[1]);
-    cudaFree(d_chunk[0]);
-    cudaFree(d_chunk[1]);
-    cudaFree(d_lo_table);
-    cudaFree(d_hi_table);
     return CUDA_SUCCESS_CSL;
 }
 

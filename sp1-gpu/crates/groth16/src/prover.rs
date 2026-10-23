@@ -177,6 +177,9 @@ pub struct Groth16Prover {
     persistent_g1_k: sp1_gpu_plonk::g1::PersistentMsm,
     #[cfg(feature = "cuda")]
     persistent_g1_z: sp1_gpu_plonk::g1::PersistentMsm,
+    /// Whether `data.pk_g2_b` is registered (pinned) with the runtime, to undo in `Drop`.
+    #[cfg(feature = "cuda")]
+    g2_bases_pinned: bool,
     /// Pre-uploaded G2 SRS context for the Bs2 MSM. `None` on backends that
     /// don't implement the persistent G2 API — callers fall back to the
     /// one-shot `g2_msm_gpu` (or arkworks CPU) path.
@@ -246,6 +249,17 @@ unsafe impl Sync for Groth16Prover {}
 #[cfg(feature = "cuda")]
 impl Drop for Groth16Prover {
     fn drop(&mut self) {
+        // A range freed while still registered fails the next registration over it, in a
+        // process that builds another prover.
+        #[cfg(feature = "cuda")]
+        if self.g2_bases_pinned {
+            unsafe {
+                sp1_gpu_sys::runtime::cuda_host_unregister(
+                    self.data.pk_g2_b.as_ptr() as *const std::ffi::c_void
+                );
+            }
+            self.g2_bases_pinned = false;
+        }
         if !self.d_ntt_temp.is_null() {
             unsafe {
                 sp1_gpu_sys::runtime::cuda_free(self.d_ntt_temp as *const std::ffi::c_void);
@@ -306,6 +320,8 @@ impl Groth16Prover {
         // shot g2_msm_gpu (which re-creates/destroys a temporary context
         // per call but doesn't hit the conflict).
         #[cfg(feature = "cuda")]
+        let mut g2_bases_pinned = false;
+        #[cfg(feature = "cuda")]
         let persistent_g2_b = {
             // Default to compile-time backend detection (HIP-built crates use
             // the persistent G2 path; CUDA-built crates skip it because of
@@ -337,8 +353,7 @@ impl Groth16Prover {
                 // every prove. From pageable memory that runs at ~13.6 GB/s (143 ms in nsys); pinning
                 // the host copy once here (off the critical path: the helper is prestarted) makes it a
                 // DMA at PCIe speed. Measured with the production sppark one-shot path and the real
-                // PK + witness: G2 MSM 480 -> 390 ms. Non-fatal on failure. The helper exits after
-                // the proof, so the registration is not undone.
+                // PK + witness: G2 MSM 480 -> 390 ms. Non-fatal on failure. Undone in `Drop`.
                 let g2_bytes = data.pk_g2_b.len() * std::mem::size_of::<crate::g2::G2Affine>();
                 let t = std::time::Instant::now();
                 let err = unsafe {
@@ -352,6 +367,7 @@ impl Groth16Prover {
                         "[groth16] WARN: pinning the G2 bases failed; G2 upload stays pageable"
                     );
                 } else {
+                    g2_bases_pinned = true;
                     eprintln!(
                         "[groth16] Pinned G2 bases ({} MB): {:?}",
                         g2_bytes >> 20,
@@ -544,6 +560,8 @@ impl Groth16Prover {
             persistent_g1_k,
             #[cfg(feature = "cuda")]
             persistent_g1_z,
+            #[cfg(feature = "cuda")]
+            g2_bases_pinned,
             #[cfg(feature = "cuda")]
             persistent_g2_b,
             a_indices,

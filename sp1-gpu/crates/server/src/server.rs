@@ -119,10 +119,11 @@ impl Server {
 
             let proved = matches!(request, Request::ProveWithMode { .. });
             let response = Self::handle_request(&mut ctx, request).await;
-            send_response(stream, response).await?;
+            let sent = send_response(stream, response).await;
             // Between proofs, hand the memory the allocator kept for reuse back to the OS. This
             // takes seconds after a large proof (~4 s after rsp on a 186 GB host), so it runs after
-            // the proof is sent, and off the runtime's worker threads.
+            // the proof is sent, and off the runtime's worker threads. Also when the client has
+            // gone and the proof could not be sent.
             if proved {
                 tokio::task::spawn_blocking(|| {
                     if !sp1_gpu_host_alloc::keep_warm() {
@@ -131,6 +132,7 @@ impl Server {
                     sp1_gpu_host_alloc::release_free_memory();
                 });
             }
+            sent?;
         }
     }
 
