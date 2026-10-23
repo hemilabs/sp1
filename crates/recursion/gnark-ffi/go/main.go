@@ -43,6 +43,10 @@ func main() {}
 
 //export ProvePlonkBn254
 func ProvePlonkBn254(dataDir *C.char, witnessPath *C.char) *C.C_PlonkBn254Proof {
+	// The circuit and proving key read below are tens of GB of garbage afterwards. Return them to
+	// the host rather than leave a long-lived prover that much larger: the next proof's GPU PLONK
+	// helper (~100 GiB of host memory) did not fit beside them, and was OOM-killed.
+	defer freeOSMemory()
 	dataDirString := C.GoString(dataDir)
 	witnessPathString := C.GoString(witnessPath)
 
@@ -155,10 +159,7 @@ func ExportGroth16StrippedR1cs(dataDir *C.char, outputPath *C.char) (errStr *C.c
 	// The full circuit read below is ~9 GB of garbage afterwards, whether or not the export
 	// succeeds. The CPU helper proves right after this in the same process, so return it to the
 	// host before that prove's own peak. Deferred first, so it runs after the recover below.
-	defer func() {
-		runtime.GC()
-		debug.FreeOSMemory()
-	}()
+	defer freeOSMemory()
 	defer func() {
 		if r := recover(); r != nil {
 			errStr = C.CString(fmt.Sprintf("[groth16-strip] panic: %v", r))
@@ -166,6 +167,13 @@ func ExportGroth16StrippedR1cs(dataDir *C.char, outputPath *C.char) (errStr *C.c
 	}()
 	sp1.ExportGroth16StrippedR1cs(C.GoString(dataDir), C.GoString(outputPath))
 	return nil
+}
+
+// freeOSMemory collects the garbage and returns the freed memory to the host now, rather than
+// as Go's background scavenger gets to it.
+func freeOSMemory() {
+	runtime.GC()
+	debug.FreeOSMemory()
 }
 
 func groth16ProofToC(proof sp1.Proof) *C.C_Groth16Bn254Proof {
@@ -209,10 +217,7 @@ func FreeGroth16Bn254Proof(proof *C.C_Groth16Bn254Proof) {
 func ExportGroth16GpuData(dataDir *C.char, outputDir *C.char) (errStr *C.char) {
 	// The export reads the full circuit and proving key (~9 GB of garbage afterwards); return it
 	// to the host either way rather than leave a long-lived prover that much larger.
-	defer func() {
-		runtime.GC()
-		debug.FreeOSMemory()
-	}()
+	defer freeOSMemory()
 	defer func() {
 		if r := recover(); r != nil {
 			errStr = C.CString(fmt.Sprintf("[groth16-export] panic: %v", r))
@@ -246,6 +251,9 @@ func PrefetchGroth16GpuWitnessCircuit(dataDir *C.char, pkDir *C.char) (errStr *C
 
 //export ExportPlonkGpuData
 func ExportPlonkGpuData(dataDir *C.char, outputDir *C.char) (errStr *C.char) {
+	// As in ProvePlonkBn254, whether or not the export succeeds. Deferred first, so it runs after
+	// the recover below.
+	defer freeOSMemory()
 	defer func() {
 		if r := recover(); r != nil {
 			errStr = C.CString(fmt.Sprintf("[plonk-export] panic: %v", r))
@@ -257,6 +265,8 @@ func ExportPlonkGpuData(dataDir *C.char, outputDir *C.char) (errStr *C.char) {
 
 //export ExportPlonkGpuWitness
 func ExportPlonkGpuWitness(dataDir *C.char, witnessPath *C.char, outputDir *C.char) (errStr *C.char) {
+	// As in ExportPlonkGpuData: the GPU PLONK helper starts right after this, and needs the room.
+	defer freeOSMemory()
 	defer func() {
 		if r := recover(); r != nil {
 			errStr = C.CString(fmt.Sprintf("[plonk-witness] panic: %v", r))
