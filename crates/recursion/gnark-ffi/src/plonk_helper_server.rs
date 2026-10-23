@@ -35,10 +35,11 @@
 //!
 //! Request:
 //! ```json
-//! {"witness_init_dir":"…","witness_json":"…","vkey_hash_hex":"…","out":"…"}
+//! {"witness_init_dir":"…","witness_json":"…","witness_dir":"…","vkey_hash_hex":"…","out":"…"}
 //! {"command":"shutdown"}
 //! {"command":"ping"}
 //! ```
+//! `witness_dir` holds the proof's solved witness (the server's `--gpu-dir` if absent).
 //! `witness_init_dir` is required iff the server was started with
 //! `--prep-circuit-dir` (Phase H GPU SCS solver path).
 //!
@@ -155,6 +156,7 @@ impl PlonkHelperServer {
     pub fn prove(
         &mut self,
         witness_json: &Path,
+        witness_dir: &Path,
         vkey_hash_hex: &str,
         out: &Path,
         witness_init_dir: Option<&Path>,
@@ -164,6 +166,7 @@ impl PlonkHelperServer {
         }
         let mut req = serde_json::Map::new();
         req.insert("witness_json".into(), witness_json.to_string_lossy().into_owned().into());
+        req.insert("witness_dir".into(), witness_dir.to_string_lossy().into_owned().into());
         req.insert("vkey_hash_hex".into(), vkey_hash_hex.into());
         req.insert("out".into(), out.to_string_lossy().into_owned().into());
         if let Some(d) = witness_init_dir {
@@ -250,6 +253,7 @@ pub fn with_server(
     prep_circuit_dir: Option<&Path>,
     extra_env: &[(String, String)],
     witness_json: &Path,
+    witness_dir: &Path,
     vkey_hash_hex: &str,
     out: &Path,
     witness_init_dir: Option<&Path>,
@@ -284,7 +288,7 @@ pub fn with_server(
     }
 
     let server = guard.as_mut().expect("server just inserted");
-    match server.prove(witness_json, vkey_hash_hex, out, witness_init_dir) {
+    match server.prove(witness_json, witness_dir, vkey_hash_hex, out, witness_init_dir) {
         Ok(outcome) => Ok(outcome),
         Err(e) => {
             tracing::warn!("[plonk-server] prove failed ({e}); tearing down server for respawn");

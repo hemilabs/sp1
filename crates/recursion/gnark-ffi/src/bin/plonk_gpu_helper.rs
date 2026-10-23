@@ -107,6 +107,11 @@ struct Args {
     /// the in-process solver path in single-shot mode.
     #[arg(long)]
     witness_init_dir: Option<PathBuf>,
+
+    /// Single-shot: directory with this proof's solved witness (ExportSolvedWitness's files).
+    /// Defaults to --gpu-dir, where provers before per-proof witness directories wrote it.
+    #[arg(long)]
+    witness_dir: Option<PathBuf>,
 }
 
 // Subset of GnarkWitness — only the five public-input fields we need.
@@ -160,8 +165,9 @@ fn run_single_shot(args: Args) {
         });
     let nb_public = proving_data.nb_public_variables;
 
+    let witness_dir = args.witness_dir.as_deref().unwrap_or(&gpu_dir);
     let witness_data = load_witness_data(
-        gpu_dir_str,
+        witness_dir.to_str().expect("--witness-dir is not valid UTF-8"),
         &proving_data,
         args.prep_circuit_dir.as_deref(),
         args.witness_init_dir.as_deref(),
@@ -209,7 +215,7 @@ fn run_single_shot(args: Args) {
 /// caller's gnark.Solve-produced l/r/o + bsb22 files can still be consumed.
 /// This keeps the helper backward-compatible.
 fn load_witness_data(
-    gpu_dir_str: &str,
+    witness_dir: &str,
     proving_data: &sp1_gpu_plonk::types::PlonkProvingData,
     prep_circuit_dir: Option<&Path>,
     witness_init_dir: Option<&Path>,
@@ -225,13 +231,13 @@ fn load_witness_data(
                     "[plonk-gpu-helper] WARN: GPU SCS solver path failed ({e}); \
                      falling back to disk-load. The parent must have already run \
                      gnark.spr.Solve and exported witness_l/r/o.bin + bsb22_*.bin into \
-                     --gpu-dir for the fallback to succeed."
+                     --witness-dir (or --gpu-dir) for the fallback to succeed."
                 );
             }
         }
     }
-    eprintln!("[plonk-gpu-helper] loading PLONK witness data from {gpu_dir_str}");
-    sp1_gpu_plonk::types::PlonkWitnessData::load(gpu_dir_str).unwrap_or_else(|e| {
+    eprintln!("[plonk-gpu-helper] loading PLONK witness data from {witness_dir}");
+    sp1_gpu_plonk::types::PlonkWitnessData::load(witness_dir).unwrap_or_else(|e| {
         eprintln!("[plonk-gpu-helper] failed to load PlonkWitnessData: {e}");
         std::process::exit(2);
     })
@@ -255,6 +261,9 @@ struct ServerRequest {
     /// Hex-encoded 32-byte vkey hash. Required for `solve` requests.
     #[serde(default)]
     vkey_hash_hex: Option<String>,
+    /// Directory with this proof's solved witness; the server's `--gpu-dir` if absent.
+    #[serde(default)]
+    witness_dir: Option<String>,
     /// Per-prove witness-init dir (from `scs_solve_plan make-witness-init`).
     /// Required iff the server was started with `--prep-circuit-dir`.
     #[serde(default)]
@@ -467,6 +476,7 @@ fn handle_solve(
         .vkey_hash_hex
         .as_deref()
         .ok_or_else(|| anyhow::anyhow!("request missing 'vkey_hash_hex'"))?;
+    let witness_dir = req.witness_dir.as_deref().unwrap_or(gpu_dir_str);
 
     let witness_data = if let Some(state) = scs_state {
         let init = req.witness_init_dir.as_deref().ok_or_else(|| {
@@ -480,14 +490,14 @@ fn handle_solve(
             Err(e) => {
                 eprintln!(
                     "[plonk-gpu-helper] [server] WARN: GPU SCS solver path failed ({e}); \
-                     falling back to disk-load from {gpu_dir_str}"
+                     falling back to disk-load from {witness_dir}"
                 );
-                sp1_gpu_plonk::types::PlonkWitnessData::load(gpu_dir_str)
+                sp1_gpu_plonk::types::PlonkWitnessData::load(witness_dir)
                     .map_err(|e| anyhow::anyhow!("disk-load fallback failed: {e}"))?
             }
         }
     } else {
-        sp1_gpu_plonk::types::PlonkWitnessData::load(gpu_dir_str)
+        sp1_gpu_plonk::types::PlonkWitnessData::load(witness_dir)
             .map_err(|e| anyhow::anyhow!("PlonkWitnessData::load: {e}"))?
     };
     let public_inputs_fr = witness_data.public_inputs(nb_public);

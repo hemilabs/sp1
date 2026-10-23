@@ -88,7 +88,7 @@ pub struct SP1RecursionProverConfig {
     /// Whether this worker's card may use the GPU Groth16 prover. Set by the GPU worker builder for
     /// cards above the 16 GB tier; false, i.e. gnark's CPU prover, otherwise. Whether it does is
     /// decided before each proof from the free GPU and host memory (see `groth16_backend`), which
-    /// in practice leaves the CPU prover on cards below 48 GB unless `SP1_GPU_RESET_BEFORE_WRAP`.
+    /// in practice leaves the CPU prover on cards below 32 GB unless `SP1_GPU_RESET_BEFORE_WRAP`.
     pub groth16_gpu: bool,
 }
 
@@ -896,7 +896,9 @@ impl<A: ArtifactClient, C: SP1ProverComponents> SP1RecursionProver<A, C> {
                     && helper_available
                     && !matches!(override_env.as_deref(), Some("0" | "false"))
                 {
-                    if let Some((before, after)) = sp1_recursion_gnark_ffi::gpu_trim_memory_pool() {
+                    if let Some((before, after)) = sp1_recursion_gnark_ffi::gpu_trim_memory_pool(
+                        super::groth16_backend::GPU_HELPER_VRAM_BYTES,
+                    ) {
                         tracing::info!(
                             "Groth16: trimmed the GPU memory pool: {} -> {} MiB free",
                             before >> 20,
@@ -909,7 +911,9 @@ impl<A: ArtifactClient, C: SP1ProverComponents> SP1RecursionProver<A, C> {
                     card_eligible,
                     helper_available,
                     vram_free: sp1_recursion_gnark_ffi::gpu_free_memory(),
-                    gpu_reset: sp1_recursion_gnark_ffi::gpu_reset_requested(),
+                    vram_total: sp1_recursion_gnark_ffi::gpu_total_memory(),
+                    gpu_reset: sp1_recursion_gnark_ffi::gpu_reset_requested()
+                        && sp1_recursion_gnark_ffi::gpu_reset_available(),
                     mem_available: sp1_recursion_gnark_ffi::host_memory::available(),
                     pk_cache_ready: Groth16Bn254Prover::gpu_pk_cache_ready(&build_dir),
                 });
@@ -1097,9 +1101,13 @@ impl<A: ArtifactClient, C: SP1ProverComponents> SP1RecursionProver<A, C> {
             #[cfg(feature = "native-gnark")]
             let use_gpu = plonk_gpu && {
                 use super::groth16_backend::{use_gpu_plonk, PlonkInputs};
-                let helper_routed = std::env::var_os("SP1_PLONK_GPU_HELPER_DEVICES").is_some();
-                if !helper_routed {
-                    if let Some((before, after)) = sp1_recursion_gnark_ffi::gpu_trim_memory_pool() {
+                use sp1_recursion_gnark_ffi as ffi;
+                let helper_available = PlonkBn254Prover::gpu_helper_available();
+                let helper_routed = ffi::plonk_helper_devices().is_some();
+                if helper_available && !helper_routed {
+                    if let Some((before, after)) =
+                        ffi::gpu_trim_memory_pool(ffi::PLONK_GPU_HELPER_VRAM_BYTES)
+                    {
                         tracing::info!(
                             "PLONK: trimmed the GPU memory pool: {} -> {} MiB free",
                             before >> 20,
@@ -1108,11 +1116,11 @@ impl<A: ArtifactClient, C: SP1ProverComponents> SP1RecursionProver<A, C> {
                     }
                 }
                 let (gpu, reason) = use_gpu_plonk(&PlonkInputs {
+                    helper_available,
                     helper_routed,
-                    helper_server: sp1_recursion_gnark_ffi::plonk_helper_server::enabled(),
-                    vram_free: sp1_recursion_gnark_ffi::gpu_free_memory(),
-                    vram_total: sp1_recursion_gnark_ffi::gpu_total_memory(),
-                    gpu_reset: sp1_recursion_gnark_ffi::gpu_reset_requested(),
+                    vram_free: ffi::gpu_free_memory(),
+                    vram_total: ffi::gpu_total_memory(),
+                    gpu_reset: ffi::gpu_reset_requested() && ffi::gpu_reset_available(),
                 });
                 tracing::info!(
                     "PLONK prover: {} ({reason})",

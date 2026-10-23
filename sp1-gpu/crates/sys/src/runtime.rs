@@ -19,6 +19,13 @@ extern "C" {
 
     pub fn cuda_mem_get_info(free: *mut usize, total: *mut usize) -> CudaRustError;
 
+    /// Frees the device allocator's cached blocks (HIP and SYCL; nothing on CUDA), after waiting
+    /// for the device: to the driver, or with HIP's arena back to the arena.
+    pub fn cuda_release_cached_memory();
+
+    /// The device memory HIP's arena holds, free or not (0 without an arena, and on CUDA and SYCL).
+    pub fn sp1_hip_arena_bytes() -> usize;
+
     pub fn cuda_get_device_name(name: *mut c_char, len: usize) -> CudaRustError;
 
     pub fn cuda_sm_count(count: *mut i32) -> CudaRustError;

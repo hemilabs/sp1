@@ -203,9 +203,9 @@ static bool deviceHeadroom(size_t* headroom) {
 // The first allocation reserves the card's free memory less SP1_GPU_ARENA_HEADROOM_MB (2048) for
 // the driver and kernel scratch, or SP1_GPU_ARENA_MB; a block that doesn't fit after the cached
 // blocks are returned grows it by another allocation, reported on stderr. SP1_GPU_ARENA=0 turns it
-// off, and it is off with the GPU PLONK helper (SP1_PLONK_GPU) unless SP1_GPU_ARENA=1. The memory
-// the arena holds free counts as free for this process (cuda_mem_get_info), not for helper
-// processes.
+// off, and it is off where the GPU PLONK helper (SP1_PLONK_GPU=1) runs on this card, unless
+// SP1_GPU_ARENA=1. The memory the arena holds free counts as free for this process
+// (cuda_mem_get_info), not for helper processes.
 struct ArenaRange {
     size_t length;
     char* chunk;  // the allocation the range belongs to: ranges never merge across allocations
@@ -270,10 +270,11 @@ static void* arenaTake(size_t s) {
     return at;
 }
 
-// Adds an allocation of `size` bytes to the arena, with the device idle, then written once and
-// waited for before any block of it is handed out. A growth is still a mapping change (see above),
-// which is why the first allocation takes nearly all of the card's free memory. False if the
-// driver has no memory for it.
+// Adds an allocation of `size` bytes to the arena, after the work queued so far has finished, then
+// written once and waited for before any block of it is handed out. Other threads can launch
+// kernels meanwhile (launches take no allocator lock), so a growth is still a mapping change while
+// the card may be busy (see above): that is why the first allocation takes nearly all of the card's
+// free memory. False if the driver has no memory for it.
 static bool arenaGrow(size_t size) {
     hipDeviceSynchronize();
     void* base = nullptr;
@@ -306,6 +307,20 @@ static void arenaReportMiss(size_t s, size_t free_b, size_t largest, size_t grow
             grown ? "grew it by" : "trying a separate allocation of", (grown ? grown : s) >> 20);
 }
 
+// Whether the GPU PLONK helper will run on this card (see arenaInit).
+static bool plonkHelperOnThisCard(size_t total_b) {
+    const char* plonk_gpu = std::getenv("SP1_PLONK_GPU");
+    if (!plonk_gpu || std::strcmp(plonk_gpu, "1") != 0) return false;
+    if (total_b < (size_t(23) << 30)) return false;
+    const char* routed = std::getenv("SP1_PLONK_GPU_HELPER_DEVICES");
+    if (!routed || !*routed) return true;
+    for (const char* own_var : {"HIP_VISIBLE_DEVICES", "CUDA_VISIBLE_DEVICES"}) {
+        const char* own = std::getenv(own_var);
+        if (own && std::strcmp(own, routed) == 0) return true;
+    }
+    return false;
+}
+
 // Creates the arena on the first allocation (Linux; see above).
 static void arenaInit() {
     static bool tried = false;
@@ -316,19 +331,18 @@ static void arenaInit() {
 #endif
     const char* on = std::getenv("SP1_GPU_ARENA");
     if (on && std::strcmp(on, "0") == 0) return;
-    // The GPU PLONK helper (SP1_PLONK_GPU) is another process that needs most of the card, which
-    // the arena would hold.
-    const char* plonk_gpu = std::getenv("SP1_PLONK_GPU");
-    if (!on && plonk_gpu && (std::strcmp(plonk_gpu, "1") == 0 || std::strcmp(plonk_gpu, "true") == 0)) {
+    size_t free_b = 0, total_b = 0;
+    if (hipMemGetInfo(&free_b, &total_b) != hipSuccess) {
+        (void)hipGetLastError();
         return;
     }
+    // The GPU PLONK helper (SP1_PLONK_GPU=1, as the prover reads it) is another process that needs
+    // most of the card, which the arena would hold: on a card it fits on (the prover's
+    // PLONK_GPU_HELPER_VRAM_BYTES, 23 GiB) and when SP1_PLONK_GPU_HELPER_DEVICES does not send it
+    // to other cards.
+    if (!on && plonkHelperOnThisCard(total_b)) return;
     size_t want = envMib("SP1_GPU_ARENA_MB", 0);
     if (want == 0) {
-        size_t free_b = 0, total_b = 0;
-        if (hipMemGetInfo(&free_b, &total_b) != hipSuccess) {
-            (void)hipGetLastError();
-            return;
-        }
         const size_t headroom = envMib("SP1_GPU_ARENA_HEADROOM_MB", 2048ULL << 20);
         if (free_b < headroom + (size_t(1) << 30)) return;
         want = (free_b - headroom) & ~((size_t(2) << 20) - 1);
@@ -529,6 +543,18 @@ extern "C" void cuda_release_cached_memory() {
 #ifdef __HIPCC__
     std::lock_guard<std::mutex> lock(g_alloc_mutex);
     releaseCachedBlocks();
+#endif
+}
+
+// The device memory the arena holds (HIP), free or not: none for a wrap helper process.
+extern "C" size_t sp1_hip_arena_bytes() {
+#ifdef __HIPCC__
+    std::lock_guard<std::mutex> lock(g_alloc_mutex);
+    size_t total = 0;
+    for (auto& chunk : g_arena_chunks) total += chunk.second;
+    return total;
+#else
+    return 0;
 #endif
 }
 

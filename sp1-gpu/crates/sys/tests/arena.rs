@@ -23,6 +23,13 @@ fn arena_outlives_releasing_the_cached_blocks() {
         eprintln!("SP1_GPU_ARENA=0: no arena to test");
         return;
     }
+    // Where the GPU PLONK helper runs on this card, there is no arena (unless SP1_GPU_ARENA=1).
+    if std::env::var("SP1_PLONK_GPU").is_ok_and(|v| v == "1")
+        && std::env::var("SP1_GPU_ARENA").is_err()
+    {
+        eprintln!("SP1_PLONK_GPU=1: no arena on a card the PLONK helper fits on");
+        return;
+    }
     const SIZE: usize = 64 << 20;
     unsafe {
         let mut stream = CudaStreamHandle(ptr::null_mut());

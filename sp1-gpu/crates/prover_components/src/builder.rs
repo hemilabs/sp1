@@ -256,12 +256,22 @@ pub async fn cuda_worker_builder_with_machine(
 
     // A final-wrap GPU helper needs the memory of the shard prover's device caches too, which a
     // pool trim or a device reset does not return: rsp's PLONK helper otherwise ran out of memory.
+    // With HIP and SYCL, also the allocator's cached blocks, which the pool trim does not see (on
+    // HIP they go back to the arena when there is one, which a helper cannot have either).
     sp1_recursion_gnark_ffi::device_caches::set_releaser(|| {
         sp1_gpu_cudart::release_device_caches(true);
+        // SAFETY: takes nothing; waits for the device and frees blocks no one holds.
+        unsafe { sp1_gpu_cudart::sys::runtime::cuda_release_cached_memory() };
+    });
+    // HIP's arena holds the card's memory for the process's lifetime, out of a helper's reach.
+    // SAFETY: takes nothing and reads the arena's size under its lock.
+    sp1_recursion_gnark_ffi::device_caches::set_arena_bytes(|| unsafe {
+        sp1_gpu_cudart::sys::runtime::sp1_hip_arena_bytes() as u64
     });
     // Measuring and trimming GPU memory for that helper. On Linux the wrap paths find the CUDA
     // runtime library themselves; on Windows it is linked statically, and without these the GPU
     // Groth16 prover was never chosen ("free GPU memory is unknown").
+    #[cfg(not(target_os = "linux"))]
     if sp1_gpu_cudart::sys::BACKEND == "cuda" {
         sp1_recursion_gnark_ffi::device_caches::set_runtime(
             sp1_recursion_gnark_ffi::device_caches::Runtime {
@@ -384,7 +394,8 @@ pub async fn cuda_worker_builder_with_machine(
     // The GPU Groth16 prover is for cards above the 16 GB tier; 16 GB cards use gnark's CPU
     // prover, as the v6.0.0 fork always did. Before each proof the recursion prover also checks
     // that the card has the GPU memory free for the GPU prover's helper (beside this prover's own
-    // state, that rules out cards below 48 GB unless SP1_GPU_RESET_BEFORE_WRAP is set) and the host
+    // state, once its memory pool's idle reserve is given back, that rules out cards below 32 GB
+    // unless SP1_GPU_RESET_BEFORE_WRAP is set) and the host
     // has the memory, and uses the CPU prover if not.
     let groth16_gpu = gpu_memory_gb() > 20;
 

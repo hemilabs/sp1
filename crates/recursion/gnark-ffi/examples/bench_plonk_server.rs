@@ -89,8 +89,15 @@ fn main() -> anyhow::Result<()> {
         let out = tempfile::NamedTempFile::new_in("/dev/shm")
             .or_else(|_| tempfile::NamedTempFile::new())?;
         let t1 = Instant::now();
-        let outcome =
-            server.prove(&witness_json, &vkey_hash_hex, out.path(), witness_init_dir.as_deref())?;
+        // The witness this benchmark proves is in the export directory, as the prover used to
+        // write it.
+        let outcome = server.prove(
+            &witness_json,
+            &gpu_dir,
+            &vkey_hash_hex,
+            out.path(),
+            witness_init_dir.as_deref(),
+        )?;
         let wall = t1.elapsed();
         walls.push(wall);
         prove_ms_vec.push(outcome.prove_ms);

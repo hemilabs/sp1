@@ -121,10 +121,12 @@ gnark's CPU Groth16 prover peaks at ~16 GiB on the v6.1.0 circuit. So:
   once its memory pool's idle reserve is given back: in practice cards of 32 GB or more. The GPU
   PLONK prover (`SP1_PLONK_GPU=1`) is tried only where 23 GiB is free that way (a 32 GB card) or
   after a reset; elsewhere gnark's CPU prover makes the proof without the GPU attempt.
-- A process that exits after its proof can set `SP1_GPU_RESET_BEFORE_WRAP=1` to free its card for
-  a wrap helper that would not fit otherwise. The reset destroys the state the prover proves the
-  next proof with, so afterwards the process refuses to prove again; where the helper fits without
-  it, as on a 32 GB card, there is no reset and the process keeps proving.
+- A process that exits after its proof can set `SP1_GPU_RESET_BEFORE_WRAP=1` (Linux, CUDA or HIP) to
+  free its card for a wrap helper that would not fit otherwise: not where the card is too small for
+  the helper anyway, and not while another proof uses the GPU. The reset destroys the state the
+  prover proves the next proof with, so afterwards the process refuses to prove again; where the
+  helper fits without it, as on a 32 GB card, there is no reset and the process keeps proving. A
+  helper that runs out of memory without a reset gets one, once, if the flag is set.
 
 | Variable | Default | Effect |
 | --- | --- | --- |

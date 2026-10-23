@@ -19,6 +19,19 @@ pub fn release() {
     }
 }
 
+static ARENA_BYTES: OnceLock<fn() -> u64> = OnceLock::new();
+
+/// Registers what tells how much device memory this process holds in an arena (HIP's), which a
+/// wrap helper cannot have however much of it is free. Only the first registration counts.
+pub fn set_arena_bytes(arena_bytes: fn() -> u64) {
+    let _ = ARENA_BYTES.set(arena_bytes);
+}
+
+/// The device memory this process holds in an arena, if a GPU prover registered it; 0 otherwise.
+pub fn arena_bytes() -> u64 {
+    ARENA_BYTES.get().map_or(0, |arena_bytes| arena_bytes())
+}
+
 /// What the GPU prover registers so that the wrap paths can measure and trim this process's GPU
 /// memory where `gpu_device` cannot find the runtime library itself: on Windows it is linked
 /// statically.
@@ -38,9 +51,9 @@ pub fn set_runtime(runtime: Runtime) {
     let _ = RUNTIME.set(runtime);
 }
 
-/// The registered GPU runtime calls, if any. Only read off Linux: there `gpu_device` finds the
-/// runtime library itself.
-#[cfg(not(target_os = "linux"))]
+/// The registered GPU runtime calls, if any. Only read off Linux, by `gpu_device` (with the
+/// `native` feature): on Linux it finds the runtime library itself.
+#[cfg(all(feature = "native", not(target_os = "linux")))]
 pub(crate) fn runtime() -> Option<Runtime> {
     RUNTIME.get().copied()
 }

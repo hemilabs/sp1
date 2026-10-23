@@ -992,7 +992,6 @@ impl Groth16Bn254Prover {
         // `gpu_device`.
         crate::gpu_device::reset_if_requested("Groth16 (GPU)", GROTH16_GPU_HELPER_VRAM_BYTES);
 
-        tracing::info!("Spawning GPU Groth16 subprocess: {helper_path:?}");
         // GLV defaults:
         // - HIP build: leave SP1_GPU_GLV / SP1_GPU_G2_GLV unset so the
         //   helper's auto-detect (20 GB total VRAM threshold) decides.
@@ -1006,30 +1005,51 @@ impl Groth16Bn254Prover {
         //   or it will panic at the first MSM with "GLV MSM is HIP-
         //   only". The helper's auto-detect checks the backend too; this
         //   is a second guard, keyed on SP1_GPU_BACKEND.
-        let mut cmd = std::process::Command::new(&helper_path);
-        cmd.arg("--gpu-dir")
-            .arg(&prepared.pk.dir)
-            .arg("--witness-dir")
-            .arg(prepared.witness_dir.path())
-            .arg("--witness-json")
-            .arg(&prepared.witness_json)
-            .arg("--vkey-hash-hex")
-            .arg(&prepared.vkey_hash_hex)
-            .arg("--out")
-            .arg(&out_path);
-        // Phase 11: when the GPU R1CS solver was prepared above, point the
-        // helper at the prep-circuit cache + the per-prove wires_initial.bin
-        // so it builds witness data in-process instead of disk-loading the
-        // gnark-solved files (which we did not write in this branch).
-        if let Some(ref gpu_r1cs) = prepared.gpu_r1cs {
-            cmd.arg("--prep-circuit-dir").arg(&gpu_r1cs.prep_dir);
-            cmd.arg("--wires-initial").arg(&gpu_r1cs.wires_initial);
-        }
-        // CUDA builds need GLV forced off; HIP builds let auto-detect pick.
-        set_gpu_helper_env(&mut cmd);
+        let helper_command = || {
+            let mut cmd = std::process::Command::new(&helper_path);
+            cmd.arg("--gpu-dir")
+                .arg(&prepared.pk.dir)
+                .arg("--witness-dir")
+                .arg(prepared.witness_dir.path())
+                .arg("--witness-json")
+                .arg(&prepared.witness_json)
+                .arg("--vkey-hash-hex")
+                .arg(&prepared.vkey_hash_hex)
+                .arg("--out")
+                .arg(&out_path);
+            // Phase 11: when the GPU R1CS solver was prepared above, point the
+            // helper at the prep-circuit cache + the per-prove wires_initial.bin
+            // so it builds witness data in-process instead of disk-loading the
+            // gnark-solved files (which we did not write in this branch).
+            if let Some(ref gpu_r1cs) = prepared.gpu_r1cs {
+                cmd.arg("--prep-circuit-dir").arg(&gpu_r1cs.prep_dir);
+                cmd.arg("--wires-initial").arg(&gpu_r1cs.wires_initial);
+            }
+            // CUDA builds need GLV forced off; HIP builds let auto-detect pick.
+            set_gpu_helper_env(&mut cmd);
+            cmd
+        };
         // Bound to this prover and its queue slot, and timed out if it hangs; see `subprocess`.
-        let finished = crate::subprocess::run(cmd, "groth16_gpu_helper")
-            .unwrap_or_else(|e| panic!("GPU Groth16 helper {}: {e:#}", helper_path.display()));
+        let run_helper = || {
+            tracing::info!("Spawning GPU Groth16 subprocess: {helper_path:?}");
+            crate::subprocess::run(helper_command(), "groth16_gpu_helper")
+                .unwrap_or_else(|e| panic!("GPU Groth16 helper {}: {e:#}", helper_path.display()))
+        };
+        let mut finished = run_helper();
+        // A helper that failed beside this process's state, which the measurement said it had
+        // room for, gets the card to itself once (SP1_GPU_RESET_BEFORE_WRAP).
+        if !finished.status.success()
+            && crate::gpu_device::reset_after_failed_helper(
+                "Groth16 (GPU)",
+                GROTH16_GPU_HELPER_VRAM_BYTES,
+            )
+        {
+            tracing::warn!(
+                "GPU Groth16 helper failed ({}); running it again on the reset GPU",
+                finished.describe()
+            );
+            finished = run_helper();
+        }
         if !finished.status.success() {
             panic!("GPU Groth16 helper {} failed: {}", helper_path.display(), finished.describe());
         }
