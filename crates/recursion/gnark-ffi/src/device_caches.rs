@@ -38,7 +38,9 @@ pub fn set_runtime(runtime: Runtime) {
     let _ = RUNTIME.set(runtime);
 }
 
-/// The registered GPU runtime calls, if any.
+/// The registered GPU runtime calls, if any. Only read off Linux: there `gpu_device` finds the
+/// runtime library itself.
+#[cfg(not(target_os = "linux"))]
 pub(crate) fn runtime() -> Option<Runtime> {
     RUNTIME.get().copied()
 }
