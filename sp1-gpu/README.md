@@ -117,10 +117,12 @@ gnark's CPU Groth16 prover peaks at ~16 GiB on the v6.1.0 circuit. So:
   ~14 GiB at peak, once per host):
   `sp1-gpu-server --sp1-groth16-cpu-helper --prepare --build-dir ~/.sp1/circuits/groth16/<version>`.
   Exit codes: 0 ready, 64 bad arguments or no circuit there, 65 unreadable circuit, 69 not built.
-- The GPU Groth16 prover is used only where the card has 18 GiB free beside the prover's own state:
-  in practice cards of 48 GB or more. A process that exits after its proof can set
-  `SP1_GPU_RESET_BEFORE_WRAP=1` to free its card first; a long-lived server must not, as the reset
-  destroys the state it proves the next proof with.
+- The GPU Groth16 prover is used only where the card has 18 GiB free beside the prover's own state,
+  once its memory pool's idle reserve is given back: in practice cards of 32 GB or more. The GPU
+  PLONK prover (`SP1_PLONK_GPU=1`) is tried only where 23 GiB is free that way (a 32 GB card) or
+  after a reset; elsewhere gnark's CPU prover makes the proof without the GPU attempt. A process
+  that exits after its proof can set `SP1_GPU_RESET_BEFORE_WRAP=1` to free its card first; a
+  long-lived server must not, as the reset destroys the state it proves the next proof with.
 
 | Variable | Default | Effect |
 | --- | --- | --- |

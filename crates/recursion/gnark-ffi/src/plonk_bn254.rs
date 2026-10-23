@@ -14,6 +14,13 @@ use sp1_recursion_compiler::{
     ir::{Config, Witness},
 };
 
+/// Free GPU memory the GPU PLONK prover's helper needs at N = 2^25 (the v6.1.0 circuit). Measured
+/// on an RTX 5090 with the rest of the card taken: it proved with 23000 MiB free and ran out with
+/// 22000 MiB; the streamed quotient (cards under 20 GiB, and HIP) proved with 22000 MiB and ran out
+/// with 20000 MiB. So no card under 24 GB fits it, and a 32 GB card does only once the shard
+/// prover's memory pool gives its idle reserve back (~25 GiB free on an RTX 5090).
+pub const PLONK_GPU_HELPER_VRAM_BYTES: u64 = 23 << 30;
+
 /// Create a temp directory in /dev/shm (tmpfs) on Linux, falling back to the
 /// default temp dir on other platforms. Mirrors the helper in groth16_bn254.rs.
 #[cfg(feature = "native")]

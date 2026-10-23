@@ -1081,14 +1081,43 @@ impl<A: ArtifactClient, C: SP1ProverComponents> SP1RecursionProver<A, C> {
                 let _ = (&vkey_bn, &cvd_bn, &exit_bn, &vk_root_bn, &proof_nonce_bn);
                 Ok(prover.prove(witness.clone(), &build_dir))
             };
-            // The GPU prover first, when asked for. Its helper needs ~24 GB of GPU memory, which a
-            // card holding this prover's state does not have unless the process resets it first
-            // (SP1_GPU_RESET_BEFORE_WRAP) or SP1_PLONK_GPU_HELPER_DEVICES routes the helper to
-            // another card; if it fails, the CPU prover takes over rather than losing the proof.
+            // The GPU prover first, when asked for and its helper fits: it needs ~23 GiB of GPU
+            // memory, which a card holding this prover's state has free only once the memory
+            // pool's idle reserve is given back (on a 32 GB card), or after a reset
+            // (SP1_GPU_RESET_BEFORE_WRAP), unless SP1_PLONK_GPU_HELPER_DEVICES routes the helper to
+            // another card. Deciding here spares a card that cannot fit it the witness export and
+            // the helper's start. If it fails, the CPU prover takes over rather than losing the
+            // proof.
+            #[cfg(feature = "native-gnark")]
+            let use_gpu = plonk_gpu && {
+                use super::groth16_backend::{use_gpu_plonk, PlonkInputs};
+                let helper_routed = std::env::var_os("SP1_PLONK_GPU_HELPER_DEVICES").is_some();
+                if !helper_routed {
+                    if let Some((before, after)) = sp1_recursion_gnark_ffi::gpu_trim_memory_pool() {
+                        tracing::info!(
+                            "PLONK: trimmed the GPU memory pool: {} -> {} MiB free",
+                            before >> 20,
+                            after >> 20
+                        );
+                    }
+                }
+                let (gpu, reason) = use_gpu_plonk(&PlonkInputs {
+                    helper_routed,
+                    helper_server: sp1_recursion_gnark_ffi::plonk_helper_server::enabled(),
+                    vram_free: sp1_recursion_gnark_ffi::gpu_free_memory(),
+                    vram_total: sp1_recursion_gnark_ffi::gpu_total_memory(),
+                    gpu_reset: sp1_recursion_gnark_ffi::gpu_reset_requested(),
+                });
+                tracing::info!(
+                    "PLONK prover: {} ({reason})",
+                    if gpu { "GPU" } else { "gnark CPU" }
+                );
+                gpu
+            };
             #[cfg(feature = "native-gnark")]
             let proof = super::groth16_backend::prove_preferring_gpu(
                 "PLONK",
-                plonk_gpu,
+                use_gpu,
                 || {
                     prove_with_retry(
                         "plonk_wrap_gpu",

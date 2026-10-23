@@ -1,5 +1,6 @@
 //! Which prover makes the final Groth16 proof: the GPU prover (`groth16_gpu_helper`) or gnark's
-//! CPU prover (in its own helper; see `Groth16Bn254Prover::prove_isolated`).
+//! CPU prover (in its own helper; see `Groth16Bn254Prover::prove_isolated`). Also whether a PLONK
+//! proof tries the GPU PLONK prover that `SP1_PLONK_GPU=1` asks for ([`use_gpu_plonk`]).
 //!
 //! The GPU prover's helper needs GPU memory of its own, while the prover that starts it keeps its
 //! shard-prover state on the card between proofs: 21.7 GB of an RTX 4090's 24 GB, and cards above
@@ -96,6 +97,55 @@ pub(crate) fn use_gpu(inputs: &Groth16Inputs<'_>) -> (bool, String) {
         ),
         Some(available) => (true, format!("{} GiB of host memory is available", available >> 30)),
         None => (true, "host memory is unknown, so the card decides".into()),
+    }
+}
+
+/// What trying the GPU PLONK prover (`SP1_PLONK_GPU=1`) depends on; see [`use_gpu_plonk`].
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PlonkInputs {
+    /// Whether `SP1_PLONK_GPU_HELPER_DEVICES` runs the helper on other cards than this process's.
+    pub helper_routed: bool,
+    /// Whether `SP1_PLONK_GPU_SERVER` keeps the helper, and the GPU memory it has, between proofs.
+    pub helper_server: bool,
+    /// Free memory on this process's GPU, once the memory pool's idle reserve is given back, if
+    /// known.
+    pub vram_free: Option<u64>,
+    /// Total memory of this process's GPU, if known.
+    pub vram_total: Option<u64>,
+    /// Whether this process may reset its GPU to make room for the helper
+    /// (`SP1_GPU_RESET_BEFORE_WRAP`).
+    pub gpu_reset: bool,
+}
+
+/// Returns whether to try the GPU PLONK prover that `SP1_PLONK_GPU=1` asks for, and why, for the
+/// log: only where its helper fits ([`sp1_recursion_gnark_ffi::PLONK_GPU_HELPER_VRAM_BYTES`]),
+/// so that a card that cannot fit it does not export the witness and start the helper first.
+pub(crate) fn use_gpu_plonk(inputs: &PlonkInputs) -> (bool, String) {
+    let needed = sp1_recursion_gnark_ffi::PLONK_GPU_HELPER_VRAM_BYTES;
+    if inputs.helper_routed {
+        return (true, "SP1_PLONK_GPU_HELPER_DEVICES runs its helper on other cards".into());
+    }
+    if inputs.helper_server {
+        return (true, "SP1_PLONK_GPU_SERVER keeps its helper and the helper's memory".into());
+    }
+    match (inputs.vram_free, inputs.vram_total) {
+        (Some(free), _) if free >= needed => {
+            (true, format!("{} GiB of GPU memory is free", free >> 30))
+        }
+        (_, Some(total)) if inputs.gpu_reset && total >= needed => (
+            true,
+            format!("SP1_GPU_RESET_BEFORE_WRAP frees this {} GiB card for its helper", total >> 30),
+        ),
+        (Some(free), total) => (
+            false,
+            format!(
+                "{}{} GiB of GPU memory is free and the GPU PLONK prover's helper needs {} GiB",
+                free >> 30,
+                total.map(|total| format!(" of {}", total >> 30)).unwrap_or_default(),
+                needed >> 30
+            ),
+        ),
+        (None, _) => (true, "free GPU memory is unknown, so its helper tries".into()),
     }
 }
 
@@ -303,6 +353,47 @@ mod tests {
         assert_eq!(prove_preferring_gpu("test", false, untried, cpu).unwrap(), "cpu");
         let cpu_failed = || -> anyhow::Result<&str> { Err(anyhow::anyhow!("helper failed")) };
         assert!(prove_preferring_gpu("test", true, failed, cpu_failed).is_err());
+    }
+
+    fn plonk_inputs(vram_free: u64, vram_total: u64) -> PlonkInputs {
+        PlonkInputs {
+            helper_routed: false,
+            helper_server: false,
+            vram_free: Some(vram_free),
+            vram_total: Some(vram_total),
+            gpu_reset: false,
+        }
+    }
+
+    #[test]
+    fn the_gpu_plonk_helper_needs_its_measured_gpu_memory_free() {
+        let needed = sp1_recursion_gnark_ffi::PLONK_GPU_HELPER_VRAM_BYTES;
+        // An RTX 5090 with the prover resident, after the pool trim.
+        assert!(use_gpu_plonk(&plonk_inputs(25 * GIB, 32 * GIB)).0);
+        assert!(use_gpu_plonk(&plonk_inputs(needed, 32 * GIB)).0);
+        assert!(!use_gpu_plonk(&plonk_inputs(needed - 1, 32 * GIB)).0);
+        // An RTX 4070 (12 GB): the helper ran out of memory there, after its export.
+        assert!(!use_gpu_plonk(&plonk_inputs(7 * GIB, 12 * GIB)).0);
+    }
+
+    #[test]
+    fn a_reset_frees_only_a_card_big_enough_for_the_gpu_plonk_helper() {
+        // An RTX 4090 keeps 21.7 GB of its 24 GB between proofs.
+        let card_24gb = PlonkInputs { gpu_reset: true, ..plonk_inputs(2 * GIB, 24 * GIB) };
+        assert!(use_gpu_plonk(&card_24gb).0);
+        assert!(!use_gpu_plonk(&PlonkInputs { gpu_reset: false, ..card_24gb }).0);
+        let card_16gb = PlonkInputs { gpu_reset: true, ..plonk_inputs(2 * GIB, 16 * GIB) };
+        assert!(!use_gpu_plonk(&card_16gb).0);
+    }
+
+    #[test]
+    fn a_gpu_plonk_helper_elsewhere_or_kept_running_is_not_measured_here() {
+        let small = plonk_inputs(2 * GIB, 12 * GIB);
+        assert!(use_gpu_plonk(&PlonkInputs { helper_routed: true, ..small }).0);
+        assert!(use_gpu_plonk(&PlonkInputs { helper_server: true, ..small }).0);
+        // Unknown memory: the helper tries, and the CPU prover takes over if it fails.
+        let unknown = PlonkInputs { vram_free: None, vram_total: None, ..small };
+        assert!(use_gpu_plonk(&unknown).0);
     }
 
     fn prestart_inputs() -> PrestartInputs<'static> {
