@@ -853,17 +853,16 @@ fn forget_pk_if_failed<C: SP1ProverComponents>(
     }
 }
 
-/// How many core setups must agree on the verifying key before a proof uses it
-/// (`SP1_CORE_SETUP_CHECKS`, default 2; 1 sets up once).
-fn core_setup_checks() -> usize {
-    static CHECKS: OnceLock<usize> = OnceLock::new();
-    *CHECKS.get_or_init(|| {
-        std::env::var("SP1_CORE_SETUP_CHECKS")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(2)
-            .max(1)
+/// How many core setups must agree on the verifying key before a proof uses it:
+/// `SP1_CORE_SETUP_CHECKS`, else the components' [`SP1ProverComponents::core_setup_checks`] (2 for
+/// the GPU prover, 1 for the CPU prover); 1 sets up once.
+fn core_setup_checks<C: SP1ProverComponents>() -> usize {
+    static ENV: OnceLock<Option<usize>> = OnceLock::new();
+    ENV.get_or_init(|| {
+        std::env::var("SP1_CORE_SETUP_CHECKS").ok().and_then(|v| v.parse::<usize>().ok())
     })
+    .unwrap_or_else(C::core_setup_checks)
+    .max(1)
 }
 
 /// Sets the program up until [`core_setup_checks`] setups agree on the verifying key, and returns
@@ -878,7 +877,7 @@ async fn checked_core_setup<C: SP1ProverComponents>(
     program: Arc<Program>,
     permits: ProverSemaphore,
 ) -> Result<(Arc<CoreProvingKey<C>>, MachineVerifyingKey<SP1GlobalContext>), TaskError> {
-    let needed = core_setup_checks();
+    let needed = core_setup_checks::<C>();
     let mut setups: Vec<(Arc<CoreProvingKey<C>>, MachineVerifyingKey<SP1GlobalContext>, usize)> =
         Vec::new();
     for _ in 0..needed + 4 {

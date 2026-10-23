@@ -79,13 +79,24 @@ impl UploadStream {
     ) -> Option<Arc<StagedUpload>> {
         let layout = Layout::array::<T>(len).ok()?;
         let size = layout.size() as u64;
+        // The device caches count too: an upload they leave no room for would only make the next
+        // allocation free them, and this upload with them (see `make_room_for`).
         let staged = STAGED_BYTES.load(Ordering::Relaxed);
-        if UNSTAGED_PEAK.load(Ordering::Relaxed) + staged + size
+        let cached = CACHED_BYTES.load(Ordering::Relaxed);
+        if UNSTAGED_PEAK.load(Ordering::Relaxed) + staged + cached + size
             > STAGED_LIMIT.load(Ordering::Relaxed)
         {
             return None;
         }
-        let ptr = self.stream.allocate(layout).ok()?.cast::<u8>();
+        // Counted as staged before it is allocated, so that the allocation does not count it as
+        // the prover's own (unstaged) memory, raising the peak every later upload must leave room
+        // for.
+        STAGED_BYTES.fetch_add(size, Ordering::Relaxed);
+        let Ok(ptr) = self.stream.allocate(layout) else {
+            STAGED_BYTES.fetch_sub(size, Ordering::Relaxed);
+            return None;
+        };
+        let ptr = ptr.cast::<u8>();
         let uploaded = self.events.lock().unwrap_or_else(|e| e.into_inner()).pop();
         let uploaded = match uploaded {
             Some(event) => Some(event),
@@ -108,12 +119,12 @@ impl UploadStream {
         });
         if !copied {
             self.stream.deallocate(ptr, layout);
+            STAGED_BYTES.fetch_sub(size, Ordering::Relaxed);
             if let Some(event) = uploaded {
                 self.events.lock().unwrap_or_else(|e| e.into_inner()).push(event);
             }
             return None;
         }
-        STAGED_BYTES.fetch_add(size, Ordering::Relaxed);
         let upload = Arc::new(StagedUpload {
             allocation: Mutex::new(Some(DevicePtr(ptr, layout))),
             uploaded,
@@ -239,6 +250,14 @@ pub fn release_device_caches(wait: bool) -> bool {
     released
 }
 
+/// Sets the live device memory above which [`make_room_for`] frees staged uploads and device
+/// caches, unless an upload stream set it ([`UploadStream::create`]): for device caches in a
+/// process without the trace prefetch (off by default on Windows), which would otherwise never be
+/// released under pressure, since WDDM spills over-budget memory instead of failing allocations.
+pub fn limit_device_memory_if_unset(limit: u64) {
+    let _ = STAGED_LIMIT.compare_exchange(u64::MAX, limit, Ordering::Relaxed, Ordering::Relaxed);
+}
+
 /// Called after a device allocation, with the live device memory including it.
 pub(crate) fn note_live_bytes(live: u64) {
     let unstaged = live
@@ -249,19 +268,24 @@ pub(crate) fn note_live_bytes(live: u64) {
 
 /// Called before a device allocation of `size` bytes: if staged uploads or caches hold memory
 /// and the allocation would take the live device memory above the limit, frees them (see
-/// [`StagedUpload`] and [`DeviceCache`]).
+/// [`StagedUpload`] and [`DeviceCache`]): the caches first, and the staged uploads, which the
+/// shards about to be proved are waiting for, only if the caches do not hold enough.
 pub(crate) fn make_room_for(size: u64) {
     let staged = STAGED_BYTES.load(Ordering::Relaxed);
     let cached = CACHED_BYTES.load(Ordering::Relaxed);
-    if (staged > 0 || cached > 0)
-        && crate::vram_current_bytes() + size > STAGED_LIMIT.load(Ordering::Relaxed)
-    {
-        if staged > 0 {
-            reclaim_staged_uploads(false);
+    let over =
+        (crate::vram_current_bytes() + size).saturating_sub(STAGED_LIMIT.load(Ordering::Relaxed));
+    if over == 0 || (staged == 0 && cached == 0) {
+        return;
+    }
+    if cached > 0 {
+        release_device_caches(false);
+        if cached >= over {
+            return;
         }
-        if cached > 0 {
-            release_device_caches(false);
-        }
+    }
+    if staged > 0 {
+        reclaim_staged_uploads(false);
     }
 }
 

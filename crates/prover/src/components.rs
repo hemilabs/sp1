@@ -177,6 +177,14 @@ pub trait SP1ProverComponents: Send + Sync + 'static + Sized {
     fn dependencies_in_trace() -> bool {
         false
     }
+
+    /// How many core setups must agree on the verifying key before a proof uses it, unless
+    /// `SP1_CORE_SETUP_CHECKS` says otherwise: a check for setups that went wrong on a device
+    /// (see `checked_core_setup`), which costs a setup per proof. One by default: a CPU setup has
+    /// no device to go wrong on.
+    fn core_setup_checks() -> usize {
+        1
+    }
 }
 
 pub struct CpuSP1ProverComponents;

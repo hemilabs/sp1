@@ -69,12 +69,18 @@ impl OpenShard {
             return None;
         }
         let reads = chunk.mem_reads();
-        let len = self.trace.mem_reads.len() + reads.len();
-        let mut mem_reads = Arc::<[MemValue]>::new_uninit_slice(len);
+        let (carried, next) = (self.trace.mem_reads.len(), reads.len());
+        let mut mem_reads = Arc::<[MemValue]>::new_uninit_slice(carried + next);
         let slots = Arc::get_mut(&mut mem_reads).expect("the new slice is not shared");
-        for (slot, value) in slots.iter_mut().zip(self.trace.mem_reads.iter().copied().chain(reads))
-        {
-            slot.write(value);
+        // Two bulk copies, not an element at a time: the next chunk's reads can be 256 MiB, and
+        // this runs between one chunk's splice and the next's.
+        // SAFETY: `slots` has room for both, `self.trace.mem_reads` holds `carried` initialized
+        // values and `reads` points at `next` of them (`MemValue` is `Copy`), and the new slice
+        // overlaps neither.
+        unsafe {
+            let dst = slots.as_mut_ptr() as *mut MemValue;
+            std::ptr::copy_nonoverlapping(self.trace.mem_reads.as_ptr(), dst, carried);
+            std::ptr::copy_nonoverlapping(reads.head_raw(), dst.add(carried), next);
         }
         Some(TraceChunk {
             start_registers: self.trace.start_registers,

@@ -599,6 +599,10 @@ fn read_elements<T: RawElement>(path: &std::path::Path, skip: u64) -> anyhow::Re
     // SAFETY: `T` is 32 bytes without padding and any bytes are a valid `T` (`RawElement`).
     let bytes = unsafe { std::slice::from_raw_parts_mut(elements.as_mut_ptr() as *mut u8, n * 32) };
     bytes.par_chunks_mut(CHUNK_BYTES).enumerate().try_for_each(|(i, chunk)| {
+        // Windows serializes I/O on one synchronous handle: each chunk reads through its own.
+        #[cfg(windows)]
+        let file =
+            std::fs::File::open(path).map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))?;
         read_exact_at(&file, chunk, skip + (i * CHUNK_BYTES) as u64)
             .map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))
     })?;

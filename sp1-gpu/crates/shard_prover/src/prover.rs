@@ -20,8 +20,8 @@ use sp1_gpu_cudart::{DeviceMle, DevicePoint, TaskScope};
 use sp1_gpu_jagged_assist::prove_jagged_evaluation_sync;
 use sp1_gpu_jagged_sumcheck::{generate_jagged_sumcheck_poly, jagged_sumcheck};
 use sp1_gpu_jagged_tracegen::{
-    copy_preprocessed_traces, full_tracegen_permit, main_tracegen_permit, CudaShardProverData,
-    TracePrefetcher,
+    copy_preprocessed_traces, full_tracegen_permit, main_tracegen_permit, preprocessed_copy_bytes,
+    CudaShardProverData, TracePrefetcher,
 };
 use sp1_gpu_logup_gkr::{prove_logup_gkr, CudaLogUpGkrOptions, Interactions};
 use sp1_gpu_merkle_tree::{CudaTcsProver, SingleLayerMerkleTreeProverError};
@@ -524,11 +524,13 @@ where
             (data.shared.clone(), data.trace_buffer_pool.clone())
         };
         let traces = pool.pop().await.expect("trace buffer of a proved shard");
-        let dense = traces.dense();
-        let traces_bytes = (dense.preprocessed_offset * std::mem::size_of::<Felt>()
-            + ((dense.preprocessed_offset >> 1) + 2 * dense.preprocessed_cols + 1)
-                * std::mem::size_of::<u32>()) as u64;
-        if dense.preprocessed_offset == 0 || !cache.admits(traces_bytes) {
+        let traces_bytes = preprocessed_copy_bytes(&traces) as u64;
+        // A shard of the same program that missed the cache at the same time may have cached it
+        // already: then nothing is copied (the device copies would only be dropped again).
+        if traces.dense().preprocessed_offset == 0
+            || !cache.admits(traces_bytes)
+            || cache.contains(&program, &initial_global_cumulative_sum)
+        {
             return;
         }
         // Ordered on the prover's stream after the shard's proof, which leaves the preprocessed

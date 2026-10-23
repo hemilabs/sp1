@@ -206,13 +206,77 @@ fn forced_choice() -> Option<u8> {
     }
 }
 
+/// The host's RAM, or the memory limit of this process's cgroup (v2) where that is lower: the
+/// keep-warm, allocator and cache-size choices must fit in what the process may use, as the
+/// prover's host-memory checks (`host_memory::available`) do.
 #[cfg(target_os = "linux")]
 fn host_ram_bytes() -> u64 {
     let mut info: libc::sysinfo = unsafe { std::mem::zeroed() };
     if unsafe { libc::sysinfo(&mut info) } != 0 {
         return 0;
     }
-    (info.totalram as u64).saturating_mul(info.mem_unit.max(1) as u64)
+    let ram = (info.totalram as u64).saturating_mul(info.mem_unit.max(1) as u64);
+    cgroup_memory_max().map_or(ram, |max| ram.min(max))
+}
+
+/// Reads the file at `path` into `buf`, without allocating. Returns the length read.
+#[cfg(target_os = "linux")]
+fn read_file(path: &std::ffi::CStr, buf: &mut [u8]) -> Option<usize> {
+    let fd = unsafe { libc::open(path.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
+    if fd < 0 {
+        return None;
+    }
+    let mut len = 0;
+    while len < buf.len() {
+        let n = unsafe { libc::read(fd, buf[len..].as_mut_ptr().cast(), buf.len() - len) };
+        if n <= 0 {
+            break;
+        }
+        len += n as usize;
+    }
+    unsafe { libc::close(fd) };
+    Some(len)
+}
+
+/// The least `memory.max` of this process's cgroup (v2) and of its ancestors, or `None` where none
+/// has a limit. Read without allocating: [`decide`] runs inside the first allocation.
+#[cfg(target_os = "linux")]
+fn cgroup_memory_max() -> Option<u64> {
+    const ROOT: &[u8] = b"/sys/fs/cgroup";
+    const FILE: &[u8] = b"/memory.max\0";
+    let mut cgroups = [0u8; 4096];
+    let n = read_file(c"/proc/self/cgroup", &mut cgroups)?;
+    // The v2 line is `0::<path>`; on a hybrid host the v1 lines come first.
+    let line = cgroups[..n].split(|&b| b == b'\n').find_map(|line| line.strip_prefix(b"0::"))?;
+    let mut dir = [0u8; 1024];
+    let rel = line.strip_suffix(b"/").unwrap_or(line);
+    let mut len = ROOT.len() + rel.len();
+    if len + FILE.len() > dir.len() {
+        return None;
+    }
+    dir[..ROOT.len()].copy_from_slice(ROOT);
+    dir[ROOT.len()..len].copy_from_slice(rel);
+    let mut least: Option<u64> = None;
+    loop {
+        let mut path = [0u8; 1024];
+        path[..len].copy_from_slice(&dir[..len]);
+        path[len..len + FILE.len()].copy_from_slice(FILE);
+        let path = std::ffi::CStr::from_bytes_until_nul(&path).ok()?;
+        let mut value = [0u8; 32];
+        if let Some(n) = read_file(path, &mut value) {
+            // "max" (no limit) does not parse.
+            if let Some(max) =
+                std::str::from_utf8(&value[..n]).ok().and_then(|v| v.trim().parse::<u64>().ok())
+            {
+                least = Some(least.map_or(max, |least| least.min(max)));
+            }
+        }
+        if len <= ROOT.len() {
+            return least;
+        }
+        // Up to the parent cgroup.
+        len = dir[..len].iter().rposition(|&b| b == b'/').unwrap_or(0).max(ROOT.len());
+    }
 }
 
 /// Windows: kernel32's GlobalMemoryStatusEx (kernel32 is always linked), declared here rather

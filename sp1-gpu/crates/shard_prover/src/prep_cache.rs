@@ -97,6 +97,17 @@ impl<GC: IopCtx, Air: MachineAir<GC::F>> PrepCache<GC, Air> {
         if prep_cache_budget() == 0 {
             return None;
         }
+        // What "low" means, where the trace prefetch did not set it (off by default on Windows):
+        // the memory this process can use, less the prefetch's headroom.
+        if let Ok((free, total)) = sp1_gpu_cudart::cuda_memory_info() {
+            let headroom = std::env::var("SP1_GPU_TRACE_PREFETCH_HEADROOM_MIB")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(1536)
+                << 20;
+            let usable = (free as u64 + sp1_gpu_cudart::vram_current_bytes()).min(total as u64);
+            sp1_gpu_cudart::limit_device_memory_if_unset(usable.saturating_sub(headroom));
+        }
         let cache = Arc::new(Self { entries: Mutex::new(Vec::new()), scope });
         let weak: std::sync::Weak<dyn DeviceCache> =
             Arc::downgrade(&(cache.clone() as Arc<dyn DeviceCache>));
@@ -120,13 +131,26 @@ impl<GC: IopCtx, Air: MachineAir<GC::F>> PrepCache<GC, Air> {
         Some(entry)
     }
 
+    /// Whether `program` set up with `initial_global_cumulative_sum` is cached (without making it
+    /// the most recently used).
+    pub fn contains(
+        &self,
+        program: &Arc<Air::Program>,
+        initial_global_cumulative_sum: &SepticDigest<GC::F>,
+    ) -> bool {
+        self.entries.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|e| {
+            Arc::ptr_eq(&e.program, program)
+                && e.initial_global_cumulative_sum == *initial_global_cumulative_sum
+        })
+    }
+
     /// Whether an entry of `bytes` could be cached.
     pub fn admits(&self, bytes: u64) -> bool {
         bytes <= prep_cache_budget()
     }
 
     /// Caches `entry`, evicting the least recently used entries to stay within the budget. The
-    /// entry is dropped if the other caches hold too much of the budget.
+    /// entry is dropped, and nothing evicted, if the other caches hold too much of the budget.
     pub fn insert(&self, entry: PrepEntry<GC, Air>) {
         let budget = prep_cache_budget();
         let bytes = entry.bytes;
@@ -137,6 +161,24 @@ impl<GC: IopCtx, Air: MachineAir<GC::F>> PrepCache<GC, Air> {
                 Arc::ptr_eq(&e.program, &entry.program)
                     && e.initial_global_cumulative_sum == entry.initial_global_cumulative_sum
             }) {
+                return;
+            }
+            // Entries whose program only this cache still holds can never be looked up again
+            // (programs are identified by address): a program recompiled after the normalize
+            // program cache dropped it is a new one.
+            let mut i = 0;
+            while i < entries.len() {
+                if Arc::strong_count(&entries[i].program) == 1 {
+                    let e = entries.remove(i);
+                    sp1_gpu_cudart::sub_device_cache_bytes(e.bytes);
+                    evicted.push(e);
+                } else {
+                    i += 1;
+                }
+            }
+            let own: u64 = entries.iter().map(|e| e.bytes).sum();
+            let others = sp1_gpu_cudart::device_cache_bytes().saturating_sub(own);
+            if others + bytes > budget {
                 return;
             }
             while !entries.is_empty() && sp1_gpu_cudart::device_cache_bytes() + bytes > budget {
@@ -151,6 +193,15 @@ impl<GC: IopCtx, Air: MachineAir<GC::F>> PrepCache<GC, Air> {
         }
         // Dropped outside the lock: freeing device memory may call back into `release`.
         drop(evicted);
+    }
+}
+
+impl<GC: IopCtx, Air: MachineAir<GC::F>> Drop for PrepCache<GC, Air> {
+    fn drop(&mut self) {
+        // The process-wide count must not keep the bytes of entries that go with the cache.
+        for e in self.entries.get_mut().unwrap_or_else(|e| e.into_inner()).iter() {
+            sp1_gpu_cudart::sub_device_cache_bytes(e.bytes);
+        }
     }
 }
 

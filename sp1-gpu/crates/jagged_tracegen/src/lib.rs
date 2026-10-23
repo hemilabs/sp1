@@ -1733,6 +1733,16 @@ pub fn copy_preprocessed_traces(
     })
 }
 
+/// The device bytes [`copy_preprocessed_traces`] would copy out of `traces` (a shard's whole
+/// traces), for deciding whether to copy them at all. Kept beside the copy, which allocates these
+/// lengths.
+pub fn preprocessed_copy_bytes(traces: &JaggedTraceMle<Felt, TaskScope>) -> usize {
+    let dense = traces.dense();
+    let (offset, cols) = (dense.preprocessed_offset, dense.preprocessed_cols);
+    offset * std::mem::size_of::<Felt>()
+        + ((offset >> 1) + (cols + 1) + cols) * std::mem::size_of::<u32>()
+}
+
 /// The device bytes held by a copy made by [`copy_preprocessed_traces`].
 pub fn preprocessed_traces_bytes(traces: &JaggedTraceMle<Felt, TaskScope>) -> usize {
     traces.dense().dense.capacity() * std::mem::size_of::<Felt>()

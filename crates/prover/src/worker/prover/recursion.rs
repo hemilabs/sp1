@@ -885,6 +885,8 @@ impl<A: ArtifactClient, C: SP1ProverComponents> SP1RecursionProver<A, C> {
             #[cfg(feature = "native-gnark")]
             let _slot = sp1_recursion_gnark_ffi::final_wrap_slot("Groth16");
             #[cfg(feature = "native-gnark")]
+            release_recycled_event_buffers_if_short();
+            #[cfg(feature = "native-gnark")]
             let use_gpu = {
                 use super::groth16_backend::{use_gpu, Groth16Inputs};
                 let override_env = std::env::var("SP1_GROTH16_GPU").ok();
@@ -1030,6 +1032,8 @@ impl<A: ArtifactClient, C: SP1ProverComponents> SP1RecursionProver<A, C> {
             // PLONK's final wrap is as memory-hungry as Groth16's and shares its host-wide slot.
             #[cfg(feature = "native-gnark")]
             let _slot = sp1_recursion_gnark_ffi::final_wrap_slot("PLONK");
+            #[cfg(feature = "native-gnark")]
+            release_recycled_event_buffers_if_short();
             let SP1WrapProof { vk: wrap_vk, proof: wrap_proof } = wrap_proof;
             let input = SP1ShapedWitnessValues {
                 vks_and_proofs: vec![(wrap_vk.clone(), wrap_proof.clone())],
@@ -1327,6 +1331,23 @@ fn dummy_compose_input<C: SP1ProverComponents>(
         *verifier.fri_config(),
         verifier.log_stacking_height() as usize,
     )
+}
+
+/// Host memory below which a final wrap gives back the core shards' recycled event buffers.
+#[cfg(feature = "native-gnark")]
+const WRAP_RECYCLED_BUFFERS_MIN_AVAILABLE: u64 = 64 << 30;
+
+/// Gives back the event buffers the core shards left for the next proof's (up to eight records',
+/// ~1.5 GB each) where the host has less than [`WRAP_RECYCLED_BUFFERS_MIN_AVAILABLE`] available:
+/// the final wrap's gnark solve and helper need several GB of host memory more than the next core
+/// shards need warm buffers. On hosts with more, they stay warm.
+#[cfg(feature = "native-gnark")]
+fn release_recycled_event_buffers_if_short() {
+    if sp1_recursion_gnark_ffi::host_memory::available()
+        .is_some_and(|available| available < WRAP_RECYCLED_BUFFERS_MIN_AVAILABLE)
+    {
+        sp1_core_executor::release_recycled_event_buffers();
+    }
 }
 
 /// Runs `setup` (a recursion program's setup on the GPU) until its vk is in the vk map, at most four

@@ -31,6 +31,13 @@ impl SP1ProverComponents for SP1CudaProverComponents {
     fn dependencies_in_trace() -> bool {
         std::env::var("SP1_DEPENDENCIES_IN_TRACE").map_or(true, |v| v != "0")
     }
+
+    /// Two setups must agree: a setup that goes wrong on the device would otherwise give every
+    /// shard of a proof a key the program's real vk rejects (seen on an RX 9070 XT). The second
+    /// setup costs ~120 ms per proof, within noise end to end.
+    fn core_setup_checks() -> usize {
+        2
+    }
 }
 
 /// Core prover components for the CUDA prover.

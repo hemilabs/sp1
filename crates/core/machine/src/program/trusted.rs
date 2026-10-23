@@ -7,7 +7,9 @@ use crate::{air::ProgramAirBuilder, program::InstructionCols, utils::next_multip
 use slop_air::{Air, BaseAir, PairBuilder};
 use slop_algebra::PrimeField32;
 use slop_matrix::Matrix;
-use slop_maybe_rayon::prelude::{IndexedParallelIterator, ParallelIterator, ParallelSliceMut};
+use slop_maybe_rayon::prelude::{
+    IndexedParallelIterator, IntoParallelRefIterator, ParallelIterator, ParallelSliceMut,
+};
 use sp1_core_executor::{ExecutionRecord, Program};
 use sp1_derive::AlignedBorrow;
 use sp1_hypercube::air::{MachineAir, SP1AirBuilder};
@@ -196,43 +198,46 @@ impl<F: PrimeField32> MachineAir<F> for ProgramChip {
                     .map(move |start| (v, start, (start + PROGRAM_COUNT_TASK_EVENTS).min(len)))
             })
             .collect();
-        let mut task_counts = vec![0u32; tasks.len() * nb_instructions];
-        if nb_instructions > 0 {
-            task_counts.par_chunks_mut(nb_instructions).enumerate().for_each(|(t, counts)| {
-                let (v, start, end) = tasks[t];
-                let mut count_pc = |pc: u64| {
-                    let off = pc.wrapping_sub(pc_base);
-                    if off.is_multiple_of(4) {
-                        if let Some(c) = counts.get_mut((off / 4) as usize) {
-                            *c += 1;
-                        }
-                    }
-                };
-                macro_rules! count {
-                    ($($f:ident),*) => {{
-                        let mut i = 0;
-                        $(
-                            if v == i {
-                                input.$f[start..end].iter().for_each(|event| count_pc(event.0.pc));
-                            }
-                            i += 1;
-                        )*
-                        let _ = i;
-                    }};
-                }
-                with_cpu_event_vectors!(count);
-            });
-        }
-        let mut instruction_counts = vec![0u32; nb_instructions];
-        let sum_chunk = std::cmp::max(nb_instructions.div_ceil(num_cpus::get()), 1);
-        instruction_counts.par_chunks_mut(sum_chunk).enumerate().for_each(|(i, out)| {
-            let range = i * sum_chunk..i * sum_chunk + out.len();
-            for counts in task_counts.chunks(nb_instructions) {
-                for (o, c) in out.iter_mut().zip(&counts[range.clone()]) {
-                    *o += c;
-                }
+        // Each worker counts into an array of its own (rayon's fold: one per split of the tasks,
+        // allocated and zeroed in parallel), and the arrays are summed pairwise in parallel: one
+        // array for the whole table and a single-threaded zeroing of all of them made this the
+        // last host trace a shard waited for.
+        let add = |mut a: Vec<u32>, b: Vec<u32>| {
+            for (x, y) in a.iter_mut().zip(&b) {
+                *x += y;
             }
-        });
+            a
+        };
+        let instruction_counts: Vec<u32> = tasks
+            .par_iter()
+            .fold(
+                || vec![0u32; nb_instructions],
+                |mut counts, &(v, start, end)| {
+                    let mut count_pc = |pc: u64| {
+                        let off = pc.wrapping_sub(pc_base);
+                        if off.is_multiple_of(4) {
+                            if let Some(c) = counts.get_mut((off / 4) as usize) {
+                                *c += 1;
+                            }
+                        }
+                    };
+                    macro_rules! count {
+                        ($($f:ident),*) => {{
+                            let mut i = 0;
+                            $(
+                                if v == i {
+                                    input.$f[start..end].iter().for_each(|event| count_pc(event.0.pc));
+                                }
+                                i += 1;
+                            )*
+                            let _ = i;
+                        }};
+                    }
+                    with_cpu_event_vectors!(count);
+                    counts
+                },
+            )
+            .reduce(|| vec![0u32; nb_instructions], add);
 
         // Note: The program table should only count trusted (i.e. not untrusted instructions.)
         // However, untrusted instructions are also included in the events vectors.
