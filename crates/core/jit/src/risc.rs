@@ -422,7 +422,8 @@ impl TraceChunk {
         /* ---------- 4. extract tail ---------- */
         let tail = &src[HDR..total]; // only after the length check
 
-        let mem_reads = Arc::new_uninit_slice(n_words);
+        let mut mem_reads = Arc::new_uninit_slice(n_words);
+        let slots = Arc::get_mut(&mut mem_reads).expect("the new slice is not shared");
 
         // SAFETY:
         // - The tail contains valid u64s, so doing a bitwise copy preserves the validity and
@@ -431,12 +432,12 @@ impl TraceChunk {
         //   compiler needs to do a copy.
         // - `mem_reads` was just allocated to have enough space.
         // - u8 has minimum alignment, so casting the pointer allocated by the vec is valid.
-        // - The cast from const -> mut is valid since there are no other references to the memory.
+        // - `slots` is the only reference to the memory, and a mutable one.
         //
         // This trick is mostly taken from [`std::ptr::read_unaligned`]
         // see: <https://doc.rust-lang.org/src/core/ptr/mod.rs.html#1811>.
         unsafe {
-            std::ptr::copy_nonoverlapping(tail.as_ptr(), mem_reads.as_ptr() as *mut u8, n_bytes)
+            std::ptr::copy_nonoverlapping(tail.as_ptr(), slots.as_mut_ptr() as *mut u8, n_bytes)
         };
 
         Self {
@@ -511,13 +512,15 @@ impl TraceChunk {
             return None;
         }
         let mem_reads: Arc<[MemValue]> = if cfg!(target_endian = "little") {
-            let mem_reads = Arc::<[MemValue]>::new_uninit_slice(n_reads);
+            let mut mem_reads = Arc::<[MemValue]>::new_uninit_slice(n_reads);
+            let slots = Arc::get_mut(&mut mem_reads).expect("the new slice is not shared");
             // SAFETY: `tail` holds exactly `n_reads` encoded `MemValue`s, which are their bytes on
-            // a little-endian target, and `mem_reads` has room for `n_reads` of them.
+            // a little-endian target, and `slots`, the only reference to `mem_reads`, has room for
+            // `n_reads` of them.
             unsafe {
                 std::ptr::copy_nonoverlapping(
                     tail.as_ptr(),
-                    mem_reads.as_ptr() as *mut u8,
+                    slots.as_mut_ptr() as *mut u8,
                     tail.len(),
                 );
                 mem_reads.assume_init()
