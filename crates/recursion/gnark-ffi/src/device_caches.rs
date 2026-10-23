@@ -32,6 +32,22 @@ pub fn arena_bytes() -> u64 {
     ARENA_BYTES.get().map_or(0, |arena_bytes| arena_bytes())
 }
 
+static LIVE_BLOCKS_FREER: OnceLock<fn() -> u64> = OnceLock::new();
+
+/// Registers what frees every device block the GPU prover still holds, for [`free_live_blocks`].
+/// Only the first registration counts.
+pub fn set_live_blocks_freer(free: fn() -> u64) {
+    let _ = LIVE_BLOCKS_FREER.set(free);
+}
+
+/// Frees every device block the GPU prover still holds (its proving keys, its buffers), for a
+/// process about to reset its GPU: `cudaDeviceReset` leaves stream-ordered allocations
+/// (`cudaMallocAsync`'s) allocated, owned by no context, until the process exits. Returns the
+/// bytes freed; 0 if no GPU prover registered it.
+pub fn free_live_blocks() -> u64 {
+    LIVE_BLOCKS_FREER.get().map_or(0, |free| free())
+}
+
 /// What the GPU prover registers so that the wrap paths can measure and trim this process's GPU
 /// memory where `gpu_device` cannot find the runtime library itself: on Windows it is linked
 /// statically.

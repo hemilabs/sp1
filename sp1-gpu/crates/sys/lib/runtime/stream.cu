@@ -3,6 +3,11 @@
 #include "runtime/exception.cuh"
 #include "runtime/kernel_profile.hpp"
 
+#include <atomic>
+#include <cstdint>
+#include <mutex>
+#include <unordered_map>
+
 #ifdef __HIPCC__
 using cudaStream_t = hipStream_t;
 using cudaEvent_t = hipEvent_t;
@@ -792,6 +797,29 @@ extern "C" rustCudaError_t cuda_stream_wait_event(cudaStream_t stream, cudaEvent
 
 // Async memory operations.
 
+#ifndef __HIPCC__
+// The blocks cuda_malloc_async has handed out and cuda_free_async not taken back, for
+// cuda_free_live_blocks. cudaDeviceReset does not free stream-ordered allocations (its
+// documentation: they "need to be destroyed explicitly"): they stay allocated, owned by no
+// context, until the process exits. Sharded by address, so that threads allocating at once rarely
+// share a lock. (HIP's allocator takes its blocks with hipMalloc, which a reset does free.)
+namespace {
+constexpr size_t LIVE_SHARDS = 64;
+struct LiveBlocks {
+    std::mutex mutex;
+    std::unordered_map<void*, size_t> sizes;
+};
+LiveBlocks g_live_blocks[LIVE_SHARDS];
+// Set once cuda_free_live_blocks frees them: the blocks' owners free them later, and those frees
+// are then no-ops.
+std::atomic<bool> g_live_blocks_freed{false};
+
+LiveBlocks& liveBlocksOf(void* p) {
+    return g_live_blocks[(reinterpret_cast<uintptr_t>(p) * 0x9E3779B97F4A7C15ull) >> 58];
+}
+}  // namespace
+#endif
+
 extern "C" rustCudaError_t cuda_malloc_async(void** devPtr, size_t size, cudaStream_t stream) {
     cudaError_t code = cudaMallocAsync(devPtr, size, stream);
     if (code != cudaSuccess) {
@@ -800,12 +828,57 @@ extern "C" rustCudaError_t cuda_malloc_async(void** devPtr, size_t size, cudaStr
         (void)cudaGetLastError();
         return rustCudaError_t{.message = cudaGetErrorString(code)};
     }
+#ifndef __HIPCC__
+    LiveBlocks& live = liveBlocksOf(*devPtr);
+    std::lock_guard<std::mutex> lock(live.mutex);
+    live.sizes[*devPtr] = size;
+#endif
     return CUDA_SUCCESS_CSL;
 }
 
 extern "C" rustCudaError_t cuda_free_async(void* devPtr, cudaStream_t stream) {
+#ifndef __HIPCC__
+    {
+        LiveBlocks& live = liveBlocksOf(devPtr);
+        std::lock_guard<std::mutex> lock(live.mutex);
+        // Under the lock, so that a block cuda_free_live_blocks has freed is not freed again.
+        if (live.sizes.erase(devPtr) == 0 && g_live_blocks_freed.load(std::memory_order_acquire)) {
+            return CUDA_SUCCESS_CSL;
+        }
+    }
+#endif
     CUDA_OK(cudaFreeAsync(devPtr, stream));
     return CUDA_SUCCESS_CSL;
+}
+
+// Frees every block cuda_malloc_async handed out that is still live, once the device is idle,
+// and gives the memory pool's reserve back; cuda_free_async does nothing from then on. Only for a
+// process about to reset its device and use it no more (gnark-ffi's SP1_GPU_RESET_BEFORE_WRAP),
+// which would otherwise keep these blocks after the reset: on an RTX 5090, 5 GB of proving keys
+// the wrap helper then lacked. Returns the bytes freed (none on HIP).
+extern "C" size_t cuda_free_live_blocks() {
+#ifdef __HIPCC__
+    return 0;
+#else
+    g_live_blocks_freed.store(true, std::memory_order_release);
+    (void)cudaDeviceSynchronize();
+    size_t freed = 0;
+    for (LiveBlocks& live : g_live_blocks) {
+        std::lock_guard<std::mutex> lock(live.mutex);
+        for (const auto& [ptr, size] : live.sizes) {
+            if (cudaFree(ptr) == cudaSuccess) freed += size;
+        }
+        live.sizes.clear();
+    }
+    int device = 0;
+    cudaMemPool_t pool;
+    if (cudaGetDevice(&device) == cudaSuccess &&
+        cudaDeviceGetDefaultMemPool(&pool, device) == cudaSuccess) {
+        (void)cudaMemPoolTrimTo(pool, 0);
+    }
+    (void)cudaGetLastError();
+    return freed;
+#endif
 }
 
 #ifdef __HIPCC__

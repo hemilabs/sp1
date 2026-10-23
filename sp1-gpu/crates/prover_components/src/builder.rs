@@ -268,6 +268,13 @@ pub async fn cuda_worker_builder_with_machine(
     sp1_recursion_gnark_ffi::device_caches::set_arena_bytes(|| unsafe {
         sp1_gpu_cudart::sys::runtime::sp1_hip_arena_bytes() as u64
     });
+    // A device reset before a wrap helper (SP1_GPU_RESET_BEFORE_WRAP) does not free the blocks the
+    // prover took from the stream-ordered allocator, its keys among them; this does, first.
+    // SAFETY: takes nothing; called only by a process about to reset its device, which uses the
+    // blocks no more (their later frees do nothing).
+    sp1_recursion_gnark_ffi::device_caches::set_live_blocks_freer(|| unsafe {
+        sp1_gpu_cudart::sys::runtime::cuda_free_live_blocks() as u64
+    });
     // Measuring and trimming GPU memory for that helper. On Linux the wrap paths find the CUDA
     // runtime library themselves; on Windows it is linked statically, and without these the GPU
     // Groth16 prover was never chosen ("free GPU memory is unknown").

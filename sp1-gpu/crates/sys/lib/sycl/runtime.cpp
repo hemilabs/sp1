@@ -556,6 +556,9 @@ extern "C" void cuda_release_cached_memory() {
 extern "C" size_t sp1_hip_arena_bytes() { return 0; }
 extern "C" size_t sp1_hip_arena_free_bytes() { return 0; }
 
+// Nothing resets a SYCL device (gnark-ffi's reset is CUDA and HIP only).
+extern "C" size_t cuda_free_live_blocks() { return 0; }
+
 // For the other SYCL sources (lib/sycl/ntt.cpp): times a submission if the kernel timing is on.
 void sp1_sycl_profile_event(const char* name, const sycl::event& e) {
     if (sp1prof::enabled()) GpuProfiler::get().add(name, e);

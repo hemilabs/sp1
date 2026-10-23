@@ -26,6 +26,12 @@ extern "C" {
     /// The device memory HIP's arena holds, free or not (0 without an arena, and on CUDA and SYCL).
     pub fn sp1_hip_arena_bytes() -> usize;
 
+    /// Frees every block `cuda_malloc_async` handed out that is still live, once the device is
+    /// idle, and makes `cuda_free_async` a no-op from then on; returns the bytes freed. Only for a
+    /// process about to reset its device and use it no more: `cudaDeviceReset` does not free
+    /// stream-ordered allocations. Nothing on HIP (whose blocks a reset frees) and SYCL.
+    pub fn cuda_free_live_blocks() -> usize;
+
     pub fn cuda_get_device_name(name: *mut c_char, len: usize) -> CudaRustError;
 
     pub fn cuda_sm_count(count: *mut i32) -> CudaRustError;

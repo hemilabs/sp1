@@ -11,7 +11,8 @@
 //!   helper would not fit otherwise, the card is big enough for it, and no other proof is in flight
 //!   ([`proof_started`]). That destroys every allocation, stream and pinned buffer this process has
 //!   on it, so it cannot prove again (measured: a segfault as the next proof starts; [`was_reset`]
-//!   lets it refuse the proof instead). Only a process that exits after its wrap can afford it, so
+//!   lets it refuse the proof instead). Stream-ordered allocations (`cudaMallocAsync`'s) outlive a
+//!   reset, so the GPU prover frees its own first (`device_caches::free_live_blocks`). Only a process that exits after its wrap can afford it, so
 //!   it happens only with `SP1_GPU_RESET_BEFORE_WRAP=1` (or `true`).
 //!
 //! Both use only a runtime library this process has already loaded. Loading one here would start
@@ -318,6 +319,10 @@ fn reset(what: &str) -> bool {
         return false;
     };
     crate::device_caches::release();
+    // The reset does not free stream-ordered allocations (`cudaMallocAsync`'s), which hold the
+    // provers' keys: they would stay allocated until the process exits (5 GB on an RTX 5090, which
+    // the PLONK helper then lacked). The GPU prover frees them first.
+    let freed = crate::device_caches::free_live_blocks();
     // SAFETY: `cudaDeviceReset` and `hipDeviceReset` take nothing and return an error code. The
     // caller has agreed not to use the GPU again (SP1_GPU_RESET_BEFORE_WRAP), and `was_reset`
     // turns away the proofs that would.
@@ -336,8 +341,10 @@ fn reset(what: &str) -> bool {
     crate::ffi::set_groth16_gpu_hooks(0, 0, 0);
     if rc == 0 {
         tracing::info!(
-            "{what}: reset this process's {} device (SP1_GPU_RESET_BEFORE_WRAP), so the helper \
-             gets its memory; this process cannot prove again",
+            "{what}: freed this process's {} MiB of live GPU blocks and reset its {} device \
+             (SP1_GPU_RESET_BEFORE_WRAP), so the helper gets its memory; this process cannot \
+             prove again",
+            freed >> 20,
             runtime.name
         );
     } else {

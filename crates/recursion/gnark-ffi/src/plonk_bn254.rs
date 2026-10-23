@@ -531,9 +531,8 @@ impl PlonkBn254Prover {
         // shard-prover state on the card has free only on a 32 GB card, once its memory pool's
         // idle reserve is given back. Only a process that exits after this proof may reset its
         // GPU to make room (`SP1_GPU_RESET_BEFORE_WRAP=1`; see `gpu_device`), and it does only
-        // where the helper runs on this card and would not fit otherwise. Even a reset is not
-        // always sufficient (the parent's CUDA driver context may retain pooled memory until the
-        // host process exits).
+        // where the helper runs on this card and would not fit otherwise. The reset frees what
+        // this process holds, its keys too, but not what other processes hold on the card.
         let reset = on_this_card
             && crate::gpu_device::reset_if_requested("PLONK (GPU)", PLONK_GPU_HELPER_VRAM_BYTES);
 
