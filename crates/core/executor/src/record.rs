@@ -160,6 +160,10 @@ pub struct ExecutionRecord {
 /// How many retired records' event buffers are kept for reuse (see [`ExecutionRecord::recycle`]).
 const MAX_RECYCLED_EVENT_BUFFERS: usize = 8;
 
+/// On Windows, [`ExecutionRecord::new_preallocated`] reserves this fraction of the requested
+/// per-opcode capacity: there reserved memory is committed (see there).
+const WINDOWS_RESERVATION_DIVISOR: usize = 16;
+
 /// Event buffers of retired execution records, handed to the next records.
 ///
 /// A shard writes about 1.5 GB of events. Fresh memory is faulted in by the kernel 4 KiB at a
@@ -275,6 +279,18 @@ impl ExecutionRecord {
         // Vec::reserve mostly costs virtual address space (the kernel demand-faults
         // pages on first touch), so the per-opcode generous reserve is cheap in
         // practice — keep as-is to avoid reallocation cost in event-heavy shards.
+        //
+        // Not on Windows: there a reservation is committed memory, charged against the
+        // system's commit limit whether or not it is touched. With the full reserve, a
+        // process proving 144M-cycle fibonacci core proofs committed 59-79 GB for ~7 GB in
+        // use, and a second proving process on the host took the commit to its limit, where
+        // allocations (the GPU runtime's too) failed mid-proof. A small reserve grows to what
+        // the shard needs, and recycled buffers keep that capacity for the next shards.
+        let reservation_size = if cfg!(windows) {
+            reservation_size / WINDOWS_RESERVATION_DIVISOR
+        } else {
+            reservation_size
+        };
         result.alu_x0_events.reserve(reservation_size);
         result.add_events.reserve(reservation_size);
         result.addi_events.reserve(reservation_size);
