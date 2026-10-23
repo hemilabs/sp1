@@ -64,8 +64,9 @@ binary in the directory.
   below.
 - `groth16_gpu_helper.exe` next to `node.exe`, built as above.
 - The helper solves the witness on the GPU with `r1cs_solve_plan.exe` next to `node.exe` (else
-  gnark solves it on the CPU, ~3.5 s more per proof on an RTX 5090). It is a Go program that
-  needs cgo:
+  gnark solves it on the CPU, ~3.5 s more per proof on an RTX 5090). On Linux a proof whose
+  helper was started ahead of the wrap (`SP1_GROTH16_PRESTART`) solves with gnark instead, which
+  is faster there (fib 20M: 13.7 s against 16.2 s). It is a Go program that needs cgo:
 
   ```bash
   cd crates/recursion/gnark-ffi/go

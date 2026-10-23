@@ -425,16 +425,6 @@ impl Groth16Bn254Prover {
         find_gpu_helper().is_some()
     }
 
-    /// Whether a GPU proof will try the GPU R1CS solver (`SP1_GPU_R1CS_SOLVER` is not `cpu` and
-    /// `r1cs_solve_plan` can be found) rather than gnark's solve. A prestarted helper serves only
-    /// gnark's solve, so it is not started then.
-    #[cfg(feature = "native")]
-    pub fn gpu_r1cs_solver_enabled() -> bool {
-        std::env::var("SP1_GPU_R1CS_SOLVER").ok().as_deref() != Some("cpu")
-            && crate::cpu_helper::find_executable("r1cs_solve_plan", Some("SP1_R1CS_SOLVE_PLAN"))
-                .is_some()
-    }
-
     /// Executes the prover in testing mode with a circuit definition and witness.
     pub fn test<C: Config>(constraints: Vec<Constraint>, witness: Witness<C>) {
         let serialized = serde_json::to_string(&constraints).unwrap();
@@ -906,13 +896,18 @@ impl Groth16Bn254Prover {
                 true
             }
         };
+        // A helper prestarted for this circuit has its key loaded, and maybe uploaded, already, and
+        // proves from gnark's solve: sooner than a new helper with the GPU R1CS solver.
+        let prestarted = crate::prestart::prestarted_for(&pk.dir);
+        let want_gpu_r1cs = want_gpu_r1cs && !prestarted;
         tracing::info!(
-            "[r1cs-solver] choice={} backend_is_cuda={} env={:?} (default-on for CUDA \
-             since 2026-05-06, default-on for HIP since 2026-05-10; \
-             set SP1_GPU_R1CS_SOLVER=cpu to roll back)",
+            "[r1cs-solver] choice={} backend_is_cuda={} env={:?} prestarted_helper={} (default-on \
+             for CUDA since 2026-05-06, default-on for HIP since 2026-05-10, unless a helper is \
+             prestarted; set SP1_GPU_R1CS_SOLVER=cpu to roll back)",
             if want_gpu_r1cs { "gpu" } else { "cpu" },
             backend_is_cuda,
-            solver_env.as_deref().unwrap_or("<unset>")
+            solver_env.as_deref().unwrap_or("<unset>"),
+            prestarted
         );
 
         let gpu_r1cs = if want_gpu_r1cs {

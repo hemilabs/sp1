@@ -76,6 +76,17 @@ pub fn cancel() {
     }
 }
 
+/// Whether a helper prestarted for the key in `pk_dir` waits for its proof. It proves from gnark's
+/// solve, sooner than a new helper with the GPU R1CS solver can (fib 20M Groth16 on an RTX 5090:
+/// 13.7 s against 16.2 s), so a proof that has one solves with gnark.
+pub(crate) fn prestarted_for(pk_dir: &Path) -> bool {
+    PRESTARTED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .is_some_and(|p| p.pk_dir == pk_dir)
+}
+
 fn discard(mut p: Prestarted) {
     let _ = p.child.kill();
     let _ = p.child.wait();
