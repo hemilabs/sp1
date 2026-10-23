@@ -52,10 +52,8 @@ impl<F: PrimeField32> MachineAir<F> for StateBumpChip {
     }
 
     fn generate_dependencies(&self, input: &Self::Record, _output: &mut Self::Record) {
-        let chunk_size = 1;
-        let event_iter = input.bump_state_events.chunks(chunk_size);
-
-        event_iter.for_each(|events| {
+        // One counter for all the events (rare: a sequential loop needs no more).
+        std::iter::once(&input.bump_state_events[..]).for_each(|events| {
             input.byte_lookup_counts.count(|blu| {
                 events.iter().for_each(|(clk, increment, _, pc)| {
                     let next_clk = clk + increment;

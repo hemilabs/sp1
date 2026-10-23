@@ -257,7 +257,6 @@ async fn main() {
                     recursive_core_verifier,
                     &proof_shape,
                     reduce_shape,
-                    None,
                 );
 
                 // Build the witness using the real core proof. The other fields are not checked

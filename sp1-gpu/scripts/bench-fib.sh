@@ -102,9 +102,13 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 OUT="${OUT:-bench-fib-$(date -u +%Y%m%dT%H%M%SZ)}"
 mkdir -p "$OUT"
 OUT="$(cd "$OUT" && pwd)"
+# The summary is computed from this run's processes only, even with an --out used before.
+: >"$OUT/results.txt"
 
 export SP1_SKIP_PROGRAM_BUILD=true
-export RUST_LOG="${RUST_LOG:-info}"
+# node's info-level "proof time" lines are what this script reads: an operator's RUST_LOG keeps
+# them.
+export RUST_LOG="${RUST_LOG:-info},node=info"
 
 {
     echo "# bench-fib $(date -u +%Y-%m-%dT%H:%M:%SZ)"
@@ -127,7 +131,12 @@ run_one() {
     local rc=$?
     local bad times
     bad=$(grep -ac 'verification failed' "$log")
-    times=$(grep -aoE 'proof time: [0-9.]+' "$log" | grep -oE '[0-9.]+$' | tr '\n' ' ')
+    # In seconds, whatever unit the Duration was printed in (14.39s, 850.2ms, ...).
+    times=$(grep -aoE 'proof time: [0-9.]+(s|ms|µs|us|ns)' "$log" | awk '{
+        v = $3; u = v; sub(/^[0-9.]+/, "", u); sub(/[^0-9.].*$/, "", v)
+        if (u == "ms") v /= 1e3; else if (u == "µs" || u == "us") v /= 1e6; else if (u == "ns") v /= 1e9
+        printf "%.6f ", v
+    }')
     echo "$rc $bad $times"
 }
 

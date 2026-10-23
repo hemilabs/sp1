@@ -191,7 +191,6 @@ impl NormalizeProgramCompiler {
                     &self.recursive_verifier,
                     proof_shape,
                     &self.reduce_shape,
-                    None,
                 );
                 self.cache.push(shape.clone(), program.clone());
                 program
@@ -221,21 +220,12 @@ pub fn get_normalize_program(
     recursive_verifier: &RecursiveShardVerifier<SP1GlobalContext, RiscvAir<SP1Field>, AsmConfig>,
     proof_shape: &CoreProofShape<SP1Field, RiscvAir<SP1Field>>,
     reduce_shape: &SP1RecursionProofShape,
-    cache: Option<&SP1NormalizeCache>,
 ) -> Arc<RecursionProgram<SP1Field>> {
     let shape = normalize_input_shape(verifier, proof_shape);
-    if let Some(program) = cache.as_ref().and_then(|c| c.get(&shape)) {
-        return program.clone();
-    }
-
     let input = shape.dummy_input(vk);
     let mut program = normalize_program_from_input(recursive_verifier, &input);
     program.shape = Some(reduce_shape.shape.clone());
-    let program = Arc::new(program);
-    if let Some(c) = cache {
-        c.push(shape, program.clone());
-    }
-    program
+    Arc::new(program)
 }
 
 /// Unified worker that combines tracing, core proving, and normalize proving.
@@ -307,12 +297,20 @@ static SHARD_IDX: AtomicUsize = AtomicUsize::new(0);
 /// (default: one per 16 cores, at least 2; `0` lets them all run).
 fn dependency_gate() -> &'static tokio::sync::Semaphore {
     static GATE: std::sync::OnceLock<tokio::sync::Semaphore> = std::sync::OnceLock::new();
-    GATE.get_or_init(|| {
-        let default = std::thread::available_parallelism().map_or(2, |n| (n.get() / 16).max(2));
-        let turns = std::env::var("SP1_WORKER_DEPENDENCY_TURNS")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(default);
+    turns_gate(&GATE, "SP1_WORKER_DEPENDENCY_TURNS", 16)
+}
+
+/// A gate of `env` turns (`0`: no limit), by default one per `cores_per_turn` cores, at least 2.
+fn turns_gate(
+    gate: &'static std::sync::OnceLock<tokio::sync::Semaphore>,
+    env: &str,
+    cores_per_turn: usize,
+) -> &'static tokio::sync::Semaphore {
+    gate.get_or_init(|| {
+        let default =
+            std::thread::available_parallelism().map_or(2, |n| (n.get() / cores_per_turn).max(2));
+        let turns =
+            std::env::var(env).ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(default);
         tokio::sync::Semaphore::new(if turns == 0 {
             tokio::sync::Semaphore::MAX_PERMITS
         } else {
@@ -332,18 +330,7 @@ fn dependency_gate() -> &'static tokio::sync::Semaphore {
 /// least 2; `0` lets them all run).
 fn record_gate() -> &'static tokio::sync::Semaphore {
     static GATE: std::sync::OnceLock<tokio::sync::Semaphore> = std::sync::OnceLock::new();
-    GATE.get_or_init(|| {
-        let default = std::thread::available_parallelism().map_or(2, |n| (n.get() / 8).max(2));
-        let turns = std::env::var("SP1_WORKER_RECORD_TURNS")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(default);
-        tokio::sync::Semaphore::new(if turns == 0 {
-            tokio::sync::Semaphore::MAX_PERMITS
-        } else {
-            turns
-        })
-    })
+    turns_gate(&GATE, "SP1_WORKER_RECORD_TURNS", 8)
 }
 
 impl<A, W, C> AsyncWorker<CoreProvingTask, Result<TaskMetadata, TaskError>> for CoreWorker<A, W, C>

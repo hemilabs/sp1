@@ -307,8 +307,8 @@ size_t g_cached_bytes = 0;
 // shard to the next. So sizes above 1 MiB are rounded up to a sixteenth of their power of two,
 // for a cached block to fit the next shard's slightly different request, and the cache may hold
 // up to half the card. When an allocation would not fit, cached blocks are freed, largest first,
-// only until it does, each once its own last use has finished, instead of draining the device
-// and freeing them all.
+// only until it does, instead of freeing them all. (With SYCL the eviction first waits for every
+// queue: see evict_until_fits.)
 size_t round_alloc_size(size_t s) {
     if (s <= (size_t(1) << 20)) return (s + 4095) & ~size_t(4095);
     int lg = 63;

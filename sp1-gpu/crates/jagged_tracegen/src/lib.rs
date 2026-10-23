@@ -1713,8 +1713,24 @@ pub fn copy_preprocessed_traces(
 ) -> JaggedTraceMle<Felt, TaskScope> {
     let dense = traces.dense();
     let (offset, cols) = (dense.preprocessed_offset, dense.preprocessed_cols);
+    copy_preprocessed_into(traces, offset, cols + 1, backend)
+}
+
+/// The preprocessed part of `traces` (the layout `allocate_and_initialize_traces` gives it)
+/// copied into new device buffers, with no main part: dense values and column indices with room
+/// for `dense_capacity` values, start indices for `start_indices_capacity` columns. The cache's
+/// copy ([`copy_preprocessed_traces`]) has room for just the preprocessed part; a shard's traces
+/// for the shard's main traces too.
+fn copy_preprocessed_into(
+    traces: &JaggedTraceMle<Felt, TaskScope>,
+    dense_capacity: usize,
+    start_indices_capacity: usize,
+    backend: &TaskScope,
+) -> JaggedTraceMle<Felt, TaskScope> {
+    let dense = traces.dense();
+    let (offset, cols) = (dense.preprocessed_offset, dense.preprocessed_cols);
     let dense_data = TraceDenseData {
-        dense: copy_prefix_into(&dense.dense, offset, offset, backend),
+        dense: copy_prefix_into(&dense.dense, offset, dense_capacity, backend),
         preprocessed_offset: offset,
         preprocessed_cols: cols,
         preprocessed_table_index: dense.preprocessed_table_index.clone(),
@@ -1726,8 +1742,13 @@ pub fn copy_preprocessed_traces(
     };
     JaggedTraceMle(JaggedMle {
         dense_data,
-        col_index: copy_prefix_into(&traces.col_index, offset >> 1, offset >> 1, backend),
-        start_indices: copy_prefix_into(&traces.start_indices, cols + 1, cols + 1, backend),
+        col_index: copy_prefix_into(&traces.col_index, offset >> 1, dense_capacity >> 1, backend),
+        start_indices: copy_prefix_into(
+            &traces.start_indices,
+            cols + 1,
+            start_indices_capacity,
+            backend,
+        ),
         column_heights: copy_prefix_into(&traces.column_heights, cols, cols, backend),
         host_column_heights: None,
     })
@@ -1808,37 +1829,8 @@ pub async fn full_tracegen_permit<A: CudaTracegenAir<Felt>>(
 
     log_chip_stats(machine, &chip_set, &main_traces);
 
-    // The layout `allocate_and_initialize_traces` gives the preprocessed traces.
-    let dense = preprocessed.dense();
-    let (offset, cols) = (dense.preprocessed_offset, dense.preprocessed_cols);
-    let dense_data = TraceDenseData {
-        dense: copy_prefix_into(&dense.dense, offset, max_trace_size, backend),
-        preprocessed_offset: offset,
-        preprocessed_cols: cols,
-        preprocessed_table_index: dense.preprocessed_table_index.clone(),
-        main_table_index: BTreeMap::new(),
-        preprocessed_padding: dense.preprocessed_padding,
-        main_padding: 0,
-        prep_padding_col_count: dense.prep_padding_col_count,
-        main_padding_col_count: 0,
-    };
-    let mut jagged_mle = JaggedTraceMle(JaggedMle {
-        dense_data,
-        col_index: copy_prefix_into(
-            &preprocessed.col_index,
-            offset >> 1,
-            max_trace_size >> 1,
-            backend,
-        ),
-        start_indices: copy_prefix_into(
-            &preprocessed.start_indices,
-            cols + 1,
-            MAX_COLS_PER_TRACE,
-            backend,
-        ),
-        column_heights: copy_prefix_into(&preprocessed.column_heights, cols, cols, backend),
-        host_column_heights: None,
-    });
+    let mut jagged_mle =
+        copy_preprocessed_into(preprocessed, max_trace_size, MAX_COLS_PER_TRACE, backend);
 
     copy_main_jagged_traces(
         main_traces,

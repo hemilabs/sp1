@@ -8,7 +8,6 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
-	"strconv"
 	"sync"
 	"time"
 
@@ -112,16 +111,11 @@ func hasGroth16Commitments(r constraint.ConstraintSystem) bool {
 // cache ahead of the proof, so that the solve does not wait ~2 s for it. Reading the circuit needs
 // none of the environment variables the solve sets, so this runs without touching the environment
 // (other threads read it concurrently).
+//
+// The prover runs meanwhile; gnark decodes the circuit in 4 goroutines, which bounds the read's
+// share of the CPU. (Lowering GOMAXPROCS for it, as this once did, throttled all other Go work in
+// the process too: another proof's solve or export.)
 func PrefetchGroth16GpuWitnessCircuit(dataDir string, pkDir string) {
-	// The prover runs meanwhile, so the read gets 2 threads (SP1_GROTH16_PREFETCH_PROCS, 0 for
-	// all); it decodes in 4 goroutines, and was no slower for it.
-	procs := 2
-	if n, err := strconv.Atoi(os.Getenv("SP1_GROTH16_PREFETCH_PROCS")); err == nil && n >= 0 {
-		procs = n
-	}
-	if procs > 0 {
-		defer runtime.GOMAXPROCS(runtime.GOMAXPROCS(procs))
-	}
 	gpuWitnessCircuit(dataDir, pkDir)
 }
 

@@ -743,6 +743,8 @@ impl<A: ArtifactClient, C: SP1ProverComponents> SP1RecursionProver<A, C> {
                         .recursion_vks
                         .vk_verification()
                         .then_some(expected_wrap_vk.clone());
+                    // With a known vk, `new` checks any setup it runs against it (a mismatch is
+                    // retried: the build runs again) and keeps it as the verifying key.
                     let wrap_prover = WrapProver::new(
                         wrap_air_prover,
                         wrap_air_permits,
@@ -752,19 +754,7 @@ impl<A: ArtifactClient, C: SP1ProverComponents> SP1RecursionProver<A, C> {
                         known_vk,
                     )?;
 
-                    // The vk comes from a setup on the GPU: a mismatch is retried (the build runs
-                    // again) rather than failing the proof.
-                    if wrap_prover.prover_data.recursion_vks.vk_verification()
-                        && wrap_prover.verifying_key != expected_wrap_vk
-                    {
-                        return Err(TaskError::Retryable(anyhow::anyhow!(
-                            "Wrap vk mismatch, expected: {:?}, got: {:?}",
-                            expected_wrap_vk,
-                            wrap_prover.verifying_key
-                        )));
-                    }
-
-                    Ok(Arc::new(wrap_prover))
+                    Ok::<_, TaskError>(Arc::new(wrap_prover))
                 })
                 .await
                 .map_err(|err| TaskError::Fatal(anyhow::anyhow!(err)))?
@@ -1557,6 +1547,20 @@ impl<C: SP1ProverComponents> ShrinkProver<C> {
     }
 }
 
+/// Checks the vk a wrap setup just computed on the GPU against the one proofs are verified
+/// against. A mismatch is retryable: the setup may have gone wrong on the device.
+fn check_wrap_vk(
+    expected: &MachineVerifyingKey<SP1OuterGlobalContext>,
+    got: &MachineVerifyingKey<SP1OuterGlobalContext>,
+) -> Result<(), TaskError> {
+    if expected == got {
+        return Ok(());
+    }
+    Err(TaskError::Retryable(anyhow::anyhow!(
+        "Wrap vk mismatch, expected: {expected:?}, got: {got:?}"
+    )))
+}
+
 /// The wrap program's proving key.
 type WrapProvingKey<C> =
     ProvingKey<SP1OuterGlobalContext, WrapSC, <C as SP1ProverComponents>::WrapProver>;
@@ -1616,11 +1620,7 @@ impl<C: SP1ProverComponents> WrapProver<C> {
             // The setup computed the vk of the wrap program; it must be the one proofs are checked
             // against.
             if let Some(known_vk) = &known_vk {
-                if *known_vk != verifying_key {
-                    return Err(TaskError::Retryable(anyhow::anyhow!(
-                        "Wrap vk mismatch, expected: {known_vk:?}, got: {verifying_key:?}"
-                    )));
-                }
+                check_wrap_vk(known_vk, &verifying_key)?;
             }
             // The setup's permit is released here, as when the key was dropped: proving takes its
             // own.
@@ -1672,13 +1672,7 @@ impl<C: SP1ProverComponents> WrapProver<C> {
                     .await;
                 // The setup above computed the vk of the wrap program; it must be the one proofs
                 // are checked against.
-                if vk != self.verifying_key {
-                    return Err(TaskError::Retryable(anyhow::anyhow!(
-                        "Wrap vk mismatch, expected: {:?}, got: {:?}",
-                        self.verifying_key,
-                        vk
-                    )));
-                }
+                check_wrap_vk(&self.verifying_key, &vk)?;
                 (proof, permit)
             }
         };
