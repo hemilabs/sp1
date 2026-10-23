@@ -31,8 +31,13 @@ pub const GPU_NORMALIZE_PROGRAM_CACHE_MIN_AVAILABLE_RAM: u64 = 64 << 30;
 
 /// Whether the compress prover gets its own CUDA stream and permit (see
 /// `cuda_worker_builder_with_machine`). On by default above the 30 GB tier, where a core shard and
-/// a compress proof fit on the card together, except with SYCL on Linux; `SP1_GPU_RECURSION_STREAM=0|1`
+/// a compress proof fit on the card together, except with SYCL; `SP1_GPU_RECURSION_STREAM=0|1`
 /// overrides.
+///
+/// On Windows two streams do not fit an Arc Pro B70 either: the video memory budget (31.8 GB) is
+/// below the card's 32 GB, and past it WDDM moves memory to shared system memory. Groth16 proofs
+/// of `local-fibonacci --param 20000000` (1.44B cycles) took 58-225 s, erratically, with two
+/// streams, and 44.4-44.8 s with one, without spilling (peak 30.7 GB).
 ///
 /// On an Arc Pro B70 under Linux (xe driver, compute runtime 26.09, Level Zero's legacy adapter),
 /// two streams first crashed about one proof in nine inside the driver; with pageable copies
@@ -45,10 +50,7 @@ fn separate_recursion_stream() -> bool {
     match std::env::var("SP1_GPU_RECURSION_STREAM").as_deref() {
         Ok("0") | Ok("false") => false,
         Ok("1") | Ok("true") => true,
-        _ => {
-            gpu_memory_gb() > 30
-                && !(cfg!(target_os = "linux") && sp1_gpu_cudart::sys::BACKEND == "sycl")
-        }
+        _ => gpu_memory_gb() > 30 && sp1_gpu_cudart::sys::BACKEND != "sycl",
     }
 }
 
