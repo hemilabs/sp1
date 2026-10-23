@@ -132,6 +132,23 @@ pub(crate) fn helper_room(
     }
 }
 
+/// Host memory the GPU PLONK prover needs beyond what is in use when it is chosen, with its
+/// GPU-format proving key exported: the in-process witness export (~10 GB, released first), then
+/// the helper, which reads the key into memory of its own (106.5 GB at its peak, nearly all
+/// anonymous), beside the proof's witness files in `/dev/shm`. On an RTX 5090 host `MemAvailable`
+/// fell by 105.3 GiB from the choice to the helper's peak; the wrap circuit is the same for every
+/// program. Rounded up. gnark's CPU prover needs ~42 GB of it.
+pub(crate) const PLONK_GPU_MIN_AVAILABLE_BYTES: u64 = 112 << 30;
+
+/// Extra host memory for the GPU PLONK prover's one-time key export on a cold cache: 14 GB of
+/// files, in RAM-backed `/dev/shm` unless `SP1_PLONK_GPU_CACHE` points elsewhere (and every proof's
+/// with `SP1_PLONK_GPU_CACHE_DISABLE`). Measured: 13.4 GiB more than with the key exported.
+pub(crate) const PLONK_GPU_PK_EXPORT_BYTES: u64 = 14 << 30;
+
+/// Host memory a GPU PLONK proof needs while a `SP1_PLONK_GPU_SERVER` helper from an earlier proof
+/// still runs: the helper keeps 71 GB between proofs, and the next proof took 21.6 GiB more.
+pub(crate) const PLONK_GPU_SERVER_PROOF_BYTES: u64 = 24 << 30;
+
 /// What trying the GPU PLONK prover (`SP1_PLONK_GPU=1`) depends on; see [`use_gpu_plonk`].
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct PlonkInputs {
@@ -148,13 +165,22 @@ pub(crate) struct PlonkInputs {
     pub vram_total: Option<u64>,
     /// Whether this process may reset its GPU to make room for the helper: as for Groth16.
     pub gpu_reset: bool,
+    /// Memory this process can still use (`host_memory::available`), if known.
+    pub mem_available: Option<u64>,
+    /// Whether the GPU-format proving key is already exported.
+    pub pk_cache_ready: bool,
+    /// Whether a `SP1_PLONK_GPU_SERVER` helper from an earlier proof still runs, holding most of
+    /// the memory the next proof needs.
+    pub server_running: bool,
 }
 
 /// Returns whether to try the GPU PLONK prover that `SP1_PLONK_GPU=1` asks for, and why, for the
-/// log: only where its helper is installed and fits
-/// ([`sp1_recursion_gnark_ffi::PLONK_GPU_HELPER_VRAM_BYTES`]), so that a card that cannot fit it
-/// does not export the witness and start the helper first. Where free memory is unknown (no
-/// runtime to ask), the helper tries, since it was asked for.
+/// log: only where its helper is installed and fits, on the card
+/// ([`sp1_recursion_gnark_ffi::PLONK_GPU_HELPER_VRAM_BYTES`]) and in host memory
+/// ([`PLONK_GPU_MIN_AVAILABLE_BYTES`]), so that a card or host that cannot fit it does not export
+/// the witness and start the helper first; gnark's CPU prover, which needs less than half its host
+/// memory, makes the proof instead. Where free GPU memory is unknown (no runtime to ask), the
+/// helper tries, since it was asked for, as it does where host memory is unknown.
 pub(crate) fn use_gpu_plonk(inputs: &PlonkInputs) -> (bool, String) {
     if !inputs.helper_available {
         return (
@@ -164,21 +190,44 @@ pub(crate) fn use_gpu_plonk(inputs: &PlonkInputs) -> (bool, String) {
                 .into(),
         );
     }
-    if inputs.helper_routed {
-        return (true, "SP1_PLONK_GPU_HELPER_DEVICES runs its helper on other cards".into());
-    }
-    match helper_room(
-        sp1_recursion_gnark_ffi::PLONK_GPU_HELPER_VRAM_BYTES,
-        inputs.vram_free,
-        inputs.vram_total,
-        inputs.gpu_reset,
-    ) {
-        HelperRoom::Fits(free) => (true, format!("{} GiB of GPU memory is free", free >> 30)),
-        HelperRoom::AfterReset(_) => {
-            (true, "SP1_GPU_RESET_BEFORE_WRAP frees this card for its helper".into())
+    let gpu = if inputs.helper_routed {
+        "SP1_PLONK_GPU_HELPER_DEVICES runs its helper on other cards".to_string()
+    } else {
+        match helper_room(
+            sp1_recursion_gnark_ffi::PLONK_GPU_HELPER_VRAM_BYTES,
+            inputs.vram_free,
+            inputs.vram_total,
+            inputs.gpu_reset,
+        ) {
+            HelperRoom::Fits(free) => format!("{} GiB of GPU memory is free", free >> 30),
+            HelperRoom::AfterReset(_) => {
+                "SP1_GPU_RESET_BEFORE_WRAP frees this card for its helper".into()
+            }
+            HelperRoom::Lacking(reason) => {
+                return (false, format!("{reason} the GPU PLONK prover's helper"))
+            }
+            HelperRoom::Unknown => "free GPU memory is unknown, so its helper tries".into(),
         }
-        HelperRoom::Lacking(reason) => (false, format!("{reason} the GPU PLONK prover's helper")),
-        HelperRoom::Unknown => (true, "free GPU memory is unknown, so its helper tries".into()),
+    };
+    let needed = if inputs.server_running {
+        PLONK_GPU_SERVER_PROOF_BYTES
+    } else {
+        PLONK_GPU_MIN_AVAILABLE_BYTES
+            + if inputs.pk_cache_ready { 0 } else { PLONK_GPU_PK_EXPORT_BYTES }
+    };
+    match inputs.mem_available {
+        Some(available) if available < needed => (
+            false,
+            format!(
+                "{} GiB of host memory is available and the GPU PLONK prover needs {} GiB",
+                available >> 30,
+                needed >> 30
+            ),
+        ),
+        Some(available) => {
+            (true, format!("{gpu}; {} GiB of host memory is available", available >> 30))
+        }
+        None => (true, format!("{gpu}; host memory is unknown")),
     }
 }
 
@@ -417,7 +466,31 @@ mod tests {
             vram_free: Some(vram_free),
             vram_total: Some(vram_total),
             gpu_reset: false,
+            mem_available: Some(160 * GIB),
+            pk_cache_ready: true,
+            server_running: false,
         }
+    }
+
+    #[test]
+    fn the_gpu_plonk_helper_needs_its_measured_host_memory_available() {
+        let card = plonk_inputs(25 * GIB, 32 * GIB);
+        let host = |available| PlonkInputs { mem_available: Some(available), ..card };
+        assert!(use_gpu_plonk(&host(PLONK_GPU_MIN_AVAILABLE_BYTES)).0);
+        // A 128 GB host with the prover resident: its helper would be OOM-killed.
+        assert!(!use_gpu_plonk(&host(100 * GIB)).0);
+        // The key's export on a cold cache needs its files' memory too.
+        let cold = |available| PlonkInputs { pk_cache_ready: false, ..host(available) };
+        assert!(!use_gpu_plonk(&cold(PLONK_GPU_MIN_AVAILABLE_BYTES)).0);
+        assert!(use_gpu_plonk(&cold(PLONK_GPU_MIN_AVAILABLE_BYTES + PLONK_GPU_PK_EXPORT_BYTES)).0);
+        // A helper server from an earlier proof already holds most of it.
+        let served = |available| PlonkInputs { server_running: true, ..host(available) };
+        assert!(use_gpu_plonk(&served(70 * GIB)).0);
+        assert!(!use_gpu_plonk(&served(PLONK_GPU_SERVER_PROOF_BYTES - 1)).0);
+        // A helper on other cards still runs on this host.
+        assert!(!use_gpu_plonk(&PlonkInputs { helper_routed: true, ..host(100 * GIB) }).0);
+        // Unknown host memory: the helper tries.
+        assert!(use_gpu_plonk(&PlonkInputs { mem_available: None, ..card }).0);
     }
 
     #[test]

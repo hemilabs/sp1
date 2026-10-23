@@ -1089,9 +1089,9 @@ impl<A: ArtifactClient, C: SP1ProverComponents> SP1RecursionProver<A, C> {
             // memory, which a card holding this prover's state has free only once the memory
             // pool's idle reserve is given back (on a 32 GB card), or after a reset
             // (SP1_GPU_RESET_BEFORE_WRAP), unless SP1_PLONK_GPU_HELPER_DEVICES routes the helper to
-            // another card. Deciding here spares a card that cannot fit it the witness export and
-            // the helper's start. If it fails, the CPU prover takes over rather than losing the
-            // proof.
+            // another card; and ~112 GiB of host memory (the CPU prover needs ~42 GB). Deciding
+            // here spares a card or host that cannot fit it the witness export and the helper's
+            // start. If it fails, the CPU prover takes over rather than losing the proof.
             #[cfg(feature = "native-gnark")]
             let use_gpu = plonk_gpu && {
                 use super::groth16_backend::{use_gpu_plonk, PlonkInputs};
@@ -1115,6 +1115,9 @@ impl<A: ArtifactClient, C: SP1ProverComponents> SP1RecursionProver<A, C> {
                     vram_free: ffi::gpu_free_memory(),
                     vram_total: ffi::gpu_total_memory(),
                     gpu_reset: ffi::gpu_reset_requested() && ffi::gpu_reset_available(),
+                    mem_available: ffi::host_memory::available(),
+                    pk_cache_ready: PlonkBn254Prover::gpu_pk_cache_ready(&build_dir),
+                    server_running: PlonkBn254Prover::gpu_helper_server_running(),
                 });
                 tracing::info!(
                     "PLONK prover: {} ({reason})",

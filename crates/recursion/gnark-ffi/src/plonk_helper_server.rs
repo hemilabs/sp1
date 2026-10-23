@@ -109,6 +109,7 @@ impl PlonkHelperServer {
         for (k, v) in extra_env {
             cmd.env(k, v);
         }
+        crate::subprocess::kill_first_when_out_of_memory(&mut cmd);
         let mut child = cmd
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -232,6 +233,16 @@ impl Drop for PlonkHelperServer {
 pub fn singleton() -> &'static Mutex<Option<PlonkHelperServer>> {
     static SERVER: OnceLock<Mutex<Option<PlonkHelperServer>>> = OnceLock::new();
     SERVER.get_or_init(|| Mutex::new(None))
+}
+
+/// Whether the singleton server has a helper running: started by an earlier proof, or proving
+/// for another one now (its lock is held).
+pub fn running() -> bool {
+    match singleton().try_lock() {
+        Ok(server) => server.is_some(),
+        Err(std::sync::TryLockError::WouldBlock) => true,
+        Err(std::sync::TryLockError::Poisoned(_)) => false,
+    }
 }
 
 /// Returns true iff `SP1_PLONK_GPU_SERVER` is set to `1`/`true`/`on`.

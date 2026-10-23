@@ -120,7 +120,13 @@ gnark's CPU Groth16 prover peaks at ~16 GiB on the v6.1.0 circuit. So:
 - The GPU Groth16 prover is used only where the card has 18 GiB free beside the prover's own state,
   once its memory pool's idle reserve is given back: in practice cards of 32 GB or more. The GPU
   PLONK prover (`SP1_PLONK_GPU=1`) is tried only where 23 GiB is free that way (a 32 GB card) or
-  after a reset; elsewhere gnark's CPU prover makes the proof without the GPU attempt.
+  after a reset, and where the host has 112 GiB of memory available for its helper (126 GiB before
+  its key is exported, 24 GiB while a `SP1_PLONK_GPU_SERVER` helper runs); elsewhere gnark's CPU
+  prover, which needs ~42 GB, makes the proof without the GPU attempt.
+- On Linux the wrap helpers are the kernel's first choice when memory runs out (`oom_score_adj`
+  1000), so that a prover is not killed in their place: a killed helper's proof is retried or made
+  by gnark's CPU prover. Under systemd, give the prover's unit `OOMPolicy=continue`: with the
+  default, `stop`, a helper's OOM kill stops the whole unit, the prover with it.
 - A process that exits after its proof can set `SP1_GPU_RESET_BEFORE_WRAP=1` (Linux, CUDA or HIP) to
   free its card for a wrap helper that would not fit otherwise: not where the card is too small for
   the helper anyway, and not while another proof uses the GPU. The reset destroys the state the

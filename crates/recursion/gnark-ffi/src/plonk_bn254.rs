@@ -430,6 +430,27 @@ impl PlonkBn254Prover {
         find_plonk_helper().is_some()
     }
 
+    /// Whether this circuit's GPU-format proving key is already exported (14 GB, under `/dev/shm`
+    /// unless `SP1_PLONK_GPU_CACHE` says otherwise), so that [`Self::prove_gpu_subprocess`] skips
+    /// the one-time export. Read-only, unlike the resolution the prover does. Always false when the
+    /// cache is disabled, or the circuit's vk is unreadable.
+    #[cfg(feature = "native")]
+    pub fn gpu_pk_cache_ready(build_dir: &Path) -> bool {
+        let Ok(vk_bin_bytes) = std::fs::read(build_dir.join("plonk_vk.bin")) else {
+            return false;
+        };
+        let vkey_hash_hex = hex::encode(Sha256::digest(vk_bin_bytes));
+        plonk_gpu_cache_dir(&vkey_hash_hex)
+            .is_some_and(|dir| dir.join(PLONK_CACHE_SENTINEL).is_file())
+    }
+
+    /// Whether a `SP1_PLONK_GPU_SERVER` helper from an earlier proof still runs (or proves now),
+    /// holding most of the host memory the next proof needs.
+    #[cfg(feature = "native")]
+    pub fn gpu_helper_server_running() -> bool {
+        crate::plonk_helper_server::enabled() && crate::plonk_helper_server::running()
+    }
+
     /// Subprocess-isolated GPU PLONK prove. Spawns the `plonk_gpu_helper`
     /// binary so the GPU PLONK prover runs in a clean process that does NOT
     /// inherit HIP/CUDA state from the caller (sp1-prover's recursion task

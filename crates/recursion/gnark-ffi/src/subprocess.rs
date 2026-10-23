@@ -9,6 +9,8 @@
 //! - On Linux it gets `SIGKILL` when the spawning thread goes away (`PR_SET_PDEATHSIG`), so it is
 //!   not left running as an orphan. That thread waits for it, so in practice this means when the
 //!   parent process dies.
+//! - On Linux the kernel kills it before its prover when memory runs out
+//!   ([`kill_first_when_out_of_memory`]).
 //! - It is killed if it runs longer than `SP1_GROTH16_HELPER_TIMEOUT_SECS` (default 1800; 0 for no
 //!   limit). A hung helper would otherwise hold the host-wide slot, and stall every prover on the
 //!   host, for ever.
@@ -261,10 +263,39 @@ pub(crate) fn bind_to_parent(cmd: &mut Command) {
             Ok(())
         });
     }
+    kill_first_when_out_of_memory(cmd);
 }
 
 #[cfg(not(unix))]
 pub(crate) fn bind_to_parent(_cmd: &mut Command) {}
+
+/// Makes the child the kernel's first choice when the host, or this process's cgroup, runs out of
+/// memory (`oom_score_adj` 1000). A killed helper's proof falls back to gnark's CPU prover or is
+/// retried, while a killed prover loses everything it was proving; by size alone the kernel can
+/// pick the prover, which outgrows a Groth16 CPU helper (~16 GB). Any process may raise its own
+/// score. (Under systemd the prover's unit needs `OOMPolicy=continue`: by default an OOM kill
+/// stops the whole unit.) Runs between fork and exec, so it only makes async-signal-safe calls.
+#[cfg(target_os = "linux")]
+pub(crate) fn kill_first_when_out_of_memory(cmd: &mut Command) {
+    use std::os::unix::process::CommandExt;
+    // SAFETY: the closure only calls open, write and close, which are async-signal-safe, with a
+    // static path and buffer.
+    unsafe {
+        cmd.pre_exec(|| {
+            let fd =
+                libc::open(c"/proc/self/oom_score_adj".as_ptr(), libc::O_WRONLY | libc::O_CLOEXEC);
+            if fd >= 0 {
+                // Best effort: a helper that cannot raise its score still runs.
+                let _ = libc::write(fd, b"1000".as_ptr().cast(), 4);
+                libc::close(fd);
+            }
+            Ok(())
+        });
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn kill_first_when_out_of_memory(_cmd: &mut Command) {}
 
 #[cfg(all(test, unix))]
 pub(crate) mod tests {
@@ -323,6 +354,20 @@ pub(crate) mod tests {
 
         let killed = run_with_timeout(sh("kill -9 $$"), "test", None).unwrap();
         assert_eq!(killed.signal(), Some(9));
+    }
+
+    /// A helper, whether run through `run` or spawned by the PLONK helper server, is the kernel's
+    /// first choice when memory runs out.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_helper_is_killed_first_when_memory_runs_out() {
+        let finished =
+            run_with_timeout(sh("cat /proc/self/oom_score_adj >&2"), "test", None).unwrap();
+        assert_eq!(finished.stderr_tail.trim(), "1000");
+        let mut cmd = sh("cat /proc/self/oom_score_adj");
+        kill_first_when_out_of_memory(&mut cmd);
+        let output = cmd.output().unwrap();
+        assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "1000");
     }
 
     #[test]
