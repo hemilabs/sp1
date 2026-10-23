@@ -120,9 +120,11 @@ gnark's CPU Groth16 prover peaks at ~16 GiB on the v6.1.0 circuit. So:
 - The GPU Groth16 prover is used only where the card has 18 GiB free beside the prover's own state,
   once its memory pool's idle reserve is given back: in practice cards of 32 GB or more. The GPU
   PLONK prover (`SP1_PLONK_GPU=1`) is tried only where 23 GiB is free that way (a 32 GB card) or
-  after a reset; elsewhere gnark's CPU prover makes the proof without the GPU attempt. A process
-  that exits after its proof can set `SP1_GPU_RESET_BEFORE_WRAP=1` to free its card first; a
-  long-lived server must not, as the reset destroys the state it proves the next proof with.
+  after a reset; elsewhere gnark's CPU prover makes the proof without the GPU attempt.
+- A process that exits after its proof can set `SP1_GPU_RESET_BEFORE_WRAP=1` to free its card for
+  a wrap helper that would not fit otherwise. The reset destroys the state the prover proves the
+  next proof with, so afterwards the process refuses to prove again; where the helper fits without
+  it, as on a 32 GB card, there is no reset and the process keeps proving.
 
 | Variable | Default | Effect |
 | --- | --- | --- |
@@ -135,7 +137,7 @@ gnark's CPU Groth16 prover peaks at ~16 GiB on the v6.1.0 circuit. So:
 | `SP1_GROTH16_GPU` | decided per proof | `1`/`true` forces the GPU prover, `0`/`false` the CPU prover. |
 | `SP1_GROTH16_GPU_HELPER` | beside the binary, then `PATH` | `groth16_gpu_helper` (`--features native,cuda`). |
 | `SP1_GROTH16_PK_CACHE`, `_DISABLE` | `/dev/shm` | The GPU prover's proving key (~9 GB, exported once). |
-| `SP1_GPU_RESET_BEFORE_WRAP` | off | `1`/`true`: reset the GPU before a GPU wrap helper. Only for a process that exits after its proof. |
+| `SP1_GPU_RESET_BEFORE_WRAP` | off | `1`/`true`: reset the GPU before a GPU wrap helper that would not fit otherwise. Only for a process that exits after its proof: after a reset it refuses to prove again. |
 | `GOMEMLIMIT` | set per helper where memory is short | An operator's value is kept, and applies to this process's own Go runtime too. |
 
 ## Profiling

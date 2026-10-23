@@ -568,26 +568,31 @@ impl PlonkBn254Prover {
         let helper_path = resolve_plonk_helper_path("plonk_gpu_helper");
         let out_file = shm_named_tempfile();
 
-        // The helper needs ~24 GB of VRAM at N=2^25, which a prover keeping its shard-prover
-        // state on the card does not have free. Only a process that exits after this proof may
-        // reset its GPU to make room (`SP1_GPU_RESET_BEFORE_WRAP=1`; see `gpu_device`).
-        crate::gpu_device::reset_if_requested("PLONK (GPU)");
-
-        // Even a reset is not always sufficient (the parent's CUDA driver context
-        // may retain pooled memory until the host process exits). Operators
-        // can route the helper to a different GPU via SP1_PLONK_GPU_HELPER_DEVICES
-        // (semicolon-separated CUDA_VISIBLE_DEVICES / HIP_VISIBLE_DEVICES
-        // override for the helper subprocess only). On a multi-GPU box this
-        // is the most reliable mitigation; the standalone helper validated
-        // at 17-19 s on a clean GPU.
+        // Operators can route the helper to a different GPU via SP1_PLONK_GPU_HELPER_DEVICES
+        // (semicolon-separated CUDA_VISIBLE_DEVICES / HIP_VISIBLE_DEVICES override for the helper
+        // subprocess only). On a multi-GPU box this is the most reliable way to give it room; the
+        // standalone helper validated at 17-19 s on a clean GPU.
         let helper_devices_override = std::env::var("SP1_PLONK_GPU_HELPER_DEVICES").ok();
 
+        // The helper needs PLONK_GPU_HELPER_VRAM_BYTES of GPU memory, which a prover keeping its
+        // shard-prover state on the card has free only on a 32 GB card, once its memory pool's
+        // idle reserve is given back. Only a process that exits after this proof may reset its
+        // GPU to make room (`SP1_GPU_RESET_BEFORE_WRAP=1`; see `gpu_device`), and it does only
+        // where the helper runs on this card and would not fit otherwise. Even a reset is not
+        // always sufficient (the parent's CUDA driver context may retain pooled memory until the
+        // host process exits).
+        let reset = helper_devices_override.is_none()
+            && crate::gpu_device::reset_if_requested("PLONK (GPU)", PLONK_GPU_HELPER_VRAM_BYTES);
+
         // Log free VRAM, so operators can see whether the helper has room (after a reset, give
-        // the driver a moment to return the memory first).
-        if crate::gpu_device::reset_requested() {
+        // the driver a moment to return the memory first). A routed helper's cards are not
+        // measured here.
+        if reset {
             std::thread::sleep(std::time::Duration::from_millis(500));
         }
-        if let Some(free) = crate::gpu_device::free_memory() {
+        if let Some(free) =
+            crate::gpu_device::free_memory().filter(|_| helper_devices_override.is_none())
+        {
             tracing::info!("[plonk] {} MiB of GPU memory is free for the helper", free >> 20);
         }
 

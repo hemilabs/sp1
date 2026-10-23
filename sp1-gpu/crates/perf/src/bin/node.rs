@@ -117,7 +117,18 @@ async fn run() {
             let context = context.clone();
             let time = tokio::time::Instant::now();
             tracing::info!("proving with mode: {mode:?}");
-            let proof = client.prove_with_mode(&elf, stdin, context, mode).await.unwrap();
+            let proof = client.prove_with_mode(&elf, stdin, context, mode).await;
+            // A proof refused because an earlier one reset the GPU (SP1_GPU_RESET_BEFORE_WRAP):
+            // exit as below, since a panic would unwind through destructors that segfault on it.
+            #[cfg(feature = "native-gnark")]
+            if let Err(e) = &proof {
+                if sp1_recursion_gnark_ffi::gpu_was_reset() {
+                    eprintln!("proof failed: {e:#}");
+                    std::io::Write::flush(&mut std::io::stdout()).ok();
+                    std::process::exit(1);
+                }
+            }
+            let proof = proof.unwrap();
             let proof_time = time.elapsed();
             tracing::info!("proof time: {:?}", proof_time);
 
@@ -173,8 +184,9 @@ async fn run() {
         }
 
         // Exit explicitly once all proofs are produced and verified, while still
-        // inside the GPU task scope. The Groth16/PLONK wrap path calls
-        // `cudaDeviceReset` in the parent to free VRAM for the helper subprocess,
+        // inside the GPU task scope. The Groth16/PLONK wrap path can call
+        // `cudaDeviceReset` in the parent to free VRAM for the helper subprocess
+        // (SP1_GPU_RESET_BEFORE_WRAP, where the helper would not fit otherwise),
         // which invalidates the parent's remaining CUDA-backed objects (caching
         // allocator, device buffers, task scope). Letting the scope unwind then
         // runs their `Drop` impls, which call `cudaFree` on dead pointers and

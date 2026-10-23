@@ -153,6 +153,12 @@ fn memory_available() -> Option<u64> {
     crate::host_memory::available()
 }
 
+/// Free GPU memory the GPU Groth16 prover's helper needs. Measured on the v6.1.0 circuit: 14.5 GiB
+/// at peak on an RTX 4090 with gnark's solver (no `r1cs_solve_plan`). The GPU R1CS solver, the
+/// default when `r1cs_solve_plan` is installed, also uploads ~3 GB of circuit data, hence the
+/// margin. A helper that runs out anyway fails, and the CPU prover takes over.
+pub const GROTH16_GPU_HELPER_VRAM_BYTES: u64 = 18 << 30;
+
 /// The stripped-R1CS cache's marker and file; see `Groth16Bn254Prover::ensure_stripped_r1cs`.
 #[cfg(feature = "native")]
 pub(crate) const R1CS_CACHE_MARKER: &str = ".sp1_r1cs_cache_complete";
@@ -982,8 +988,9 @@ impl Groth16Bn254Prover {
 
         // The helper needs ~15 GB of GPU memory, which a prover keeping its shard-prover state on
         // a 24 GB card does not have free. Only a process that exits after this proof may reset
-        // its GPU to make room; see `gpu_device`.
-        crate::gpu_device::reset_if_requested("Groth16 (GPU)");
+        // its GPU to make room, and it does only where the helper would not fit otherwise; see
+        // `gpu_device`.
+        crate::gpu_device::reset_if_requested("Groth16 (GPU)", GROTH16_GPU_HELPER_VRAM_BYTES);
 
         tracing::info!("Spawning GPU Groth16 subprocess: {helper_path:?}");
         // GLV defaults:

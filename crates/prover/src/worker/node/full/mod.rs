@@ -43,6 +43,20 @@ impl Clone for SP1LocalNode {
     }
 }
 
+/// Refuses work that needs the GPU once this process has reset it before a final wrap
+/// (`SP1_GPU_RESET_BEFORE_WRAP`, where the wrap's helper would not fit otherwise): the reset
+/// destroyed the provers' GPU state, and the next proof would crash on it.
+fn ensure_gpu_not_reset() -> anyhow::Result<()> {
+    #[cfg(feature = "native-gnark")]
+    if sp1_recursion_gnark_ffi::gpu_was_reset() {
+        anyhow::bail!(
+            "this process reset its GPU before a final wrap (SP1_GPU_RESET_BEFORE_WRAP), which \
+             destroyed its provers' GPU state: restart it to prove again"
+        );
+    }
+    Ok(())
+}
+
 impl SP1LocalNode {
     pub fn core(&self) -> &SP1NodeCore {
         &self.inner.core
@@ -59,6 +73,7 @@ impl SP1LocalNode {
     }
 
     pub async fn setup(&self, elf: &[u8]) -> anyhow::Result<SP1VerifyingKey> {
+        ensure_gpu_not_reset()?;
         let elf_artifact = self.inner.artifact_client.create_artifact()?;
         self.inner.artifact_client.upload_program(&elf_artifact, elf.to_vec()).await?;
 
@@ -114,6 +129,7 @@ impl SP1LocalNode {
         range_or_limit: Option<Either<Vec<usize>, usize>>,
         chunk_size: usize,
     ) -> anyhow::Result<VkeyMapControllerOutput> {
+        ensure_gpu_not_reset()?;
         let vk_controller_artifact = self.inner.artifact_client.create_artifact()?;
         let input =
             VkeyMapControllerInput { range_or_limit, chunk_size, reduce_batch_size: DEFAULT_ARITY };
@@ -172,6 +188,7 @@ impl SP1LocalNode {
         context: SP1Context<'static>,
         mode: ProofMode,
     ) -> anyhow::Result<ProofFromNetwork> {
+        ensure_gpu_not_reset()?;
         // Allocate the per-proof artifacts and id up front so the cleanup below
         // can always reach them, regardless of how the proving body exits.
         let elf_artifact = self.inner.artifact_client.create_artifact()?;

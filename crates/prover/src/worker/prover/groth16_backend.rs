@@ -19,11 +19,10 @@
 /// then 12.9 GB for the helper (the solve's memory is released first), rounded up for headroom.
 pub(crate) const GPU_MIN_AVAILABLE_BYTES: u64 = 16 << 30;
 
-/// Free GPU memory the GPU prover's helper needs. Measured on the v6.1.0 circuit: 14.5 GiB at peak
-/// on an RTX 4090 with gnark's solver (no `r1cs_solve_plan`). The GPU R1CS solver, the default when
-/// `r1cs_solve_plan` is installed, also uploads ~3 GB of circuit data, hence the margin. A helper
-/// that runs out anyway fails, and the CPU prover takes over.
-pub(crate) const GPU_HELPER_VRAM_BYTES: u64 = 18 << 30;
+/// Free GPU memory the GPU prover's helper needs; see
+/// [`sp1_recursion_gnark_ffi::GROTH16_GPU_HELPER_VRAM_BYTES`].
+pub(crate) const GPU_HELPER_VRAM_BYTES: u64 =
+    sp1_recursion_gnark_ffi::GROTH16_GPU_HELPER_VRAM_BYTES;
 
 /// Extra host memory for the one-time proving-key export on a cold cache: ~9 GB of files, written
 /// to RAM-backed `/dev/shm` unless `SP1_GROTH16_PK_CACHE` points elsewhere.

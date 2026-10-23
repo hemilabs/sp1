@@ -1,20 +1,24 @@
 //! The GPU runtime this process already uses, as seen by the final wrap's GPU helpers.
 //!
 //! The GPU wrap provers run in helper processes that need GPU memory of their own (14.5 GiB for
-//! Groth16 on the v6.1.0 circuit, measured with gnark's solver; PLONK's ~24 GB), while the prover
+//! Groth16 on the v6.1.0 circuit, measured with gnark's solver; PLONK's ~22 GiB), while the prover
 //! that starts them keeps its shard-prover state on the card between proofs (21.7 GB of an RTX
 //! 4090's 24 GB). So:
-//! - [`free_memory`] says what a helper could get on the calling thread's current device, and the
+//! - [`trim_memory_pool`] gives that state's idle memory-pool reserve back to the driver, and
+//!   [`free_memory`] then says what a helper could get on the calling thread's current device; the
 //!   GPU path is chosen only where it fits.
-//! - [`reset_if_requested`] frees that device with `cudaDeviceReset` or `hipDeviceReset`. That
-//!   destroys every allocation, stream and pinned buffer this process has on it, so its next proof
-//!   crashes (measured: a segfault as the next proof starts). Only a process that exits after its
-//!   wrap can afford it, so it happens only with `SP1_GPU_RESET_BEFORE_WRAP=1` (or `true`).
+//! - [`reset_if_requested`] frees that device with `cudaDeviceReset` or `hipDeviceReset` where the
+//!   helper would not fit otherwise. That destroys every allocation, stream and pinned buffer this
+//!   process has on it, so it cannot prove again (measured: a segfault as the next proof starts;
+//!   [`was_reset`] lets it refuse the proof instead). Only a process that exits after its wrap can
+//!   afford it, so it happens only with `SP1_GPU_RESET_BEFORE_WRAP=1` (or `true`).
 //!
 //! Both use only a runtime library this process has already loaded. Loading one here would start
 //! a second runtime, and on a host with both toolkits installed it could be the wrong one. Off
 //! Linux the runtime is linked statically, and measuring and trimming use the calls the GPU prover
 //! registers instead (`device_caches::set_runtime`); there is no reset.
+
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// A GPU runtime library and the two calls used from it.
 struct Runtime {
@@ -201,12 +205,34 @@ pub fn reset_requested() -> bool {
     std::env::var("SP1_GPU_RESET_BEFORE_WRAP").is_ok_and(|v| v == "1" || v == "true")
 }
 
+/// Set once [`reset_if_requested`] has reset this process's GPU.
+static RESET: AtomicBool = AtomicBool::new(false);
+
+/// Whether this process has reset its GPU before a wrap helper (`SP1_GPU_RESET_BEFORE_WRAP`). Its
+/// shard-prover state went with it, so another proof would crash: callers refuse to start one.
+pub fn was_reset() -> bool {
+    RESET.load(Ordering::Relaxed)
+}
+
 /// Resets this process's GPU before a wrap helper runs, if `SP1_GPU_RESET_BEFORE_WRAP` asks for
-/// it; see the module docs. `what` names the caller in logs.
+/// it and less than `needed` bytes, what the helper needs, is free once the memory pool's idle
+/// reserve is given back; see the module docs. Returns whether it reset the GPU. `what` names the
+/// caller in logs.
 #[cfg(target_os = "linux")]
-pub(crate) fn reset_if_requested(what: &str) {
+pub(crate) fn reset_if_requested(what: &str, needed: u64) -> bool {
     if !reset_requested() {
-        return;
+        return false;
+    }
+    // Where the helper fits beside this process's state, the process keeps it, and can prove again.
+    let free = trim_memory_pool().map(|(_, after)| after).or_else(free_memory);
+    if let Some(free) = free.filter(|&free| free >= needed) {
+        tracing::info!(
+            "{what}: {} MiB of GPU memory is free and the helper needs {} MiB, so this process \
+             keeps its GPU (SP1_GPU_RESET_BEFORE_WRAP resets it only to make room)",
+            free >> 20,
+            needed >> 20
+        );
+        return false;
     }
     crate::device_caches::release();
     let Some((library, runtime)) = loaded() else {
@@ -214,32 +240,38 @@ pub(crate) fn reset_if_requested(what: &str) {
             "{what}: SP1_GPU_RESET_BEFORE_WRAP is set, but this process has no CUDA or HIP runtime \
              loaded to reset"
         );
-        return;
+        return false;
     };
     // SAFETY: `cudaDeviceReset` and `hipDeviceReset` take nothing and return an error code. The
-    // caller has agreed not to use the GPU again (SP1_GPU_RESET_BEFORE_WRAP).
+    // caller has agreed not to use the GPU again (SP1_GPU_RESET_BEFORE_WRAP), and `was_reset`
+    // turns away the proofs that would.
     let rc = unsafe {
         match library.get::<unsafe extern "C" fn() -> i32>(runtime.device_reset.as_bytes()) {
             Ok(reset) => reset(),
             Err(e) => {
                 tracing::warn!("{what}: {} has no {}: {e}", runtime.library, runtime.device_reset);
-                return;
+                return false;
             }
         }
     };
     if rc == 0 {
+        RESET.store(true, Ordering::Relaxed);
         tracing::info!(
             "{what}: reset this process's {} device (SP1_GPU_RESET_BEFORE_WRAP), so the helper \
-             gets its memory",
+             gets its memory; this process cannot prove again",
             runtime.name
         );
+        true
     } else {
         tracing::warn!("{what}: {} failed with error {rc}", runtime.device_reset);
+        false
     }
 }
 
 #[cfg(not(target_os = "linux"))]
-pub(crate) fn reset_if_requested(_what: &str) {}
+pub(crate) fn reset_if_requested(_what: &str, _needed: u64) -> bool {
+    false
+}
 
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
@@ -262,7 +294,8 @@ mod tests {
         let _env = crate::test_env::lock();
         std::env::set_var("SP1_GPU_RESET_BEFORE_WRAP", "1");
         assert!(reset_requested());
-        reset_if_requested("test");
+        assert!(!reset_if_requested("test", 0));
+        assert!(!was_reset());
         std::env::set_var("SP1_GPU_RESET_BEFORE_WRAP", "0");
         assert!(!reset_requested());
         std::env::remove_var("SP1_GPU_RESET_BEFORE_WRAP");
