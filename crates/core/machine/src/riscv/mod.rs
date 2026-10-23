@@ -1899,6 +1899,72 @@ pub mod tests {
 
     use crate::{io::SP1Stdin, utils::run_test};
 
+    /// Every ALU opcode, in register and immediate form, and every load, with `rd = x0`: the
+    /// events of the AluX0 and LoadX0 chips, which compiled programs rarely produce.
+    fn x0_program() -> Program {
+        let mut instructions = vec![
+            Instruction::new(Opcode::ADDI, 29, 0, 0x1234_8765, false, true),
+            Instruction::new(Opcode::ADDI, 30, 0, 37, false, true),
+            Instruction::new(Opcode::SD, 29, 0, 0x2765_4320, false, true),
+            Instruction::new(Opcode::ADDI, 0, 29, 5, false, true),
+        ];
+        for op in [
+            Opcode::ADD,
+            Opcode::SUB,
+            Opcode::XOR,
+            Opcode::OR,
+            Opcode::AND,
+            Opcode::SLL,
+            Opcode::SRL,
+            Opcode::SRA,
+            Opcode::SLT,
+            Opcode::SLTU,
+            Opcode::MUL,
+            Opcode::MULH,
+            Opcode::MULHU,
+            Opcode::MULHSU,
+            Opcode::DIV,
+            Opcode::DIVU,
+            Opcode::REM,
+            Opcode::REMU,
+            Opcode::ADDW,
+            Opcode::SUBW,
+            Opcode::SLLW,
+            Opcode::SRLW,
+            Opcode::SRAW,
+            Opcode::MULW,
+            Opcode::DIVW,
+            Opcode::DIVUW,
+            Opcode::REMW,
+            Opcode::REMUW,
+        ] {
+            instructions.push(Instruction::new(op, 0, 29, 30, false, false));
+        }
+        for op in [
+            Opcode::XOR,
+            Opcode::OR,
+            Opcode::AND,
+            Opcode::SLL,
+            Opcode::SRL,
+            Opcode::SRA,
+            Opcode::SLT,
+            Opcode::SLTU,
+            Opcode::ADDW,
+            Opcode::SLLW,
+            Opcode::SRLW,
+            Opcode::SRAW,
+        ] {
+            instructions.push(Instruction::new(op, 0, 29, 3, false, true));
+        }
+        for op in
+            [Opcode::LB, Opcode::LH, Opcode::LW, Opcode::LD, Opcode::LBU, Opcode::LHU, Opcode::LWU]
+        {
+            instructions.push(Instruction::new(op, 0, 0, 0x2765_4320, false, true));
+        }
+        add_halt(&mut instructions);
+        Program::new(instructions, 0, 0)
+    }
+
     /// The traces of the chips whose trace generates their dependencies, and the byte and range
     /// traces, are the same as with `generate_dependencies` for every chip.
     #[test]
@@ -1926,9 +1992,22 @@ pub mod tests {
             unsafe { values.set_len(n) };
             values
         };
-        for program in
-            [ssz_withdrawals_program(), keccak_permute_program(), secp256r1_add_program()]
-        {
+        let programs = vec![
+            ssz_withdrawals_program(),
+            keccak_permute_program(),
+            secp256r1_add_program(),
+            x0_program(),
+        ];
+        // Untrusted programs, for the user-mode chips.
+        #[cfg(feature = "mprotect")]
+        let programs = {
+            let mut programs = programs;
+            for elf in [test_artifacts::TRAP_EXEC_ELF, test_artifacts::TRAP_LOAD_STORE_ELF] {
+                programs.push(Program::from(&elf).unwrap());
+            }
+            programs
+        };
+        for program in programs {
             let (records, _) = crate::utils::generate_records::<SP1Field>(
                 Arc::new(program),
                 SP1Stdin::new(),

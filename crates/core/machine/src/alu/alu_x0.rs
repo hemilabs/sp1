@@ -193,6 +193,13 @@ impl<M: TrustMode> AluX0Chip<M> {
 
                     if idx < input.alu_x0_events.len() {
                         let event = &input.alu_x0_events[idx];
+                        // The AIR's `0 <= opcode < 29` lookup, as in `generate_dependencies`.
+                        blu.add_byte_lookup_event(ByteLookupEvent {
+                            opcode: ByteOpcode::LTU,
+                            a: 1,
+                            b: event.0.opcode as u8,
+                            c: 29,
+                        });
                         cols.is_real = F::one();
                         cols.opcode = F::from_canonical_u32(event.0.opcode as u32);
                         cols.state.populate(blu, event.0.clk, event.0.pc);
