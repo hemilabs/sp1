@@ -70,6 +70,19 @@ fn start_gpu_work() -> anyhow::Result<GpuWork> {
     Ok(GpuWork)
 }
 
+/// Releases a request's bookkeeping ([`SP1LocalNode::release`], which a second time finds nothing
+/// left) if its caller drops it before it has: on a task of its own, as a failed request's.
+struct ReleaseOnDrop(Option<(SP1LocalNode, ProofId)>);
+
+impl Drop for ReleaseOnDrop {
+    fn drop(&mut self) {
+        let Some((node, proof_id)) = self.0.take() else { return };
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move { node.release(&proof_id, ProofRequestStatus::Failed).await });
+        }
+    }
+}
+
 impl SP1LocalNode {
     pub fn core(&self) -> &SP1NodeCore {
         &self.inner.core
@@ -79,17 +92,20 @@ impl SP1LocalNode {
     /// bookkeeping and the artifacts its tasks referenced, whether it succeeded or not. The node
     /// (and its worker client) serves every request of the process, and `submit_task` records
     /// every task in the worker client's `db`/`proof_index`, which only `complete_proof` prunes.
-    /// (A caller that drops the request before it ends leaves them: its tasks still run, and
-    /// releasing them would leave those tasks' waiters without a status.)
+    /// Also when the caller drops the request before then: its tasks run on, as a failed request's
+    /// do, but those waiting for the proof's end (its splicers, for a common input that may never
+    /// come) see it, and a wait for one of its tasks ends as a failure.
     async fn with_bookkeeping<T>(
         &self,
         proof_id: &ProofId,
         requests: impl std::future::Future<Output = anyhow::Result<T>>,
     ) -> anyhow::Result<T> {
+        let mut release_on_drop = ReleaseOnDrop(Some((self.clone(), proof_id.clone())));
         let result = requests.await;
         let status =
             if result.is_ok() { ProofRequestStatus::Completed } else { ProofRequestStatus::Failed };
         self.release(proof_id, status).await;
+        release_on_drop.0 = None;
         result
     }
 

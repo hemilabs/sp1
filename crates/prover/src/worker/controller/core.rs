@@ -30,8 +30,8 @@ use tracing::Instrument;
 
 use crate::worker::{
     global_memory, precompile_channel, shared_program, DeferredMessage, MinimalExecutorCache,
-    OpenShard, PrecompileArtifactSlice, ProveShardTaskRequest, RawTaskRequest, SplicingEngine,
-    SplicingTask, TaskContext, TaskError, TaskId, WorkerClient,
+    OpenShard, PrecompileArtifactSlice, ProofId, ProveShardTaskRequest, RawTaskRequest,
+    SplicingEngine, SplicingTask, TaskContext, TaskError, TaskId, WorkerClient,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -631,6 +631,11 @@ pub(super) async fn create_core_proving_task<A: ArtifactClient, W: WorkerClient>
         TraceData::Memory(_) | TraceData::Precompile(_, _) => None,
     };
 
+    // Not for a proof that has ended, which refuses the task: the record, tracked under its proof
+    // only by the task, would stay stored for good.
+    if worker_client.proof_ended(&context.proof_id) {
+        return Err(ExecutionError::Other(format!("proof {} has ended", context.proof_id)));
+    }
     artifact_client
         .upload(&record_artifact, trace_data)
         .await
@@ -644,7 +649,7 @@ pub(super) async fn create_core_proving_task<A: ArtifactClient, W: WorkerClient>
     let request = ProveShardTaskRequest {
         elf: elf_artifact,
         common_input: common_input_artifact,
-        record: record_artifact,
+        record: record_artifact.clone(),
         output: proof_artifact.clone(),
         deferred_marker_task: deferred_message
             .as_ref()
@@ -656,11 +661,17 @@ pub(super) async fn create_core_proving_task<A: ArtifactClient, W: WorkerClient>
 
     let task = request.into_raw().map_err(|e| ExecutionError::Other(e.to_string()))?;
 
-    // Send the task to the worker.
-    let task_id = worker_client
-        .submit_task(TaskType::ProveShard, task)
-        .await
-        .map_err(|e| ExecutionError::Other(e.to_string()))?;
+    // Send the task to the worker. A refused one (its proof ended meanwhile) leaves its record to
+    // be deleted here.
+    let task_id = match worker_client.submit_task(TaskType::ProveShard, task).await {
+        Ok(task_id) => task_id,
+        Err(e) => {
+            let _ = artifact_client
+                .try_delete(&record_artifact, ArtifactType::UnspecifiedArtifactType)
+                .await;
+            return Err(ExecutionError::Other(e.to_string()));
+        }
+    };
 
     gate.schedule_release(task_id.clone(), shard_permit);
 
@@ -676,14 +687,20 @@ const COMMON_INPUT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs
 /// The controller can start the executor while the proof's setup task is still running (the
 /// common input holds the vk), so whatever reads the common input or hands it to a task waits
 /// for it here first. Once it is there this is a single lookup.
-pub(crate) async fn wait_for_common_input<A: ArtifactClient>(
+pub(crate) async fn wait_for_common_input<A: ArtifactClient, W: WorkerClient>(
     artifact_client: &A,
+    worker_client: &W,
+    proof_id: &ProofId,
     common_input: &Artifact,
 ) -> anyhow::Result<()> {
     let start = std::time::Instant::now();
     while !artifact_client.exists(common_input, ArtifactType::UnspecifiedArtifactType).await? {
         if start.elapsed() > COMMON_INPUT_TIMEOUT {
             anyhow::bail!("timed out waiting for the common prover input {}", common_input.0);
+        }
+        // A failed proof's end deletes its common input while its executor still runs.
+        if worker_client.proof_ended(proof_id) {
+            anyhow::bail!("proof {proof_id} ended before its common prover input appeared");
         }
         tokio::time::sleep(std::time::Duration::from_millis(2)).await;
     }
@@ -704,6 +721,30 @@ fn classify_chunk_error(e: ExecutionError) -> TaskError {
             TaskError::Retryable(err)
         }
         _ => TaskError::Fatal(err),
+    }
+}
+
+#[cfg(test)]
+mod common_input_tests {
+    use sp1_prover_types::{InMemoryArtifactClient, ProofRequestStatus};
+
+    use super::*;
+    use crate::worker::LocalWorkerClient;
+
+    /// A failed proof's end deletes its common input while its executor may still run: the
+    /// executor's wait for it stops at once instead of running out its 600 s.
+    #[tokio::test]
+    async fn the_wait_for_the_common_input_stops_once_the_proof_has_ended() {
+        let artifacts = InMemoryArtifactClient::new();
+        let common_input = artifacts.create_artifact().unwrap();
+        let (client, _channels) = LocalWorkerClient::init();
+        let proof_id = ProofId::new("proof");
+        let wait = || wait_for_common_input(&artifacts, &client, &proof_id, &common_input);
+        // Still waiting while the proof runs.
+        assert!(tokio::time::timeout(std::time::Duration::from_millis(50), wait()).await.is_err());
+        client.complete_proof(proof_id.clone(), None, ProofRequestStatus::Failed, "").await.ok();
+        let ended = tokio::time::timeout(std::time::Duration::from_secs(5), wait()).await;
+        assert!(ended.expect("the wait stopped").is_err());
     }
 }
 

@@ -39,9 +39,16 @@ pub struct LocalWorkerClientInner {
     /// Resubmission counts per logical task (proof + type + output artifact). Pruned by
     /// `cleanup`.
     retry_counts: RwLock<HashMap<String, u8>>,
+    /// The last [`ENDED_PROOFS`] proofs completed ([`WorkerClient::proof_ended`]); a proof's
+    /// straggling work (its executor after the proof failed) runs far sooner. Marked under the
+    /// `proof_index` lock, which `submit_task` checks it under.
+    ended_proofs: std::sync::Mutex<lru::LruCache<ProofId, ()>>,
 }
 
 const MAX_LOCAL_TASK_RETRIES: u8 = 3;
+
+/// How many completed proofs [`LocalWorkerClientInner::ended_proofs`] remembers.
+const ENDED_PROOFS: std::num::NonZeroUsize = std::num::NonZeroUsize::new(4096).unwrap();
 
 impl LocalWorkerClientInner {
     fn create_id() -> TaskId {
@@ -82,6 +89,7 @@ impl LocalWorkerClientInner {
             input_task_queues: task_queues,
             task_channels,
             retry_counts: RwLock::new(HashMap::new()),
+            ended_proofs: std::sync::Mutex::new(lru::LruCache::new(ENDED_PROOFS)),
         };
         (inner, LocalWorkerClientChannels { task_receivers: task_outputs })
     }
@@ -167,6 +175,13 @@ impl LocalWorkerClient {
         kind: TaskType,
         task: RawTaskRequest,
     ) -> anyhow::Result<Option<TaskId>> {
+        // Not for a proof that has ended: its bookkeeping is gone, nothing waits for the task, and
+        // the device caches its retry would empty serve other proofs.
+        anyhow::ensure!(
+            !self.proof_ended(&task.context.proof_id),
+            "proof {} has ended: not retrying its task",
+            task.context.proof_id
+        );
         let key = format!(
             "{}:{}:{}",
             task.context.proof_id,
@@ -223,29 +238,45 @@ impl WorkerClient for LocalWorkerClient {
     async fn submit_task(&self, kind: TaskType, task: RawTaskRequest) -> anyhow::Result<TaskId> {
         tracing::debug!("submitting task of kind {kind:?}");
         let task_id = LocalWorkerClientInner::create_id();
-        // Add the task to the proof index.
-        self.inner
-            .proof_index
-            .write()
-            .await
-            .entry(task.context.proof_id.clone())
-            .or_insert_with(HashSet::new)
-            .insert(task_id.clone());
-        // Record the task's artifacts under this proof. The shared index is
-        // pruned as artifacts are deleted, so it holds only live ones; `cleanup`
-        // deletes whatever the proof leaves behind.
-        let proof = task.context.proof_id.to_string();
-        for artifact in task.inputs.iter().chain(task.outputs.iter()) {
-            self.inner.artifact_index.track(&proof, &artifact.0);
+        {
+            // All under the proof index's lock, which `complete_proof` marks the proof ended
+            // under: either this sees the end, or `complete_proof` and `cleanup` see this task.
+            let mut proof_index = self.inner.proof_index.write().await;
+            // Its bookkeeping is gone, and would not be released again.
+            anyhow::ensure!(
+                !self.proof_ended(&task.context.proof_id),
+                "proof {} has ended: not submitting its {kind:?} task",
+                task.context.proof_id
+            );
+            // Add the task to the proof index.
+            proof_index
+                .entry(task.context.proof_id.clone())
+                .or_insert_with(HashSet::new)
+                .insert(task_id.clone());
+            // Record the task's artifacts under this proof. The shared index is
+            // pruned as artifacts are deleted, so it holds only live ones; `cleanup`
+            // deletes whatever the proof leaves behind.
+            let proof = task.context.proof_id.to_string();
+            for artifact in task.inputs.iter().chain(task.outputs.iter()) {
+                self.inner.artifact_index.track(&proof, &artifact.0);
+            }
+            // Create a db entry for the task.
+            let (tx, rx) = watch::channel(TaskStatus::Pending);
+            self.inner.db.write().await.insert(task_id.clone(), (tx, rx));
         }
-        // Create a db entry for the task.
-        let (tx, rx) = watch::channel(TaskStatus::Pending);
-        self.inner.db.write().await.insert(task_id.clone(), (tx, rx));
         // Send the task to the input queue.
+        let proof_id = task.context.proof_id.clone();
         self.inner.input_task_queues[&kind]
             .send((task_id.clone(), task))
             .await
             .map_err(|e| anyhow::anyhow!("failed to send task of kind {:?} to queue: {e}", kind))?;
+        // The proof may have ended while this waited for room in the queue: `complete_proof` then
+        // pruned the task's bookkeeping, so the task fails at its first status update, and its
+        // caller must not wait for it.
+        anyhow::ensure!(
+            !self.proof_ended(&proof_id),
+            "proof {proof_id} ended as its {kind:?} task was submitted"
+        );
         Ok(task_id)
     }
 
@@ -266,14 +297,19 @@ impl WorkerClient for LocalWorkerClient {
         _extra_data: impl Into<String> + Send,
     ) -> anyhow::Result<()> {
         // (Artifacts are released separately via `cleanup`, which the node calls
-        // with its artifact client.) Remove the proof from the proof index.
-        let tasks = self
-            .inner
-            .proof_index
-            .write()
-            .await
-            .remove(&proof_id)
-            .ok_or_else(|| anyhow::anyhow!("proof does not exist for id {proof_id}"))?;
+        // with its artifact client.) Mark the proof ended and remove it from the proof index,
+        // under the index's lock (see `submit_task`).
+        let tasks = {
+            let mut proof_index = self.inner.proof_index.write().await;
+            self.inner
+                .ended_proofs
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .put(proof_id.clone(), ());
+            proof_index
+                .remove(&proof_id)
+                .ok_or_else(|| anyhow::anyhow!("proof does not exist for id {proof_id}"))?
+        };
         // Prune the db and any message channels for the proof's tasks. Two
         // short critical sections rather than one holding both writer locks
         // (avoids nesting and keeps each scope's hold time bounded by
@@ -295,6 +331,10 @@ impl WorkerClient for LocalWorkerClient {
         Ok(())
     }
 
+    fn proof_ended(&self, proof_id: &ProofId) -> bool {
+        self.inner.ended_proofs.lock().unwrap_or_else(|e| e.into_inner()).contains(proof_id)
+    }
+
     async fn subscriber(&self, _proof_id: ProofId) -> anyhow::Result<SubscriberBuilder<Self>> {
         let (subscriber_input_tx, mut subscriber_input_rx) = mpsc::unbounded_channel();
         let (subscriber_output_tx, subscriber_output_rx) = mpsc::unbounded_channel();
@@ -308,8 +348,12 @@ impl WorkerClient for LocalWorkerClient {
                     let db = db.clone();
                     let output_tx = output_tx.clone();
                     tokio::task::spawn(async move {
-                        let (_, mut rx) =
-                            db.read().await.get(&id).cloned().expect("task does not exist");
+                        // A task whose proof has ended is pruned (`complete_proof`): it will not
+                        // succeed.
+                        let Some((_, mut rx)) = db.read().await.get(&id).cloned() else {
+                            output_tx.send((id, TaskStatus::FailedFatal)).ok();
+                            return;
+                        };
                         rx.mark_changed();
                         while let Ok(()) = rx.changed().await {
                             let value = *rx.borrow();
@@ -323,6 +367,9 @@ impl WorkerClient for LocalWorkerClient {
                                 return;
                             }
                         }
+                        // Pruned while waited for (its proof ended, the request maybe dropped):
+                        // its controller, still waiting, must not wait for ever.
+                        output_tx.send((id, TaskStatus::FailedFatal)).ok();
                     });
                 }
             }
@@ -502,5 +549,37 @@ mod tests {
                 "leaked artifact not deleted after proof {i}"
             );
         }
+    }
+
+    /// Once a proof has ended, its straggling work learns it, and submits no tasks whose
+    /// bookkeeping no one would release; only the last proofs ended are remembered.
+    #[tokio::test]
+    async fn an_ended_proof_takes_no_more_tasks() {
+        let (client, mut channels) = LocalWorkerClient::init();
+        let controller_rx = channels.task_receivers.get_mut(&TaskType::Controller).unwrap();
+        let proof_id = ProofId::new("proof");
+        client.submit_task(TaskType::Controller, controller_request(&proof_id, &[])).await.unwrap();
+        controller_rx.recv().await.unwrap();
+        assert!(!client.proof_ended(&proof_id));
+        client
+            .complete_proof(proof_id.clone(), None, ProofRequestStatus::Failed, "")
+            .await
+            .unwrap();
+        assert!(client.proof_ended(&proof_id));
+        let refused =
+            client.submit_task(TaskType::Controller, controller_request(&proof_id, &[])).await;
+        assert!(refused.is_err());
+        assert!(client.inner.proof_index.read().await.is_empty());
+        assert!(client.inner.db.read().await.is_empty());
+
+        // Only the last proofs ended are remembered.
+        for i in 0..ENDED_PROOFS.get() {
+            client
+                .complete_proof(ProofId::new(format!("p{i}")), None, ProofRequestStatus::Failed, "")
+                .await
+                .ok();
+        }
+        assert!(!client.proof_ended(&proof_id));
+        assert!(client.proof_ended(&ProofId::new(format!("p{}", ENDED_PROOFS.get() - 1))));
     }
 }

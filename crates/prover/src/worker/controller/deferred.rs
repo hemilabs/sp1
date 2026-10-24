@@ -81,9 +81,14 @@ impl DeferredInputs {
         worker_client: W,
     ) -> Result<(), TaskError> {
         if !self.inputs.is_empty() {
-            super::wait_for_common_input(&artifact_client, &common_input)
-                .await
-                .map_err(TaskError::Fatal)?;
+            super::wait_for_common_input(
+                &artifact_client,
+                &worker_client,
+                &context.proof_id,
+                &common_input,
+            )
+            .await
+            .map_err(TaskError::Fatal)?;
         }
         for input in self.inputs {
             // Calculate the range of the deferred proof.
