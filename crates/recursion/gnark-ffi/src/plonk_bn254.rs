@@ -531,19 +531,18 @@ impl PlonkBn254Prover {
 
     /// Whether a `SP1_PLONK_GPU_SERVER` helper from an earlier proof still runs (or proves now)
     /// that this circuit's next proof would use, so that it holds most of the host memory that
-    /// proof needs. Not with the GPU cache off, where each proof's key is in a directory of its
-    /// own, and needs a new server.
+    /// proof needs. A kept helper that proof cannot use is shut down, so that the memory the proof
+    /// measures next is not held for nothing: one for another key, or any with the GPU cache off,
+    /// where each proof's key is in a directory of its own, and needs a new server.
     #[cfg(feature = "native")]
-    pub fn gpu_helper_server_running(build_dir: &Path) -> bool {
+    pub fn keep_usable_gpu_helper_server(build_dir: &Path) -> bool {
         if !crate::plonk_helper_server::enabled() {
             return false;
         }
-        let Ok(vk_bin_bytes) = std::fs::read(build_dir.join("plonk_vk.bin")) else {
-            return false;
-        };
-        let vkey_hash_hex = hex::encode(Sha256::digest(vk_bin_bytes));
-        plonk_gpu_cache_dir(&vkey_hash_hex)
-            .is_some_and(|dir| crate::plonk_helper_server::running_for(&dir))
+        let cache = std::fs::read(build_dir.join("plonk_vk.bin"))
+            .ok()
+            .and_then(|vk| plonk_gpu_cache_dir(&hex::encode(Sha256::digest(vk))));
+        crate::plonk_helper_server::keep_only_for(cache.as_deref())
     }
 
     /// Subprocess-isolated GPU PLONK prove. Spawns the `plonk_gpu_helper`
@@ -705,6 +704,11 @@ impl PlonkBn254Prover {
                         outcome.proof_size,
                         t0.elapsed(),
                     );
+                    if cache.is_none() {
+                        // Its key goes with this proof's scratch directory: no later proof can use
+                        // it, and it holds ~71 GB of host memory.
+                        crate::plonk_helper_server::keep_only_for(None);
+                    }
                     let proof_bytes = std::fs::read(&out_path).unwrap();
                     return serde_json::from_slice(&proof_bytes).unwrap_or_else(|e| {
                         panic!("failed to parse helper's PlonkBn254Proof JSON: {e}");

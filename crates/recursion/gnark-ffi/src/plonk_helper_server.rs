@@ -61,7 +61,7 @@
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
-use std::sync::{mpsc, Mutex, OnceLock};
+use std::sync::{mpsc, Mutex, OnceLock, TryLockError};
 use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
@@ -306,26 +306,53 @@ pub fn singleton() -> &'static Mutex<Option<PlonkHelperServer>> {
     SERVER.get_or_init(|| Mutex::new(None))
 }
 
-/// Whether the singleton server has a helper running that proves from the key in `gpu_dir`
-/// (without a prep-circuit directory): started by an earlier proof, or proving for another one
-/// now (its lock is held). A server that has exited since (the kernel kills it first when memory
-/// runs out) is dropped, so that the next proof's memory need counts a new one; so does one for
-/// another key, which the next proof replaces.
-pub fn running_for(gpu_dir: &Path) -> bool {
-    match singleton().try_lock() {
-        Ok(mut server) => {
-            let exited = server.as_mut().is_some_and(|s| !matches!(s.child.try_wait(), Ok(None)));
-            if exited {
-                tracing::info!("[plonk-server] the long-lived helper has exited");
-                *server = None;
-            }
-            server.as_ref().is_some_and(|s| {
-                s.key == ServerKey { gpu_dir: gpu_dir.to_path_buf(), prep_circuit_dir: None }
-            })
+/// The key of the server in the singleton, for [`keep_only_for`] while a proof holds the
+/// singleton's lock.
+static SERVER_KEY: Mutex<Option<ServerKey>> = Mutex::new(None);
+
+/// Puts `server` in the singleton, whose lock `kept` is, and returns the one it held.
+fn replace(
+    kept: &mut Option<PlonkHelperServer>,
+    server: Option<PlonkHelperServer>,
+) -> Option<PlonkHelperServer> {
+    *SERVER_KEY.lock().unwrap_or_else(|e| e.into_inner()) = server.as_ref().map(|s| s.key.clone());
+    std::mem::replace(kept, server)
+}
+
+/// Whether the singleton server has a helper running that the next proof can use: one that
+/// proves from the key in `gpu_dir` (without a prep-circuit directory), started by an earlier
+/// proof, or proving for another one now (its lock is held). A server it cannot use is shut down
+/// here, before that proof measures the host memory it needs, which the server would otherwise
+/// hold for nothing (~71 GB): one for another key, or any, when the proof has no lasting key
+/// directory (`None`: with the GPU cache off, each proof exports a key of its own). So is one that
+/// has exited since (the kernel kills it first when memory runs out).
+pub fn keep_only_for(gpu_dir: Option<&Path>) -> bool {
+    let wanted =
+        gpu_dir.map(|dir| ServerKey { gpu_dir: dir.to_path_buf(), prep_circuit_dir: None });
+    let mut kept = match singleton().try_lock() {
+        Ok(kept) => kept,
+        Err(TryLockError::WouldBlock) => {
+            return wanted.is_some()
+                && *SERVER_KEY.lock().unwrap_or_else(|e| e.into_inner()) == wanted;
         }
-        Err(std::sync::TryLockError::WouldBlock) => true,
-        Err(std::sync::TryLockError::Poisoned(_)) => false,
+        Err(TryLockError::Poisoned(_)) => return false,
+    };
+    let Some(server) = kept.as_mut() else { return false };
+    if !matches!(server.child.try_wait(), Ok(None)) {
+        tracing::info!("[plonk-server] the long-lived helper has exited");
+        replace(&mut kept, None);
+        return false;
     }
+    if wanted.as_ref() == Some(&server.key) {
+        return true;
+    }
+    tracing::info!(
+        "[plonk-server] the next proof cannot use the long-lived helper; shutting it down"
+    );
+    if let Some(server) = replace(&mut kept, None) {
+        server.shutdown();
+    }
+    false
 }
 
 /// Returns true iff `SP1_PLONK_GPU_SERVER` is set to `1`/`true`/`on`.
@@ -362,7 +389,7 @@ pub fn with_server(
     if let Some(s) = guard.as_ref() {
         if s.key != key {
             tracing::info!("[plonk-server] (gpu_dir,prep_circuit_dir) changed; respawning server");
-            if let Some(old) = guard.take() {
+            if let Some(old) = replace(&mut guard, None) {
                 old.shutdown();
             }
         }
@@ -378,7 +405,7 @@ pub fn with_server(
             t0.elapsed(),
             s.initial_setup_ms,
         );
-        *guard = Some(s);
+        replace(&mut guard, Some(s));
     }
 
     let server = guard.as_mut().expect("server just inserted");
@@ -386,7 +413,7 @@ pub fn with_server(
         Ok(outcome) => Ok(outcome),
         Err(e) => {
             tracing::warn!("[plonk-server] prove failed ({e}); tearing down server for respawn");
-            let _ = guard.take(); // Drop kills the child.
+            replace(&mut guard, None); // Drop kills the child.
             Err(e)
         }
     }
@@ -490,21 +517,41 @@ exec sleep 1000"#;
         assert_ne!(unsafe { libc::kill(pid, 0) }, 0, "the server was left running");
     }
 
+    /// Keeps `server` in the singleton.
+    fn keep(server: PlonkHelperServer) {
+        replace(&mut singleton().lock().unwrap(), Some(server));
+    }
+
     #[test]
-    fn only_a_live_server_for_the_same_key_counts_as_running() {
+    fn only_a_live_server_the_next_proof_can_use_is_kept() {
+        let _env = crate::test_env::lock();
         let dir = tempfile::tempdir().unwrap();
         let helper = fake_helper(dir.path(), &serving(dir.path()));
-        let server = PlonkHelperServer::spawn(&helper, dir.path(), None, &[]).unwrap();
-        let mut kept = singleton().lock().unwrap();
-        *kept = Some(server);
-        drop(kept);
-        assert!(running_for(dir.path()));
-        assert!(!running_for(&dir.path().join("other")));
+        let spawn = || PlonkHelperServer::spawn(&helper, dir.path(), None, &[]).unwrap();
+        let stopped = dir.path().join("stopped");
 
-        let mut kept = singleton().lock().unwrap();
-        assert!(kill_and_reap(&mut kept.as_mut().unwrap().child));
-        drop(kept);
-        assert!(!running_for(dir.path()));
+        keep(spawn());
+        assert!(keep_only_for(Some(dir.path())));
+        assert!(!keep_only_for(Some(&dir.path().join("other"))));
+        assert!(singleton().lock().unwrap().is_none(), "a server for another key was kept");
+        assert!(std::fs::remove_file(&stopped).is_ok(), "it was not shut down");
+
+        keep(spawn());
+        assert!(!keep_only_for(None));
+        assert!(singleton().lock().unwrap().is_none(), "a server was kept with the cache off");
+        assert!(std::fs::remove_file(&stopped).is_ok(), "it was not shut down");
+
+        keep(spawn());
+        assert!(kill_and_reap(&mut singleton().lock().unwrap().as_mut().unwrap().child));
+        assert!(!keep_only_for(Some(dir.path())));
         assert!(singleton().lock().unwrap().is_none(), "the exited server was kept");
+
+        // While a proof holds the singleton, the key it was last given decides.
+        keep(spawn());
+        let held = singleton().lock().unwrap();
+        assert!(keep_only_for(Some(dir.path())));
+        assert!(!keep_only_for(Some(&dir.path().join("other"))));
+        drop(held);
+        replace(&mut singleton().lock().unwrap(), None);
     }
 }

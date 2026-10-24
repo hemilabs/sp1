@@ -1136,6 +1136,8 @@ impl<A: ArtifactClient, C: SP1ProverComponents> SP1RecursionProver<A, C> {
                 // choice, and kept only for a GPU wrap that counts on it, until this wrap ends.
                 let reservation = (!helper_routed).then(ffi::gpu_reserve_reset).flatten();
                 PlonkBn254Prover::remove_stale_gpu_witness(&build_dir);
+                // Before host memory is measured: a kept server the proof cannot use is shut down.
+                let server_running = PlonkBn254Prover::keep_usable_gpu_helper_server(&build_dir);
                 let inputs = PlonkInputs {
                     helper_available,
                     helper_routed,
@@ -1144,7 +1146,7 @@ impl<A: ArtifactClient, C: SP1ProverComponents> SP1RecursionProver<A, C> {
                     gpu_reset: reservation.is_some(),
                     mem_available: ffi::host_memory::available(),
                     pk_cache_ready: PlonkBn254Prover::gpu_pk_cache_ready(&build_dir),
-                    server_running: PlonkBn254Prover::gpu_helper_server_running(&build_dir),
+                    server_running,
                 };
                 let (gpu, reason) = use_gpu_plonk(&inputs);
                 let after_reset = !helper_routed
