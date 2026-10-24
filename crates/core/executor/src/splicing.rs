@@ -54,6 +54,8 @@ impl SplicingVM<'_, SupervisorMode> {
             // If we're not already done, ensure that we don't have a shard boundary.
             if !result.is_done() && self.shape_checker.check_shard_limit() {
                 result = CycleResult::ShardBoundary;
+            } else if self.shape_checker.commit_outgrew_halt_room() {
+                return Err(commit_long_before_halt());
             }
 
             match result {
@@ -189,6 +191,8 @@ impl SplicingVM<'_, UserMode> {
             // If we're not already done, ensure that we don't have a shard boundary.
             if !result.is_done() && self.shape_checker.check_shard_limit() {
                 result = CycleResult::ShardBoundary;
+            } else if self.shape_checker.commit_outgrew_halt_room() {
+                return Err(commit_long_before_halt());
             }
 
             match result {
@@ -371,6 +375,18 @@ impl SplicingVM<'_, UserMode> {
 
         Ok(())
     }
+}
+
+/// The error for a shard that holds a commit syscall and outgrew the room the sharding threshold
+/// keeps for `syscall_halt` ([`ShapeChecker::commit_outgrew_halt_room`]): the program committed
+/// (with an `ecall`; the SDK does so only in its halt) long before halting, and a shard is not cut
+/// between a commit and the halt, so this one would grow until the halt, past what can be proven.
+fn commit_long_before_halt() -> ExecutionError {
+    ExecutionError::Other(
+        "the program made a commit syscall long before it halted: the shard holding the commit \
+         cannot end before the halt, and it outgrew what a shard can prove"
+            .to_string(),
+    )
 }
 
 impl<M: ExecutionMode> SplicingVM<'_, M> {

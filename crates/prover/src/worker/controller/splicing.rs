@@ -40,7 +40,7 @@ pub struct SplicingTask<W: WorkerClient> {
     pub deferred_marker_tx: mpsc::UnboundedSender<DeferredMessage>,
     /// The shard left open at the end of the previous chunk; it starts this chunk's first shard.
     pub carry: Option<OpenShard>,
-    /// Receives the shard left open at the end of this chunk (`None` once the program is done).
+    /// Receives the shard left open at the end of this chunk (`None` if it leaves none open).
     pub carry_tx: oneshot::Sender<Option<OpenShard>>,
 }
 
@@ -164,6 +164,20 @@ where
     W: WorkerClient,
 {
     async fn call(&self, input: SplicingTask<W>) -> Result<(), ExecutionError> {
+        // Logged here: the executor can fail on this splicer's end first (a carry it never got),
+        // and its error is the one the task reports.
+        self.splice_chunk(input)
+            .await
+            .inspect_err(|e| tracing::error!("splicing a trace chunk failed: {e}"))
+    }
+}
+
+impl<A, W> SplicingWorker<A, W>
+where
+    A: ArtifactClient,
+    W: WorkerClient,
+{
+    async fn splice_chunk(&self, input: SplicingTask<W>) -> Result<(), ExecutionError> {
         let SplicingTask {
             program,
             chunk,
@@ -373,7 +387,7 @@ impl ChunkSplicer<'_> {
     }
 
     /// Splice `chunk` into shards and send them. Returns the shard left open at the end of the
-    /// chunk, or `None` if the program is done.
+    /// chunk, or `None` if the chunk leaves none open.
     fn splice<T: MinimalTrace>(&mut self, chunk: T) -> Result<Option<OpenShard>, ExecutionError> {
         let (num_deferred_proofs, splicing_tx) = (self.num_deferred_proofs, self.splicing_tx);
         let final_vm_state = self.final_vm_state;
@@ -419,6 +433,9 @@ impl ChunkSplicer<'_> {
                             "spliced trace sent to splicing tx"
                         );
                     } else if vm.mem_reads_len() == 0 {
+                        // A shard with a commit syscall stays open until the halt, so it is
+                        // carried like any other, as `syscall_halt`'s commits must be; the
+                        // splicing VM fails one that outgrows a shard's room for them.
                         tracing::debug!(
                             global_clk = vm.global_clk(),
                             pc = vm.pc(),
@@ -554,15 +571,21 @@ type SendSpliceEngine<A, W> =
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sp1_core_executor::{ShardingThreshold, DEFAULT_MEMORY_LIMIT};
+    use sp1_core_executor::{
+        Instruction, Opcode, ShardingThreshold, SyscallCode, DEFAULT_MEMORY_LIMIT,
+    };
     use sp1_core_executor_runner::MinimalExecutorRunner;
 
+    /// The clock at each chunk's end, and each shard's range and serialized trace.
+    type Splices = (Vec<u64>, Vec<(ShardRange, Vec<u8>)>);
+
     /// Splices a program's execution with the given trace chunk size, carrying the open shard
-    /// across chunks like the executor does. Returns each shard's range and serialized trace.
+    /// across chunks like the executor does. An error comes with the number of the chunk that
+    /// failed (from 0).
     fn splices(
         program: &Arc<Program>,
         chunk_threshold: u64,
-    ) -> (usize, Vec<(ShardRange, Vec<u8>)>) {
+    ) -> Result<Splices, (usize, ExecutionError)> {
         // Small shards, so the chunks hold several shards each.
         let opts = SP1CoreOpts {
             sharding_threshold: ShardingThreshold {
@@ -582,9 +605,9 @@ mod tests {
         let (splicing_tx, mut splicing_rx) = mpsc::channel(1 << 16);
         let mut touched_addresses = CompressedMemory::new();
         let mut touched_pages = CompressedPages::new();
-        let (mut num_chunks, mut shards, mut carry) = (0, Vec::new(), None);
+        let (mut chunk_ends, mut shards, mut carry) = (Vec::new(), Vec::new(), None);
         while let Some(chunk) = runner.execute_chunk() {
-            num_chunks += 1;
+            chunk_ends.push(chunk.clk_end());
             let mut splicer = ChunkSplicer {
                 program: program.clone(),
                 nonce: [0; PROOF_NONCE_NUM_WORDS],
@@ -602,21 +625,82 @@ mod tests {
                     splicer.splice(open.join(&chunk).expect("the open shard continues"))
                 }
             }
-            .unwrap();
+            .map_err(|e| (chunk_ends.len() - 1, e))?;
             // Serialize now: the splices hold the chunk's slot in the executor's trace ring.
             while let Ok(task) = splicing_rx.try_recv() {
                 shards.push((task.range, task.chunk.to_bytes()));
             }
         }
         assert!(carry.is_none(), "the program ended inside a shard");
-        (num_chunks, shards)
+        Ok((chunk_ends, shards))
+    }
+
+    /// `instructions` as a program: a loop of `loops` loads, then `instructions`, then the halt.
+    fn program_after_loads(loops: u64, instructions: Vec<Instruction>) -> Arc<Program> {
+        let mut all = vec![
+            Instruction::new(Opcode::ADD, 11, 0, 42, false, true),
+            Instruction::new(Opcode::SD, 11, 0, 0x2765_4320, false, true),
+            Instruction::new(Opcode::ADD, 20, 0, loops, false, true),
+            Instruction::new(Opcode::LD, 21, 0, 0x2765_4320, false, true),
+            Instruction::new(Opcode::ADD, 20, 20, (-1i64) as u64, false, true),
+            Instruction::new(Opcode::BNE, 20, 0, (-8i64) as u64, false, true),
+        ];
+        all.extend(instructions);
+        sp1_core_executor::add_halt(&mut all);
+        Arc::new(Program::new(all, 0, 0))
+    }
+
+    /// The commit syscall for word `word` of the public values digest.
+    fn commit(word: u64) -> Vec<Instruction> {
+        vec![
+            Instruction::new(Opcode::ADD, 5, 0, SyscallCode::COMMIT as u64, false, true),
+            Instruction::new(Opcode::ADD, 10, 0, word, false, true),
+            Instruction::new(Opcode::ADD, 11, 0, word + 1, false, true),
+            Instruction::new(Opcode::ECALL, 5, 10, 11, false, false),
+        ]
+    }
+
+    /// Commits interleaved with loads just before the halt, as in `syscall_halt`, with chunk ends
+    /// between them: the shard is carried through them to the halt, as if the program had run as
+    /// one chunk. (A shard cut after a commit cannot be traced: the prover runs it to the halt.)
+    #[test]
+    fn a_commit_window_split_by_chunk_ends_is_carried_to_the_halt() {
+        let load = Instruction::new(Opcode::LD, 21, 0, 0x2765_4320, false, true);
+        let window = (0..8).flat_map(|word| commit(word).into_iter().chain([load; 8])).collect();
+        let program = program_after_loads(16, window);
+        let (one_chunk, expected) = splices(&program, 1 << 30).unwrap();
+        assert_eq!((one_chunk.len(), expected.len()), (1, 1));
+        for chunk_threshold in [8, 13] {
+            let (chunk_ends, shards) = splices(&program, chunk_threshold).unwrap();
+            // The loads before the window fill at most 3 chunks: the rest end inside it.
+            assert!(chunk_ends.len() > 5, "{} chunks", chunk_ends.len());
+            assert_eq!(shards.len(), 1);
+            assert_eq!(shards[0].0, expected[0].0);
+            assert!(shards[0].1 == expected[0].1, "the shard differs");
+        }
+    }
+
+    /// A program that commits (by inline asm; the SDK commits only in its halt) and then runs on:
+    /// a shard is not cut between a commit and the halt, so it would grow without bound, each
+    /// chunk joining and splicing it again from its start. The splice fails as soon as the shard
+    /// outgrows the room kept for `syscall_halt`, early in a run of over 16 chunks.
+    #[test]
+    fn a_commit_long_before_the_halt_fails_the_splice() {
+        let mut instructions = commit(0);
+        instructions.extend(program_after_loads(1 << 20, vec![]).instructions.iter().copied());
+        // The commit first, then the loop and the halt.
+        let program = Arc::new(Program::new(instructions, 0, 0));
+        let (chunk, e) = splices(&program, 1 << 16).unwrap_err();
+        assert!(e.to_string().contains("commit syscall long before it halted"), "{e}");
+        assert!(chunk < 4, "failed only at chunk {chunk}");
     }
 
     #[test]
     fn shards_carried_across_chunks_match_a_single_chunk() {
         let program = Arc::new(Program::from(&test_artifacts::SSZ_WITHDRAWALS_ELF).unwrap());
-        let (one_chunk, expected) = splices(&program, 1 << 30);
-        let (num_chunks, shards) = splices(&program, 1 << 16);
+        let (one_chunk, expected) = splices(&program, 1 << 30).unwrap();
+        let (chunk_ends, shards) = splices(&program, 1 << 16).unwrap();
+        let (one_chunk, num_chunks) = (one_chunk.len(), chunk_ends.len());
         assert_eq!(one_chunk, 1);
         assert!(
             num_chunks > 4 && expected.len() > 4,

@@ -420,11 +420,14 @@ where
                     tokio::select! {
                         Some((chunk_count, splicing_handle)) = splicing_submit_rx.recv() => {
                             tracing::debug!(chunk_count = chunk_count, "Received splicing handle");
-                            let handle = splicing_handle.map_ok(move |_| chunk_count);
+                            let handle = splicing_handle.map_ok(move |spliced| (chunk_count, spliced));
                             splicing_handles.push(handle);
                         }
                         Some(result) = splicing_handles.next() => {
-                            let chunk_count = result.map_err(|e| anyhow::anyhow!("splicing task panicked: {}", e))?;
+                            let (chunk_count, spliced) = result.map_err(|e| anyhow::anyhow!("splicing task panicked: {}", e))?;
+                            // A splicer can fail after handing its carry to the next chunk (sending
+                            // a shard to be proven, say): that chunk's shards are then missing.
+                            spliced?;
                             tracing::debug!(chunk_count = chunk_count, "Splicing task finished");
                         }
                         else => {
