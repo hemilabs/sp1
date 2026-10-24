@@ -389,34 +389,41 @@ static void arenaReportMiss(size_t s, size_t free_b, size_t total, size_t larges
 // wholly free allocations of the arena: a mapping change, so only when nothing else made room.
 static thread_local size_t t_failed_miss = 0;
 
-// The first device a CUDA_VISIBLE_DEVICES-style list names, without surrounding whitespace.
-static std::string firstDevice(const char* list) {
-    std::string device(list ? list : "");
-    device = device.substr(0, device.find(','));
+// `s` without surrounding whitespace ("" for none).
+static std::string trimmed(const std::string& s) {
     const char* space = " \t\n\r\v\f";
-    const size_t begin = device.find_first_not_of(space);
+    const size_t begin = s.find_first_not_of(space);
     if (begin == std::string::npos) return "";
-    return device.substr(begin, device.find_last_not_of(space) - begin + 1);
+    return s.substr(begin, s.find_last_not_of(space) - begin + 1);
+}
+
+// The first device a CUDA_VISIBLE_DEVICES-style list names, without surrounding whitespace.
+static std::string firstDevice(const std::string& list) {
+    return trimmed(list.substr(0, list.find(',')));
+}
+
+// The value of the environment variable `name`, "" where it is unset.
+static std::string envString(const char* name) {
+    const char* value = std::getenv(name);
+    return value ? value : "";
 }
 
 // Whether the GPU PLONK helper will run on this card (see arenaInit). The rule of gnark-ffi's
-// helper_shares_card: each proves on the first device its list names (SP1_PLONK_GPU_HELPER_DEVICES
-// for the helper; CUDA_VISIBLE_DEVICES or HIP_VISIBLE_DEVICES for this process, device 0 with
-// neither set), and an empty helper list leaves the helper this process's devices.
+// helper_shares_card: each proves on the first device its list names: the helper,
+// SP1_PLONK_GPU_HELPER_DEVICES's; this process, HIP_VISIBLE_DEVICES's, or CUDA_VISIBLE_DEVICES's
+// where that is unset or empty (as HIP reads them), and device 0 with neither. An empty helper list
+// leaves the helper this process's devices, and one whose first entry is empty gives it none.
 static bool plonkHelperOnThisCard(size_t total_b) {
     const char* plonk_gpu = std::getenv("SP1_PLONK_GPU");
     if (!plonk_gpu || std::strcmp(plonk_gpu, "1") != 0) return false;
     if (total_b < (size_t(23) << 30)) return false;
-    const std::string helper = firstDevice(std::getenv("SP1_PLONK_GPU_HELPER_DEVICES"));
-    if (helper.empty()) return true;
-    bool own_listed = false;
-    for (const char* own_var : {"CUDA_VISIBLE_DEVICES", "HIP_VISIBLE_DEVICES"}) {
-        const std::string own = firstDevice(std::getenv(own_var));
-        if (own.empty()) continue;
-        own_listed = true;
-        if (own == helper) return true;
-    }
-    return !own_listed && helper == "0";
+    const std::string helper_list = trimmed(envString("SP1_PLONK_GPU_HELPER_DEVICES"));
+    const std::string helper = firstDevice(helper_list);
+    if (helper.empty()) return helper_list.empty();
+    const std::string hip_list = trimmed(envString("HIP_VISIBLE_DEVICES"));
+    const std::string own =
+        firstDevice(hip_list.empty() ? envString("CUDA_VISIBLE_DEVICES") : hip_list);
+    return own.empty() ? helper == "0" : own == helper;
 }
 
 // An on/off setting: 1 for 1, true, on or yes, -1 for 0, false, off or no (in any case), and 0,

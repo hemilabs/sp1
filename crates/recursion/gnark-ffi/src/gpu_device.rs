@@ -75,6 +75,18 @@ const RUNTIMES: &[Runtime] = &[
     },
 ];
 
+/// Which GPU runtime this process has loaded (`"CUDA"` or `"HIP"`): on Linux, where it is a
+/// shared library. `None` elsewhere, or before the runtime is loaded.
+#[cfg(target_os = "linux")]
+pub(crate) fn runtime_name() -> Option<&'static str> {
+    loaded().map(|(_, runtime)| runtime.name)
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn runtime_name() -> Option<&'static str> {
+    None
+}
+
 /// The runtime library this process has loaded, if any.
 #[cfg(target_os = "linux")]
 fn loaded() -> Option<(libloading::os::unix::Library, &'static Runtime)> {

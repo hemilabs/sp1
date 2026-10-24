@@ -37,24 +37,11 @@ fn shm_tempdir() -> tempfile::TempDir {
     tempfile::TempDir::new().expect("failed to create temp dir")
 }
 
-/// Detect whether the parent process was built against the CUDA backend by
-/// probing `/proc/self/maps` for the loaded runtime library. Returns true
-/// iff `libcudart.so.*` is loaded. Falls back to `false` when the maps file
-/// cannot be read (non-Linux or sandboxed). Used to gate the Phase H GPU
-/// PLONK SCS solver dispatch (CUDA-only at present).
+/// Whether this process has the CUDA runtime loaded (`gpu_device::runtime_name`; false off
+/// Linux). Only logged, for the Phase H GPU PLONK SCS solver (CUDA-only at present).
 #[cfg(feature = "native")]
 fn detect_runtime_backend_is_cuda() -> bool {
-    match std::fs::read_to_string("/proc/self/maps") {
-        Ok(maps) => {
-            let cuda = maps.contains("libcudart.so");
-            // If CUDA runtime is present, treat as CUDA backend. Mixed
-            // (CUDA + HIP loaded) is unusual but CUDA-first is the safe
-            // default since the solver is CUDA-only at present and the
-            // helper falls back gracefully if it can't initialize.
-            cuda
-        }
-        Err(_) => false,
-    }
+    crate::gpu_device::runtime_name() == Some("CUDA")
 }
 
 /// Per-vk PLONK GPU data cache directory. Mirror of Groth16's `pk_cache_dir`.
@@ -184,25 +171,42 @@ pub fn plonk_helper_devices() -> Option<String> {
 #[cfg(feature = "native")]
 pub fn plonk_helper_routed() -> bool {
     let Some(devices) = plonk_helper_devices() else { return false };
-    let own = ["CUDA_VISIBLE_DEVICES", "HIP_VISIBLE_DEVICES"].map(|var| std::env::var(var).ok());
-    !helper_shares_card(&devices, &own)
+    !helper_shares_card(&devices, &own_device_lists())
+}
+
+/// The visible-devices lists that place this process on its card, as its runtime reads them: CUDA
+/// reads `CUDA_VISIBLE_DEVICES`; HIP reads `HIP_VISIBLE_DEVICES`, or `CUDA_VISIBLE_DEVICES` where
+/// that is unset or empty. Both where the runtime is not known (not loaded yet, or linked
+/// statically, as on Windows). (The helper is given its list as both.)
+#[cfg(feature = "native")]
+fn own_device_lists() -> Vec<String> {
+    let var = |name| std::env::var(name).ok().filter(|list: &String| !list.trim().is_empty());
+    let (cuda, hip) = (var("CUDA_VISIBLE_DEVICES"), var("HIP_VISIBLE_DEVICES"));
+    match crate::gpu_device::runtime_name() {
+        Some("CUDA") => cuda.into_iter().collect(),
+        Some(_) => hip.or(cuda).into_iter().collect(),
+        None => cuda.into_iter().chain(hip).collect(),
+    }
 }
 
 /// Whether a GPU PLONK helper given `devices` (`SP1_PLONK_GPU_HELPER_DEVICES`) proves on this
-/// process's card, which has the visible devices `own` (`CUDA_VISIBLE_DEVICES`,
-/// `HIP_VISIBLE_DEVICES`). Each proves on the first device its list names, this process on device
-/// 0 where neither of its lists is set; an empty `devices` leaves the helper this process's
-/// devices. (A device named by index in one list and by UUID in the other cannot be matched, and
-/// counts as another card.) `stream.cu`'s `plonkHelperOnThisCard` follows the same rule.
+/// process's card, which the visible-devices lists `own` place it on (see [`own_device_lists`]).
+/// Each proves on the first device its list names, this process on device 0 where it has no list;
+/// an empty `devices` leaves the helper this process's devices, and one whose first entry is empty
+/// names no device the runtime can use, so not this card. (A device named by index in one list and
+/// by UUID in the other cannot be matched, and counts as another card.) `stream.cu`'s
+/// `plonkHelperOnThisCard` follows the same rule.
 #[cfg(feature = "native")]
-fn helper_shares_card(devices: &str, own: &[Option<String>]) -> bool {
+fn helper_shares_card(devices: &str, own: &[String]) -> bool {
     let first = |list: &str| list.split(',').next().unwrap_or_default().trim().to_string();
-    let helper = first(devices);
-    if helper.is_empty() {
+    if devices.trim().is_empty() {
         return true;
     }
-    let own: Vec<String> =
-        own.iter().flatten().map(|list| first(list)).filter(|d| !d.is_empty()).collect();
+    let helper = first(devices);
+    if helper.is_empty() {
+        return false;
+    }
+    let own: Vec<String> = own.iter().map(|list| first(list)).filter(|d| !d.is_empty()).collect();
     if own.is_empty() {
         helper == "0"
     } else {
@@ -859,19 +863,34 @@ mod tests {
     /// The helper shares this process's card where both prove on the same first device.
     #[test]
     fn a_helper_shares_the_card_of_its_first_device() {
-        let own = |cuda: Option<&str>, hip: Option<&str>| {
-            [cuda.map(str::to_string), hip.map(str::to_string)]
-        };
-        assert!(helper_shares_card("", &own(Some("1"), None)));
-        assert!(helper_shares_card("  ", &own(Some("1"), None)));
-        assert!(helper_shares_card("0", &own(None, None)));
-        assert!(helper_shares_card(" 0 ", &own(None, None)));
-        assert!(!helper_shares_card("1", &own(None, None)));
-        assert!(helper_shares_card("0", &own(Some("0,1"), None)));
-        assert!(helper_shares_card("1 ", &own(None, Some("1"))));
-        assert!(!helper_shares_card("1", &own(Some("0,1"), None)));
-        assert!(!helper_shares_card("0,1", &own(Some("1,0"), None)));
-        assert!(helper_shares_card("0", &own(Some(""), None)));
+        let own = |lists: &[&str]| lists.iter().map(|list| list.to_string()).collect::<Vec<_>>();
+        assert!(helper_shares_card("", &own(&["1"])));
+        assert!(helper_shares_card("  ", &own(&["1"])));
+        assert!(helper_shares_card("0", &own(&[])));
+        assert!(helper_shares_card(" 0 ", &own(&[])));
+        assert!(!helper_shares_card("1", &own(&[])));
+        assert!(helper_shares_card("0", &own(&["0,1"])));
+        assert!(helper_shares_card("1 ", &own(&["1"])));
+        assert!(!helper_shares_card("1", &own(&["0,1"])));
+        assert!(!helper_shares_card("0,1", &own(&["1,0"])));
+        assert!(helper_shares_card("0", &own(&[""])));
+        // A list naming no device first gives the helper none: not this card.
+        assert!(!helper_shares_card(",1", &own(&["0"])));
+        assert!(!helper_shares_card(" ,0", &own(&[])));
+    }
+
+    /// This process's card is placed by the list its runtime reads.
+    #[test]
+    fn the_runtime_decides_which_list_places_this_process() {
+        let _env = crate::test_env::lock();
+        let _cuda = crate::test_env::set_var("CUDA_VISIBLE_DEVICES", "0");
+        let _hip = crate::test_env::set_var("HIP_VISIBLE_DEVICES", "1");
+        let lists = own_device_lists();
+        match crate::gpu_device::runtime_name() {
+            Some("CUDA") => assert_eq!(lists, ["0"]),
+            Some(_) => assert_eq!(lists, ["1"]),
+            None => assert_eq!(lists, ["0", "1"]),
+        }
     }
 
     /// A cache in the layout before per-proof directories loses an earlier proof's witness, and
