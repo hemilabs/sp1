@@ -11,7 +11,7 @@
 use std::sync::{Arc, Mutex, OnceLock};
 
 use slop_challenger::IopCtx;
-use sp1_gpu_cudart::{DeviceCache, TaskScope};
+use sp1_gpu_cudart::{CachedDeviceBytes, DeviceCache, TaskScope};
 use sp1_gpu_jagged_tracegen::{preprocessed_traces_bytes, CudaShardProverShared};
 use sp1_gpu_utils::{Felt, JaggedTraceMle};
 use sp1_hypercube::{air::MachineAir, septic_digest::SepticDigest, MachineVerifyingKey};
@@ -57,6 +57,9 @@ pub(crate) struct PrepEntry<GC: IopCtx, Air: MachineAir<GC::F>> {
     /// The preprocessed part of the traces (see `copy_preprocessed_traces`).
     pub traces: JaggedTraceMle<Felt, TaskScope>,
     bytes: u64,
+    /// Its bytes, as a cache counts them once it holds the entry. Last, so that it drops after the
+    /// device buffers above are freed.
+    charge: Option<CachedDeviceBytes>,
 }
 
 impl<GC: IopCtx, Air: MachineAir<GC::F>> PrepEntry<GC, Air> {
@@ -75,11 +78,18 @@ impl<GC: IopCtx, Air: MachineAir<GC::F>> PrepEntry<GC, Air> {
         let traces_bytes = preprocessed_traces_bytes(&traces);
         tracing::debug!(traces_bytes, tree_bytes, codeword_bytes, "preprocessed data size");
         let bytes = (traces_bytes + tree_bytes + codeword_bytes) as u64;
-        Self { program, initial_global_cumulative_sum, vk, shared, traces, bytes }
+        Self { program, initial_global_cumulative_sum, vk, shared, traces, bytes, charge: None }
     }
 
     pub fn bytes(&self) -> u64 {
         self.bytes
+    }
+
+    /// Records that its cache let go of it: a shard may still use it.
+    fn released(&self) {
+        if let Some(charge) = &self.charge {
+            charge.release();
+        }
     }
 }
 
@@ -151,7 +161,7 @@ impl<GC: IopCtx, Air: MachineAir<GC::F>> PrepCache<GC, Air> {
 
     /// Caches `entry`, evicting the least recently used entries to stay within the budget. The
     /// entry is dropped, and nothing evicted, if the other caches hold too much of the budget.
-    pub fn insert(&self, entry: PrepEntry<GC, Air>) {
+    pub fn insert(&self, mut entry: PrepEntry<GC, Air>) {
         let budget = prep_cache_budget();
         let bytes = entry.bytes;
         let mut evicted = Vec::new();
@@ -170,7 +180,7 @@ impl<GC: IopCtx, Air: MachineAir<GC::F>> PrepCache<GC, Air> {
             while i < entries.len() {
                 if Arc::strong_count(&entries[i].program) == 1 {
                     let e = entries.remove(i);
-                    sp1_gpu_cudart::sub_device_cache_bytes(e.bytes);
+                    e.released();
                     evicted.push(e);
                 } else {
                     i += 1;
@@ -183,11 +193,11 @@ impl<GC: IopCtx, Air: MachineAir<GC::F>> PrepCache<GC, Air> {
             }
             while !entries.is_empty() && sp1_gpu_cudart::device_cache_bytes() + bytes > budget {
                 let e = entries.remove(0);
-                sp1_gpu_cudart::sub_device_cache_bytes(e.bytes);
+                e.released();
                 evicted.push(e);
             }
             if sp1_gpu_cudart::device_cache_bytes() + bytes <= budget {
-                sp1_gpu_cudart::add_device_cache_bytes(bytes);
+                entry.charge = Some(CachedDeviceBytes::new(bytes));
                 entries.push(Arc::new(entry));
             }
         }
@@ -200,7 +210,7 @@ impl<GC: IopCtx, Air: MachineAir<GC::F>> Drop for PrepCache<GC, Air> {
     fn drop(&mut self) {
         // The process-wide count must not keep the bytes of entries that go with the cache.
         for e in self.entries.get_mut().unwrap_or_else(|e| e.into_inner()).iter() {
-            sp1_gpu_cudart::sub_device_cache_bytes(e.bytes);
+            e.released();
         }
     }
 }
@@ -213,7 +223,7 @@ impl<GC: IopCtx, Air: MachineAir<GC::F>> DeviceCache for PrepCache<GC, Air> {
             return false;
         }
         for e in &released {
-            sp1_gpu_cudart::sub_device_cache_bytes(e.bytes);
+            e.released();
         }
         // A shard using an entry keeps it alive until it is done; the rest is freed here, on the
         // prover's stream.

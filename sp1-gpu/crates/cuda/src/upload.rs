@@ -2,7 +2,7 @@ use std::{
     alloc::Layout,
     ptr::NonNull,
     sync::{
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, Mutex, Weak,
     },
 };
@@ -80,9 +80,10 @@ impl UploadStream {
         let layout = Layout::array::<T>(len).ok()?;
         let size = layout.size() as u64;
         // The device caches count too: an upload they leave no room for would only make the next
-        // allocation free them, and this upload with them (see `make_room_for`).
+        // allocation free them, and this upload with them (see `make_room_for`). So do entries they
+        // let go of that a shard still uses, which no allocation can free.
         let staged = STAGED_BYTES.load(Ordering::Relaxed);
-        let cached = CACHED_BYTES.load(Ordering::Relaxed);
+        let cached = CACHED_BYTES.load(Ordering::Relaxed) + RELEASED_BYTES.load(Ordering::Relaxed);
         if UNSTAGED_PEAK.load(Ordering::Relaxed) + staged + cached + size
             > STAGED_LIMIT.load(Ordering::Relaxed)
         {
@@ -207,8 +208,46 @@ pub trait DeviceCache: Send + Sync {
 
 /// The registered device caches.
 static CACHES: Mutex<Vec<Weak<dyn DeviceCache>>> = Mutex::new(Vec::new());
-/// The device bytes the registered caches hold (kept up to date by the caches).
+/// The device bytes the registered caches hold (see [`CachedDeviceBytes`]).
 static CACHED_BYTES: AtomicU64 = AtomicU64::new(0);
+/// The device bytes of entries the caches let go of that are not freed yet: a shard still using
+/// one keeps it until it is done. Live, but neither the caches' nor the prover's own memory.
+static RELEASED_BYTES: AtomicU64 = AtomicU64::new(0);
+
+/// The device bytes of one entry of a cache (see [`DeviceCache`]): the caches' while the cache
+/// holds the entry; once the cache lets go of it ([`Self::release`]), live until this is dropped,
+/// but neither the caches' memory nor the prover's own (a shard may still use the entry). An entry
+/// holds this as its last field, so that it drops after the entry's device buffers are freed: an
+/// allocation meanwhile must not count them as the prover's own memory, which would raise for good
+/// the peak every later upload must leave room for.
+#[must_use = "the bytes are counted only while this is alive"]
+pub struct CachedDeviceBytes {
+    bytes: u64,
+    released: AtomicBool,
+}
+
+impl CachedDeviceBytes {
+    /// Counts `bytes` as a cache's.
+    pub fn new(bytes: u64) -> Self {
+        CACHED_BYTES.fetch_add(bytes, Ordering::Relaxed);
+        Self { bytes, released: AtomicBool::new(false) }
+    }
+
+    /// Records that the cache let go of the entry. Only the first call counts.
+    pub fn release(&self) {
+        if !self.released.swap(true, Ordering::Relaxed) {
+            RELEASED_BYTES.fetch_add(self.bytes, Ordering::Relaxed);
+            CACHED_BYTES.fetch_sub(self.bytes, Ordering::Relaxed);
+        }
+    }
+}
+
+impl Drop for CachedDeviceBytes {
+    fn drop(&mut self) {
+        let counted = if *self.released.get_mut() { &RELEASED_BYTES } else { &CACHED_BYTES };
+        counted.fetch_sub(self.bytes, Ordering::Relaxed);
+    }
+}
 
 /// Registers a cache to empty when device memory runs low.
 pub fn register_device_cache(cache: Weak<dyn DeviceCache>) {
@@ -220,16 +259,6 @@ pub fn register_device_cache(cache: Weak<dyn DeviceCache>) {
 /// The device bytes held by caches (see [`DeviceCache`]).
 pub fn device_cache_bytes() -> u64 {
     CACHED_BYTES.load(Ordering::Relaxed)
-}
-
-/// Records that a cache now holds `bytes` more device bytes.
-pub fn add_device_cache_bytes(bytes: u64) {
-    CACHED_BYTES.fetch_add(bytes, Ordering::Relaxed);
-}
-
-/// Records that a cache released `bytes` device bytes.
-pub fn sub_device_cache_bytes(bytes: u64) {
-    CACHED_BYTES.fetch_sub(bytes, Ordering::Relaxed);
 }
 
 /// Empties the registered caches. Returns whether anything was dropped. Also for a process
@@ -262,25 +291,27 @@ pub fn limit_device_memory_if_unset(limit: u64) {
 pub(crate) fn note_live_bytes(live: u64) {
     let unstaged = live
         .saturating_sub(STAGED_BYTES.load(Ordering::Relaxed))
-        .saturating_sub(CACHED_BYTES.load(Ordering::Relaxed));
+        .saturating_sub(CACHED_BYTES.load(Ordering::Relaxed))
+        .saturating_sub(RELEASED_BYTES.load(Ordering::Relaxed));
     UNSTAGED_PEAK.fetch_max(unstaged, Ordering::Relaxed);
 }
 
 /// Called before a device allocation of `size` bytes: if staged uploads or caches hold memory
 /// and the allocation would take the live device memory above the limit, frees them (see
 /// [`StagedUpload`] and [`DeviceCache`]): the caches first, and the staged uploads, which the
-/// shards about to be proved are waiting for, only if the caches do not hold enough.
+/// shards about to be proved are waiting for, only if the live memory is still above the limit
+/// then (entries a shard still uses stay live).
 pub(crate) fn make_room_for(size: u64) {
+    let fits = || crate::vram_current_bytes() + size <= STAGED_LIMIT.load(Ordering::Relaxed);
     let staged = STAGED_BYTES.load(Ordering::Relaxed);
     let cached = CACHED_BYTES.load(Ordering::Relaxed);
-    let over =
-        (crate::vram_current_bytes() + size).saturating_sub(STAGED_LIMIT.load(Ordering::Relaxed));
-    if over == 0 || (staged == 0 && cached == 0) {
+    if fits() || (staged == 0 && cached == 0) {
         return;
     }
     if cached > 0 {
+        // Measured whoever releases them: another thread may have just done so.
         release_device_caches(false);
-        if cached >= over {
+        if fits() {
             return;
         }
     }
@@ -321,6 +352,24 @@ pub(crate) fn reclaim_staged_uploads(wait: bool) -> bool {
 mod tests {
     use super::*;
     use crate::{run_sync_in_place, PinnedBuffer};
+
+    /// A cache entry's bytes are the caches' until the cache lets go of it, then live but nobody's
+    /// until it is dropped. (No other test of this binary has a cache.)
+    #[test]
+    fn a_cache_entry_counts_as_cached_then_released_until_dropped() {
+        let counts =
+            || (CACHED_BYTES.load(Ordering::Relaxed), RELEASED_BYTES.load(Ordering::Relaxed));
+        let (cached, released) = counts();
+        let charge = CachedDeviceBytes::new(1000);
+        assert_eq!(counts(), (cached + 1000, released));
+        charge.release();
+        charge.release();
+        assert_eq!(counts(), (cached, released + 1000));
+        drop(charge);
+        assert_eq!(counts(), (cached, released));
+        drop(CachedDeviceBytes::new(10));
+        assert_eq!(counts(), (cached, released));
+    }
 
     #[test]
     fn test_staged_upload() {
