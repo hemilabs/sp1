@@ -709,16 +709,13 @@ impl<A: ArtifactClient, C: SP1ProverComponents> SP1RecursionProver<A, C> {
         Ok(handle)
     }
 
-    /// Makes the next wrap build the wrap prover again, if it is still `used`: when a wrap proof
-    /// made with a kept proving key fails verification, the key's data on the device may be what
-    /// went wrong, and every later wrap proof would fail the same way.
-    fn forget_wrap_prover(&self, used: &Arc<WrapProver<C>>) {
-        if used.proving_key.is_none() {
-            return;
-        }
+    /// Makes the next wrap build the wrap prover again, if it is still `used`: when its kept
+    /// proving key, or the vk of its own setup, may be what went wrong (`why`), and every later wrap
+    /// proof would fail the same way.
+    fn forget_wrap_prover(&self, used: &Arc<WrapProver<C>>, why: &str) {
         let mut cell = self.wrap_prover.lock().unwrap_or_else(|e| e.into_inner());
         if cell.get().is_some_and(|current| Arc::ptr_eq(current, used)) {
-            tracing::warn!("rebuilding the wrap prover after a failed wrap proof verification");
+            tracing::warn!("rebuilding the wrap prover {why}");
             *cell = Arc::new(OnceCell::new());
         }
     }
@@ -736,15 +733,14 @@ impl<A: ArtifactClient, C: SP1ProverComponents> SP1RecursionProver<A, C> {
                     let expected_wrap_vk = wrap_prover_init.expected_wrap_vk.clone();
                     let wrap_air_prover = wrap_prover_init.wrap_air_prover.build();
                     let wrap_air_permits = wrap_prover_init.wrap_air_prover.permits();
-                    // With vk verification on, the wrap vk is known: skip the GPU setup here and
-                    // check the vk that each wrap proof's own setup computes instead (see
-                    // `WrapProver::prove`). Without it, the vk is computed here.
+                    // With vk verification on, the wrap vk is known, and `new` checks the setup it
+                    // runs (or, with SP1_WRAP_PERSISTENT_PK=0, each wrap proof's own setup) against
+                    // it: a mismatch another setup repeats fails the task, else it is retried (see
+                    // `wrap_vk_mismatch`). Without it, the vk is computed here.
                     let known_vk = prover_data
                         .recursion_vks
                         .vk_verification()
                         .then_some(expected_wrap_vk.clone());
-                    // With a known vk, `new` checks any setup it runs against it (a mismatch is
-                    // retried: the build runs again) and keeps it as the verifying key.
                     let wrap_prover = WrapProver::new(
                         wrap_air_prover,
                         wrap_air_permits,
@@ -796,11 +792,23 @@ impl<A: ArtifactClient, C: SP1ProverComponents> SP1RecursionProver<A, C> {
         let wrap_proof = wrap_prover
             .prove(shrink_proof, &metrics)
             .instrument(tracing::info_span!("prove wrap"))
-            .await?;
+            .await
+            .inspect_err(|_| {
+                if wrap_prover.vk_disproved.load(std::sync::atomic::Ordering::Relaxed) {
+                    self.forget_wrap_prover(
+                        &wrap_prover,
+                        "whose vk two later setups disagree with",
+                    );
+                }
+            })?;
 
         tracing::debug_span!("verify wrap proof")
             .in_scope(|| wrap_prover.verify(&wrap_proof))
-            .inspect_err(|_| self.forget_wrap_prover(&wrap_prover))?;
+            .inspect_err(|_| {
+                if wrap_prover.proving_key.is_some() {
+                    self.forget_wrap_prover(&wrap_prover, "after a failed wrap proof verification");
+                }
+            })?;
 
         self.artifact_client
             .upload(&wrap_proof_artifact, wrap_proof)
@@ -1347,19 +1355,33 @@ fn release_recycled_event_buffers_if_short() {
 /// times, for keys set up once and used by every proof of the process. Without vk verification
 /// there is nothing to check against, and the first setup is kept.
 ///
+/// Two setups in a row that give the same vk outside the vk map give the program's own vk: the vk
+/// map does not match this build. That key is kept, with a warning, as it was before this check:
+/// the proofs that use it fail their vk check, and everything else (core proofs, the tools that
+/// regenerate the vk map) still runs.
+///
 /// # Panics
 ///
-/// If no setup's vk is allowed: the device keeps setting the program up wrong, or the vk map does
-/// not match this build, and every proof that uses the key would fail its vk check.
+/// If the setups give a different vk outside the vk map each time: the device keeps setting the
+/// program up wrong.
 fn setup_until_allowed<K>(
     recursion_vks: &RecursionVks,
     setup: impl Fn() -> (K, MachineVerifyingKey<SP1GlobalContext>),
 ) -> (K, MachineVerifyingKey<SP1GlobalContext>) {
     const SETUPS: usize = 4;
+    let mut last = None;
     for attempt in 1..=SETUPS {
-        let keys = setup();
-        if !recursion_vks.vk_verification() || recursion_vks.open(&keys.1).is_ok() {
-            return keys;
+        let (keys, vk) = setup();
+        if !recursion_vks.vk_verification() || recursion_vks.open(&vk).is_ok() {
+            return (keys, vk);
+        }
+        if last.as_ref() == Some(&vk) {
+            tracing::warn!(
+                "a recursion program's setup gave the same vk outside the vk map twice: the vk \
+                 map does not match this build (or the device sets the program up wrong every \
+                 time), and the proofs that use this key will fail"
+            );
+            return (keys, vk);
         }
         tracing::warn!(
             "a recursion program's setup gave a vk outside the vk map (setup {attempt} of \
@@ -1368,10 +1390,11 @@ fn setup_until_allowed<K>(
         // The keys go before the next setup: they hold a prover permit, which that setup may need
         // (the shrink setup takes one from the provers' shared pool).
         drop(keys);
+        last = Some(vk);
     }
     panic!(
-        "a recursion program's setup gave a vk outside the vk map {SETUPS} times: the device sets \
-         it up wrong, or the vk map does not match this build"
+        "a recursion program's setup gave a different vk outside the vk map each of {SETUPS} \
+         times: the device sets it up wrong"
     );
 }
 
@@ -1550,18 +1573,21 @@ impl<C: SP1ProverComponents> ShrinkProver<C> {
     }
 }
 
-/// Checks the vk a wrap setup just computed on the GPU against the one proofs are verified
-/// against. A mismatch is retryable: the setup may have gone wrong on the device.
-fn check_wrap_vk(
-    expected: &MachineVerifyingKey<SP1OuterGlobalContext>,
-    got: &MachineVerifyingKey<SP1OuterGlobalContext>,
-) -> Result<(), TaskError> {
-    if expected == got {
-        return Ok(());
+/// The error for a wrap setup whose vk, `got`, is not the one proofs are verified against.
+/// `again` is the vk of another setup of the program: where it is the same, `got` is the wrap
+/// program's own vk (the expected one is stale), which no retry can change, and the task fails at
+/// once. Otherwise the setup went wrong on the device, and the task is retried.
+fn wrap_vk_mismatch<GC: IopCtx>(
+    expected: &MachineVerifyingKey<GC>,
+    got: &MachineVerifyingKey<GC>,
+    again: &MachineVerifyingKey<GC>,
+) -> TaskError {
+    let e = anyhow::anyhow!("Wrap vk mismatch, expected: {expected:?}, got: {got:?}");
+    if got == again {
+        TaskError::Fatal(e)
+    } else {
+        TaskError::Retryable(e)
     }
-    Err(TaskError::Retryable(anyhow::anyhow!(
-        "Wrap vk mismatch, expected: {expected:?}, got: {got:?}"
-    )))
 }
 
 /// The wrap program's proving key.
@@ -1573,6 +1599,12 @@ pub struct WrapProver<C: SP1ProverComponents> {
     permits: ProverSemaphore,
     program: Arc<RecursionProgram<SP1Field>>,
     pub verifying_key: MachineVerifyingKey<SP1OuterGlobalContext>,
+    /// Whether `verifying_key` was known in advance (vk verification on), rather than the vk of a
+    /// setup here, which a device fault could have changed.
+    vk_known: bool,
+    /// Set when a wrap proof's setup and another after it agree on a vk that is not the computed
+    /// `verifying_key`: the setup that computed it went wrong, and this prover must be built again.
+    vk_disproved: std::sync::atomic::AtomicBool,
     /// The proving key from the setup, kept to prove with: the setup commits the program's
     /// preprocessed traces, which takes seconds (3.6 s on an Arc Pro B70), and the wrap program is
     /// the same for every proof. None with SP1_WRAP_PERSISTENT_PK=0, which keeps the key's memory
@@ -1618,12 +1650,21 @@ impl<C: SP1ProverComponents> WrapProver<C> {
             rx.blocking_recv().unwrap()
         };
         let keep = std::env::var("SP1_WRAP_PERSISTENT_PK").map(|v| v != "0").unwrap_or(true);
+        let vk_known = known_vk.is_some();
         let (verifying_key, proving_key) = if keep {
-            let (preprocessed, verifying_key) = setup();
+            let (mut preprocessed, mut verifying_key) = setup();
             // The setup computed the vk of the wrap program; it must be the one proofs are checked
             // against.
-            if let Some(known_vk) = &known_vk {
-                check_wrap_vk(known_vk, &verifying_key)?;
+            if let Some(known_vk) = known_vk.filter(|known| *known != verifying_key) {
+                // The keys go first: they hold a prover permit, which the next setup may need.
+                drop(preprocessed);
+                let again;
+                (preprocessed, again) = setup();
+                if again != known_vk {
+                    return Err(wrap_vk_mismatch(&known_vk, &verifying_key, &again));
+                }
+                tracing::warn!("a wrap setup gave another vk than the expected one; kept the next");
+                verifying_key = again;
             }
             // The setup's permit is released here, as when the key was dropped: proving takes its
             // own.
@@ -1632,7 +1673,16 @@ impl<C: SP1ProverComponents> WrapProver<C> {
             (known_vk.unwrap_or_else(|| setup().1), None)
         };
 
-        Ok(Self { prover, permits, program, verifying_key, proving_key, prover_data })
+        Ok(Self {
+            prover,
+            permits,
+            program,
+            verifying_key,
+            vk_known,
+            vk_disproved: Default::default(),
+            proving_key,
+            prover_data,
+        })
     }
 
     pub async fn prove(
@@ -1675,7 +1725,25 @@ impl<C: SP1ProverComponents> WrapProver<C> {
                     .await;
                 // The setup above computed the vk of the wrap program; it must be the one proofs
                 // are checked against.
-                check_wrap_vk(&self.verifying_key, &vk)?;
+                if vk != self.verifying_key {
+                    // The proof's permit goes first: the next setup may need it. (A setup does not
+                    // read the device caches; the retry, if any, empties them.)
+                    drop(permit);
+                    let (_keys, again) =
+                        self.prover.setup(self.program.clone(), self.permits.clone()).await;
+                    if !self.vk_known {
+                        // Without a known vk, the expected one came from the setup that built this
+                        // prover, which may itself have gone wrong: if the next setup repeats this
+                        // proof's vk, it did, and the retry gets a prover built again.
+                        if again == vk {
+                            self.vk_disproved.store(true, std::sync::atomic::Ordering::Relaxed);
+                        }
+                        return Err(TaskError::Retryable(anyhow::anyhow!(
+                            "Wrap vk mismatch with the vk of the setup that built the wrap prover"
+                        )));
+                    }
+                    return Err(wrap_vk_mismatch(&self.verifying_key, &vk, &again));
+                }
                 (proof, permit)
             }
         };
@@ -1715,17 +1783,53 @@ mod tests {
         }
     }
 
+    /// A vk unlike any other, as from a setup gone wrong on the device.
+    fn vk_number(n: u32) -> MachineVerifyingKey<SP1GlobalContext> {
+        let mut vk = dummy_vk();
+        vk.pc_start[0] = SP1Field::from_canonical_u32(n);
+        vk
+    }
+
     /// A setup whose vk is not allowed is run again only once its keys are gone: with a one-permit
     /// pool (the shrink setup's), the next setup would otherwise wait for their permit forever.
-    /// After the last setup, start-up fails.
+    /// After the last setup, each with another vk, start-up fails.
     #[test]
-    #[should_panic(expected = "outside the vk map 4 times")]
+    #[should_panic(expected = "a different vk outside the vk map each of 4 times")]
     fn a_setup_is_run_again_without_the_keys_of_the_last() {
         let alive = AtomicUsize::new(0);
+        let setups = AtomicUsize::new(0);
         let recursion_vks = RecursionVks::new(None, 4, true);
         let _ = setup_until_allowed(&recursion_vks, || {
             assert_eq!(alive.fetch_add(1, Ordering::SeqCst), 0, "the last setup's keys are alive");
-            (Keys(&alive), dummy_vk())
+            (Keys(&alive), vk_number(setups.fetch_add(1, Ordering::SeqCst) as u32 + 1))
         });
+    }
+
+    /// A wrap vk mismatch that another setup repeats is the program's own vk, which no retry can
+    /// change; one that it does not repeat is retried.
+    #[test]
+    fn a_wrap_vk_mismatch_is_fatal_only_where_another_setup_repeats_it() {
+        let (expected, got) = (vk_number(1), vk_number(2));
+        assert!(matches!(wrap_vk_mismatch(&expected, &got, &vk_number(2)), TaskError::Fatal(_)));
+        assert!(matches!(
+            wrap_vk_mismatch(&expected, &got, &vk_number(3)),
+            TaskError::Retryable(_)
+        ));
+    }
+
+    /// A vk outside the vk map that a second setup gives again is the program's own: the vk map
+    /// does not match this build. Start-up keeps that key after two setups instead of failing.
+    #[test]
+    fn a_setup_whose_vk_repeats_outside_the_vk_map_is_kept() {
+        let alive = AtomicUsize::new(0);
+        let setups = AtomicUsize::new(0);
+        let recursion_vks = RecursionVks::new(None, 4, true);
+        let (_keys, vk) = setup_until_allowed(&recursion_vks, || {
+            setups.fetch_add(1, Ordering::SeqCst);
+            assert_eq!(alive.fetch_add(1, Ordering::SeqCst), 0, "the last setup's keys are alive");
+            (Keys(&alive), vk_number(7))
+        });
+        assert_eq!(setups.load(Ordering::SeqCst), 2);
+        assert!(vk == vk_number(7));
     }
 }
