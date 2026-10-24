@@ -54,6 +54,10 @@ pub struct Groth16ProvingData {
 }
 
 /// Solved Groth16 witness data (exported from gnark R1CS solver).
+///
+/// Its vectors are not pinned: the prover reads them only on the host, copying them into its
+/// own pinned buffers (the wire-value scatters, `compute_h`'s copies), and pinning their 2 GB
+/// made each wrap ~35 ms slower.
 pub struct Groth16WitnessData {
     /// All wire values (public + private), pre-converted to Montgomery Fr at
     /// load time to avoid ~350ms per-proof conversion in the hot prove path.
@@ -71,12 +75,6 @@ pub struct Groth16WitnessData {
     pub commitments: Vec<BN254G1Affine>,
     /// Pedersen commitment proof-of-knowledge
     pub commitment_pok: BN254G1Affine,
-    /// Whether the big vecs (wire_values, solution_a/b/c) are cuda_host_register'd
-    /// so async H2D actually uses SDMA. Set by load() on CUDA/HIP builds; cleared
-    /// by Drop which unregisters them. Hardware-agnostic callers can still use
-    /// the data unchanged; pinning is opaque at the Rust-type level.
-    #[cfg(feature = "cuda")]
-    pub(crate) pinned_on_device: bool,
 }
 
 /// Groth16 proof (BN254).
@@ -343,52 +341,6 @@ impl Groth16WitnessData {
             }
         };
 
-        // Pin the four big vecs so async H2D on copy_stream actually uses SDMA
-        // (and the GPU wire-gather path sees sub-20ms H2D instead of 140ms
-        // paged-memory staging). Failure to pin is non-fatal — we just fall
-        // back to the CPU-scatter / sync-H2D path.
-        #[cfg(feature = "cuda")]
-        let pinned_on_device = {
-            let mut ok = true;
-            let pin = |v: &[u8], label: &str| -> bool {
-                let err = unsafe {
-                    sp1_gpu_sys::runtime::cuda_host_register(
-                        v.as_ptr() as *const std::ffi::c_void,
-                        v.len(),
-                    )
-                };
-                if err != unsafe { sp1_gpu_sys::runtime::CUDA_SUCCESS_CSL } {
-                    eprintln!("[groth16-load] WARN: cuda_host_register({label}) failed");
-                    false
-                } else {
-                    true
-                }
-            };
-            unsafe {
-                let wv_bytes = std::slice::from_raw_parts(
-                    wire_values.as_ptr() as *const u8,
-                    wire_values.len() * std::mem::size_of::<Fr>(),
-                );
-                let sa_bytes = std::slice::from_raw_parts(
-                    solution_a.as_ptr() as *const u8,
-                    solution_a.len() * std::mem::size_of::<BN254Fr>(),
-                );
-                let sb_bytes = std::slice::from_raw_parts(
-                    solution_b.as_ptr() as *const u8,
-                    solution_b.len() * std::mem::size_of::<BN254Fr>(),
-                );
-                let sc_bytes = std::slice::from_raw_parts(
-                    solution_c.as_ptr() as *const u8,
-                    solution_c.len() * std::mem::size_of::<BN254Fr>(),
-                );
-                ok &= pin(wv_bytes, "wire_values");
-                ok &= pin(sa_bytes, "solution_a");
-                ok &= pin(sb_bytes, "solution_b");
-                ok &= pin(sc_bytes, "solution_c");
-            }
-            ok
-        };
-
         Ok(Self {
             wire_values,
             solution_a,
@@ -397,32 +349,7 @@ impl Groth16WitnessData {
             h_coefficients,
             commitments,
             commitment_pok,
-            #[cfg(feature = "cuda")]
-            pinned_on_device,
         })
-    }
-}
-
-#[cfg(feature = "cuda")]
-impl Drop for Groth16WitnessData {
-    fn drop(&mut self) {
-        if !self.pinned_on_device {
-            return;
-        }
-        unsafe {
-            let _ = sp1_gpu_sys::runtime::cuda_host_unregister(
-                self.wire_values.as_ptr() as *const std::ffi::c_void
-            );
-            let _ = sp1_gpu_sys::runtime::cuda_host_unregister(
-                self.solution_a.as_ptr() as *const std::ffi::c_void
-            );
-            let _ = sp1_gpu_sys::runtime::cuda_host_unregister(
-                self.solution_b.as_ptr() as *const std::ffi::c_void
-            );
-            let _ = sp1_gpu_sys::runtime::cuda_host_unregister(
-                self.solution_c.as_ptr() as *const std::ffi::c_void
-            );
-        }
     }
 }
 
