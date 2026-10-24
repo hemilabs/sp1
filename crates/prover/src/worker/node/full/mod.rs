@@ -11,7 +11,7 @@ use sp1_core_machine::io::SP1Stdin;
 use sp1_hypercube::{SP1PcsProofOuter, SP1VerifyingKey, SP1WrapProof};
 use sp1_primitives::{io::SP1PublicValues, SP1OuterGlobalContext};
 use sp1_prover_types::{
-    network_base_types::ProofMode, Artifact, ArtifactClient, ArtifactType, InMemoryArtifactClient,
+    network_base_types::ProofMode, ArtifactClient, ArtifactType, InMemoryArtifactClient,
     ProofRequestStatus, TaskStatus, TaskType,
 };
 pub use sp1_verifier::{ProofFromNetwork, SP1Proof};
@@ -75,6 +75,36 @@ impl SP1LocalNode {
         &self.inner.core
     }
 
+    /// Runs `requests`, the tasks of one request under `proof_id`, then releases the proof's task
+    /// bookkeeping and the artifacts its tasks referenced, whether it succeeded or not. The node
+    /// (and its worker client) serves every request of the process, and `submit_task` records
+    /// every task in the worker client's `db`/`proof_index`, which only `complete_proof` prunes.
+    /// (A caller that drops the request before it ends leaves them: its tasks still run, and
+    /// releasing them would leave those tasks' waiters without a status.)
+    async fn with_bookkeeping<T>(
+        &self,
+        proof_id: &ProofId,
+        requests: impl std::future::Future<Output = anyhow::Result<T>>,
+    ) -> anyhow::Result<T> {
+        let result = requests.await;
+        let status =
+            if result.is_ok() { ProofRequestStatus::Completed } else { ProofRequestStatus::Failed };
+        self.release(proof_id, status).await;
+        result
+    }
+
+    /// Releases the task bookkeeping of the request under `proof_id`, and deletes the artifacts its
+    /// tasks referenced that are left (all of them for setup, build_vks and shrink_wrap; those not
+    /// deleted inline for a proof).
+    async fn release(&self, proof_id: &ProofId, status: ProofRequestStatus) {
+        if let Err(e) =
+            self.inner.worker_client.complete_proof(proof_id.clone(), None, status, "").await
+        {
+            tracing::warn!("failed to release task bookkeeping for proof {proof_id}: {e}");
+        }
+        self.inner.worker_client.cleanup(proof_id, &self.inner.artifact_client).await;
+    }
+
     #[instrument(name = "execute_program", skip_all)]
     pub async fn execute(
         &self,
@@ -87,13 +117,18 @@ impl SP1LocalNode {
 
     pub async fn setup(&self, elf: &[u8]) -> anyhow::Result<SP1VerifyingKey> {
         let _gpu_work = start_gpu_work()?;
+        let proof_id = ProofId::new("setup".create_type_id::<V7>().to_string());
+        self.with_bookkeeping(&proof_id, self.setup_vk(elf, proof_id.clone())).await
+    }
+
+    async fn setup_vk(&self, elf: &[u8], proof_id: ProofId) -> anyhow::Result<SP1VerifyingKey> {
         let elf_artifact = self.inner.artifact_client.create_artifact()?;
         self.inner.artifact_client.upload_program(&elf_artifact, elf.to_vec()).await?;
 
         // Create a setup task and wait for the vk
         let vk_artifact = self.inner.artifact_client.create_artifact()?;
         let context = TaskContext {
-            proof_id: ProofId::new("core_proof"),
+            proof_id,
             parent_id: None,
             parent_context: None,
             requester_id: RequesterId::new("local node"),
@@ -115,17 +150,8 @@ impl SP1LocalNode {
             return Err(anyhow::anyhow!("setup task failed"));
         }
         tracing::trace!("setup task succeeded");
-        // Download the vk
-        let vk = self.inner.artifact_client.download::<SP1VerifyingKey>(&vk_artifact).await?;
-
-        // Clean up the artifacts
-        self.inner.artifact_client.try_delete(&elf_artifact, ArtifactType::Program).await?;
-        self.inner
-            .artifact_client
-            .try_delete(&vk_artifact, ArtifactType::UnspecifiedArtifactType)
-            .await?;
-
-        Ok(vk)
+        // Download the vk; the artifacts go with the request's bookkeeping.
+        self.inner.artifact_client.download::<SP1VerifyingKey>(&vk_artifact).await
     }
 
     pub async fn prove(
@@ -163,34 +189,23 @@ impl SP1LocalNode {
             },
         };
 
-        let task_id =
-            self.inner.worker_client.submit_task(TaskType::UtilVkeyMapController, request).await?;
-        let subscriber = self.inner.worker_client.subscriber(proof_id).await?.per_task();
-        let status = subscriber.wait_task(task_id).await?;
-        if status != TaskStatus::Succeeded {
-            return Err(anyhow::anyhow!("controller task failed"));
-        }
+        let building = async {
+            let task_id = self
+                .inner
+                .worker_client
+                .submit_task(TaskType::UtilVkeyMapController, request)
+                .await?;
+            let subscriber =
+                self.inner.worker_client.subscriber(proof_id.clone()).await?.per_task();
+            let status = subscriber.wait_task(task_id).await?;
+            if status != TaskStatus::Succeeded {
+                return Err(anyhow::anyhow!("controller task failed"));
+            }
 
-        // Clean up the input artifacts
-        self.inner
-            .artifact_client
-            .try_delete(&vk_controller_artifact, ArtifactType::Program)
-            .await?;
-
-        // Download the output proof and return it.
-        let output = self
-            .inner
-            .artifact_client
-            .download::<VkeyMapControllerOutput>(&output_artifact)
-            .await?;
-
-        // Clean up the output artifact
-        self.inner
-            .artifact_client
-            .try_delete(&output_artifact, ArtifactType::UnspecifiedArtifactType)
-            .await?;
-
-        Ok(output)
+            // Download the output; the artifacts go with the request's bookkeeping.
+            self.inner.artifact_client.download::<VkeyMapControllerOutput>(&output_artifact).await
+        };
+        self.with_bookkeeping(&proof_id, building).await
     }
 
     #[instrument(name = "prove", skip_all, fields(mode = ?mode))]
@@ -212,7 +227,7 @@ impl SP1LocalNode {
 
         // Run the actual proving. `?` inside only short-circuits this block; the
         // cleanup afterwards always runs (on both success and failure).
-        let result = async {
+        let proving = async {
             self.inner.artifact_client.upload_program(&elf_artifact, elf.to_vec()).await?;
             self.inner
                 .artifact_client
@@ -223,14 +238,14 @@ impl SP1LocalNode {
                 .upload_with_type(&stdin_artifact, ArtifactType::Stdin, stdin)
                 .await?;
 
-            let mode_artifact = Artifact((mode as i32).to_string());
             let request = RawTaskRequest {
-                inputs: vec![
+                inputs: crate::worker::ControllerInputs::request_inputs(
                     elf_artifact.clone(),
                     stdin_artifact.clone(),
-                    mode_artifact,
+                    mode,
+                    context.max_cycles,
                     proof_nonce_artifact.clone(),
-                ],
+                ),
                 outputs: vec![output_artifact.clone()],
                 context: TaskContext {
                     proof_id: proof_id.clone(),
@@ -251,28 +266,8 @@ impl SP1LocalNode {
 
             // Download the output proof.
             self.inner.artifact_client.download::<ProofFromNetwork>(&output_artifact).await
-        }
-        .await;
-
-        // Always release this proof's task bookkeeping. The node (and its
-        // worker_client) is reused across proofs, and `submit_task` records every
-        // task in the worker client's `db`/`proof_index`; `complete_proof` is the
-        // only thing that prunes them, so it must run for every proof.
-        let status =
-            if result.is_ok() { ProofRequestStatus::Completed } else { ProofRequestStatus::Failed };
-        if let Err(e) =
-            self.inner.worker_client.complete_proof(proof_id.clone(), None, status, "").await
-        {
-            tracing::warn!("failed to release task bookkeeping for proof {proof_id}: {e}");
-        }
-
-        // Delete whatever artifacts this proof leaked - the index has already
-        // been pruned of everything deleted inline during proving, so this only
-        // hits the leftovers (e.g. on an error path). The backstop that bounds
-        // growth across proofs.
-        self.inner.worker_client.cleanup(&proof_id, &self.inner.artifact_client).await;
-
-        result
+        };
+        self.with_bookkeeping(&proof_id, proving).await
     }
 
     pub fn verify(&self, vk: &SP1VerifyingKey, proof: &SP1Proof) -> anyhow::Result<()> {
@@ -315,31 +310,24 @@ impl SP1LocalNode {
             },
         };
 
-        let task_id = self.inner.worker_client.submit_task(TaskType::ShrinkWrap, request).await?;
-        // Wait for the task to finish
-        let subscriber = self.inner.worker_client.subscriber(proof_id).await?.per_task();
-        let status = subscriber.wait_task(task_id).await?;
-        if status != TaskStatus::Succeeded {
-            return Err(anyhow::anyhow!("shrink wrap task failed"));
-        }
+        let wrapping = async {
+            let task_id =
+                self.inner.worker_client.submit_task(TaskType::ShrinkWrap, request).await?;
+            // Wait for the task to finish
+            let subscriber =
+                self.inner.worker_client.subscriber(proof_id.clone()).await?.per_task();
+            let status = subscriber.wait_task(task_id).await?;
+            if status != TaskStatus::Succeeded {
+                return Err(anyhow::anyhow!("shrink wrap task failed"));
+            }
 
-        // Download the output proof and return it.
-        let proof = self
-            .inner
-            .artifact_client
-            .download::<SP1WrapProof<SP1OuterGlobalContext, SP1PcsProofOuter>>(&output_artifact)
-            .await?;
-        // Clean up the input and output artifacts
-        tokio::try_join!(
+            // Download the output proof; the artifacts go with the request's bookkeeping.
             self.inner
                 .artifact_client
-                .try_delete(&compressed_proof_artifact, ArtifactType::UnspecifiedArtifactType),
-            self.inner
-                .artifact_client
-                .try_delete(&output_artifact, ArtifactType::UnspecifiedArtifactType)
-        )?;
-
-        Ok(proof)
+                .download::<SP1WrapProof<SP1OuterGlobalContext, SP1PcsProofOuter>>(&output_artifact)
+                .await
+        };
+        self.with_bookkeeping(&proof_id, wrapping).await
     }
 }
 
@@ -397,6 +385,22 @@ mod tests {
             .expect("proof failed");
         let proof_time = time.elapsed();
         tracing::info!("proof time: {:?}", proof_time);
+
+        // The setup and the proof released their task bookkeeping and artifacts.
+        assert_eq!(client.inner.worker_client.tracked().await, (0, 0, 0));
+
+        // The proof commits the nonce it was asked for (verifying does not check it).
+        let SP1Proof::Compressed(compressed) = &proof.proof else {
+            panic!("a compressed proof was asked for");
+        };
+        let public_values: &sp1_recursion_executor::RecursionPublicValues<
+            sp1_primitives::SP1Field,
+        > = std::borrow::Borrow::borrow(compressed.proof.public_values.as_slice());
+        assert_eq!(
+            public_values.proof_nonce,
+            proof_nonce
+                .map(<sp1_primitives::SP1Field as slop_algebra::AbstractField>::from_canonical_u32)
+        );
 
         // Verify the proof
         tokio::task::spawn_blocking(move || client.verify(&vk, &proof.proof).unwrap())

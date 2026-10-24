@@ -98,6 +98,14 @@ impl LocalWorkerClient {
         Self::init_with_index(ProofArtifacts::default())
     }
 
+    /// The proofs and tasks with bookkeeping still held, and the artifacts still tracked.
+    #[cfg(test)]
+    pub(crate) async fn tracked(&self) -> (usize, usize, usize) {
+        let proofs = self.inner.proof_index.read().await.len();
+        let tasks = self.inner.db.read().await.len();
+        (proofs, tasks, self.inner.artifact_index.len())
+    }
+
     /// Like [`init`](Self::init) but sharing `artifact_index` with the node's
     /// artifact client, so a proof's artifacts are pruned as they are deleted.
     #[must_use]

@@ -727,6 +727,26 @@ pub struct ControllerInputs {
     pub metadata: ControllerInputMetadata,
 }
 
+impl ControllerInputs {
+    /// The inputs of a controller task, in the order `TryFrom<&[Artifact]>` reads them: elf, stdin,
+    /// mode, cycle limit (empty for none) and proof nonce.
+    pub fn request_inputs(
+        elf: Artifact,
+        stdin: Artifact,
+        mode: ProofMode,
+        cycle_limit: Option<u64>,
+        proof_nonce: Artifact,
+    ) -> Vec<Artifact> {
+        vec![
+            elf,
+            stdin,
+            Artifact((mode as i32).to_string()),
+            Artifact(cycle_limit.map(|limit| limit.to_string()).unwrap_or_default()),
+            proof_nonce,
+        ]
+    }
+}
+
 impl TryFrom<&[String]> for ControllerInputs {
     type Error = TaskError;
 
@@ -793,6 +813,29 @@ impl ControllerInputMetadata {
 mod tests {
     use super::*;
     use sp1_prover_types::InMemoryArtifactClient;
+
+    #[test]
+    fn request_inputs_parse_back_with_their_nonce_and_cycle_limit() {
+        let (elf, stdin, nonce) =
+            (Artifact("elf".into()), Artifact("stdin".into()), Artifact("nonce".into()));
+        for (cycle_limit, parsed_limit) in
+            [(None, None), (Some(0), Some(0)), (Some(1_000_000), Some(1_000_000))]
+        {
+            let inputs = ControllerInputs::request_inputs(
+                elf.clone(),
+                stdin.clone(),
+                ProofMode::Groth16,
+                cycle_limit,
+                nonce.clone(),
+            );
+            let parsed = ControllerInputs::try_from(inputs.as_slice()).unwrap();
+            assert_eq!(parsed.elf, elf);
+            assert_eq!(parsed.stdin_artifact, stdin);
+            assert_eq!(parsed.mode, ProofMode::Groth16);
+            assert_eq!(parsed.cycle_limit, parsed_limit);
+            assert_eq!(parsed.proof_nonce, Some(nonce.clone()));
+        }
+    }
 
     #[tokio::test]
     async fn a_first_delivery_executes() {
