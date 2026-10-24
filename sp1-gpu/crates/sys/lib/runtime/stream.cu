@@ -426,12 +426,12 @@ static bool plonkHelperOnThisCard(size_t total_b) {
     return own.empty() ? helper == "0" : own == helper;
 }
 
-// An on/off setting: 1 for 1, true, on or yes, -1 for 0, false, off or no (in any case), and 0,
-// the default, when unset or anything else (reported).
+// An on/off setting: 1 for 1, true, on or yes, -1 for 0, false, off or no (in any case, with any
+// whitespace around it), and 0, the default, when unset or empty, or anything else (reported).
 static int envSwitch(const char* name) {
     const char* value = std::getenv(name);
-    if (!value) return 0;
-    std::string v(value);
+    std::string v = trimmed(value ? value : "");
+    if (v.empty()) return 0;
     for (char& c : v) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
     if (v == "1" || v == "true" || v == "on" || v == "yes") return 1;
     if (v == "0" || v == "false" || v == "off" || v == "no") return -1;
@@ -1079,8 +1079,8 @@ static bool isPinnedHost(const void* ptr) {
 // Small uploads from pageable memory go as the arguments of a kernel: the launch copies its
 // arguments, so the source may be reused at once and the upload needs no wait for the stream,
 // which a pageable copy does (about 8600 uploads per 144M-cycle core proof; on a Radeon RX 9070
-// XT 8.73 -> 7.82 s). The data lands in stream order, as a copy's would. SP1_HIP_ARG_UPLOAD=0
-// copies and waits instead.
+// XT 8.73 -> 7.82 s). The data lands in stream order, as a copy's would. SP1_HIP_ARG_UPLOAD=0 (or
+// false, off, no) copies and waits instead.
 static constexpr size_t ARG_UPLOAD_WORDS = 512;
 
 struct ArgUpload {
@@ -1092,10 +1092,7 @@ __global__ void argUploadKernel(uint32_t* __restrict__ dst, ArgUpload data, uint
 }
 
 static bool argUploadEnabled() {
-    static const bool on = [] {
-        const char* v = std::getenv("SP1_HIP_ARG_UPLOAD");
-        return !(v && v[0] == '0');
-    }();
+    static const bool on = envSwitch("SP1_HIP_ARG_UPLOAD") >= 0;
     return on;
 }
 #endif
