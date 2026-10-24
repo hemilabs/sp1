@@ -356,6 +356,12 @@ pub fn vram_current_bytes() -> u64 {
     VRAM_STATS.current.load(Ordering::Relaxed)
 }
 
+/// Gives the small device blocks the streams keep for reuse back to the memory pool (see
+/// [`crate::release_device_caches`]).
+pub(crate) fn release_small_block_cache() {
+    small_blocks::release_all();
+}
+
 /// High-water mark of `vram_current_bytes()` since the last `vram_reset_peak()`.
 pub fn vram_peak_bytes() -> u64 {
     VRAM_STATS.peak.load(Ordering::Relaxed)
@@ -411,13 +417,11 @@ unsafe impl Allocator for CudaStream {
                 match malloc(&mut ptr) {
                     Ok(()) => {}
                     // Drop the prefetched uploads not yet in use (their owners copy again) and
-                    // the device caches (their owners rebuild them), then give the cached small
-                    // blocks back to the pool (last: the first two free small blocks into it
-                    // too), and try once more.
+                    // the device caches (their owners rebuild them), with the cached small blocks,
+                    // and try once more.
                     Err(CudaError::OutOfMemory) => {
                         crate::upload::reclaim_staged_uploads(true);
                         crate::upload::release_device_caches(true);
-                        small_blocks::release_all();
                         malloc(&mut ptr).map_err(|_| AllocError)?
                     }
                     Err(_) => return Err(AllocError),
@@ -547,20 +551,37 @@ mod small_blocks {
         true
     }
 
+    /// Held while blocks taken out of the cache are freed, so that no stream they belong to is
+    /// destroyed meanwhile ([`release_stream`] takes it too), without holding the cache's lock,
+    /// which every small allocation and free takes, across the driver calls.
+    static RELEASING: Mutex<()> = Mutex::new(());
+
+    /// Frees `blocks` on `stream`, which must not be destroyed yet. A failure is logged (once per
+    /// call), not a panic: this runs inside allocations, and in stream drops.
     fn free_blocks(stream: usize, blocks: StreamBlocks) {
+        let mut failed = 0;
+        let mut first_error = None;
         for ptr in blocks.free.into_iter().flatten() {
-            unsafe {
+            let freed = unsafe {
                 CudaError::result_from_ffi(cuda_free_async(
                     ptr as *mut c_void,
                     CudaStreamHandle(stream as *mut _),
                 ))
-                .unwrap()
+            };
+            if let Err(e) = freed {
+                failed += 1;
+                first_error.get_or_insert(e);
             }
+        }
+        if let Some(e) = first_error {
+            tracing::warn!("could not free {failed} cached small device blocks: {e}");
         }
     }
 
-    /// Frees the blocks cached for a stream that is being destroyed.
+    /// Frees the blocks cached for a stream that is being destroyed, once no [`release_all`] is
+    /// freeing blocks of it.
     pub(super) fn release_stream(stream: CudaStreamHandle) {
+        let _releasing = RELEASING.lock().unwrap_or_else(|e| e.into_inner());
         let blocks = {
             let mut cache = cache().lock().unwrap_or_else(|e| e.into_inner());
             let blocks = cache.streams.remove(&(stream.0 as usize));
@@ -572,8 +593,9 @@ mod small_blocks {
         }
     }
 
-    /// Frees every cached block (on an allocation failure).
+    /// Frees every cached block (on an allocation failure, or for a final-wrap helper).
     pub(super) fn release_all() {
+        let _releasing = RELEASING.lock().unwrap_or_else(|e| e.into_inner());
         let all = std::mem::take(&mut *cache().lock().unwrap_or_else(|e| e.into_inner()));
         for (stream, blocks) in all.streams {
             free_blocks(stream, blocks);

@@ -261,9 +261,10 @@ pub fn device_cache_bytes() -> u64 {
     CACHED_BYTES.load(Ordering::Relaxed)
 }
 
-/// Empties the registered caches. Returns whether anything was dropped. Also for a process
-/// handing the device to another one (the final wrap's GPU helpers), which would otherwise not get
-/// the memory the caches hold.
+/// Empties the registered caches. Returns whether anything was dropped. With `wait`, also gives the
+/// small device blocks the streams keep for reuse back to the pool (last: the caches' release frees
+/// small blocks into it too), for an allocation that failed, or for a process handing the device to
+/// another one (the final wrap's GPU helpers), which would otherwise not get that memory.
 pub fn release_device_caches(wait: bool) -> bool {
     let caches: Vec<Arc<dyn DeviceCache>> = {
         let caches = CACHES.lock().unwrap_or_else(|e| e.into_inner());
@@ -275,6 +276,9 @@ pub fn release_device_caches(wait: bool) -> bool {
     }
     if released {
         tracing::debug!(wait, "device memory low: released device caches");
+    }
+    if wait {
+        crate::stream::release_small_block_cache();
     }
     released
 }

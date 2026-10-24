@@ -256,14 +256,16 @@ pub async fn cuda_worker_builder_with_machine(
 
     // A final-wrap GPU helper needs the memory of the shard prover's device caches too, which a
     // pool trim or a device reset does not return: rsp's PLONK helper otherwise ran out of memory.
-    // With HIP and SYCL, also the allocator's cached blocks, which the pool trim does not see (on
-    // HIP they go back to the arena when there is one, which a helper cannot have either).
+    // (Their release also gives back the small blocks the streams keep for reuse.) With HIP and
+    // SYCL, also the allocator's cached blocks, which the pool trim does not see (on HIP they go
+    // back to the arena when there is one, which a helper cannot have either).
     sp1_recursion_gnark_ffi::device_caches::set_releaser(|| {
         sp1_gpu_cudart::release_device_caches(true);
         // SAFETY: takes nothing; waits for the device and frees blocks no one holds.
         unsafe { sp1_gpu_cudart::sys::runtime::cuda_release_cached_memory() };
     });
-    // HIP's arena holds the card's memory for the process's lifetime, out of a helper's reach.
+    // HIP's arena holds the card's memory, out of a helper's reach: it gives an allocation back
+    // only when that is wholly free, and only to make room for one of this process's blocks.
     // SAFETY: takes nothing and reads the arena's size under its lock.
     sp1_recursion_gnark_ffi::device_caches::set_arena_bytes(|| unsafe {
         sp1_gpu_cudart::sys::runtime::sp1_hip_arena_bytes() as u64
