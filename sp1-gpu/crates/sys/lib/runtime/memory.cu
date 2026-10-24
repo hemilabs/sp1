@@ -39,14 +39,9 @@ extern "C" rustCudaError_t cuda_malloc_host(void** devPtr, size_t size) {
 }
 
 // A failed (un)registration is the caller's to report, and callers carry on without it (pinning
-// only speeds copies up): it must not also stay the thread's last error, which the next checked
-// kernel launch (sppark's, through `cudaGetLastError`) would report as its own failure.
+// only speeds copies up); CUDA_OK clears it.
 extern "C" rustCudaError_t cuda_host_register(void* hostPtr, size_t size) {
-    const cudaError_t code = cudaHostRegister(hostPtr, size, cudaHostRegisterDefault);
-    if (code != cudaSuccess) {
-        (void)cudaGetLastError();
-        return rustCudaError_t{.message = cudaGetErrorString(code)};
-    }
+    CUDA_OK(cudaHostRegister(hostPtr, size, cudaHostRegisterDefault));
     return CUDA_SUCCESS_CSL;
 }
 
@@ -139,11 +134,7 @@ extern "C" rustCudaError_t cuda_free_host(void* devPtr) {
 }
 
 extern "C" rustCudaError_t cuda_host_unregister(void* hostPtr) {
-    const cudaError_t code = cudaHostUnregister(hostPtr);
-    if (code != cudaSuccess) {
-        (void)cudaGetLastError();  // as for cuda_host_register
-        return rustCudaError_t{.message = cudaGetErrorString(code)};
-    }
+    CUDA_OK(cudaHostUnregister(hostPtr));
     return CUDA_SUCCESS_CSL;
 }
 

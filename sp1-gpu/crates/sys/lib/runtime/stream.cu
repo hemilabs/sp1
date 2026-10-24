@@ -187,7 +187,10 @@ static bool deviceHeadroom(size_t* headroom) {
     }
 #endif
     size_t free_b = 0, total_b = 0;
-    if (hipMemGetInfo(&free_b, &total_b) != hipSuccess) return false;
+    if (hipMemGetInfo(&free_b, &total_b) != hipSuccess) {
+        (void)hipGetLastError();  // not the next checked launch's error
+        return false;
+    }
     *headroom = free_b;
     return true;
 }
@@ -939,13 +942,9 @@ LiveBlocks& liveBlocksOf(void* p) {
 #endif
 
 extern "C" rustCudaError_t cuda_malloc_async(void** devPtr, size_t size, cudaStream_t stream) {
-    cudaError_t code = cudaMallocAsync(devPtr, size, stream);
-    if (code != cudaSuccess) {
-        // An allocation failure can be recovered from (the caller may free memory and retry), so
-        // do not leave it as the thread's last error for a later `cudaGetLastError` check.
-        (void)cudaGetLastError();
-        return rustCudaError_t{.message = cudaGetErrorString(code)};
-    }
+    // An allocation failure can be recovered from (the caller may free memory and retry); CUDA_OK
+    // does not leave it as the thread's last error for a later `cudaGetLastError` check.
+    CUDA_OK(cudaMallocAsync(devPtr, size, stream));
 #ifndef __HIPCC__
     LiveBlocks& live = liveBlocksOf(*devPtr);
     std::lock_guard<std::mutex> lock(live.mutex);
