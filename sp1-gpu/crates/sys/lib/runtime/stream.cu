@@ -6,6 +6,7 @@
 #include <atomic>
 #include <cstdint>
 #include <mutex>
+#include <string>
 #include <unordered_map>
 
 #ifdef __HIPCC__
@@ -312,18 +313,34 @@ static void arenaReportMiss(size_t s, size_t free_b, size_t largest, size_t grow
             grown ? "grew it by" : "trying a separate allocation of", (grown ? grown : s) >> 20);
 }
 
-// Whether the GPU PLONK helper will run on this card (see arenaInit).
+// The first device a CUDA_VISIBLE_DEVICES-style list names, without surrounding whitespace.
+static std::string firstDevice(const char* list) {
+    std::string device(list ? list : "");
+    device = device.substr(0, device.find(','));
+    const char* space = " \t\n\r\v\f";
+    const size_t begin = device.find_first_not_of(space);
+    if (begin == std::string::npos) return "";
+    return device.substr(begin, device.find_last_not_of(space) - begin + 1);
+}
+
+// Whether the GPU PLONK helper will run on this card (see arenaInit). The rule of gnark-ffi's
+// helper_shares_card: each proves on the first device its list names (SP1_PLONK_GPU_HELPER_DEVICES
+// for the helper; CUDA_VISIBLE_DEVICES or HIP_VISIBLE_DEVICES for this process, device 0 with
+// neither set), and an empty helper list leaves the helper this process's devices.
 static bool plonkHelperOnThisCard(size_t total_b) {
     const char* plonk_gpu = std::getenv("SP1_PLONK_GPU");
     if (!plonk_gpu || std::strcmp(plonk_gpu, "1") != 0) return false;
     if (total_b < (size_t(23) << 30)) return false;
-    const char* routed = std::getenv("SP1_PLONK_GPU_HELPER_DEVICES");
-    if (!routed || !*routed) return true;
-    for (const char* own_var : {"HIP_VISIBLE_DEVICES", "CUDA_VISIBLE_DEVICES"}) {
-        const char* own = std::getenv(own_var);
-        if (own && std::strcmp(own, routed) == 0) return true;
+    const std::string helper = firstDevice(std::getenv("SP1_PLONK_GPU_HELPER_DEVICES"));
+    if (helper.empty()) return true;
+    bool own_listed = false;
+    for (const char* own_var : {"CUDA_VISIBLE_DEVICES", "HIP_VISIBLE_DEVICES"}) {
+        const std::string own = firstDevice(std::getenv(own_var));
+        if (own.empty()) continue;
+        own_listed = true;
+        if (own == helper) return true;
     }
-    return false;
+    return !own_listed && helper == "0";
 }
 
 // Creates the arena on the first allocation (Linux; see above).

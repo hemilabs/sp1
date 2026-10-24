@@ -24,6 +24,7 @@
 
 use std::fs::File;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
@@ -234,85 +235,121 @@ impl ProofDir {
 /// after creating it; this covers the moment in between.
 const SWEEP_MIN_AGE: Duration = Duration::from_secs(60);
 
+/// How old another host's directory (or this host's from before a reboot) must be before a sweep
+/// removes it: older than any proof, whose lock this host cannot see.
+const FOREIGN_SWEEP_MIN_AGE: Duration = Duration::from_secs(24 * 60 * 60);
+
 /// A fresh directory for one proof's files under `root` (by default RAM-backed `/dev/shm`), named
-/// `<prefix><pid>_<random>`. Removed when dropped.
+/// `<prefix><pid>_<host>_<random>` (see [`host_tag`]). Removed when dropped.
 ///
 /// A prover killed mid-proof cannot remove its own, and in `/dev/shm` each one holds RAM (a GPU
 /// witness is several GB), so every call first removes those of provers that are gone. The owner
 /// holds a lock on its directory for as long as it exists, which is what tells the two apart. The
 /// pid in the name is not enough: a shared directory (a mounted cache, or `/dev/shm` shared between
 /// containers) can hold directories of provers in other pid namespaces, which look dead from here.
+/// Nor is the lock, for another host's directory on storage shared between hosts, where a lock is
+/// seen only on the host that took it: such a directory goes only once it is older than any proof.
 pub(crate) fn proof_tempdir(root: Option<&Path>, prefix: &str) -> Result<ProofDir> {
     let root = root.map_or_else(default_root, Path::to_path_buf);
     std::fs::create_dir_all(&root)
         .with_context(|| format!("failed to create {}", root.display()))?;
     sweep_abandoned(&root, prefix);
+    let host = host_tag().map(|tag| format!("{tag}_")).unwrap_or_default();
     let dir = tempfile::Builder::new()
-        .prefix(&format!("{prefix}{}_", std::process::id()))
+        .prefix(&format!("{prefix}{}_{host}", std::process::id()))
         .tempdir_in(&root)
         .with_context(|| format!("failed to create a {prefix}* directory in {}", root.display()))?;
-    // Best effort: without the lock (no flock on this filesystem) the directory still works, and
-    // is swept only once its pid is gone and it is old.
-    let owner =
-        File::open(dir.path()).ok().filter(|file| host_lock::try_lock(file).unwrap_or(false));
+    // Without the lock (no flock on this filesystem, or not Unix, where a directory does not open
+    // as a file) the directory still works; a sweep, unable to tell whether it is in use, leaves it
+    // to this process, or to another host once it is older than any proof. On Unix it must open: a
+    // directory left unlocked there is one a sweep may remove.
+    let owner = match File::open(dir.path()) {
+        Ok(file) => host_lock::try_lock(&file).unwrap_or(false).then_some(file),
+        Err(e) if cfg!(unix) => {
+            return Err(e).with_context(|| format!("failed to open {}", dir.path().display()))
+        }
+        Err(_) => None,
+    };
     Ok(ProofDir { dir, _owner: owner })
 }
 
-/// Removes `<root>/<prefix><pid>_*` directories that their owners have abandoned: the pid is not
-/// running here, the directory is older than [`SWEEP_MIN_AGE`], and no one holds its lock.
+/// [`proof_tempdir`] beside the cache at `cache`, where the cache's root (`SP1_GROTH16_PK_CACHE`,
+/// `SP1_PLONK_GPU_CACHE`) puts the GPU path's large files: out of a small `/dev/shm`, say. Under
+/// the default root without a cache (it is disabled), or where none can be made beside it (a
+/// cache mounted read-only, say). The default root is swept too, of directories made there before
+/// the cache moved, or by such a fallback.
+pub(crate) fn proof_tempdir_beside(cache: Option<&Path>, prefix: &str) -> Result<ProofDir> {
+    let Some(root) = cache.and_then(Path::parent) else {
+        return proof_tempdir(None, prefix);
+    };
+    if root != default_root() {
+        sweep_abandoned(&default_root(), prefix);
+    }
+    proof_tempdir(Some(root), prefix).or_else(|e| {
+        tracing::warn!("{e:#}; using {} instead", default_root().display());
+        proof_tempdir(None, prefix)
+    })
+}
+
+/// Removes `<root>/<prefix><pid>_*` directories that their owners have abandoned: this host's (or
+/// one from before names had a host) once older than [`SWEEP_MIN_AGE`] where no one holds the
+/// lock, and another host's once older than [`FOREIGN_SWEEP_MIN_AGE`]. Not where the lock cannot
+/// be taken (no flock on this filesystem): the pid cannot tell, since a shared directory can hold
+/// directories of provers in other pid namespaces. Off Unix, where a directory does not open as a
+/// file, nothing is swept.
 fn sweep_abandoned(root: &Path, prefix: &str) {
     let Ok(entries) = std::fs::read_dir(root) else {
         return;
     };
     for entry in entries.flatten() {
         let name = entry.file_name().to_string_lossy().into_owned();
-        let Some(pid) = name
+        let Some(rest) = name
             .strip_prefix(prefix)
             .and_then(|rest| rest.split_once('_'))
-            .and_then(|(pid, _)| pid.parse::<u32>().ok())
+            .filter(|(pid, _)| pid.parse::<u32>().is_ok())
+            .map(|(_, rest)| rest)
         else {
             continue;
         };
+        // `<host>_<random>`, or just the random part (no `_` in it) from before names had a host.
+        let foreign = rest.split_once('_').is_some_and(|(host, _)| Some(host) != host_tag());
         let path = entry.path();
         // `symlink_metadata`: a symlink with the right name is not a directory to sweep.
         let Ok(meta) = std::fs::symlink_metadata(&path) else {
             continue;
         };
-        let old = meta
-            .modified()
-            .ok()
-            .and_then(|t| t.elapsed().ok())
-            .is_some_and(|age| age >= SWEEP_MIN_AGE);
-        if !meta.is_dir() || !old || process_alive(pid) {
+        let min_age = if foreign { FOREIGN_SWEEP_MIN_AGE } else { SWEEP_MIN_AGE };
+        let old =
+            meta.modified().ok().and_then(|t| t.elapsed().ok()).is_some_and(|age| age >= min_age);
+        if !meta.is_dir() || !old {
             continue;
         }
         let Ok(dir) = File::open(&path) else {
             continue;
         };
-        // Held while removing, so its owner cannot be mid-way through using it.
-        if host_lock::try_lock(&dir).unwrap_or(false) {
+        // Where taken, the lock is held while removing, so its owner cannot be mid-way through
+        // using it.
+        let abandoned = match host_lock::try_lock(&dir) {
+            Ok(unheld) => unheld,
+            Err(_) => foreign,
+        };
+        if abandoned {
             tracing::info!("removing {} left by a prover that is gone", path.display());
             let _ = std::fs::remove_dir_all(&path);
         }
     }
 }
 
-#[cfg(unix)]
-fn process_alive(pid: u32) -> bool {
-    let Ok(pid) = libc::pid_t::try_from(pid) else {
-        return true;
-    };
-    // SAFETY: signal 0 only checks whether the process exists.
-    if unsafe { libc::kill(pid, 0) } == 0 {
-        return true;
-    }
-    // EPERM: it exists but belongs to someone else.
-    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
-}
-
-#[cfg(not(unix))]
-fn process_alive(_pid: u32) -> bool {
-    true
+/// This host's part of per-proof directory names: the first 8 hex digits of its boot id (Linux),
+/// the same in every container on it, whose locks this host sees. `None` elsewhere.
+fn host_tag() -> Option<&'static str> {
+    static TAG: OnceLock<Option<String>> = OnceLock::new();
+    TAG.get_or_init(|| {
+        let id = std::fs::read_to_string("/proc/sys/kernel/random/boot_id").ok()?;
+        let tag: String = id.chars().filter(char::is_ascii_hexdigit).take(8).collect();
+        (tag.len() == 8).then_some(tag)
+    })
+    .as_deref()
 }
 
 /// `/dev/shm` where it exists, otherwise the system temp directory: where the GPU path's large
@@ -514,9 +551,11 @@ mod tests {
         assert!(b_path.exists());
     }
 
-    /// A prover killed mid-proof leaves its scratch directory behind; the next proof removes it,
-    /// and nothing else: not a live prover's (here, or in another pid namespace, where its pid
-    /// looks dead), not one just created, and not a cache whose name merely shares the prefix.
+    /// A prover killed mid-proof leaves its scratch directory behind; the next proof removes it
+    /// (also one from another pid namespace whose pid a process here has), and nothing else: not a
+    /// live prover's (here, or in another pid namespace, where its pid looks dead), not one just
+    /// created, not another host's younger than a day, and not a cache whose name merely shares the
+    /// prefix.
     #[cfg(unix)]
     #[test]
     fn only_abandoned_scratch_is_swept() {
@@ -531,10 +570,11 @@ mod tests {
             std::fs::write(dir.join("wire_values.bin"), b"x").unwrap();
             dir
         };
-        let age = |dir: &Path| {
-            let old = std::time::SystemTime::now() - SWEEP_MIN_AGE * 2;
+        let age_by = |dir: &Path, age: Duration| {
+            let old = std::time::SystemTime::now() - age;
             File::open(dir).unwrap().set_modified(old).unwrap();
         };
+        let age = |dir: &Path| age_by(dir, SWEEP_MIN_AGE * 2);
         let abandoned = dir(format!("witness_{dead}_abc"));
         let elsewhere = dir(format!("witness_{dead}_def"));
         let fresh = dir(format!("witness_{dead}_ghi"));
@@ -546,20 +586,36 @@ mod tests {
         for dir in [&abandoned, &elsewhere, &mine, &pid_1, &unrelated, &pk_cache, &prep_cache] {
             age(dir);
         }
+        // Another host's, on storage shared with it: this host cannot see its lock.
+        let other = if host_tag() == Some("00000000") { "11111111" } else { "00000000" };
+        let foreign = dir(format!("witness_{dead}_{other}_pqr"));
+        age(&foreign);
+        let foreign_old = dir(format!("witness_{dead}_{other}_stu"));
+        age_by(&foreign_old, FOREIGN_SWEEP_MIN_AGE * 2);
+        let tagged = host_tag().map(|tag| dir(format!("witness_{dead}_{tag}_vwx")));
+        if let Some(tagged) = &tagged {
+            age(tagged);
+        }
         // A prover in another pid namespace: its pid is dead here, but it holds its directory.
         let other_namespace = File::open(&elsewhere).unwrap();
         assert!(host_lock::try_lock(&other_namespace).unwrap());
+        // As this process does its own.
+        let own = File::open(&mine).unwrap();
+        assert!(host_lock::try_lock(&own).unwrap());
 
         let _new = proof_tempdir(Some(root.path()), "witness_").unwrap();
         sweep_abandoned(root.path(), "sp1_groth16_pk_");
         sweep_abandoned(root.path(), "sp1_groth16_prep_");
 
         assert!(!abandoned.exists(), "the dead prover's scratch was not removed");
+        assert!(!pid_1.exists(), "a gone prover's whose pid is running here was not removed");
+        assert!(!foreign_old.exists(), "another host's from over a day ago was not removed");
+        assert!(tagged.is_none_or(|tagged| !tagged.exists()), "a tagged one was not removed");
         for (dir, what) in [
+            (&foreign, "another host's from a few minutes ago"),
             (&elsewhere, "a live prover's in another pid namespace"),
             (&fresh, "a just-created one"),
             (&mine, "this process's"),
-            (&pid_1, "one whose pid is running (as another user)"),
             (&unrelated, "an unrelated directory"),
             (&pk_cache, "the PK cache"),
             (&prep_cache, "the prep-circuit cache"),

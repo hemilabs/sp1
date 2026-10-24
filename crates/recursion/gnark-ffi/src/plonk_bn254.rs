@@ -77,6 +77,13 @@ fn plonk_gpu_cache_dir(vkey_hash_hex: &str) -> Option<std::path::PathBuf> {
     Some(std::path::PathBuf::from(root).join(format!("sp1_plonk_gpu_cache_{vkey_hash_hex}")))
 }
 
+/// [`plonk_gpu_cache_dir`] for the circuit in `build_dir`. `None` too where its vk is unreadable.
+#[cfg(feature = "native")]
+fn gpu_cache_dir_of(build_dir: &Path) -> Option<std::path::PathBuf> {
+    let vk_bin_bytes = std::fs::read(build_dir.join("plonk_vk.bin")).ok()?;
+    plonk_gpu_cache_dir(&hex::encode(Sha256::digest(vk_bin_bytes)))
+}
+
 #[cfg(feature = "native")]
 const PLONK_CACHE_SENTINEL: &str = ".sp1_plonk_gpu_cache_complete";
 
@@ -106,8 +113,54 @@ fn plonk_gpu_pk_dir(build_dir: &Path, vkey_hash_hex: &str, scratch: &Path) -> st
     .unwrap_or_else(|e| panic!("PLONK GPU cache at {}: {e:#}", cache_dir.display()));
     if outcome != crate::gpu_cache::CacheOutcome::Built {
         tracing::info!("Using cached PLONK GPU export at {}", cache_dir.display());
+        remove_old_layout_witness(&cache_dir);
     }
     cache_dir
+}
+
+/// How recently written an old-layout cache's witness may be in use by a prover from before
+/// per-proof directories that still runs on this host.
+#[cfg(feature = "native")]
+const OLD_LAYOUT_WITNESS_IN_USE: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// Removes the solved witness of the last proof from a cache in the layout before per-proof
+/// directories, which wrote each proof's witness (~4 GiB at the wrap circuit's size) into the
+/// cache, where nothing removes it now. Such a cache's marker lists no files (`ok`); the files are
+/// the ones `ExportSolvedWitness` writes. One written in the last [`OLD_LAYOUT_WITNESS_IN_USE`]
+/// may be a running older prover's, and is left.
+#[cfg(feature = "native")]
+fn remove_old_layout_witness(cache_dir: &Path) {
+    let marker = std::fs::read_to_string(cache_dir.join(PLONK_CACHE_SENTINEL)).unwrap_or_default();
+    if marker.trim() != "ok" {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(cache_dir) else { return };
+    let mut removed = 0;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        let witness = matches!(
+            &*name,
+            "witness_l.bin" | "witness_r.bin" | "witness_o.bin" | "witness_info.bin"
+        ) || name.starts_with("bsb22_poly_")
+            || name.starts_with("bsb22_commitment_");
+        let Ok(meta) = entry.metadata() else { continue };
+        let in_use = meta
+            .modified()
+            .ok()
+            .and_then(|modified| modified.elapsed().ok())
+            .is_none_or(|age| age < OLD_LAYOUT_WITNESS_IN_USE);
+        if witness && !in_use && std::fs::remove_file(entry.path()).is_ok() {
+            removed += meta.len();
+        }
+    }
+    if removed > 0 {
+        tracing::info!(
+            "removed {} MiB of an earlier proof's witness from the PLONK GPU cache at {}",
+            removed >> 20,
+            cache_dir.display()
+        );
+    }
 }
 
 /// Locates the `plonk_gpu_helper` binary: at `SP1_PLONK_GPU_HELPER` when that is set (and only
@@ -117,17 +170,44 @@ fn find_plonk_helper() -> Option<std::path::PathBuf> {
     crate::cpu_helper::find_executable("plonk_gpu_helper", Some("SP1_PLONK_GPU_HELPER"))
 }
 
-/// The devices `SP1_PLONK_GPU_HELPER_DEVICES` routes the GPU PLONK helper to (a
-/// `CUDA_VISIBLE_DEVICES`/`HIP_VISIBLE_DEVICES` value for the helper only), if it names other
-/// devices than this process's: unset, empty or the same as this process's own visible devices,
-/// the helper shares this process's card.
+/// The devices `SP1_PLONK_GPU_HELPER_DEVICES` gives the GPU PLONK helper (a
+/// `CUDA_VISIBLE_DEVICES`/`HIP_VISIBLE_DEVICES` value for the helper only), if it names any.
 #[cfg(feature = "native")]
 pub fn plonk_helper_devices() -> Option<String> {
     let devices = std::env::var("SP1_PLONK_GPU_HELPER_DEVICES").ok()?;
     let devices = devices.trim();
-    let own = |var| std::env::var(var).is_ok_and(|own| own.trim() == devices);
-    (!devices.is_empty() && !own("CUDA_VISIBLE_DEVICES") && !own("HIP_VISIBLE_DEVICES"))
-        .then(|| devices.to_string())
+    (!devices.is_empty()).then(|| devices.to_string())
+}
+
+/// Whether `SP1_PLONK_GPU_HELPER_DEVICES` puts the GPU PLONK helper on another card than this
+/// process's; see [`helper_shares_card`].
+#[cfg(feature = "native")]
+pub fn plonk_helper_routed() -> bool {
+    let Some(devices) = plonk_helper_devices() else { return false };
+    let own = ["CUDA_VISIBLE_DEVICES", "HIP_VISIBLE_DEVICES"].map(|var| std::env::var(var).ok());
+    !helper_shares_card(&devices, &own)
+}
+
+/// Whether a GPU PLONK helper given `devices` (`SP1_PLONK_GPU_HELPER_DEVICES`) proves on this
+/// process's card, which has the visible devices `own` (`CUDA_VISIBLE_DEVICES`,
+/// `HIP_VISIBLE_DEVICES`). Each proves on the first device its list names, this process on device
+/// 0 where neither of its lists is set; an empty `devices` leaves the helper this process's
+/// devices. (A device named by index in one list and by UUID in the other cannot be matched, and
+/// counts as another card.) `stream.cu`'s `plonkHelperOnThisCard` follows the same rule.
+#[cfg(feature = "native")]
+fn helper_shares_card(devices: &str, own: &[Option<String>]) -> bool {
+    let first = |list: &str| list.split(',').next().unwrap_or_default().trim().to_string();
+    let helper = first(devices);
+    if helper.is_empty() {
+        return true;
+    }
+    let own: Vec<String> =
+        own.iter().flatten().map(|list| first(list)).filter(|d| !d.is_empty()).collect();
+    if own.is_empty() {
+        helper == "0"
+    } else {
+        own.contains(&helper)
+    }
 }
 
 // =====================================================================
@@ -436,12 +516,17 @@ impl PlonkBn254Prover {
     /// cache is disabled, or the circuit's vk is unreadable.
     #[cfg(feature = "native")]
     pub fn gpu_pk_cache_ready(build_dir: &Path) -> bool {
-        let Ok(vk_bin_bytes) = std::fs::read(build_dir.join("plonk_vk.bin")) else {
-            return false;
-        };
-        let vkey_hash_hex = hex::encode(Sha256::digest(vk_bin_bytes));
-        plonk_gpu_cache_dir(&vkey_hash_hex)
-            .is_some_and(|dir| dir.join(PLONK_CACHE_SENTINEL).is_file())
+        gpu_cache_dir_of(build_dir).is_some_and(|dir| dir.join(PLONK_CACHE_SENTINEL).is_file())
+    }
+
+    /// Removes an earlier proof's solved witness that this circuit's GPU cache holds from before
+    /// per-proof witness directories (see `remove_old_layout_witness`): ~4 GiB of host memory that
+    /// the decision whether the GPU prover fits would otherwise count as taken.
+    #[cfg(feature = "native")]
+    pub fn remove_stale_gpu_witness(build_dir: &Path) {
+        if let Some(dir) = gpu_cache_dir_of(build_dir) {
+            remove_old_layout_witness(&dir);
+        }
     }
 
     /// Whether a `SP1_PLONK_GPU_SERVER` helper from an earlier proof still runs (or proves now)
@@ -478,18 +563,20 @@ impl PlonkBn254Prover {
         witness: Witness<C>,
         build_dir: &Path,
     ) -> PlonkBn254Proof {
+        let vkey_hash = Self::get_vkey_hash(build_dir);
+        let vkey_hash_hex = hex::encode(vkey_hash);
+
         // Step 1: this proof's files (the witness JSON, the solved witness, the helper's proof) go
         // in a directory of its own, swept if this prover dies before removing it. (Into the
         // shared PK cache, a concurrent proof of the same circuit would overwrite them while the
-        // helper reads them.)
-        let scratch = crate::gpu_cache::proof_tempdir(None, "sp1_plonk_gpu_")
+        // helper reads them.) It goes beside the cache, as Groth16's does: where
+        // SP1_PLONK_GPU_CACHE puts it, out of a small /dev/shm.
+        let cache = plonk_gpu_cache_dir(&vkey_hash_hex);
+        let scratch = crate::gpu_cache::proof_tempdir_beside(cache.as_deref(), "sp1_plonk_gpu_")
             .expect("failed to create a scratch directory for the PLONK witness");
         let witness_json = scratch.path().join("witness.json");
         std::fs::write(&witness_json, serde_json::to_string(&GnarkWitness::new(witness)).unwrap())
             .expect("failed to write the witness");
-
-        let vkey_hash = Self::get_vkey_hash(build_dir);
-        let vkey_hash_hex = hex::encode(vkey_hash);
 
         // Step 2: Go shell-out to export PLONK GPU data + solve witness in
         // GPU-friendly layout (CPU-only, no GPU state). The PLONK PK export
@@ -549,14 +636,13 @@ impl PlonkBn254Prover {
         let out_path = scratch.path().join("proof.json");
 
         // Operators can route the helper to a different GPU via SP1_PLONK_GPU_HELPER_DEVICES
-        // (semicolon-separated CUDA_VISIBLE_DEVICES / HIP_VISIBLE_DEVICES override for the helper
-        // subprocess only). On a multi-GPU box this is the most reliable way to give it room; the
+        // (a CUDA_VISIBLE_DEVICES / HIP_VISIBLE_DEVICES value for the helper subprocess only). On a multi-GPU box this is the most reliable way to give it room; the
         // standalone helper validated at 17-19 s on a clean GPU.
         let helper_devices_override = plonk_helper_devices();
         // A helper on other cards needs no room made on this one. A `SP1_PLONK_GPU_SERVER` helper
         // kept from an earlier proof does: idle, it holds ~0.8 GiB, and it allocates its working
         // memory again for each proof.
-        let on_this_card = helper_devices_override.is_none();
+        let on_this_card = !plonk_helper_routed();
 
         // The helper needs PLONK_GPU_HELPER_VRAM_BYTES of GPU memory, which a prover keeping its
         // shard-prover state on the card has free only on a 32 GB card, once its memory pool's
@@ -759,5 +845,56 @@ impl PlonkBn254Prover {
 impl Default for PlonkBn254Prover {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(all(test, feature = "native"))]
+mod tests {
+    use super::*;
+
+    /// The helper shares this process's card where both prove on the same first device.
+    #[test]
+    fn a_helper_shares_the_card_of_its_first_device() {
+        let own = |cuda: Option<&str>, hip: Option<&str>| {
+            [cuda.map(str::to_string), hip.map(str::to_string)]
+        };
+        assert!(helper_shares_card("", &own(Some("1"), None)));
+        assert!(helper_shares_card("  ", &own(Some("1"), None)));
+        assert!(helper_shares_card("0", &own(None, None)));
+        assert!(helper_shares_card(" 0 ", &own(None, None)));
+        assert!(!helper_shares_card("1", &own(None, None)));
+        assert!(helper_shares_card("0", &own(Some("0,1"), None)));
+        assert!(helper_shares_card("1 ", &own(None, Some("1"))));
+        assert!(!helper_shares_card("1", &own(Some("0,1"), None)));
+        assert!(!helper_shares_card("0,1", &own(Some("1,0"), None)));
+        assert!(helper_shares_card("0", &own(Some(""), None)));
+    }
+
+    /// A cache in the layout before per-proof directories loses an earlier proof's witness, and
+    /// keeps its key; a cache with a manifest is left alone.
+    #[test]
+    fn an_old_layout_cache_loses_its_last_witness() {
+        let dir = tempfile::tempdir().unwrap();
+        let files = ["trace_ql.bin", "witness_l.bin", "witness_info.bin", "bsb22_poly_0.bin"];
+        let age = |file: &str, age: std::time::Duration| {
+            let file = std::fs::File::options().write(true).open(dir.path().join(file)).unwrap();
+            file.set_modified(std::time::SystemTime::now() - age).unwrap();
+        };
+        for file in files {
+            std::fs::write(dir.path().join(file), b"x").unwrap();
+            age(file, OLD_LAYOUT_WITNESS_IN_USE * 2);
+        }
+        std::fs::write(dir.path().join(PLONK_CACHE_SENTINEL), "1 trace_ql.bin\n").unwrap();
+        remove_old_layout_witness(dir.path());
+        assert!(files.iter().all(|file| dir.path().join(file).exists()));
+        std::fs::write(dir.path().join(PLONK_CACHE_SENTINEL), "ok\n").unwrap();
+        // One an older prover wrote just now may still be in use.
+        std::fs::write(dir.path().join("witness_r.bin"), b"x").unwrap();
+        remove_old_layout_witness(dir.path());
+        assert!(dir.path().join("trace_ql.bin").exists());
+        for file in &files[1..] {
+            assert!(!dir.path().join(file).exists(), "{file} was kept");
+        }
+        assert!(dir.path().join("witness_r.bin").exists(), "a recent witness was removed");
     }
 }

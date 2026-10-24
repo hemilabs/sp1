@@ -1120,7 +1120,7 @@ impl<A: ArtifactClient, C: SP1ProverComponents> SP1RecursionProver<A, C> {
                 use super::groth16_backend::{helper_room, use_gpu_plonk, HelperRoom, PlonkInputs};
                 use sp1_recursion_gnark_ffi as ffi;
                 let helper_available = PlonkBn254Prover::gpu_helper_available();
-                let helper_routed = ffi::plonk_helper_devices().is_some();
+                let helper_routed = ffi::plonk_helper_routed();
                 if helper_available && !helper_routed {
                     if let Some((before, after)) =
                         ffi::gpu_trim_memory_pool(ffi::PLONK_GPU_HELPER_VRAM_BYTES)
@@ -1135,6 +1135,7 @@ impl<A: ArtifactClient, C: SP1ProverComponents> SP1RecursionProver<A, C> {
                 // As for Groth16: a reset that could make room on this card is reserved before the
                 // choice, and kept only for a GPU wrap that counts on it, until this wrap ends.
                 let reservation = (!helper_routed).then(ffi::gpu_reserve_reset).flatten();
+                PlonkBn254Prover::remove_stale_gpu_witness(&build_dir);
                 let inputs = PlonkInputs {
                     helper_available,
                     helper_routed,

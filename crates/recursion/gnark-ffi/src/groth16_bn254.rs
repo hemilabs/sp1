@@ -126,13 +126,18 @@ pub(crate) fn gpu_pk(build_dir: &Path, vkey_hash_hex: &str) -> GpuPk {
     }
 }
 
-/// A directory for one proof's witness files, beside the PK cache. Never the cache itself: provers
-/// share the cache, and a second proof's witness written there would replace this one's before the
-/// GPU prover reads it, giving an invalid proof.
+/// A directory for one proof's files, beside the PK cache (see `gpu_cache::proof_tempdir_beside`).
+/// Never the cache itself: provers share the cache, and a second proof's witness written there
+/// would replace this one's before the GPU prover reads it, giving an invalid proof.
+#[cfg(feature = "native")]
+fn proof_dir(vkey_hash_hex: &str, prefix: &str) -> anyhow::Result<crate::gpu_cache::ProofDir> {
+    crate::gpu_cache::proof_tempdir_beside(pk_cache_dir(vkey_hash_hex).as_deref(), prefix)
+}
+
+/// A directory for one proof's witness files; see [`proof_dir`].
 #[cfg(feature = "native")]
 fn witness_dir(vkey_hash_hex: &str) -> crate::gpu_cache::ProofDir {
-    let cache = pk_cache_dir(vkey_hash_hex);
-    crate::gpu_cache::proof_tempdir(cache.as_deref().and_then(Path::parent), "sp1_groth16_witness_")
+    proof_dir(vkey_hash_hex, "sp1_groth16_witness_")
         .expect("failed to create a per-proof witness directory")
 }
 
@@ -303,7 +308,7 @@ fn try_prepare_gpu_r1cs_inputs(
         }
     };
 
-    let wires_dir = crate::gpu_cache::proof_tempdir(None, "sp1_groth16_wires_").ok()?;
+    let wires_dir = proof_dir(vkey_hash_hex, "sp1_groth16_wires_").ok()?;
     let wires_initial = wires_dir.path().join("wires_initial.bin");
     tracing::info!("Running r1cs_solve_plan make-witness-init...");
     let t0 = std::time::Instant::now();
@@ -845,7 +850,8 @@ impl Groth16Bn254Prover {
 
         // Step 1: write witness JSON (CPU-only, no HIP), in a scratch directory that is swept if
         // this prover dies before removing it.
-        let scratch = crate::gpu_cache::proof_tempdir(None, "sp1_groth16_gpu_")
+        let vkey_hash_hex = hex::encode(Self::get_vkey_hash(build_dir));
+        let scratch = proof_dir(&vkey_hash_hex, "sp1_groth16_gpu_")
             .expect("failed to create a scratch directory for the witness");
         let witness_json = scratch.path().join("witness.json");
         let mut writer = std::io::BufWriter::new(
