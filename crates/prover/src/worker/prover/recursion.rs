@@ -1143,7 +1143,7 @@ impl<A: ArtifactClient, C: SP1ProverComponents> SP1RecursionProver<A, C> {
                     gpu_reset: reservation.is_some(),
                     mem_available: ffi::host_memory::available(),
                     pk_cache_ready: PlonkBn254Prover::gpu_pk_cache_ready(&build_dir),
-                    server_running: PlonkBn254Prover::gpu_helper_server_running(),
+                    server_running: PlonkBn254Prover::gpu_helper_server_running(&build_dir),
                 };
                 let (gpu, reason) = use_gpu_plonk(&inputs);
                 let after_reset = !helper_routed

@@ -327,6 +327,21 @@ pub(crate) fn kill_first_when_out_of_memory(cmd: &mut Command) {
 #[cfg(not(target_os = "linux"))]
 pub(crate) fn kill_first_when_out_of_memory(_cmd: &mut Command) {}
 
+/// [`kill_first_when_out_of_memory`] for a child already started, from its parent: for a spawn
+/// that must not `fork` this process, which a `pre_exec` closure makes `Command` do instead of
+/// `posix_spawn` (a fork copies the page tables of a prover holding tens of GB). A process may
+/// raise the score of another of its user's. Best effort, as there.
+#[cfg(target_os = "linux")]
+pub(crate) fn kill_child_first_when_out_of_memory(child: &std::process::Child) {
+    let path = format!("/proc/{}/oom_score_adj", child.id());
+    if let Err(e) = std::fs::write(&path, "1000") {
+        tracing::debug!("could not raise {path}: {e}");
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn kill_child_first_when_out_of_memory(_child: &std::process::Child) {}
+
 #[cfg(all(test, unix))]
 pub(crate) mod tests {
     use super::*;
@@ -421,6 +436,13 @@ pub(crate) mod tests {
         kill_first_when_out_of_memory(&mut cmd);
         let output = cmd.output().unwrap();
         assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "1000");
+        // The server's way: raised by its parent once it runs.
+        let mut server = sh("exec sleep 60").spawn().unwrap();
+        kill_child_first_when_out_of_memory(&server);
+        let score = std::fs::read_to_string(format!("/proc/{}/oom_score_adj", server.id()));
+        let _ = server.kill();
+        let _ = server.wait();
+        assert_eq!(score.unwrap().trim(), "1000");
     }
 
     #[test]

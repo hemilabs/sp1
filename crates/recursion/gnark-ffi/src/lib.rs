@@ -84,4 +84,23 @@ pub(crate) mod test_env {
     pub(crate) fn lock() -> MutexGuard<'static, ()> {
         LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
     }
+
+    /// An environment variable set until this is dropped (also when a test fails), which then
+    /// has its earlier value again. Taken under [`lock`].
+    pub(crate) struct Var(&'static str, Option<std::ffi::OsString>);
+
+    pub(crate) fn set_var(name: &'static str, value: &str) -> Var {
+        let earlier = std::env::var_os(name);
+        std::env::set_var(name, value);
+        Var(name, earlier)
+    }
+
+    impl Drop for Var {
+        fn drop(&mut self) {
+            match self.1.take() {
+                Some(earlier) => std::env::set_var(self.0, earlier),
+                None => std::env::remove_var(self.0),
+            }
+        }
+    }
 }
