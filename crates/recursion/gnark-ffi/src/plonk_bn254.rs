@@ -686,12 +686,13 @@ impl PlonkBn254Prover {
         };
         let mut finished = run_helper();
         // A helper that failed beside this process's state, which the measurement said it had
-        // room for, gets the card to itself once (SP1_GPU_RESET_BEFORE_WRAP).
-        if !finished.status.success()
-            && on_this_card
+        // room for, gets the card to itself once (SP1_GPU_RESET_BEFORE_WRAP), if it may have run
+        // out of GPU memory.
+        if on_this_card
             && crate::gpu_device::reset_after_failed_helper(
                 "PLONK (GPU)",
                 PLONK_GPU_HELPER_VRAM_BYTES,
+                &finished,
             )
         {
             tracing::warn!(

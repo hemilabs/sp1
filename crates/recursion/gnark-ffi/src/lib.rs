@@ -47,6 +47,18 @@ pub use gpu_device::{
 #[cfg(feature = "native")]
 pub use groth16_queue::{final_wrap_slot, FinalWrapSlot};
 
+/// The exit codes of the GPU wrap helpers (`groth16_gpu_helper`, `plonk_gpu_helper`), which their
+/// parent reads to tell a failure a GPU reset may help from one it cannot
+/// (`subprocess::Finished::may_be_out_of_gpu_memory`).
+pub mod helper_exit {
+    /// The prove failed, on the GPU (out of memory, say).
+    pub const PROVE_FAILED: i32 = 1;
+    /// A file could not be read, parsed or written.
+    pub const FILE_ERROR: i32 = 2;
+    /// Bad arguments or a bad message from the parent.
+    pub const BAD_ARGUMENTS: i32 = 3;
+}
+
 /// Lets this binary act as its own Groth16 CPU helper; see `cpu_helper`. Without the `native`
 /// feature there is no CPU helper, and this does nothing.
 #[cfg(not(feature = "native"))]

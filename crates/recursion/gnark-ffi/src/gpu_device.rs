@@ -341,11 +341,19 @@ pub(crate) fn reset_if_requested(what: &str, needed: u64) -> bool {
     reset_to_make_room(what, needed)
 }
 
-/// Resets this process's GPU after a wrap helper needing `needed` bytes failed without one (it ran
-/// out of memory with what [`reset_if_requested`] measured as room), so that it can be run again,
-/// on the same terms as [`reset_if_requested`]. Returns whether it reset the GPU.
-pub(crate) fn reset_after_failed_helper(what: &str, needed: u64) -> bool {
-    reset_requested() && reset_available() && !was_reset() && reset_to_make_room(what, needed)
+/// Resets this process's GPU after a wrap helper needing `needed` bytes failed without one, so that
+/// it can be run again, on the same terms as [`reset_if_requested`]: only where the failure may be
+/// the GPU running out of memory beside this process's state, which the measurement said it had
+/// room for (`Finished::may_be_out_of_gpu_memory`). Returns whether it reset the GPU.
+pub(crate) fn reset_after_failed_helper(
+    what: &str,
+    needed: u64,
+    failed: &crate::subprocess::Finished,
+) -> bool {
+    failed.may_be_out_of_gpu_memory()
+        && reset_requested()
+        && reset_available()
+        && reset_to_make_room(what, needed)
 }
 
 /// The reset of [`reset_if_requested`] and [`reset_after_failed_helper`], unless the card is too

@@ -1032,13 +1032,13 @@ impl Groth16Bn254Prover {
         };
         let mut finished = run_helper();
         // A helper that failed beside this process's state, which the measurement said it had
-        // room for, gets the card to itself once (SP1_GPU_RESET_BEFORE_WRAP).
-        if !finished.status.success()
-            && crate::gpu_device::reset_after_failed_helper(
-                "Groth16 (GPU)",
-                GROTH16_GPU_HELPER_VRAM_BYTES,
-            )
-        {
+        // room for, gets the card to itself once (SP1_GPU_RESET_BEFORE_WRAP), if it may have run
+        // out of GPU memory.
+        if crate::gpu_device::reset_after_failed_helper(
+            "Groth16 (GPU)",
+            GROTH16_GPU_HELPER_VRAM_BYTES,
+            &finished,
+        ) {
             tracing::warn!(
                 "GPU Groth16 helper failed ({}); running it again on the reset GPU",
                 finished.describe()

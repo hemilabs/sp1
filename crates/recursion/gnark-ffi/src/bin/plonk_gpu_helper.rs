@@ -66,13 +66,15 @@
 //!   - On stdin EOF, the server shuts down cleanly.
 //!   - Soft errors (bad request, prove failure) leave the server alive.
 //!
-//! Exit codes: 0 success, 1 prover failure, 2 file I/O failure, 3 bad CLI.
+//! Exit codes (`sp1_recursion_gnark_ffi::helper_exit`): 0 success, 1 prover failure, 2 file I/O
+//! failure, 3 bad CLI.
 
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 
 use clap::Parser;
 use num_bigint::BigUint;
+use sp1_recursion_gnark_ffi::helper_exit;
 
 #[derive(Parser, Debug)]
 #[command(about = "GPU PLONK final-wrap subprocess helper", long_about = None)]
@@ -140,19 +142,19 @@ fn main() {
 fn run_single_shot(args: Args) {
     let gpu_dir = args.gpu_dir.unwrap_or_else(|| {
         eprintln!("[plonk-gpu-helper] missing --gpu-dir");
-        std::process::exit(3);
+        std::process::exit(helper_exit::BAD_ARGUMENTS);
     });
     let witness_json = args.witness_json.unwrap_or_else(|| {
         eprintln!("[plonk-gpu-helper] missing --witness-json");
-        std::process::exit(3);
+        std::process::exit(helper_exit::BAD_ARGUMENTS);
     });
     let vkey_hash_hex = args.vkey_hash_hex.unwrap_or_else(|| {
         eprintln!("[plonk-gpu-helper] missing --vkey-hash-hex");
-        std::process::exit(3);
+        std::process::exit(helper_exit::BAD_ARGUMENTS);
     });
     let out = args.out.unwrap_or_else(|| {
         eprintln!("[plonk-gpu-helper] missing --out");
-        std::process::exit(3);
+        std::process::exit(helper_exit::BAD_ARGUMENTS);
     });
 
     let gpu_dir_str = gpu_dir.to_str().expect("--gpu-dir is not valid UTF-8");
@@ -161,7 +163,7 @@ fn run_single_shot(args: Args) {
     let proving_data =
         sp1_gpu_plonk::types::PlonkProvingData::load(gpu_dir_str).unwrap_or_else(|e| {
             eprintln!("[plonk-gpu-helper] failed to load PlonkProvingData: {e}");
-            std::process::exit(2);
+            std::process::exit(helper_exit::FILE_ERROR);
         });
     let nb_public = proving_data.nb_public_variables;
 
@@ -190,18 +192,18 @@ fn run_single_shot(args: Args) {
         )
         .unwrap_or_else(|e| {
             eprintln!("[plonk-gpu-helper] GPU PLONK prove failed: {e}");
-            std::process::exit(1);
+            std::process::exit(helper_exit::PROVE_FAILED);
         });
 
     let proof = build_plonk_proof(&gpu_proof, &pubs, &vkey_hash_hex).unwrap_or_else(|e| {
         eprintln!("[plonk-gpu-helper] failed to assemble PlonkBn254Proof: {e}");
-        std::process::exit(2);
+        std::process::exit(helper_exit::FILE_ERROR);
     });
 
     let proof_json = serde_json::to_vec_pretty(&proof).unwrap();
     std::fs::write(&out, &proof_json).unwrap_or_else(|e| {
         eprintln!("[plonk-gpu-helper] failed to write {}: {e}", out.display());
-        std::process::exit(2);
+        std::process::exit(helper_exit::FILE_ERROR);
     });
 
     eprintln!("[plonk-gpu-helper] wrote proof to {}", out.display());
@@ -239,7 +241,7 @@ fn load_witness_data(
     eprintln!("[plonk-gpu-helper] loading PLONK witness data from {witness_dir}");
     sp1_gpu_plonk::types::PlonkWitnessData::load(witness_dir).unwrap_or_else(|e| {
         eprintln!("[plonk-gpu-helper] failed to load PlonkWitnessData: {e}");
-        std::process::exit(2);
+        std::process::exit(helper_exit::FILE_ERROR);
     })
 }
 
@@ -344,14 +346,14 @@ fn run_server(args: Args) {
         Some(p) => p,
         None => {
             emit(&mut out, &ServerResponse::err("--server requires --gpu-dir"));
-            std::process::exit(3);
+            std::process::exit(helper_exit::BAD_ARGUMENTS);
         }
     };
     let gpu_dir_str = match gpu_dir.to_str() {
         Some(s) => s.to_string(),
         None => {
             emit(&mut out, &ServerResponse::err("--gpu-dir is not valid UTF-8"));
-            std::process::exit(3);
+            std::process::exit(helper_exit::BAD_ARGUMENTS);
         }
     };
 
@@ -361,7 +363,7 @@ fn run_server(args: Args) {
         Ok(d) => d,
         Err(e) => {
             emit(&mut out, &ServerResponse::err(format!("load PlonkProvingData: {e}")));
-            std::process::exit(2);
+            std::process::exit(helper_exit::FILE_ERROR);
         }
     };
     let nb_public = proving_data.nb_public_variables;
@@ -380,7 +382,7 @@ fn run_server(args: Args) {
                          use the gnark.spr.Solve disk-load path per request."
                     )),
                 );
-                std::process::exit(2);
+                std::process::exit(helper_exit::FILE_ERROR);
             }
         },
         None => None,
@@ -609,11 +611,11 @@ fn read_pub_inputs(witness_json: &Path) -> GnarkPubInputs {
     eprintln!("[plonk-gpu-helper] reading public inputs from {}", witness_json.display());
     let s = std::fs::read_to_string(witness_json).unwrap_or_else(|e| {
         eprintln!("[plonk-gpu-helper] failed to read witness JSON: {e}");
-        std::process::exit(2);
+        std::process::exit(helper_exit::FILE_ERROR);
     });
     serde_json::from_str(&s).unwrap_or_else(|e| {
         eprintln!("[plonk-gpu-helper] failed to parse witness JSON: {e}");
-        std::process::exit(2);
+        std::process::exit(helper_exit::FILE_ERROR);
     })
 }
 

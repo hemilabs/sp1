@@ -61,6 +61,29 @@ impl Finished {
         None
     }
 
+    /// Whether the failure could be its GPU running out of memory, which a reset of this process's
+    /// GPU can help: it exited with an error (a panic's 101 included: a failed `cuda_malloc` panics)
+    /// or aborted (an uncaught C++ exception, as for a CUDA error). The helpers' messages for a
+    /// device allocation that failed do not all say so ("Failed to create persistent MSM context",
+    /// "cuda_malloc failed for ..."), so other failures count too: one that a reset cannot help (a
+    /// GPU R1CS solver set up from a stale prep cache, say) costs the process its GPU and a rerun
+    /// that fails the same way, which SP1_GPU_RESET_BEFORE_WRAP's processes (they exit after their
+    /// proof) can afford. Not the GPU helpers' exit codes for a file they could not read or write or
+    /// for bad arguments (`helper_exit`), not the shell's for a program it could not run (126, 127),
+    /// not a kill (the kernel kills a helper first when the host runs out of memory), and not a
+    /// host allocation that failed (under strict overcommit), which aborts with Rust's or C++'s own
+    /// message.
+    pub(crate) fn may_be_out_of_gpu_memory(&self) -> bool {
+        use crate::helper_exit::{BAD_ARGUMENTS, FILE_ERROR};
+        let host_allocation_failed = self.stderr_tail.contains("memory allocation of")
+            || self.stderr_tail.contains("std::bad_alloc");
+        !host_allocation_failed
+            && match self.status.code() {
+                Some(code) => !matches!(code, 0 | FILE_ERROR | BAD_ARGUMENTS | 126 | 127),
+                None => self.signal() == Some(libc::SIGABRT),
+            }
+    }
+
     /// The status and the last of its stderr, for an error message.
     pub(crate) fn describe(&self) -> String {
         let tail = self.stderr_tail.trim();
@@ -354,6 +377,29 @@ pub(crate) mod tests {
 
         let killed = run_with_timeout(sh("kill -9 $$"), "test", None).unwrap();
         assert_eq!(killed.signal(), Some(9));
+    }
+
+    /// A reset of this process's GPU is tried after a helper's failure only where the helper may
+    /// have run out of GPU memory: not after a file or argument error, a program the shell could
+    /// not run, or a kill.
+    #[cfg(unix)]
+    #[test]
+    fn only_a_failure_that_may_be_out_of_gpu_memory_asks_for_a_reset() {
+        let ended = |script: &str| run_with_timeout(sh(script), "test", None).unwrap();
+        assert!(!ended("exit 0").may_be_out_of_gpu_memory());
+        assert!(ended("exit 1").may_be_out_of_gpu_memory());
+        assert!(ended("exit 101").may_be_out_of_gpu_memory());
+        assert!(ended("kill -6 $$").may_be_out_of_gpu_memory());
+        assert!(!ended("exit 2").may_be_out_of_gpu_memory());
+        assert!(!ended("exit 3").may_be_out_of_gpu_memory());
+        assert!(!ended("exit 126").may_be_out_of_gpu_memory());
+        assert!(!ended("exit 127").may_be_out_of_gpu_memory());
+        assert!(!ended("kill -9 $$").may_be_out_of_gpu_memory());
+        // A host allocation that failed: the same abort, but with Rust's (or C++'s) message.
+        let host = "echo 'memory allocation of 4096 bytes failed' >&2; kill -6 $$";
+        assert!(!ended(host).may_be_out_of_gpu_memory());
+        let host = "echo 'terminate called after throwing std::bad_alloc' >&2; kill -6 $$";
+        assert!(!ended(host).may_be_out_of_gpu_memory());
     }
 
     /// A helper, whether run through `run` or spawned by the PLONK helper server, is the kernel's
