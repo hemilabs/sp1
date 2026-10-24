@@ -43,6 +43,33 @@ impl Clone for SP1LocalNode {
     }
 }
 
+/// GPU work of this node in flight: a final wrap does not reset the GPU
+/// (`SP1_GPU_RESET_BEFORE_WRAP`) while there is other work.
+#[cfg(feature = "native-gnark")]
+type GpuWork = sp1_recursion_gnark_ffi::GpuProofInFlight;
+#[cfg(not(feature = "native-gnark"))]
+struct GpuWork;
+
+/// Starts work that needs the GPU, counting it as in flight while the result is alive. Refused
+/// once this process has reset its GPU before a final wrap (`SP1_GPU_RESET_BEFORE_WRAP`, where the
+/// wrap's helper would not fit otherwise): the reset destroyed the provers' GPU state, and the work
+/// would crash on it.
+fn start_gpu_work() -> anyhow::Result<GpuWork> {
+    #[cfg(feature = "native-gnark")]
+    {
+        let work = sp1_recursion_gnark_ffi::gpu_proof_started();
+        if sp1_recursion_gnark_ffi::gpu_was_reset() {
+            anyhow::bail!(
+                "this process reset its GPU before a final wrap (SP1_GPU_RESET_BEFORE_WRAP), which \
+                 destroyed its provers' GPU state: restart it to prove again"
+            );
+        }
+        Ok(work)
+    }
+    #[cfg(not(feature = "native-gnark"))]
+    Ok(GpuWork)
+}
+
 impl SP1LocalNode {
     pub fn core(&self) -> &SP1NodeCore {
         &self.inner.core
@@ -59,6 +86,7 @@ impl SP1LocalNode {
     }
 
     pub async fn setup(&self, elf: &[u8]) -> anyhow::Result<SP1VerifyingKey> {
+        let _gpu_work = start_gpu_work()?;
         let elf_artifact = self.inner.artifact_client.create_artifact()?;
         self.inner.artifact_client.upload_program(&elf_artifact, elf.to_vec()).await?;
 
@@ -114,6 +142,7 @@ impl SP1LocalNode {
         range_or_limit: Option<Either<Vec<usize>, usize>>,
         chunk_size: usize,
     ) -> anyhow::Result<VkeyMapControllerOutput> {
+        let _gpu_work = start_gpu_work()?;
         let vk_controller_artifact = self.inner.artifact_client.create_artifact()?;
         let input =
             VkeyMapControllerInput { range_or_limit, chunk_size, reduce_batch_size: DEFAULT_ARITY };
@@ -172,6 +201,7 @@ impl SP1LocalNode {
         context: SP1Context<'static>,
         mode: ProofMode,
     ) -> anyhow::Result<ProofFromNetwork> {
+        let _gpu_work = start_gpu_work()?;
         // Allocate the per-proof artifacts and id up front so the cleanup below
         // can always reach them, regardless of how the proving body exits.
         let elf_artifact = self.inner.artifact_client.create_artifact()?;
@@ -260,6 +290,7 @@ impl SP1LocalNode {
         &self,
         compressed_proof: &SP1Proof,
     ) -> anyhow::Result<SP1WrapProof<SP1OuterGlobalContext, SP1PcsProofOuter>> {
+        let _gpu_work = start_gpu_work()?;
         let compressed_proof = match compressed_proof {
             SP1Proof::Compressed(proof) => *proof.clone(),
             _ => return Err(anyhow::anyhow!("given proof is not a compressed proof")),

@@ -177,6 +177,9 @@ pub struct Groth16Prover {
     persistent_g1_k: sp1_gpu_plonk::g1::PersistentMsm,
     #[cfg(feature = "cuda")]
     persistent_g1_z: sp1_gpu_plonk::g1::PersistentMsm,
+    /// Whether `data.pk_g2_b` is registered (pinned) with the runtime, to undo in `Drop`.
+    #[cfg(feature = "cuda")]
+    g2_bases_pinned: bool,
     /// Pre-uploaded G2 SRS context for the Bs2 MSM. `None` on backends that
     /// don't implement the persistent G2 API — callers fall back to the
     /// one-shot `g2_msm_gpu` (or arkworks CPU) path.
@@ -224,19 +227,6 @@ pub struct Groth16Prover {
     /// from compute_h_gpu which runs single-threaded.
     #[cfg(feature = "cuda")]
     d_ntt_temp: *mut std::ffi::c_void,
-    /// GPU wire-gather: persistent device-side u32 index arrays, uploaded
-    /// once at setup. Used by `sp1_bn254_msm_preupload_gather` to skip the
-    /// ~22ms CPU par_iter scatter for Ar MSM (~51 MB for a_indices at
-    /// N=12.76M).
-    #[cfg(feature = "cuda")]
-    d_a_indices: *mut std::ffi::c_void,
-    /// GPU wire-gather: persistent device-side wire-values buffer, sized to
-    /// hold nb_wires × 32 bytes (~504 MB at nb_wires=15.74M). Re-filled at
-    /// the start of each prove via async H2D on copy_stream.
-    #[cfg(feature = "cuda")]
-    d_wire_values: *mut std::ffi::c_void,
-    #[cfg(feature = "cuda")]
-    d_wire_values_cap: usize,
 }
 
 // Raw pointers need explicit Send/Sync.
@@ -246,23 +236,22 @@ unsafe impl Sync for Groth16Prover {}
 #[cfg(feature = "cuda")]
 impl Drop for Groth16Prover {
     fn drop(&mut self) {
+        // A range freed while still registered fails the next registration over it, in a
+        // process that builds another prover.
+        #[cfg(feature = "cuda")]
+        if self.g2_bases_pinned {
+            unsafe {
+                sp1_gpu_sys::runtime::cuda_host_unregister(
+                    self.data.pk_g2_b.as_ptr() as *const std::ffi::c_void
+                );
+            }
+            self.g2_bases_pinned = false;
+        }
         if !self.d_ntt_temp.is_null() {
             unsafe {
                 sp1_gpu_sys::runtime::cuda_free(self.d_ntt_temp as *const std::ffi::c_void);
             }
             self.d_ntt_temp = std::ptr::null_mut();
-        }
-        if !self.d_a_indices.is_null() {
-            unsafe {
-                sp1_gpu_sys::runtime::cuda_free(self.d_a_indices as *const std::ffi::c_void);
-            }
-            self.d_a_indices = std::ptr::null_mut();
-        }
-        if !self.d_wire_values.is_null() {
-            unsafe {
-                sp1_gpu_sys::runtime::cuda_free(self.d_wire_values as *const std::ffi::c_void);
-            }
-            self.d_wire_values = std::ptr::null_mut();
         }
     }
 }
@@ -274,13 +263,10 @@ impl Groth16Prover {
         #[cfg(feature = "cuda")]
         let (persistent_g1_a, persistent_g1_b, persistent_g1_k, persistent_g1_z) = {
             let t = std::time::Instant::now();
-            let to_g1 = |pts: &[BN254G1Affine]| -> Vec<G1Affine> {
-                pts.par_iter().map(G1Affine::from_bn254).collect()
-            };
-            let g1_a = to_g1(&data.pk_g1_a);
-            let g1_b = to_g1(&data.pk_g1_b);
-            let g1_k = to_g1(&data.pk_g1_k);
-            let g1_z = to_g1(&data.pk_g1_z);
+            // The contexts read `BN254G1Affine`s, so the points are uploaded as loaded, without
+            // the 4 GB `G1Affine` copy (on all cores, while the parent solves the witness).
+            let (g1_a, g1_b, g1_k, g1_z) =
+                (&data.pk_g1_a, &data.pk_g1_b, &data.pk_g1_k, &data.pk_g1_z);
             // Pre-reserve the shared GLV pool to the max-of-all-contexts size,
             // so subsequent per-context `init_glv_buffers` calls all reuse the
             // pre-allocated buffers instead of growing (which would transiently
@@ -292,10 +278,10 @@ impl Groth16Prover {
                     eprintln!("[groth16] WARN: glv_pool_reserve({}) failed; continuing", max_n);
                 }
             }
-            let pa = sp1_gpu_plonk::g1::PersistentMsm::new(&g1_a);
-            let pb = sp1_gpu_plonk::g1::PersistentMsm::new(&g1_b);
-            let pk = sp1_gpu_plonk::g1::PersistentMsm::new(&g1_k);
-            let pz = sp1_gpu_plonk::g1::PersistentMsm::new(&g1_z);
+            let pa = sp1_gpu_plonk::g1::PersistentMsm::from_bn254_points(g1_a);
+            let pb = sp1_gpu_plonk::g1::PersistentMsm::from_bn254_points(g1_b);
+            let pk = sp1_gpu_plonk::g1::PersistentMsm::from_bn254_points(g1_k);
+            let pz = sp1_gpu_plonk::g1::PersistentMsm::from_bn254_points(g1_z);
             eprintln!("[groth16] Pre-uploaded 4 G1 SRS to GPU: {:?}", t.elapsed());
             (pa, pb, pk, pz)
         };
@@ -308,6 +294,8 @@ impl Groth16Prover {
         // "BN254 MSM invoke failed". The CUDA path keeps using the one-
         // shot g2_msm_gpu (which re-creates/destroys a temporary context
         // per call but doesn't hit the conflict).
+        #[cfg(feature = "cuda")]
+        let mut g2_bases_pinned = false;
         #[cfg(feature = "cuda")]
         let persistent_g2_b = {
             // Default to compile-time backend detection (HIP-built crates use
@@ -340,8 +328,7 @@ impl Groth16Prover {
                 // every prove. From pageable memory that runs at ~13.6 GB/s (143 ms in nsys); pinning
                 // the host copy once here (off the critical path: the helper is prestarted) makes it a
                 // DMA at PCIe speed. Measured with the production sppark one-shot path and the real
-                // PK + witness: G2 MSM 480 -> 390 ms. Non-fatal on failure. The helper exits after
-                // the proof, so the registration is not undone.
+                // PK + witness: G2 MSM 480 -> 390 ms. Non-fatal on failure. Undone in `Drop`.
                 let g2_bytes = data.pk_g2_b.len() * std::mem::size_of::<crate::g2::G2Affine>();
                 let t = std::time::Instant::now();
                 let err = unsafe {
@@ -355,6 +342,7 @@ impl Groth16Prover {
                         "[groth16] WARN: pinning the G2 bases failed; G2 upload stays pageable"
                     );
                 } else {
+                    g2_bases_pinned = true;
                     eprintln!(
                         "[groth16] Pinned G2 bases ({} MB): {:?}",
                         g2_bytes >> 20,
@@ -493,50 +481,6 @@ impl Groth16Prover {
             }
         }
 
-        // Pre-compute GPU wire-gather buffers (d_a_indices one-time H2D, and
-        // d_wire_values reserved at nb_wires × 32 B). Done before the struct
-        // literal to avoid moving a_indices / data into the literal first.
-        #[cfg(feature = "cuda")]
-        let d_a_indices: *mut std::ffi::c_void = {
-            let a_idx_u32: Vec<u32> = a_indices.iter().map(|&i| i as u32).collect();
-            let byte_sz = a_idx_u32.len() * std::mem::size_of::<u32>();
-            let mut ptr: *mut std::ffi::c_void = std::ptr::null_mut();
-            let err = unsafe { sp1_gpu_sys::runtime::cuda_malloc(&mut ptr as *mut _, byte_sz) };
-            if err != unsafe { sp1_gpu_sys::runtime::CUDA_SUCCESS_CSL } || ptr.is_null() {
-                eprintln!("[groth16] WARN: d_a_indices malloc failed; GPU gather disabled");
-                std::ptr::null_mut()
-            } else {
-                let err = unsafe {
-                    sp1_gpu_sys::runtime::cuda_mem_copy_host_to_device(
-                        ptr,
-                        a_idx_u32.as_ptr() as *const std::ffi::c_void,
-                        byte_sz,
-                    )
-                };
-                if err != unsafe { sp1_gpu_sys::runtime::CUDA_SUCCESS_CSL } {
-                    eprintln!("[groth16] WARN: d_a_indices H2D failed; freeing");
-                    unsafe { sp1_gpu_sys::runtime::cuda_free(ptr as *const _) };
-                    std::ptr::null_mut()
-                } else {
-                    ptr
-                }
-            }
-        };
-        #[cfg(feature = "cuda")]
-        let d_wire_values_cap: usize = data.nb_wires;
-        #[cfg(feature = "cuda")]
-        let d_wire_values: *mut std::ffi::c_void = {
-            let byte_sz = d_wire_values_cap * std::mem::size_of::<Fr>();
-            let mut ptr: *mut std::ffi::c_void = std::ptr::null_mut();
-            let err = unsafe { sp1_gpu_sys::runtime::cuda_malloc(&mut ptr as *mut _, byte_sz) };
-            if err != unsafe { sp1_gpu_sys::runtime::CUDA_SUCCESS_CSL } || ptr.is_null() {
-                eprintln!("[groth16] WARN: d_wire_values malloc failed; GPU gather disabled");
-                std::ptr::null_mut()
-            } else {
-                ptr
-            }
-        };
-
         Self {
             data,
             #[cfg(feature = "cuda")]
@@ -547,6 +491,8 @@ impl Groth16Prover {
             persistent_g1_k,
             #[cfg(feature = "cuda")]
             persistent_g1_z,
+            #[cfg(feature = "cuda")]
+            g2_bases_pinned,
             #[cfg(feature = "cuda")]
             persistent_g2_b,
             a_indices,
@@ -580,12 +526,6 @@ impl Groth16Prover {
                 }
                 ptr
             },
-            #[cfg(feature = "cuda")]
-            d_a_indices,
-            #[cfg(feature = "cuda")]
-            d_wire_values,
-            #[cfg(feature = "cuda")]
-            d_wire_values_cap,
         }
     }
 
@@ -643,44 +583,12 @@ impl Groth16Prover {
             //
             // The pre-pinned buffers eliminate per-prove hipHostRegister /
             // hipHostUnregister calls (~60-80ms of TLB shootdown overhead).
-            // GPU wire-gather (enabled when witness is pinned at load time).
-            // witness.pinned_on_device means wire_values is hipHostRegister'd,
-            // so the async H2D on copy_stream actually uses SDMA and doesn't
-            // block the host. Skipping the CPU par_iter scatter saves ~22 ms
-            // on the critical path; the 504 MB async H2D + 1 ms gather kernel
-            // run in parallel with the H-poly NTTs on compute_h's thread.
-            // Debug toggle: SP1_GPU_USE_GATHER=1 to enable GPU wire-gather path.
-            // Default off — even with pinned witness, the gather path has shown
-            // a ~27ms regression on H-poly phase (SDMA queue serialization of
-            // +504 MB wire_values H2D behind the existing 3×504 MB solution
-            // H2Ds on copy_stream; combined exceeds NTT-compute wall window).
-            let gather_env_on = std::env::var("SP1_GPU_USE_GATHER").ok().as_deref() == Some("1");
-            let use_gpu_gather_a = gather_env_on
-                && witness.pinned_on_device
-                && !self.d_wire_values.is_null()
-                && !self.d_a_indices.is_null();
-            if use_gpu_gather_a {
-                let t_gather = std::time::Instant::now();
-                let _g = crate::profile::Scope::new("2a_gpu_gather_ar");
-                let wv_bytes = wv.len() * std::mem::size_of::<Fr>();
-                debug_assert!(wv.len() <= self.d_wire_values_cap);
-                let err = unsafe {
-                    sp1_gpu_sys::msm::sp1_bn254_msm_preupload_gather(
-                        self.d_wire_values,
-                        wv.as_ptr() as *const std::ffi::c_void,
-                        wv_bytes,
-                        self.d_a_indices,
-                        self.a_indices.len(),
-                    )
-                };
-                if err != unsafe { sp1_gpu_sys::runtime::CUDA_SUCCESS_CSL } {
-                    panic!("[groth16] sp1_bn254_msm_preupload_gather failed");
-                }
-                eprintln!(
-                    "[T] 2a. Wire gather Ar (GPU pinned async H2D+kernel): {:?}",
-                    t_gather.elapsed()
-                );
-            } else {
+            //
+            // A GPU gather of the Ar scalars from the uploaded wire values
+            // (instead of this CPU scatter) was ~27 ms slower on HIP: its
+            // 504 MB H2D queued behind the three 504 MB solution H2Ds on
+            // copy_stream, past the NTTs' compute window.
+            {
                 let t_gather = std::time::Instant::now();
                 let _g = crate::profile::Scope::new("2a_scatter_ar");
                 let buf = self.pinned_a.as_mut_slice();
@@ -695,27 +603,16 @@ impl Groth16Prover {
             // are now correctly looped (previously only poly 0 was transformed).
             let wva_ptr_usize = self.pinned_a.as_ptr() as usize;
             let wva_len = self.pinned_a.len();
-            let gpu_gather_active = use_gpu_gather_a;
             let (h_result, size_h) = std::thread::scope(|scope| {
                 let h_handle = scope.spawn(move || {
                     let _g = crate::profile::Scope::new("2b_compute_h_worker");
-                    // When GPU gather is active, the Ar scalars are already
-                    // being uploaded onto copy_stream by the gather path; pass
-                    // None so compute_h doesn't re-upload from pinned_a
-                    // (pinned_a is stale in that case).
-                    let ar_slice_opt: Option<&[Fr]> = if gpu_gather_active {
-                        None
-                    } else {
-                        let ar_slice = unsafe {
-                            std::slice::from_raw_parts(wva_ptr_usize as *const Fr, wva_len)
-                        };
-                        Some(ar_slice)
-                    };
+                    let ar_slice =
+                        unsafe { std::slice::from_raw_parts(wva_ptr_usize as *const Fr, wva_len) };
                     self.compute_h(
                         &witness.solution_a,
                         &witness.solution_b,
                         &witness.solution_c,
-                        ar_slice_opt,
+                        ar_slice,
                     )
                 });
 
@@ -1493,7 +1390,7 @@ impl Groth16Prover {
         solution_a: &[BN254Fr],
         solution_b: &[BN254Fr],
         solution_c: &[BN254Fr],
-        #[cfg(feature = "cuda")] ar_preupload_scalars: Option<&[Fr]>,
+        #[cfg(feature = "cuda")] ar_preupload_scalars: &[Fr],
     ) -> HResult {
         let _n = self.data.domain_size;
 
@@ -1616,9 +1513,9 @@ impl Groth16Prover {
     ///      (replaces ~78 ms of CPU rayon Montgomery multiplies with ~1 ms
     ///      GPU kernel).
     ///   3. Fused iNTT + coset NTT, batched over A,B,C (sppark on CUDA/HIP).
-    ///   4. If `ar_preupload_scalars` is `Some`, issue an async H2D of those
-    ///      scalars onto the MSM pool's copy_stream so the Ar MSM scalar
-    ///      upload (~130 ms) overlaps the NTT kernels.
+    ///   4. Issue an async H2D of `ar_preupload_scalars` onto the MSM pool's
+    ///      copy_stream so the Ar MSM scalar upload (~130 ms) overlaps the NTT
+    ///      kernels (only HIP's GLV MSM reads them).
     ///   5. Pointwise h = (a*b - c) * den, where den = (g^N - 1)^(-1)
     ///      (matches gnark prove.go).
     ///   6. Coset iNTT -> H in coefficient form, stays on GPU in `d_a`.
@@ -1636,7 +1533,7 @@ impl Groth16Prover {
         solution_a: &[BN254Fr],
         solution_b: &[BN254Fr],
         solution_c: &[BN254Fr],
-        ar_preupload_scalars: Option<&[Fr]>,
+        ar_preupload_scalars: &[Fr],
     ) -> DeviceH {
         use std::ffi::c_void;
         let n = self.data.domain_size;
@@ -1877,23 +1774,21 @@ impl Groth16Prover {
         // (see feedback_hip_cross_thread_gpu_ops.md). We are already on
         // that thread, and all GPU ops enqueued in order, so the SDMA
         // copy and NTT compute are properly scheduled by the runtime.
-        if let Some(ar_scalars) = ar_preupload_scalars {
-            let err = unsafe {
-                sp1_gpu_sys::msm::sp1_bn254_msm_preupload_scalars(
-                    ar_scalars.as_ptr() as *const c_void,
-                    ar_scalars.len(),
-                )
+        let err = unsafe {
+            sp1_gpu_sys::msm::sp1_bn254_msm_preupload_scalars(
+                ar_preupload_scalars.as_ptr() as *const c_void,
+                ar_preupload_scalars.len(),
+            )
+        };
+        if err != unsafe { sp1_gpu_sys::runtime::CUDA_SUCCESS_CSL } {
+            let msg = if err.message.is_null() {
+                "unknown error".to_string()
+            } else {
+                unsafe { std::ffi::CStr::from_ptr(err.message) }.to_string_lossy().into_owned()
             };
-            if err != unsafe { sp1_gpu_sys::runtime::CUDA_SUCCESS_CSL } {
-                let msg = if err.message.is_null() {
-                    "unknown error".to_string()
-                } else {
-                    unsafe { std::ffi::CStr::from_ptr(err.message) }.to_string_lossy().into_owned()
-                };
-                eprintln!(
-                    "[WARN] Ar MSM scalar preupload failed: {msg} — MSM will upload synchronously"
-                );
-            }
+            eprintln!(
+                "[WARN] Ar MSM scalar preupload failed: {msg} — MSM will upload synchronously"
+            );
         }
 
         // Pointwise: a[i] = (a[i]*b[i] - c[i]) * den

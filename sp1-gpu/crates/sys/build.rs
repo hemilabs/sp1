@@ -733,6 +733,11 @@ fn build_sycl(
         format!("-I{}", crate_dir.join("sppark").display()).into(),
         format!("-I{}", cbindgen_dir.display()).into(),
     ];
+    // The objects go into a shared library, which outside Windows needs position-independent
+    // code (ld rejects absolute relocations in one).
+    if env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
+        args.push("-fPIC".into());
+    }
     // Ahead-of-time device code, e.g. SP1_SYCL_TARGETS=spir64_gen with SP1_SYCL_DEVICE=bmg-g31;
     // without it the kernels are SPIR-V that the driver compiles on first use.
     if let Ok(targets) = env::var("SP1_SYCL_TARGETS") {
@@ -810,8 +815,6 @@ fn build_sycl(
         link.arg(format!("-Wl,/DEF:{}", def.display()));
         // DXGI's video memory budget (lib/sycl/runtime.cpp, device_headroom).
         link.arg("-ldxgi");
-    } else {
-        link.arg("-fPIC");
     }
     link.arg("-o").arg(&lib);
     let out = link.output().unwrap_or_else(|e| panic!("failed to run {}: {e}", icpx.display()));

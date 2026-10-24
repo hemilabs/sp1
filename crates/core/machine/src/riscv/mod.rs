@@ -1899,6 +1899,160 @@ pub mod tests {
 
     use crate::{io::SP1Stdin, utils::run_test};
 
+    /// Every ALU opcode, in register and immediate form, and every load, with `rd = x0`: the
+    /// events of the AluX0 and LoadX0 chips, which compiled programs rarely produce.
+    fn x0_program() -> Program {
+        let mut instructions = vec![
+            Instruction::new(Opcode::ADDI, 29, 0, 0x1234_8765, false, true),
+            Instruction::new(Opcode::ADDI, 30, 0, 37, false, true),
+            Instruction::new(Opcode::SD, 29, 0, 0x2765_4320, false, true),
+            Instruction::new(Opcode::ADDI, 0, 29, 5, false, true),
+        ];
+        for op in [
+            Opcode::ADD,
+            Opcode::SUB,
+            Opcode::XOR,
+            Opcode::OR,
+            Opcode::AND,
+            Opcode::SLL,
+            Opcode::SRL,
+            Opcode::SRA,
+            Opcode::SLT,
+            Opcode::SLTU,
+            Opcode::MUL,
+            Opcode::MULH,
+            Opcode::MULHU,
+            Opcode::MULHSU,
+            Opcode::DIV,
+            Opcode::DIVU,
+            Opcode::REM,
+            Opcode::REMU,
+            Opcode::ADDW,
+            Opcode::SUBW,
+            Opcode::SLLW,
+            Opcode::SRLW,
+            Opcode::SRAW,
+            Opcode::MULW,
+            Opcode::DIVW,
+            Opcode::DIVUW,
+            Opcode::REMW,
+            Opcode::REMUW,
+        ] {
+            instructions.push(Instruction::new(op, 0, 29, 30, false, false));
+        }
+        for op in [
+            Opcode::XOR,
+            Opcode::OR,
+            Opcode::AND,
+            Opcode::SLL,
+            Opcode::SRL,
+            Opcode::SRA,
+            Opcode::SLT,
+            Opcode::SLTU,
+            Opcode::ADDW,
+            Opcode::SLLW,
+            Opcode::SRLW,
+            Opcode::SRAW,
+        ] {
+            instructions.push(Instruction::new(op, 0, 29, 3, false, true));
+        }
+        for op in
+            [Opcode::LB, Opcode::LH, Opcode::LW, Opcode::LD, Opcode::LBU, Opcode::LHU, Opcode::LWU]
+        {
+            instructions.push(Instruction::new(op, 0, 0, 0x2765_4320, false, true));
+        }
+        add_halt(&mut instructions);
+        Program::new(instructions, 0, 0)
+    }
+
+    /// The traces of the chips whose trace generates their dependencies, and the byte and range
+    /// traces, are the same as with `generate_dependencies` for every chip.
+    #[test]
+    fn test_dependencies_in_trace_match_generate_dependencies() {
+        use sp1_core_executor::{events::ByteRecord, ExecutionRecord, SP1CoreOpts};
+
+        let machine = RiscvAir::<SP1Field>::machine();
+        let trace = |air: &RiscvAir<SP1Field>, record: &ExecutionRecord, fused: bool| {
+            let n = air.num_rows(record).unwrap()
+                * <RiscvAir<SP1Field> as BaseAir<SP1Field>>::width(air);
+            let mut values = Vec::<SP1Field>::with_capacity(n);
+            if fused {
+                air.generate_trace_into_with_dependencies(
+                    record,
+                    &mut values.spare_capacity_mut()[..n],
+                );
+            } else {
+                air.generate_trace_into(
+                    record,
+                    &mut ExecutionRecord::default(),
+                    &mut values.spare_capacity_mut()[..n],
+                );
+            }
+            unsafe { values.set_len(n) };
+            values
+        };
+        let programs = vec![
+            ssz_withdrawals_program(),
+            keccak_permute_program(),
+            secp256r1_add_program(),
+            x0_program(),
+        ];
+        // Untrusted programs, for the user-mode chips.
+        #[cfg(feature = "mprotect")]
+        let programs = {
+            let mut programs = programs;
+            for elf in [test_artifacts::TRAP_EXEC_ELF, test_artifacts::TRAP_LOAD_STORE_ELF] {
+                programs.push(Program::from(&elf).unwrap());
+            }
+            programs
+        };
+        for program in programs {
+            let (records, _) = crate::utils::generate_records::<SP1Field>(
+                Arc::new(program),
+                SP1Stdin::new(),
+                SP1CoreOpts::default(),
+                [0; 4],
+            )
+            .unwrap();
+            for record in records {
+                let included = machine
+                    .chips()
+                    .iter()
+                    .filter(|chip| chip.name() != "Global" && chip.included(&record))
+                    .collect::<Vec<_>>();
+                let is_lookup_table = |name: &str| name == "Byte" || name == "Range";
+                let reference = included
+                    .iter()
+                    .map(|chip| (chip.name(), trace(&chip.air, &record, false)))
+                    .collect::<BTreeMap<_, _>>();
+
+                // Regenerate the byte lookups with the fused chips counting them in their traces.
+                let mut fused = record.clone();
+                fused.byte_lookups.clear();
+                fused.byte_lookup_counts.clear();
+                fused.dependencies_in_trace = true;
+                for chip in machine.chips().iter().filter(|chip| !chip.dependencies_in_trace()) {
+                    let mut output = ExecutionRecord::default();
+                    chip.generate_dependencies(&fused, &mut output);
+                    fused.add_byte_lookup_events_from_maps(vec![&output.byte_lookups]);
+                }
+                let mut traces = BTreeMap::new();
+                for chip in included.iter().filter(|chip| !is_lookup_table(chip.name())) {
+                    traces.insert(
+                        chip.name(),
+                        trace(&chip.air, &fused, chip.dependencies_in_trace()),
+                    );
+                }
+                for chip in included.iter().filter(|chip| is_lookup_table(chip.name())) {
+                    traces.insert(chip.name(), trace(&chip.air, &fused, false));
+                }
+                for (name, values) in &reference {
+                    assert!(&traces[name] == values, "{name} trace differs");
+                }
+            }
+        }
+    }
+
     #[tokio::test]
     async fn test_simple_prove() {
         setup_logger();

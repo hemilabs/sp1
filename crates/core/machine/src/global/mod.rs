@@ -12,7 +12,7 @@ use slop_air::{Air, BaseAir, PairBuilder};
 use slop_algebra::PrimeField32;
 use slop_matrix::Matrix;
 use sp1_core_executor::{
-    events::{ByteLookupEvent, ByteRecord, GlobalInteractionEvent},
+    events::{ByteRecord, GlobalInteractionEvent},
     ExecutionRecord, Program,
 };
 use sp1_hypercube::{
@@ -87,10 +87,8 @@ impl<F: PrimeField32> MachineAir<F> for GlobalChip {
 
         let chunk_size = std::cmp::max(events.len() / num_cpus::get(), 1);
 
-        let blu_batches = events
-            .par_chunks(chunk_size)
-            .map(|events| {
-                let mut blu: Vec<ByteLookupEvent> = Vec::new();
+        events.par_chunks(chunk_size).for_each(|events| {
+            input.byte_lookup_counts.count(|blu| {
                 let mut row = [F::zero(); NUM_GLOBAL_COLS];
                 let cols: &mut GlobalCols<F> = row.as_mut_slice().borrow_mut();
                 events.iter().for_each(|event| {
@@ -102,7 +100,7 @@ impl<F: PrimeField32> MachineAir<F> for GlobalChip {
                     blu.add_bit_range_check(event.kind as u16, 6);
                     if !input.global_dependencies_opt {
                         cols.interaction.populate(
-                            &mut blu,
+                            blu,
                             event.message,
                             event.is_receive,
                             true,
@@ -110,11 +108,8 @@ impl<F: PrimeField32> MachineAir<F> for GlobalChip {
                         );
                     }
                 });
-                blu
-            })
-            .collect::<Vec<_>>();
-
-        output.add_byte_lookup_events(blu_batches.into_iter().flatten().collect());
+            });
+        });
         output.public_values.global_count = events.len() as u32;
     }
 
@@ -214,25 +209,23 @@ impl<F: PrimeField32> MachineAir<F> for GlobalChip {
         let start_digest_plus_dummy = start_digest.add_incomplete(dummy);
 
         let chunk_size = std::cmp::max(padded_nb_rows / num_cpus::get(), 0) + 1;
-        values.par_chunks_mut(chunk_size * NUM_GLOBAL_COLS).enumerate().for_each(
-            |(i, rows)| {
-                rows.chunks_mut(NUM_GLOBAL_COLS).enumerate().for_each(|(j, row)| {
-                    let idx = i * chunk_size + j;
-                    if idx >= nb_rows {
-                        unsafe {
-                            core::ptr::write_bytes(row.as_mut_ptr(), 0, NUM_GLOBAL_COLS);
-                        }
+        values.par_chunks_mut(chunk_size * NUM_GLOBAL_COLS).enumerate().for_each(|(i, rows)| {
+            rows.chunks_mut(NUM_GLOBAL_COLS).enumerate().for_each(|(j, row)| {
+                let idx = i * chunk_size + j;
+                if idx >= nb_rows {
+                    unsafe {
+                        core::ptr::write_bytes(row.as_mut_ptr(), 0, NUM_GLOBAL_COLS);
                     }
-                    let cols: &mut GlobalCols<F> = row.borrow_mut();
-                    if idx < nb_rows {
-                        cols.accumulation.populate_real(&cumulative_sum[idx..idx + 2]);
-                    } else {
-                        cols.interaction.populate_dummy();
-                        cols.accumulation.populate_dummy(start_digest, start_digest_plus_dummy);
-                    }
-                });
-            },
-        );
+                }
+                let cols: &mut GlobalCols<F> = row.borrow_mut();
+                if idx < nb_rows {
+                    cols.accumulation.populate_real(&cumulative_sum[idx..idx + 2]);
+                } else {
+                    cols.interaction.populate_dummy();
+                    cols.accumulation.populate_dummy(start_digest, start_digest_plus_dummy);
+                }
+            });
+        });
     }
 
     fn included(&self, _: &Self::Record) -> bool {

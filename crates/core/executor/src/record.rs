@@ -23,9 +23,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     events::{
-        AluEvent, BranchEvent, ByteLookupEvent, ByteRecord, GlobalInteractionEvent,
-        InstructionDecodeEvent, InstructionFetchEvent, JumpEvent, MemInstrEvent,
-        MemoryInitializeFinalizeEvent, MemoryLocalEvent, MemoryRecordEnum,
+        AluEvent, BranchEvent, ByteLookupCounts, ByteLookupEvent, ByteRecord,
+        GlobalInteractionEvent, InstructionDecodeEvent, InstructionFetchEvent, JumpEvent,
+        MemInstrEvent, MemoryInitializeFinalizeEvent, MemoryLocalEvent, MemoryRecordEnum,
         PageProtInitializeFinalizeEvent, PageProtLocalEvent, PrecompileEvent, PrecompileEvents,
         SyscallEvent, UTypeEvent,
     },
@@ -94,6 +94,13 @@ pub struct ExecutionRecord {
     pub jalr_events: Vec<(JumpEvent, ITypeRecord)>,
     /// A trace of the byte lookups that are needed.
     pub byte_lookups: HashMap<ByteLookupEvent, usize>,
+    /// Byte lookups counted by slot, which chips add to while generating dependencies (see
+    /// [`ByteLookupCounts`]). The byte and range tables count both these and `byte_lookups`.
+    pub byte_lookup_counts: ByteLookupCounts,
+    /// Whether the dependencies were generated without the chips whose `dependencies_in_trace`
+    /// holds: their trace generation must then use `generate_trace_into_with_dependencies`, and
+    /// finish before the byte and range traces are generated.
+    pub dependencies_in_trace: bool,
     /// A trace of the precompile events.
     pub precompile_events: PrecompileEvents,
     /// A trace of the global memory initialize events.
@@ -150,6 +157,76 @@ pub struct ExecutionRecord {
     pub global_dependencies_opt: bool,
 }
 
+/// How many retired records' event buffers are kept for reuse (see [`ExecutionRecord::recycle`]).
+const MAX_RECYCLED_EVENT_BUFFERS: usize = 8;
+
+/// On Windows, [`ExecutionRecord::new_preallocated`] reserves this fraction of the requested
+/// per-opcode capacity: there reserved memory is committed (see there).
+const WINDOWS_RESERVATION_DIVISOR: usize = 16;
+
+/// Event buffers of retired execution records, handed to the next records.
+///
+/// A shard writes about 1.5 GB of events. Fresh memory is faulted in by the kernel 4 KiB at a
+/// time as the tracing executor fills it, which costs about as much system CPU as writing the
+/// events (tens of seconds per large proof), and the allocator cannot reuse much of a retired
+/// record's memory because every event vector reserves far more than it touches. Reusing the
+/// buffers whole means the events are written to memory that is already mapped.
+static RECYCLED_EVENT_BUFFERS: Mutex<Vec<EventBuffers>> = Mutex::new(Vec::new());
+
+/// Gives back the event buffers kept by [`ExecutionRecord::recycle`] (call it between proofs).
+pub fn release_recycled_event_buffers() {
+    let buffers = std::mem::take(&mut *RECYCLED_EVENT_BUFFERS.lock().unwrap());
+    drop(buffers);
+}
+
+macro_rules! event_buffers {
+    ($($field:ident: $ty:ty),* $(,)?) => {
+        /// The per-instruction event vectors of an [`ExecutionRecord`], emptied.
+        struct EventBuffers {
+            $($field: Vec<$ty>,)*
+        }
+
+        impl EventBuffers {
+            fn take_from(record: &mut ExecutionRecord) -> Self {
+                Self { $($field: { let mut v = take(&mut record.$field); v.clear(); v },)* }
+            }
+
+            fn put_into(self, record: &mut ExecutionRecord) {
+                $(record.$field = self.$field;)*
+            }
+        }
+    };
+}
+
+event_buffers!(
+    alu_x0_events: (AluEvent, ALUTypeRecord),
+    add_events: (AluEvent, RTypeRecord),
+    addw_events: (AluEvent, ALUTypeRecord),
+    addi_events: (AluEvent, ITypeRecord),
+    mul_events: (AluEvent, RTypeRecord),
+    sub_events: (AluEvent, RTypeRecord),
+    subw_events: (AluEvent, RTypeRecord),
+    bitwise_events: (AluEvent, ALUTypeRecord),
+    shift_left_events: (AluEvent, ALUTypeRecord),
+    shift_right_events: (AluEvent, ALUTypeRecord),
+    divrem_events: (AluEvent, RTypeRecord),
+    lt_events: (AluEvent, ALUTypeRecord),
+    memory_load_byte_events: (MemInstrEvent, ITypeRecord),
+    memory_load_half_events: (MemInstrEvent, ITypeRecord),
+    memory_load_word_events: (MemInstrEvent, ITypeRecord),
+    memory_load_x0_events: (MemInstrEvent, ITypeRecord),
+    memory_load_double_events: (MemInstrEvent, ITypeRecord),
+    memory_store_byte_events: (MemInstrEvent, ITypeRecord),
+    memory_store_half_events: (MemInstrEvent, ITypeRecord),
+    memory_store_word_events: (MemInstrEvent, ITypeRecord),
+    memory_store_double_events: (MemInstrEvent, ITypeRecord),
+    utype_events: (UTypeEvent, JTypeRecord),
+    branch_events: (BranchEvent, ITypeRecord),
+    jal_events: (JumpEvent, JTypeRecord),
+    jalr_events: (JumpEvent, ITypeRecord),
+    cpu_local_memory_access: MemoryLocalEvent,
+);
+
 impl ExecutionRecord {
     /// Create a new [`ExecutionRecord`].
     #[must_use]
@@ -194,10 +271,26 @@ impl ExecutionRecord {
         #[cfg(feature = "mprotect")]
         let untrusted_memory = program.untrusted_memory;
         let mut result = Self { program, ..Default::default() };
+        let recycled = RECYCLED_EVENT_BUFFERS.lock().unwrap().pop();
+        if let Some(buffers) = recycled {
+            buffers.put_into(&mut result);
+        }
 
         // Vec::reserve mostly costs virtual address space (the kernel demand-faults
         // pages on first touch), so the per-opcode generous reserve is cheap in
         // practice — keep as-is to avoid reallocation cost in event-heavy shards.
+        //
+        // Not on Windows: there a reservation is committed memory, charged against the
+        // system's commit limit whether or not it is touched. With the full reserve, a
+        // process proving 144M-cycle fibonacci core proofs committed 59-79 GB for ~7 GB in
+        // use, and a second proving process on the host took the commit to its limit, where
+        // allocations (the GPU runtime's too) failed mid-proof. A small reserve grows to what
+        // the shard needs, and recycled buffers keep that capacity for the next shards.
+        let reservation_size = if cfg!(windows) {
+            reservation_size / WINDOWS_RESERVATION_DIVISOR
+        } else {
+            reservation_size
+        };
         result.alu_x0_events.reserve(reservation_size);
         result.add_events.reserve(reservation_size);
         result.addi_events.reserve(reservation_size);
@@ -247,6 +340,19 @@ impl ExecutionRecord {
         }
         result.global_dependencies_opt = global_dependencies_opt;
         result
+    }
+
+    /// Keeps the event buffers of an execution shard's record for the next record made by
+    /// [`ExecutionRecord::new_preallocated`], and drops the rest.
+    pub fn recycle(mut self) {
+        if self.cpu_event_count == 0 {
+            return;
+        }
+        let buffers = EventBuffers::take_from(&mut self);
+        let mut recycled = RECYCLED_EVENT_BUFFERS.lock().unwrap();
+        if recycled.len() < MAX_RECYCLED_EVENT_BUFFERS {
+            recycled.push(buffers);
+        }
     }
 
     /// Take out events from the [`ExecutionRecord`] that should be deferred to a separate shard.
@@ -583,6 +689,7 @@ impl ExecutionRecord {
         self.jal_events.clear();
         self.jalr_events.clear();
         self.byte_lookups.clear();
+        self.byte_lookup_counts.clear();
         self.precompile_events = PrecompileEvents::default();
         self.global_memory_initialize_events.clear();
         self.global_memory_finalize_events.clear();
@@ -648,6 +755,8 @@ pub struct RTypeRecord {
 }
 
 impl RTypeRecord {
+    #[allow(clippy::inline_always)]
+    #[inline(always)]
     pub(crate) fn new(value: &MemoryAccessRecord, instruction: &Instruction) -> Self {
         Self {
             op_a: instruction.op_a,
@@ -678,6 +787,8 @@ pub struct ITypeRecord {
 }
 
 impl ITypeRecord {
+    #[allow(clippy::inline_always)]
+    #[inline(always)]
     pub(crate) fn new(value: &MemoryAccessRecord, instruction: &Instruction) -> Self {
         debug_assert!(value.c.is_none());
         Self {
@@ -707,6 +818,8 @@ pub struct JTypeRecord {
 }
 
 impl JTypeRecord {
+    #[allow(clippy::inline_always)]
+    #[inline(always)]
     pub(crate) fn new(value: &MemoryAccessRecord, instruction: &Instruction) -> Self {
         debug_assert!(value.b.is_none());
         debug_assert!(value.c.is_none());
@@ -742,6 +855,8 @@ pub struct ALUTypeRecord {
 }
 
 impl ALUTypeRecord {
+    #[allow(clippy::inline_always)]
+    #[inline(always)]
     pub(crate) fn new(value: &MemoryAccessRecord, instruction: &Instruction) -> Self {
         Self {
             op_a: instruction.op_a,
@@ -768,6 +883,14 @@ pub struct UntrustedProgramInstructionRecord {
 }
 
 impl MachineRecord for ExecutionRecord {
+    fn recycle(self) {
+        ExecutionRecord::recycle(self);
+    }
+
+    fn dependencies_in_trace(&self) -> bool {
+        self.dependencies_in_trace
+    }
+
     fn stats(&self) -> HashMap<String, usize> {
         let mut stats = HashMap::new();
         stats.insert("cpu_events".to_string(), self.cpu_event_count as usize);
@@ -868,6 +991,7 @@ impl MachineRecord for ExecutionRecord {
         } else {
             self.add_byte_lookup_events_from_maps(vec![&other.byte_lookups]);
         }
+        self.byte_lookup_counts.append(&mut other.byte_lookup_counts);
 
         self.global_memory_initialize_events.append(&mut other.global_memory_initialize_events);
         self.global_memory_finalize_events.append(&mut other.global_memory_finalize_events);
@@ -940,6 +1064,40 @@ impl ByteRecord for ExecutionRecord {
                 *self.byte_lookups.entry(*blu_event).or_insert(0) += count;
             }
         }
+    }
+}
+
+/// The tag a record dump starts with ([`ExecutionRecord::to_dump_bytes`]). Bincode is
+/// positional, so a dump reads back only into a build with the same record layout: change the
+/// version whenever a serialized field is added, removed or reordered. Version 2 added
+/// `byte_lookup_counts` and `dependencies_in_trace`; untagged dumps are older.
+const RECORD_DUMP_TAG: &[u8; 12] = b"sp1-record\x00\x02";
+
+impl ExecutionRecord {
+    /// The record as a dump file's bytes (`SP1_RECORD_WRITE_DIR`): the format tag, then the
+    /// record.
+    pub fn to_dump_bytes(&self) -> bincode::Result<Vec<u8>> {
+        let mut bytes = RECORD_DUMP_TAG.to_vec();
+        bincode::serialize_into(&mut bytes, self)?;
+        Ok(bytes)
+    }
+
+    /// Reads a record dump ([`Self::to_dump_bytes`]). A dump of another record layout (another
+    /// build's) is an error saying so, not a misread record.
+    pub fn from_dump_bytes(bytes: &[u8]) -> Result<Self, String> {
+        let Some(record) = bytes.strip_prefix(RECORD_DUMP_TAG.as_slice()) else {
+            return Err(match bytes.strip_prefix(&RECORD_DUMP_TAG[..11]) {
+                Some([version, ..]) => format!(
+                    "the record dump has format version {version}, this build reads version {}: \
+                     dump it again with this build",
+                    RECORD_DUMP_TAG[11]
+                ),
+                _ => "the record dump has no format tag: it is from a build before record dumps \
+                      had one, so dump it again with this build"
+                    .to_string(),
+            });
+        };
+        bincode::deserialize(record).map_err(|e| format!("failed to deserialize the record: {e}"))
     }
 }
 
@@ -1645,5 +1803,24 @@ impl ExecutionRecord {
             .as_canonical_u32();
         }
         state.is_first_execution_shard = (state.initial_timestamp == 1) as u32;
+    }
+}
+
+#[cfg(test)]
+mod dump_tests {
+    use super::*;
+
+    #[test]
+    fn a_record_dump_reads_back_and_an_untagged_one_says_why_not() {
+        let record = ExecutionRecord::default();
+        let bytes = record.to_dump_bytes().unwrap();
+        assert!(ExecutionRecord::from_dump_bytes(&bytes).is_ok());
+        let untagged = bincode::serialize(&record).unwrap();
+        let e = ExecutionRecord::from_dump_bytes(&untagged).unwrap_err();
+        assert!(e.contains("no format tag"), "{e}");
+        let mut other_version = bytes.clone();
+        other_version[11] = 1;
+        let e = ExecutionRecord::from_dump_bytes(&other_version).unwrap_err();
+        assert!(e.contains("format version 1"), "{e}");
     }
 }

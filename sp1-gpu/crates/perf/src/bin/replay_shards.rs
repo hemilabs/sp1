@@ -202,8 +202,8 @@ async fn main() {
         for (i, job) in jobs.iter().enumerate() {
             // Deserialize the record.
             let record_bytes = std::fs::read(&job.record_path).expect("failed to read record file");
-            let record: ExecutionRecord =
-                bincode::deserialize(&record_bytes).expect("failed to deserialize record");
+            let record = ExecutionRecord::from_dump_bytes(&record_bytes)
+                .unwrap_or_else(|e| panic!("{}: {e}", job.record_path.display()));
 
             // Deserialize the VK.
             let vk_bytes = std::fs::read(&job.vk_path).expect("failed to read vk file");
@@ -257,7 +257,6 @@ async fn main() {
                     recursive_core_verifier,
                     &proof_shape,
                     reduce_shape,
-                    None,
                 );
 
                 // Build the witness using the real core proof. The other fields are not checked

@@ -7787,6 +7787,7 @@ name = "sp1-gpu-shard-prover"
 version = "6.8.1"
 dependencies = [
  "criterion",
+ "libc",
  "rand 0.8.6",
  "rayon",
  "serde_json",

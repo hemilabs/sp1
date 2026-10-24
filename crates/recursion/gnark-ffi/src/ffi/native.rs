@@ -353,6 +353,12 @@ pub fn release_groth16_caches() {
     unsafe { bind::ReleaseGroth16Caches() }
 }
 
+/// [`release_groth16_caches`], except that the circuit [`export_groth16_gpu_witness`] solves stays
+/// cached for the next proof.
+pub fn trim_groth16_caches() {
+    unsafe { bind::TrimGroth16Caches() }
+}
+
 /// Writes the Groth16 R1CS in `data_dir` to `output_path` without its debug information, which
 /// the prover does not use and which makes up about a third of the file.
 pub fn export_groth16_stripped_r1cs(data_dir: &str, output_path: &str) {

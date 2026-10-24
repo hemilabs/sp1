@@ -1,4 +1,5 @@
 //! The integration of all the prover components.
+mod prep_cache;
 mod prover;
 mod setup;
 mod types;

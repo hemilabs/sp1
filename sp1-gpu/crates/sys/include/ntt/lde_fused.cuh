@@ -176,11 +176,16 @@ __global__ void __launch_bounds__(128) lde_pass2(kb31_t* __restrict__ data, size
     }
 }
 
-// Kernels are only launched from host-only code; instantiate them for the device pass.
-template __global__ void lde_pass1<10>(const kb31_t*, kb31_t*, size_t, size_t, int, const kb31_t*, const kb31_t*, const kb31_t*);
-template __global__ void lde_pass1<11>(const kb31_t*, kb31_t*, size_t, size_t, int, const kb31_t*, const kb31_t*, const kb31_t*);
-template __global__ void lde_pass2<10>(kb31_t*, size_t, const kb31_t*);
-template __global__ void lde_pass2<11>(kb31_t*, size_t, const kb31_t*);
+// Kernels are only launched from host-only code; instantiate them for the device pass. The
+// parameters repeat `__restrict__`: with MSVC as nvcc's host compiler it is part of the type.
+template __global__ void lde_pass1<10>(const kb31_t* __restrict__, kb31_t* __restrict__, size_t, size_t, int,
+                                       const kb31_t* __restrict__, const kb31_t* __restrict__,
+                                       const kb31_t* __restrict__);
+template __global__ void lde_pass1<11>(const kb31_t* __restrict__, kb31_t* __restrict__, size_t, size_t, int,
+                                       const kb31_t* __restrict__, const kb31_t* __restrict__,
+                                       const kb31_t* __restrict__);
+template __global__ void lde_pass2<10>(kb31_t* __restrict__, size_t, const kb31_t* __restrict__);
+template __global__ void lde_pass2<11>(kb31_t* __restrict__, size_t, const kb31_t* __restrict__);
 
 // Small LDEs (lg ext domain <= 21): copy + zero-pad every column in one launch, then the sppark
 // GS passes batched over columns (GS_launcher's blockIdx.y batching), instead of 4 + 1..3

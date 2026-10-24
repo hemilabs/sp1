@@ -88,7 +88,7 @@ pub struct SP1RecursionProverConfig {
     /// Whether this worker's card may use the GPU Groth16 prover. Set by the GPU worker builder for
     /// cards above the 16 GB tier; false, i.e. gnark's CPU prover, otherwise. Whether it does is
     /// decided before each proof from the free GPU and host memory (see `groth16_backend`), which
-    /// in practice leaves the CPU prover on cards below 48 GB unless `SP1_GPU_RESET_BEFORE_WRAP`.
+    /// in practice leaves the CPU prover on cards below 32 GB unless `SP1_GPU_RESET_BEFORE_WRAP`.
     pub groth16_gpu: bool,
 }
 
@@ -347,7 +347,7 @@ impl<A: ArtifactClient, C: SP1ProverComponents> RecursionProverWorker<A, C> {
             RecursionKeys::Program(program) => {
                 let (vk, proof, permit) = self
                     .recursion_prover
-                    .setup_and_prove_shard(program, record, None, self.permits.clone())
+                    .setup_and_prove_shard(program.clone(), record, None, self.permits.clone())
                     .await;
                 let duration = permit.release();
                 metrics.increment_permit_time(duration);
@@ -369,7 +369,14 @@ impl<A: ArtifactClient, C: SP1ProverComponents> RecursionProverWorker<A, C> {
                     .await
                     .map_err(|e| TaskError::Fatal(e.into()))??;
                 }
-                let vk_merkle_proof = self.prover_data.recursion_vks.open(&vk)?.1;
+                let vk_merkle_proof = open_fresh_vk::<C>(
+                    &self.prover_data.recursion_vks,
+                    &self.recursion_prover,
+                    program,
+                    self.permits.clone(),
+                    &vk,
+                )
+                .await?;
                 SP1RecursionProof { vk, proof, vk_merkle_proof }
             }
         };
@@ -431,10 +438,15 @@ pub type RecursionProveSubmitHandle<A, C> = SubmitHandle<RecursionProvePipeline<
 
 pub type ReduceSubmitHandle<A, C> = SubmitHandle<ReducePipeline<A, C>>;
 
+/// The wrap prover, once built.
+type WrapProverCell<C> = Arc<OnceCell<Arc<WrapProver<C>>>>;
+
 pub struct SP1RecursionProver<A, C: SP1ProverComponents> {
     reduce_pipeline: Arc<ReducePipeline<A, C>>,
     pub shrink_prover: Arc<ShrinkProver<C>>,
-    wrap_prover: Arc<OnceCell<Arc<WrapProver<C>>>>,
+    /// The wrap prover, built once; the cell is replaced to build it again (see
+    /// [`Self::forget_wrap_prover`]).
+    wrap_prover: Arc<std::sync::Mutex<WrapProverCell<C>>>,
     wrap_prover_init: Arc<WrapProverInit<C>>,
     pub prover_data: Arc<RecursionProverData<C>>,
     artifact_client: A,
@@ -526,17 +538,22 @@ impl<A: ArtifactClient, C: SP1ProverComponents> SP1RecursionProver<A, C> {
             // Now do key generation sequentially (requires tokio runtime for GPU setup)
             let mut deferred_program = None;
             for (arity, program) in all_programs {
-                let (tx, rx) = oneshot::channel();
-                tokio::task::spawn({
-                    let program = program.clone();
-                    let air_prover = compress_prover.clone();
-                    async move {
-                        let permits = ProverSemaphore::new(1);
-                        let (pk, vk) = air_prover.setup(program, permits).await;
-                        tx.send((pk, vk)).ok();
-                    }
-                });
-                let (pk, vk) = rx.blocking_recv().unwrap();
+                let setup = || {
+                    let (tx, rx) = oneshot::channel();
+                    tokio::task::spawn({
+                        let program = program.clone();
+                        let air_prover = compress_prover.clone();
+                        async move {
+                            let permits = ProverSemaphore::new(1);
+                            let (pk, vk) = air_prover.setup(program, permits).await;
+                            tx.send((pk, vk)).ok();
+                        }
+                    });
+                    rx.blocking_recv().unwrap()
+                };
+                // These keys serve every proof of the process: a key set up wrong on the device
+                // would fail them all. With vk verification on, its vk must be in the vk map.
+                let (pk, vk) = setup_until_allowed(&recursion_vks, setup);
                 let pk = unsafe { pk.into_inner() };
                 if arity == 0 {
                     // Deferred
@@ -625,7 +642,7 @@ impl<A: ArtifactClient, C: SP1ProverComponents> SP1RecursionProver<A, C> {
             Self {
                 reduce_pipeline,
                 shrink_prover,
-                wrap_prover: Arc::new(OnceCell::new()),
+                wrap_prover: Arc::new(std::sync::Mutex::new(Arc::new(OnceCell::new()))),
                 wrap_prover_init: Arc::new(wrap_prover_init),
                 prover_data,
                 artifact_client,
@@ -633,6 +650,32 @@ impl<A: ArtifactClient, C: SP1ProverComponents> SP1RecursionProver<A, C> {
         })
         .await
         .unwrap()
+    }
+
+    /// Builds the wrap prover now, as the worker starts, if `SP1_PREWARM_WRAP=1`. By default the
+    /// first Groth16 or PLONK proof builds it while its earlier stages run (see
+    /// [`Self::start_building_wrap_prover`] and [`Self::run_shrink_wrap`]): built here, every
+    /// process paid for it at start-up (~0.5 s on an RTX 5090 host, where a kept wrap proving key
+    /// also sets the wrap program up on the GPU), including those that never wrap.
+    pub async fn prewarm_wrap_prover(&self) {
+        if !self.prover_data.vk_verification()
+            || std::env::var("SP1_PREWARM_WRAP").ok().as_deref() != Some("1")
+        {
+            return;
+        }
+        if let Err(e) = self.wrap_prover().await {
+            tracing::warn!("building the wrap prover ahead of time failed: {e}");
+        }
+    }
+
+    /// Starts building the wrap prover in the background, for a Groth16 or PLONK proof that has
+    /// just begun, so it is ready when the proof's wrap step needs it. If the build fails, that
+    /// step builds it again and reports the error.
+    pub fn start_building_wrap_prover(&self) {
+        let this = self.clone();
+        tokio::spawn(async move {
+            let _ = this.wrap_prover().await;
+        });
     }
 
     pub fn recursion_prover_pipeline(&self) -> &Arc<RecursionProvePipeline<A, C>> {
@@ -666,12 +709,26 @@ impl<A: ArtifactClient, C: SP1ProverComponents> SP1RecursionProver<A, C> {
         Ok(handle)
     }
 
+    /// Makes the next wrap build the wrap prover again, if it is still `used`: when a wrap proof
+    /// made with a kept proving key fails verification, the key's data on the device may be what
+    /// went wrong, and every later wrap proof would fail the same way.
+    fn forget_wrap_prover(&self, used: &Arc<WrapProver<C>>) {
+        if used.proving_key.is_none() {
+            return;
+        }
+        let mut cell = self.wrap_prover.lock().unwrap_or_else(|e| e.into_inner());
+        if cell.get().is_some_and(|current| Arc::ptr_eq(current, used)) {
+            tracing::warn!("rebuilding the wrap prover after a failed wrap proof verification");
+            *cell = Arc::new(OnceCell::new());
+        }
+    }
+
     async fn wrap_prover(&self) -> Result<Arc<WrapProver<C>>, TaskError> {
         let wrap_prover_init = self.wrap_prover_init.clone();
         let prover_data = self.prover_data.clone();
 
-        let wrap_prover = self
-            .wrap_prover
+        let cell = self.wrap_prover.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let wrap_prover = cell
             .get_or_try_init(|| async move {
                 let wrap_prover_init = wrap_prover_init.clone();
                 let prover_data = prover_data.clone();
@@ -679,25 +736,25 @@ impl<A: ArtifactClient, C: SP1ProverComponents> SP1RecursionProver<A, C> {
                     let expected_wrap_vk = wrap_prover_init.expected_wrap_vk.clone();
                     let wrap_air_prover = wrap_prover_init.wrap_air_prover.build();
                     let wrap_air_permits = wrap_prover_init.wrap_air_prover.permits();
+                    // With vk verification on, the wrap vk is known: skip the GPU setup here and
+                    // check the vk that each wrap proof's own setup computes instead (see
+                    // `WrapProver::prove`). Without it, the vk is computed here.
+                    let known_vk = prover_data
+                        .recursion_vks
+                        .vk_verification()
+                        .then_some(expected_wrap_vk.clone());
+                    // With a known vk, `new` checks any setup it runs against it (a mismatch is
+                    // retried: the build runs again) and keeps it as the verifying key.
                     let wrap_prover = WrapProver::new(
                         wrap_air_prover,
                         wrap_air_permits,
                         prover_data,
                         wrap_prover_init.config.clone(),
                         wrap_prover_init.shrink_shape.clone(),
-                    );
+                        known_vk,
+                    )?;
 
-                    if wrap_prover.prover_data.recursion_vks.vk_verification()
-                        && wrap_prover.verifying_key != expected_wrap_vk
-                    {
-                        return Err(TaskError::Fatal(anyhow::anyhow!(
-                            "Wrap vk mismatch, expected: {:?}, got: {:?}",
-                            expected_wrap_vk,
-                            wrap_prover.verifying_key
-                        )));
-                    }
-
-                    Ok(Arc::new(wrap_prover))
+                    Ok::<_, TaskError>(Arc::new(wrap_prover))
                 })
                 .await
                 .map_err(|err| TaskError::Fatal(anyhow::anyhow!(err)))?
@@ -723,22 +780,27 @@ impl<A: ArtifactClient, C: SP1ProverComponents> SP1RecursionProver<A, C> {
             .instrument(tracing::debug_span!("download compress proof"))
             .await?;
 
-        let shrink_proof = self
-            .shrink_prover
-            .prove(compress_proof, &metrics)
-            .instrument(tracing::info_span!("prove shrink"))
-            .await?;
+        // The wrap prover (built once, mostly on the CPU) is built while the shrink proof runs.
+        let (shrink_proof, wrap_prover) = tokio::join!(
+            self.shrink_prover
+                .prove(compress_proof, &metrics)
+                .instrument(tracing::info_span!("prove shrink")),
+            self.wrap_prover(),
+        );
+        let shrink_proof = shrink_proof?;
 
         tracing::debug_span!("verify shrink proof")
             .in_scope(|| self.shrink_prover.verify(&shrink_proof))?;
 
-        let wrap_prover = self.wrap_prover().await?;
+        let wrap_prover = wrap_prover?;
         let wrap_proof = wrap_prover
             .prove(shrink_proof, &metrics)
             .instrument(tracing::info_span!("prove wrap"))
             .await?;
 
-        tracing::debug_span!("verify wrap proof").in_scope(|| wrap_prover.verify(&wrap_proof))?;
+        tracing::debug_span!("verify wrap proof")
+            .in_scope(|| wrap_prover.verify(&wrap_proof))
+            .inspect_err(|_| self.forget_wrap_prover(&wrap_prover))?;
 
         self.artifact_client
             .upload(&wrap_proof_artifact, wrap_proof)
@@ -813,6 +875,8 @@ impl<A: ArtifactClient, C: SP1ProverComponents> SP1RecursionProver<A, C> {
             #[cfg(feature = "native-gnark")]
             let _slot = sp1_recursion_gnark_ffi::final_wrap_slot("Groth16");
             #[cfg(feature = "native-gnark")]
+            release_recycled_event_buffers_if_short();
+            #[cfg(feature = "native-gnark")]
             let use_gpu = {
                 use super::groth16_backend::{use_gpu, Groth16Inputs};
                 let override_env = std::env::var("SP1_GROTH16_GPU").ok();
@@ -824,7 +888,9 @@ impl<A: ArtifactClient, C: SP1ProverComponents> SP1RecursionProver<A, C> {
                     && helper_available
                     && !matches!(override_env.as_deref(), Some("0" | "false"))
                 {
-                    if let Some((before, after)) = sp1_recursion_gnark_ffi::gpu_trim_memory_pool() {
+                    if let Some((before, after)) = sp1_recursion_gnark_ffi::gpu_trim_memory_pool(
+                        super::groth16_backend::GPU_HELPER_VRAM_BYTES,
+                    ) {
                         tracing::info!(
                             "Groth16: trimmed the GPU memory pool: {} -> {} MiB free",
                             before >> 20,
@@ -837,7 +903,9 @@ impl<A: ArtifactClient, C: SP1ProverComponents> SP1RecursionProver<A, C> {
                     card_eligible,
                     helper_available,
                     vram_free: sp1_recursion_gnark_ffi::gpu_free_memory(),
-                    gpu_reset: sp1_recursion_gnark_ffi::gpu_reset_requested(),
+                    vram_total: sp1_recursion_gnark_ffi::gpu_total_memory(),
+                    gpu_reset: sp1_recursion_gnark_ffi::gpu_reset_requested()
+                        && sp1_recursion_gnark_ffi::gpu_reset_available(),
                     mem_available: sp1_recursion_gnark_ffi::host_memory::available(),
                     pk_cache_ready: Groth16Bn254Prover::gpu_pk_cache_ready(&build_dir),
                 });
@@ -877,6 +945,7 @@ impl<A: ArtifactClient, C: SP1ProverComponents> SP1RecursionProver<A, C> {
                         "synthetic verify failure (SP1_GPU_VERIFY_FAIL_INJECT)"
                     ));
                 }
+                let _span = tracing::debug_span!("verify groth16 proof").entered();
                 prover
                     .verify(
                         proof,
@@ -953,6 +1022,8 @@ impl<A: ArtifactClient, C: SP1ProverComponents> SP1RecursionProver<A, C> {
             // PLONK's final wrap is as memory-hungry as Groth16's and shares its host-wide slot.
             #[cfg(feature = "native-gnark")]
             let _slot = sp1_recursion_gnark_ffi::final_wrap_slot("PLONK");
+            #[cfg(feature = "native-gnark")]
+            release_recycled_event_buffers_if_short();
             let SP1WrapProof { vk: wrap_vk, proof: wrap_proof } = wrap_proof;
             let input = SP1ShapedWitnessValues {
                 vks_and_proofs: vec![(wrap_vk.clone(), wrap_proof.clone())],
@@ -1014,14 +1085,50 @@ impl<A: ArtifactClient, C: SP1ProverComponents> SP1RecursionProver<A, C> {
                 let _ = (&vkey_bn, &cvd_bn, &exit_bn, &vk_root_bn, &proof_nonce_bn);
                 Ok(prover.prove(witness.clone(), &build_dir))
             };
-            // The GPU prover first, when asked for. Its helper needs ~24 GB of GPU memory, which a
-            // card holding this prover's state does not have unless the process resets it first
-            // (SP1_GPU_RESET_BEFORE_WRAP) or SP1_PLONK_GPU_HELPER_DEVICES routes the helper to
-            // another card; if it fails, the CPU prover takes over rather than losing the proof.
+            // The GPU prover first, when asked for and its helper fits: it needs ~23 GiB of GPU
+            // memory, which a card holding this prover's state has free only once the memory
+            // pool's idle reserve is given back (on a 32 GB card), or after a reset
+            // (SP1_GPU_RESET_BEFORE_WRAP), unless SP1_PLONK_GPU_HELPER_DEVICES routes the helper to
+            // another card; and ~112 GiB of host memory (the CPU prover needs ~42 GB). Deciding
+            // here spares a card or host that cannot fit it the witness export and the helper's
+            // start. If it fails, the CPU prover takes over rather than losing the proof.
+            #[cfg(feature = "native-gnark")]
+            let use_gpu = plonk_gpu && {
+                use super::groth16_backend::{use_gpu_plonk, PlonkInputs};
+                use sp1_recursion_gnark_ffi as ffi;
+                let helper_available = PlonkBn254Prover::gpu_helper_available();
+                let helper_routed = ffi::plonk_helper_devices().is_some();
+                if helper_available && !helper_routed {
+                    if let Some((before, after)) =
+                        ffi::gpu_trim_memory_pool(ffi::PLONK_GPU_HELPER_VRAM_BYTES)
+                    {
+                        tracing::info!(
+                            "PLONK: trimmed the GPU memory pool: {} -> {} MiB free",
+                            before >> 20,
+                            after >> 20
+                        );
+                    }
+                }
+                let (gpu, reason) = use_gpu_plonk(&PlonkInputs {
+                    helper_available,
+                    helper_routed,
+                    vram_free: ffi::gpu_free_memory(),
+                    vram_total: ffi::gpu_total_memory(),
+                    gpu_reset: ffi::gpu_reset_requested() && ffi::gpu_reset_available(),
+                    mem_available: ffi::host_memory::available(),
+                    pk_cache_ready: PlonkBn254Prover::gpu_pk_cache_ready(&build_dir),
+                    server_running: PlonkBn254Prover::gpu_helper_server_running(),
+                });
+                tracing::info!(
+                    "PLONK prover: {} ({reason})",
+                    if gpu { "GPU" } else { "gnark CPU" }
+                );
+                gpu
+            };
             #[cfg(feature = "native-gnark")]
             let proof = super::groth16_backend::prove_preferring_gpu(
                 "PLONK",
-                plonk_gpu,
+                use_gpu,
                 || {
                     prove_with_retry(
                         "plonk_wrap_gpu",
@@ -1219,6 +1326,87 @@ fn dummy_compose_input<C: SP1ProverComponents>(
     )
 }
 
+/// Host memory below which a final wrap gives back the core shards' recycled event buffers.
+#[cfg(feature = "native-gnark")]
+const WRAP_RECYCLED_BUFFERS_MIN_AVAILABLE: u64 = 64 << 30;
+
+/// Gives back the event buffers the core shards left for the next proof's (up to eight records',
+/// ~1.5 GB each) where the host has less than [`WRAP_RECYCLED_BUFFERS_MIN_AVAILABLE`] available:
+/// the final wrap's gnark solve and helper need several GB of host memory more than the next core
+/// shards need warm buffers. On hosts with more, they stay warm.
+#[cfg(feature = "native-gnark")]
+fn release_recycled_event_buffers_if_short() {
+    if sp1_recursion_gnark_ffi::host_memory::available()
+        .is_some_and(|available| available < WRAP_RECYCLED_BUFFERS_MIN_AVAILABLE)
+    {
+        sp1_core_executor::release_recycled_event_buffers();
+    }
+}
+
+/// Runs `setup` (a recursion program's setup on the GPU) until its vk is in the vk map, at most four
+/// times, for keys set up once and used by every proof of the process. Without vk verification
+/// there is nothing to check against, and the first setup is kept.
+///
+/// # Panics
+///
+/// If no setup's vk is allowed: the device keeps setting the program up wrong, or the vk map does
+/// not match this build, and every proof that uses the key would fail its vk check.
+fn setup_until_allowed<K>(
+    recursion_vks: &RecursionVks,
+    setup: impl Fn() -> (K, MachineVerifyingKey<SP1GlobalContext>),
+) -> (K, MachineVerifyingKey<SP1GlobalContext>) {
+    const SETUPS: usize = 4;
+    for attempt in 1..=SETUPS {
+        let keys = setup();
+        if !recursion_vks.vk_verification() || recursion_vks.open(&keys.1).is_ok() {
+            return keys;
+        }
+        tracing::warn!(
+            "a recursion program's setup gave a vk outside the vk map (setup {attempt} of \
+             {SETUPS})"
+        );
+        // The keys go before the next setup: they hold a prover permit, which that setup may need
+        // (the shrink setup takes one from the provers' shared pool).
+        drop(keys);
+    }
+    panic!(
+        "a recursion program's setup gave a vk outside the vk map {SETUPS} times: the device sets \
+         it up wrong, or the vk map does not match this build"
+    );
+}
+
+/// The vk-map lookup of `vk`, which a setup of `program` just computed on the GPU. A vk outside
+/// the vk map fails the task. Where setting the program up again gives the same vk, it is the
+/// program's own vk, which the vk map does not have, and no retry can change that: the task fails
+/// at once. Otherwise the first setup went wrong on the device and the task is retried, with the
+/// device caches emptied first, so that the retry sets the program up again rather than getting
+/// the cached setup back.
+async fn open_fresh_vk<C: SP1ProverComponents>(
+    recursion_vks: &RecursionVks,
+    prover: &C::RecursionProver,
+    program: Arc<RecursionProgram<SP1Field>>,
+    permits: ProverSemaphore,
+    vk: &MachineVerifyingKey<SP1GlobalContext>,
+) -> Result<MerkleProof<SP1GlobalContext>, TaskError> {
+    let e = match recursion_vks.open(vk) {
+        Ok((_, vk_merkle_proof)) => return Ok(vk_merkle_proof),
+        Err(TaskError::Fatal(e)) => e,
+        Err(e) => return Err(e),
+    };
+    tokio::task::spawn_blocking(sp1_recursion_gnark_ffi::device_caches::release)
+        .await
+        .map_err(|e| TaskError::Fatal(e.into()))?;
+    let (_keys, again) = prover.setup(program, permits).await;
+    if again.hash_koalabear() == vk.hash_koalabear() {
+        return Err(TaskError::Fatal(e.context("vk of a setup run twice on the GPU")));
+    }
+    tracing::warn!(
+        "a recursion program's setup on the GPU gave a vk outside the vk map, and setting it up \
+         again gave another vk: retrying the task"
+    );
+    Err(TaskError::Retryable(e.context("vk of a setup just run on the GPU")))
+}
+
 pub struct ShrinkProver<C: SP1ProverComponents> {
     prover: Arc<C::RecursionProver>,
     permits: ProverSemaphore,
@@ -1251,14 +1439,15 @@ impl<C: SP1ProverComponents> ShrinkProver<C> {
             &input,
         ));
 
-        let (pk, vk) = {
+        // The shrink vk serves every proof of the process (see `setup_until_allowed`).
+        let (pk, vk) = setup_until_allowed(&prover_data.recursion_vks, || {
             let (prover, program, permits) = (prover.clone(), program.clone(), permits.clone());
             let (tx, rx) = oneshot::channel();
             tokio::task::spawn(async move {
                 tx.send(prover.setup(program.clone(), permits.clone()).await).ok()
             });
             rx.blocking_recv().unwrap()
-        };
+        });
         let shrink_shape = {
             let (tx, rx) = oneshot::channel();
             tokio::task::spawn(async move {
@@ -1335,7 +1524,14 @@ impl<C: SP1ProverComponents> ShrinkProver<C> {
         let duration = permit.release();
         metrics.increment_permit_time(duration);
 
-        let vk_merkle_proof = self.prover_data.recursion_vks.open(&vk)?.1;
+        let vk_merkle_proof = open_fresh_vk::<C>(
+            &self.prover_data.recursion_vks,
+            &self.prover,
+            self.program.clone(),
+            self.permits.clone(),
+            &vk,
+        )
+        .await?;
         Ok(SP1RecursionProof { vk: self.verifying_key.clone(), proof, vk_merkle_proof })
     }
 
@@ -1348,10 +1544,24 @@ impl<C: SP1ProverComponents> ShrinkProver<C> {
         vk.observe_into(&mut challenger);
         C::shrink_verifier()
             .verify_shard(vk, proof, &mut challenger)
-            .map_err(|e| TaskError::Fatal(e.into()))?;
+            .map_err(|e| TaskError::Retryable(anyhow::anyhow!("shrink verify failed: {e}")))?;
 
         self.prover_data.recursion_vks.verify(vk_merkle_proof, vk)
     }
+}
+
+/// Checks the vk a wrap setup just computed on the GPU against the one proofs are verified
+/// against. A mismatch is retryable: the setup may have gone wrong on the device.
+fn check_wrap_vk(
+    expected: &MachineVerifyingKey<SP1OuterGlobalContext>,
+    got: &MachineVerifyingKey<SP1OuterGlobalContext>,
+) -> Result<(), TaskError> {
+    if expected == got {
+        return Ok(());
+    }
+    Err(TaskError::Retryable(anyhow::anyhow!(
+        "Wrap vk mismatch, expected: {expected:?}, got: {got:?}"
+    )))
 }
 
 /// The wrap program's proving key.
@@ -1372,13 +1582,16 @@ pub struct WrapProver<C: SP1ProverComponents> {
 }
 
 impl<C: SP1ProverComponents> WrapProver<C> {
+    /// Builds the wrap program. `known_vk` is the wrap vk when it is known in advance; otherwise
+    /// it is computed with a setup on the GPU.
     pub fn new(
         prover: Arc<C::WrapProver>,
         permits: ProverSemaphore,
         prover_data: Arc<RecursionProverData<C>>,
         config: SP1RecursionProverConfig,
         shrink_shape: BTreeMap<String, usize>,
-    ) -> Self {
+        known_vk: Option<MachineVerifyingKey<SP1OuterGlobalContext>>,
+    ) -> Result<Self, TaskError> {
         let verifier = C::shrink_verifier();
         let shrink_proof_shape =
             SP1RecursionProofShape { shape: RecursionShape::new(shrink_shape) };
@@ -1396,7 +1609,7 @@ impl<C: SP1ProverComponents> WrapProver<C> {
             config.vk_verification,
             &wrap_input,
         ));
-        let (preprocessed, verifying_key) = {
+        let setup = || {
             let (prover, program, permits) = (prover.clone(), program.clone(), permits.clone());
             let (tx, rx) = oneshot::channel();
             tokio::task::spawn(async move {
@@ -1405,10 +1618,21 @@ impl<C: SP1ProverComponents> WrapProver<C> {
             rx.blocking_recv().unwrap()
         };
         let keep = std::env::var("SP1_WRAP_PERSISTENT_PK").map(|v| v != "0").unwrap_or(true);
-        // The setup's permit is released here, as when the key was dropped: proving takes its own.
-        let proving_key = keep.then(|| unsafe { preprocessed.into_inner() });
+        let (verifying_key, proving_key) = if keep {
+            let (preprocessed, verifying_key) = setup();
+            // The setup computed the vk of the wrap program; it must be the one proofs are checked
+            // against.
+            if let Some(known_vk) = &known_vk {
+                check_wrap_vk(known_vk, &verifying_key)?;
+            }
+            // The setup's permit is released here, as when the key was dropped: proving takes its
+            // own.
+            (verifying_key, Some(unsafe { preprocessed.into_inner() }))
+        } else {
+            (known_vk.unwrap_or_else(|| setup().1), None)
+        };
 
-        Self { prover, permits, program, verifying_key, proving_key, prover_data }
+        Ok(Self { prover, permits, program, verifying_key, proving_key, prover_data })
     }
 
     pub async fn prove(
@@ -1433,13 +1657,14 @@ impl<C: SP1ProverComponents> WrapProver<C> {
         };
 
         let (proof, permit) = match &self.proving_key {
+            // The key's vk was checked when it was set up.
             Some(pk) => {
                 self.prover
                     .prove_shard_with_pk(pk.clone(), execution_record, self.permits.clone())
                     .await
             }
             None => {
-                let (_, proof, permit) = self
+                let (vk, proof, permit) = self
                     .prover
                     .setup_and_prove_shard(
                         self.program.clone(),
@@ -1448,6 +1673,9 @@ impl<C: SP1ProverComponents> WrapProver<C> {
                         self.permits.clone(),
                     )
                     .await;
+                // The setup above computed the vk of the wrap program; it must be the one proofs
+                // are checked against.
+                check_wrap_vk(&self.verifying_key, &vk)?;
                 (proof, permit)
             }
         };
@@ -1466,6 +1694,38 @@ impl<C: SP1ProverComponents> WrapProver<C> {
         vk.observe_into(&mut challenger);
         C::wrap_verifier()
             .verify_shard(vk, proof, &mut challenger)
-            .map_err(|e| TaskError::Fatal(e.into()))
+            .map_err(|e| TaskError::Retryable(anyhow::anyhow!("wrap verify failed: {e}")))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use sp1_recursion_circuit::dummy::dummy_vk;
+
+    use super::*;
+
+    /// Keys that count how many of them are alive, like a setup's keys holding a prover permit.
+    struct Keys<'a>(&'a AtomicUsize);
+
+    impl Drop for Keys<'_> {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
+    /// A setup whose vk is not allowed is run again only once its keys are gone: with a one-permit
+    /// pool (the shrink setup's), the next setup would otherwise wait for their permit forever.
+    /// After the last setup, start-up fails.
+    #[test]
+    #[should_panic(expected = "outside the vk map 4 times")]
+    fn a_setup_is_run_again_without_the_keys_of_the_last() {
+        let alive = AtomicUsize::new(0);
+        let recursion_vks = RecursionVks::new(None, 4, true);
+        let _ = setup_until_allowed(&recursion_vks, || {
+            assert_eq!(alive.fetch_add(1, Ordering::SeqCst), 0, "the last setup's keys are alive");
+            (Keys(&alive), dummy_vk())
+        });
     }
 }

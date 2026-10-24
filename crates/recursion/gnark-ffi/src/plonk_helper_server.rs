@@ -35,10 +35,11 @@
 //!
 //! Request:
 //! ```json
-//! {"witness_init_dir":"…","witness_json":"…","vkey_hash_hex":"…","out":"…"}
+//! {"witness_init_dir":"…","witness_json":"…","witness_dir":"…","vkey_hash_hex":"…","out":"…"}
 //! {"command":"shutdown"}
 //! {"command":"ping"}
 //! ```
+//! `witness_dir` holds the proof's solved witness (the server's `--gpu-dir` if absent).
 //! `witness_init_dir` is required iff the server was started with
 //! `--prep-circuit-dir` (Phase H GPU SCS solver path).
 //!
@@ -108,6 +109,7 @@ impl PlonkHelperServer {
         for (k, v) in extra_env {
             cmd.env(k, v);
         }
+        crate::subprocess::kill_first_when_out_of_memory(&mut cmd);
         let mut child = cmd
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -155,6 +157,7 @@ impl PlonkHelperServer {
     pub fn prove(
         &mut self,
         witness_json: &Path,
+        witness_dir: &Path,
         vkey_hash_hex: &str,
         out: &Path,
         witness_init_dir: Option<&Path>,
@@ -164,6 +167,7 @@ impl PlonkHelperServer {
         }
         let mut req = serde_json::Map::new();
         req.insert("witness_json".into(), witness_json.to_string_lossy().into_owned().into());
+        req.insert("witness_dir".into(), witness_dir.to_string_lossy().into_owned().into());
         req.insert("vkey_hash_hex".into(), vkey_hash_hex.into());
         req.insert("out".into(), out.to_string_lossy().into_owned().into());
         if let Some(d) = witness_init_dir {
@@ -231,6 +235,16 @@ pub fn singleton() -> &'static Mutex<Option<PlonkHelperServer>> {
     SERVER.get_or_init(|| Mutex::new(None))
 }
 
+/// Whether the singleton server has a helper running: started by an earlier proof, or proving
+/// for another one now (its lock is held).
+pub fn running() -> bool {
+    match singleton().try_lock() {
+        Ok(server) => server.is_some(),
+        Err(std::sync::TryLockError::WouldBlock) => true,
+        Err(std::sync::TryLockError::Poisoned(_)) => false,
+    }
+}
+
 /// Returns true iff `SP1_PLONK_GPU_SERVER` is set to `1`/`true`/`on`.
 /// Default OFF so the dispatcher remains backward compatible.
 pub fn enabled() -> bool {
@@ -250,6 +264,7 @@ pub fn with_server(
     prep_circuit_dir: Option<&Path>,
     extra_env: &[(String, String)],
     witness_json: &Path,
+    witness_dir: &Path,
     vkey_hash_hex: &str,
     out: &Path,
     witness_init_dir: Option<&Path>,
@@ -284,7 +299,7 @@ pub fn with_server(
     }
 
     let server = guard.as_mut().expect("server just inserted");
-    match server.prove(witness_json, vkey_hash_hex, out, witness_init_dir) {
+    match server.prove(witness_json, witness_dir, vkey_hash_hex, out, witness_init_dir) {
         Ok(outcome) => Ok(outcome),
         Err(e) => {
             tracing::warn!("[plonk-server] prove failed ({e}); tearing down server for respawn");

@@ -1,4 +1,5 @@
 use core::mem;
+use core::mem::MaybeUninit;
 use std::sync::Arc;
 
 use futures::future::join_all;
@@ -17,7 +18,7 @@ use sp1_hypercube::septic_extension::{SepticBlock, SepticExtension};
 
 use sp1_gpu_cudart::TracegenRiscvGlobalKernel;
 
-use crate::{CudaTracegenAir, F};
+use crate::{input_bytes, upload_input, CudaTracegenAir, StagedInput, F};
 
 // Keep in sync with the CUDA constants in sys/lib/scan/scan.cu.
 const CURVE_SCAN_BLOCK_SIZE: usize = 256;
@@ -62,20 +63,21 @@ impl CudaTracegenAir<F> for GlobalChip {
         true
     }
 
-    async fn generate_trace_device(
+    fn main_device_input<'a>(&self, record: &'a Self::Record) -> Option<&'a [MaybeUninit<u8>]> {
+        Some(input_bytes(&record.global_interaction_events))
+    }
+
+    async fn generate_trace_device_staged(
         &self,
         input: &Self::Record,
         output: &mut Self::Record,
+        staged: Option<StagedInput>,
         scope: &TaskScope,
     ) -> Result<DeviceMle<F>, CopyError> {
         let events = &input.global_interaction_events;
         let events_len = events.len();
 
-        let events_device = {
-            let mut buf = Buffer::try_with_capacity_in(events.len(), scope.clone()).unwrap();
-            buf.extend_from_host_slice(events)?;
-            buf
-        };
+        let events_device = upload_input(events, staged, scope)?;
 
         const NUM_GLOBAL_COLS: usize = size_of::<GlobalCols<u8>>();
 
@@ -234,7 +236,9 @@ impl CudaTracegenAir<F> for GlobalChip {
         // Wrap the trace so we can use it in concurrent tasks.
         let trace = Arc::new(trace);
 
-        let global_sum = if height == 0 {
+        // No events (the padded height is never zero): nothing accumulated, and no last event row
+        // to read the sum from.
+        let global_sum = if height == 0 || events_len == 0 {
             SepticDigest(SepticCurve::convert(SepticDigest::<F>::zero().0, |x| {
                 F::as_canonical_u32(&x)
             }))
@@ -278,11 +282,11 @@ mod tests {
     use slop_tensor::Tensor;
     use sp1_core_executor::{events::GlobalInteractionEvent, ExecutionRecord};
     use sp1_core_machine::global::GlobalChip;
-    use sp1_gpu_cudart::TaskScope;
+    use sp1_gpu_cudart::{PinnedBuffer, TaskScope};
     use sp1_hypercube::air::MachineAir;
     use sp1_hypercube::MachineRecord;
 
-    use crate::{CudaTracegenAir, F};
+    use crate::{CudaTracegenAir, StagedInput, F};
 
     #[test]
     fn test_hierarchical_curve_scan_boundaries() {
@@ -351,6 +355,30 @@ mod tests {
             .to_host()
             .expect("should copy trace to host successfully")
             .into_guts();
+
+        // The staged path (events first copied into pinned memory) must give the identical trace.
+        let staged_shard =
+            ExecutionRecord { global_interaction_events: events.clone(), ..Default::default() };
+        let input = chip.main_device_input(&staged_shard).unwrap();
+        let mut pinned = PinnedBuffer::<u8>::with_capacity(input.len());
+        unsafe {
+            std::ptr::copy_nonoverlapping(input.as_ptr().cast(), pinned.as_mut_ptr(), input.len())
+        };
+        let staged = unsafe { StagedInput::new(pinned.as_ptr(), input.len()) };
+        let gpu_trace_staged = chip
+            .generate_trace_device_staged(
+                &staged_shard,
+                &mut ExecutionRecord::default(),
+                Some(staged),
+                &scope,
+            )
+            .await
+            .expect("should copy events to device successfully")
+            .to_host()
+            .expect("should copy trace to host successfully")
+            .into_guts();
+        assert!(gpu_trace.as_slice() == gpu_trace_staged.as_slice(), "staged trace differs");
+        assert_eq!(staged_shard.public_values::<F>(), shard.public_values::<F>());
 
         crate::tests::test_traces_eq(&trace, &gpu_trace, &events);
 

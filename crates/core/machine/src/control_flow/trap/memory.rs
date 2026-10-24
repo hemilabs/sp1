@@ -11,11 +11,13 @@ use crate::{
 };
 use hashbrown::HashMap;
 use itertools::Itertools;
-use slop_maybe_rayon::prelude::{IndexedParallelIterator, ParallelIterator, ParallelSlice, ParallelSliceMut};
 use rrs_lib::instruction_formats::{OPCODE_LOAD, OPCODE_STORE};
 use slop_air::{Air, BaseAir};
 use slop_algebra::{AbstractField, PrimeField32};
 use slop_matrix::Matrix;
+use slop_maybe_rayon::prelude::{
+    IndexedParallelIterator, ParallelIterator, ParallelSlice, ParallelSliceMut,
+};
 use sp1_core_executor::{
     events::{ByteLookupEvent, ByteRecord, MemoryAccessPosition, TrapMemInstrEvent},
     ByteOpcode, ExecutionRecord, Opcode, Program, CLK_INC,

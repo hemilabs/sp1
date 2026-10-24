@@ -7,11 +7,13 @@ mod prefix_sum_checks;
 mod sbox;
 mod select;
 
+use std::mem::MaybeUninit;
+
 use slop_alloc::mem::CopyError;
 use sp1_gpu_cudart::{DeviceMle, TaskScope};
 use sp1_recursion_machine::RecursionAir;
 
-use crate::{CudaTracegenAir, PreprocessedPrep, F};
+use crate::{CudaTracegenAir, PreprocessedPrep, StagedInput, F};
 
 impl<const DEGREE: usize, const VAR_EVENTS_PER_ROW: usize> CudaTracegenAir<F>
     for RecursionAir<F, DEGREE, VAR_EVENTS_PER_ROW>
@@ -75,33 +77,50 @@ impl<const DEGREE: usize, const VAR_EVENTS_PER_ROW: usize> CudaTracegenAir<F>
         }
     }
 
+    fn preprocessed_device_input<'a>(
+        &self,
+        prep: &'a PreprocessedPrep,
+    ) -> Option<&'a [MaybeUninit<u8>]> {
+        match self {
+            Self::BaseAlu(chip) => chip.preprocessed_device_input(prep),
+            Self::ExtAlu(chip) => chip.preprocessed_device_input(prep),
+            Self::Poseidon2Wide(chip) => chip.preprocessed_device_input(prep),
+            Self::Poseidon2LinearLayer(chip) => chip.preprocessed_device_input(prep),
+            Self::Poseidon2SBox(chip) => chip.preprocessed_device_input(prep),
+            Self::ExtFeltConvert(chip) => chip.preprocessed_device_input(prep),
+            Self::Select(chip) => chip.preprocessed_device_input(prep),
+            _ => None,
+        }
+    }
+
     async fn generate_preprocessed_trace_device_prepared(
         &self,
         program: &Self::Program,
         prep: Option<PreprocessedPrep>,
+        staged: Option<StagedInput>,
         scope: &TaskScope,
     ) -> Result<Option<DeviceMle<F>>, CopyError> {
         match self {
             Self::BaseAlu(chip) => {
-                chip.generate_preprocessed_trace_device_prepared(program, prep, scope).await
+                chip.generate_preprocessed_trace_device_prepared(program, prep, staged, scope).await
             }
             Self::ExtAlu(chip) => {
-                chip.generate_preprocessed_trace_device_prepared(program, prep, scope).await
+                chip.generate_preprocessed_trace_device_prepared(program, prep, staged, scope).await
             }
             Self::Poseidon2Wide(chip) => {
-                chip.generate_preprocessed_trace_device_prepared(program, prep, scope).await
+                chip.generate_preprocessed_trace_device_prepared(program, prep, staged, scope).await
             }
             Self::Poseidon2LinearLayer(chip) => {
-                chip.generate_preprocessed_trace_device_prepared(program, prep, scope).await
+                chip.generate_preprocessed_trace_device_prepared(program, prep, staged, scope).await
             }
             Self::Poseidon2SBox(chip) => {
-                chip.generate_preprocessed_trace_device_prepared(program, prep, scope).await
+                chip.generate_preprocessed_trace_device_prepared(program, prep, staged, scope).await
             }
             Self::ExtFeltConvert(chip) => {
-                chip.generate_preprocessed_trace_device_prepared(program, prep, scope).await
+                chip.generate_preprocessed_trace_device_prepared(program, prep, staged, scope).await
             }
             Self::Select(chip) => {
-                chip.generate_preprocessed_trace_device_prepared(program, prep, scope).await
+                chip.generate_preprocessed_trace_device_prepared(program, prep, staged, scope).await
             }
             _ => self.generate_preprocessed_trace_device(program, scope).await,
         }
@@ -123,23 +142,52 @@ impl<const DEGREE: usize, const VAR_EVENTS_PER_ROW: usize> CudaTracegenAir<F>
         }
     }
 
-    async fn generate_trace_device(
+    fn main_device_input<'a>(&self, record: &'a Self::Record) -> Option<&'a [MaybeUninit<u8>]> {
+        match self {
+            Self::BaseAlu(chip) => chip.main_device_input(record),
+            Self::ExtAlu(chip) => chip.main_device_input(record),
+            Self::Poseidon2Wide(chip) => chip.main_device_input(record),
+            Self::Poseidon2LinearLayer(chip) => chip.main_device_input(record),
+            Self::Poseidon2SBox(chip) => chip.main_device_input(record),
+            Self::ExtFeltConvert(chip) => chip.main_device_input(record),
+            Self::Select(chip) => chip.main_device_input(record),
+            Self::PrefixSumChecks(chip) => chip.main_device_input(record),
+            _ => None,
+        }
+    }
+
+    async fn generate_trace_device_staged(
         &self,
         input: &Self::Record,
         output: &mut Self::Record,
+        staged: Option<StagedInput>,
         scope: &TaskScope,
     ) -> Result<DeviceMle<F>, CopyError> {
         match self {
-            Self::BaseAlu(chip) => chip.generate_trace_device(input, output, scope).await,
-            Self::ExtAlu(chip) => chip.generate_trace_device(input, output, scope).await,
-            Self::Poseidon2Wide(chip) => chip.generate_trace_device(input, output, scope).await,
-            Self::Poseidon2LinearLayer(chip) => {
-                chip.generate_trace_device(input, output, scope).await
+            Self::BaseAlu(chip) => {
+                chip.generate_trace_device_staged(input, output, staged, scope).await
             }
-            Self::Poseidon2SBox(chip) => chip.generate_trace_device(input, output, scope).await,
-            Self::ExtFeltConvert(chip) => chip.generate_trace_device(input, output, scope).await,
-            Self::Select(chip) => chip.generate_trace_device(input, output, scope).await,
-            Self::PrefixSumChecks(chip) => chip.generate_trace_device(input, output, scope).await,
+            Self::ExtAlu(chip) => {
+                chip.generate_trace_device_staged(input, output, staged, scope).await
+            }
+            Self::Poseidon2Wide(chip) => {
+                chip.generate_trace_device_staged(input, output, staged, scope).await
+            }
+            Self::Poseidon2LinearLayer(chip) => {
+                chip.generate_trace_device_staged(input, output, staged, scope).await
+            }
+            Self::Poseidon2SBox(chip) => {
+                chip.generate_trace_device_staged(input, output, staged, scope).await
+            }
+            Self::ExtFeltConvert(chip) => {
+                chip.generate_trace_device_staged(input, output, staged, scope).await
+            }
+            Self::Select(chip) => {
+                chip.generate_trace_device_staged(input, output, staged, scope).await
+            }
+            Self::PrefixSumChecks(chip) => {
+                chip.generate_trace_device_staged(input, output, staged, scope).await
+            }
             Self::PublicValues(_) => unimplemented!(),
             // Other chips don't have `CudaTracegenAir` implemented yet.
             _ => unimplemented!(),
@@ -149,7 +197,7 @@ impl<const DEGREE: usize, const VAR_EVENTS_PER_ROW: usize> CudaTracegenAir<F>
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use sp1_gpu_cudart::TaskScope;
+    use sp1_gpu_cudart::{PinnedBuffer, TaskScope};
 
     use rand::{rngs::StdRng, SeedableRng};
 
@@ -160,7 +208,7 @@ pub(crate) mod tests {
         AnalyzedInstruction, BasicBlock, RawProgram, RecursionProgram, RootProgram, SeqBlock,
     };
 
-    use crate::{CudaTracegenAir, F};
+    use crate::{CudaTracegenAir, StagedInput, F};
 
     pub async fn test_preprocessed_tracegen<A>(
         chip: A,
@@ -203,7 +251,7 @@ pub(crate) mod tests {
         let prep = chip.prepare_preprocessed_device(&program);
         assert!(prep.is_some(), "device preprocessed chips should prepare their instructions");
         let gpu_trace_prepared = chip
-            .generate_preprocessed_trace_device_prepared(&program, prep, &scope)
+            .generate_preprocessed_trace_device_prepared(&program, prep, None, &scope)
             .await
             .expect("should copy events to device successfully")
             .expect("should generate Some(preprocessed_trace)")
@@ -214,6 +262,27 @@ pub(crate) mod tests {
         assert!(
             gpu_trace.as_slice() == gpu_trace_prepared.as_slice(),
             "prepared preprocessed trace differs from the unprepared one"
+        );
+
+        // So must the staged path (prepared instructions first copied into pinned memory).
+        let prep = chip.prepare_preprocessed_device(&program).unwrap();
+        let input = chip.preprocessed_device_input(&prep).expect("prep should expose its bytes");
+        let mut pinned = PinnedBuffer::<u8>::with_capacity(input.len());
+        unsafe {
+            std::ptr::copy_nonoverlapping(input.as_ptr().cast(), pinned.as_mut_ptr(), input.len())
+        };
+        let staged = unsafe { StagedInput::new(pinned.as_ptr(), input.len()) };
+        let gpu_trace_staged = chip
+            .generate_preprocessed_trace_device_prepared(&program, Some(prep), Some(staged), &scope)
+            .await
+            .expect("should copy events to device successfully")
+            .expect("should generate Some(preprocessed_trace)")
+            .to_host()
+            .expect("should copy trace to host successfully")
+            .into_guts();
+        assert!(
+            gpu_trace.as_slice() == gpu_trace_staged.as_slice(),
+            "staged preprocessed trace differs from the unstaged one"
         );
 
         let Some(SeqBlock::Basic(BasicBlock { instrs })) =

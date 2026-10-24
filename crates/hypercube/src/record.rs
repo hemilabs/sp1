@@ -10,6 +10,17 @@ pub trait MachineRecord: Default + Sized + Send + Sync + Clone {
     /// Appends two records together.
     fn append(&mut self, other: &mut Self);
 
+    /// Called when the prover is done with the record, so that it can keep its allocations for
+    /// the next records. Dropping it is the default.
+    fn recycle(self) {}
+
+    /// Whether the record's dependencies leave out those of the chips that generate them in their
+    /// traces (`MachineAir::dependencies_in_trace`), which only a trace generator that runs those
+    /// chips first (`generate_trace_into_with_dependencies`) can trace correctly.
+    fn dependencies_in_trace(&self) -> bool {
+        false
+    }
+
     /// Returns the public values of the record.
     fn public_values<F: AbstractField>(&self) -> Vec<F>;
 

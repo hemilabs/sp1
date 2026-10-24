@@ -19,14 +19,38 @@ pub const GPU_NUM_CORE_WORKERS: usize = 8;
 /// holds a shard's records in host RAM (about +9 GB for the four extra on an RTX 5090 host).
 pub const GPU_NUM_CORE_WORKERS_MIN_AVAILABLE_RAM: u64 = 48 << 30;
 
+/// Normalize (lift) programs the GPU prover keeps compiled, on hosts with
+/// [`GPU_NORMALIZE_PROGRAM_CACHE_MIN_AVAILABLE_RAM`]. A program is compiled for each new core shard
+/// shape (0.4-1 s of CPU) and takes 50-70 MB; an rsp proof has 18 shapes, so the upstream default
+/// of 5 recompiles every one of them in every proof (~8-10 s of CPU per proof). 32 keeps a proof's
+/// programs for the next proof of a similar program, for up to ~2.3 GB.
+pub const GPU_NORMALIZE_PROGRAM_CACHE_SIZE: usize = 32;
+
+/// Host memory the process must have available for [`GPU_NORMALIZE_PROGRAM_CACHE_SIZE`].
+pub const GPU_NORMALIZE_PROGRAM_CACHE_MIN_AVAILABLE_RAM: u64 = 64 << 30;
+
 /// Whether the compress prover gets its own CUDA stream and permit (see
 /// `cuda_worker_builder_with_machine`). On by default above the 30 GB tier, where a core shard and
-/// a compress proof fit on the card together; `SP1_GPU_RECURSION_STREAM=0|1` overrides.
+/// a compress proof fit on the card together, except with SYCL; `SP1_GPU_RECURSION_STREAM=0|1`
+/// overrides.
+///
+/// On Windows two streams do not fit an Arc Pro B70 either: the video memory budget (31.8 GB) is
+/// below the card's 32 GB, and past it WDDM moves memory to shared system memory. Groth16 proofs
+/// of `local-fibonacci --param 20000000` (1.44B cycles) took 58-225 s, erratically, with two
+/// streams, and 44.4-44.8 s with one, without spilling (peak 30.7 GB).
+///
+/// On an Arc Pro B70 under Linux (xe driver, compute runtime 26.09, Level Zero's legacy adapter),
+/// two streams first crashed about one proof in nine inside the driver; with pageable copies
+/// staged and evictions draining every queue (lib/sycl/runtime.cpp) they no longer crash, but they
+/// do not fit: a 20M-cycle fibonacci Groth16 proof then reaches the card's 32 GB as compression
+/// starts (the kernels' scratch memory comes on top of the allocator's), and two of four such
+/// runs died out of device memory. One stream peaks at 30.7 GB and is under 1% slower (rsp
+/// compressed 77.0 s against 76.4 s, keccak 43.6 s against 43.3 s).
 fn separate_recursion_stream() -> bool {
     match std::env::var("SP1_GPU_RECURSION_STREAM").as_deref() {
         Ok("0") | Ok("false") => false,
         Ok("1") | Ok("true") => true,
-        _ => gpu_memory_gb() > 30,
+        _ => gpu_memory_gb() > 30 && sp1_gpu_cudart::sys::BACKEND != "sycl",
     }
 }
 
@@ -230,6 +254,43 @@ pub async fn cuda_worker_builder_with_machine(
         sp1_recursion_gnark_ffi::ffi::set_groth16_gpu_hooks(compute_h, msm_g1, msm_g2);
     }
 
+    // A final-wrap GPU helper needs the memory of the shard prover's device caches too, which a
+    // pool trim or a device reset does not return: rsp's PLONK helper otherwise ran out of memory.
+    // With HIP and SYCL, also the allocator's cached blocks, which the pool trim does not see (on
+    // HIP they go back to the arena when there is one, which a helper cannot have either).
+    sp1_recursion_gnark_ffi::device_caches::set_releaser(|| {
+        sp1_gpu_cudart::release_device_caches(true);
+        // SAFETY: takes nothing; waits for the device and frees blocks no one holds.
+        unsafe { sp1_gpu_cudart::sys::runtime::cuda_release_cached_memory() };
+    });
+    // HIP's arena holds the card's memory for the process's lifetime, out of a helper's reach.
+    // SAFETY: takes nothing and reads the arena's size under its lock.
+    sp1_recursion_gnark_ffi::device_caches::set_arena_bytes(|| unsafe {
+        sp1_gpu_cudart::sys::runtime::sp1_hip_arena_bytes() as u64
+    });
+    // A device reset before a wrap helper (SP1_GPU_RESET_BEFORE_WRAP) does not free the blocks the
+    // prover took from the stream-ordered allocator, its keys among them; this does, first.
+    // SAFETY: takes nothing; called only by a process about to reset its device, which uses the
+    // blocks no more (their later frees do nothing).
+    sp1_recursion_gnark_ffi::device_caches::set_live_blocks_freer(|| unsafe {
+        sp1_gpu_cudart::sys::runtime::cuda_free_live_blocks() as u64
+    });
+    // Measuring and trimming GPU memory for that helper. On Linux the wrap paths find the CUDA
+    // runtime library themselves; on Windows it is linked statically, and without these the GPU
+    // Groth16 prover was never chosen ("free GPU memory is unknown").
+    #[cfg(not(target_os = "linux"))]
+    if sp1_gpu_cudart::sys::BACKEND == "cuda" {
+        sp1_recursion_gnark_ffi::device_caches::set_runtime(
+            sp1_recursion_gnark_ffi::device_caches::Runtime {
+                mem_get_info: || {
+                    let (free, total) = sp1_gpu_cudart::cuda_memory_info().ok()?;
+                    Some((free as u64, total as u64))
+                },
+                trim_memory_pool: || sp1_gpu_cudart::trim_default_mem_pool().is_ok(),
+            },
+        );
+    }
+
     // The wrap prover keeps its proving key between Groth16/PLONK proofs (sp1-prover's WrapProver)
     // where the card has the memory for it: on a 32 GB Arc Pro B70 that saves ~3 s a proof, while
     // on a 16 GB Radeon RX 9070 XT the key's memory slowed the rest of each proof by more (19 s ->
@@ -340,7 +401,8 @@ pub async fn cuda_worker_builder_with_machine(
     // The GPU Groth16 prover is for cards above the 16 GB tier; 16 GB cards use gnark's CPU
     // prover, as the v6.0.0 fork always did. Before each proof the recursion prover also checks
     // that the card has the GPU memory free for the GPU prover's helper (beside this prover's own
-    // state, that rules out cards below 48 GB unless SP1_GPU_RESET_BEFORE_WRAP is set) and the host
+    // state, once its memory pool's idle reserve is given back, that rules out cards below 32 GB
+    // unless SP1_GPU_RESET_BEFORE_WRAP is set) and the host
     // has the memory, and uses the CPU prover if not.
     let groth16_gpu = gpu_memory_gb() > 20;
 
@@ -361,6 +423,14 @@ pub async fn cuda_worker_builder_with_machine(
                 && more_core_workers(separate_recursion_stream)
             {
                 config.prover_config.core_prover_config.num_core_workers = GPU_NUM_CORE_WORKERS;
+            }
+            // `SP1_WORKER_NORMALIZE_PROGRAM_CACHE_SIZE` still overrides.
+            if std::env::var("SP1_WORKER_NORMALIZE_PROGRAM_CACHE_SIZE").is_err()
+                && sp1_recursion_gnark_ffi::host_memory::available()
+                    .is_some_and(|bytes| bytes >= GPU_NORMALIZE_PROGRAM_CACHE_MIN_AVAILABLE_RAM)
+            {
+                config.prover_config.core_prover_config.normalize_program_cache_size =
+                    GPU_NORMALIZE_PROGRAM_CACHE_SIZE;
             }
         })
         .with_core_air_prover(core_prover, prover_permits.clone())

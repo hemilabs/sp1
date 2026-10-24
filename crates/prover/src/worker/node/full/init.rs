@@ -5,7 +5,8 @@ use sp1_core_machine::riscv::RiscvAir;
 use sp1_hypercube::{prover::ProverSemaphore, Machine};
 use sp1_primitives::SP1Field;
 use sp1_prover_types::{
-    ArtifactClient, ArtifactType, InMemoryArtifactClient, ProofArtifacts, TaskStatus, TaskType,
+    network_base_types::ProofMode, ArtifactClient, ArtifactType, InMemoryArtifactClient,
+    ProofArtifacts, TaskStatus, TaskType,
 };
 use tokio::{sync::mpsc, task::JoinSet};
 use tracing::Instrument;
@@ -121,21 +122,32 @@ impl<C: SP1ProverComponents> SP1LocalNodeBuilder<C> {
             async move {
                 while let Some((task_id, request)) = controller_rx.recv().await {
                     let span = tracing::debug_span!("Controller", proof_id = %request.context.proof_id, task_id = %task_id);
-                    // Run the controller task
-                    if let Err(e) = worker.controller().run(request.clone()).instrument(span).await
+                    // A proof that ends in a Groth16 or PLONK wrap gets its wrap prover built
+                    // while it executes and proves its core shards.
+                    if let Ok(inputs) =
+                        crate::worker::ControllerInputs::try_from(request.inputs.as_slice())
                     {
-                        tracing::error!("Controller: task failed: {e:?}");
+                        if matches!(inputs.mode, ProofMode::Groth16 | ProofMode::Plonk) {
+                            worker.prover_engine().recursion_prover.start_building_wrap_prover();
+                        }
                     }
-
-                    // Complete the task
-                    if let Err(e) = worker
-                        .worker_client()
-                        .complete_task(
-                            request.context.proof_id,
-                            task_id,
-                            TaskMetadata { gpu_ms: None },
-                        )
+                    // Run the controller task
+                    let status = match worker
+                        .controller()
+                        .run(request.clone())
+                        .instrument(span)
                         .await
+                    {
+                        Ok(_) => TaskStatus::Succeeded,
+                        Err(e) => {
+                            tracing::error!("Controller: task failed: {e:?}");
+                            TaskStatus::FailedFatal
+                        }
+                    };
+
+                    // Complete the task, as failed if it failed: whoever waits on it must not
+                    // go on to read outputs that were never written.
+                    if let Err(e) = worker.worker_client().update_task_status(task_id, status).await
                     {
                         tracing::error!("Controller: marking task as complete failed: {e:?}");
                     }
@@ -154,6 +166,10 @@ impl<C: SP1ProverComponents> SP1LocalNodeBuilder<C> {
             }
         });
 
+        // Build the machine that `CoreExecute` requests deserialize into now, so the first
+        // proof's executor does not wait for it.
+        tokio::task::spawn_blocking(sp1_prover_types::riscv_machine);
+
         // Spawn the CoreExecute handler
         join_set.spawn({
             let mut execute_rx =
@@ -162,24 +178,30 @@ impl<C: SP1ProverComponents> SP1LocalNodeBuilder<C> {
             async move {
                 while let Some((task_id, request)) = execute_rx.recv().await {
                     let span = tracing::debug_span!("CoreExecute", proof_id = %request.context.proof_id, task_id = %task_id);
-                    let proof_id = request.context.proof_id.clone();
-                    match crate::worker::CoreExecuteTaskRequest::from_raw(request.clone()) {
-                        Ok(req) => {
-                            if let Err(e) =
-                                worker.controller().execute(task_id.clone(), req).instrument(span).await
+                    let status =
+                        match crate::worker::CoreExecuteTaskRequest::from_raw(request.clone()) {
+                            Ok(req) => match worker
+                                .controller()
+                                .execute(task_id.clone(), req)
+                                .instrument(span)
+                                .await
                             {
-                                tracing::error!("CoreExecute: task failed: {e:?}");
+                                Ok(_) => TaskStatus::Succeeded,
+                                Err(e) => {
+                                    tracing::error!("CoreExecute: task failed: {e:?}");
+                                    TaskStatus::FailedFatal
+                                }
+                            },
+                            Err(e) => {
+                                tracing::error!("CoreExecute: failed to parse request: {e:?}");
+                                TaskStatus::FailedFatal
                             }
-                        }
-                        Err(e) => {
-                            tracing::error!("CoreExecute: failed to parse request: {e:?}");
-                        }
-                    }
+                        };
 
-                    if let Err(e) = worker
-                        .worker_client()
-                        .complete_task(proof_id, task_id, TaskMetadata { gpu_ms: None })
-                        .await
+                    // A failed execution must fail the task: marked complete, the controller
+                    // waited forever for core proofs that would never come (compressed and
+                    // wrapped modes), or failed later on a missing artifact (core mode).
+                    if let Err(e) = worker.worker_client().update_task_status(task_id, status).await
                     {
                         tracing::error!("CoreExecute: marking task as complete failed: {e:?}");
                     }
@@ -218,7 +240,13 @@ impl<C: SP1ProverComponents> SP1LocalNodeBuilder<C> {
                         }
 
                         Some(output) = task_rx.recv() => {
-                            output.handle_task_output(&worker_client).await;
+                            // Not awaited here: a retry goes back into this handler's own
+                            // input queue (capacity 1), which only this loop drains, so with the
+                            // queue full the loop waited on itself.
+                            let worker_client = worker_client.clone();
+                            tokio::spawn(async move {
+                                output.handle_task_output(&worker_client).await
+                            });
                         }
                         else => {
                             break;
@@ -236,21 +264,20 @@ impl<C: SP1ProverComponents> SP1LocalNodeBuilder<C> {
             async move {
                 while let Some((task_id, request)) = controller_rx.recv().await {
                     // Run the controller task
-                    if let Err(e) =
-                        worker.controller().run_sp1_util_vkey_map_controller(request.clone()).await
-                    {
-                        tracing::error!("Controller: task failed: {e:?}");
-                    }
-
-                    // Complete the task
-                    if let Err(e) = worker
-                        .worker_client()
-                        .complete_task(
-                            request.context.proof_id,
-                            task_id,
-                            TaskMetadata { gpu_ms: None },
-                        )
+                    let status = match worker
+                        .controller()
+                        .run_sp1_util_vkey_map_controller(request.clone())
                         .await
+                    {
+                        Ok(_) => TaskStatus::Succeeded,
+                        Err(e) => {
+                            tracing::error!("Controller: task failed: {e:?}");
+                            TaskStatus::FailedFatal
+                        }
+                    };
+
+                    // Complete the task, as failed if it failed.
+                    if let Err(e) = worker.worker_client().update_task_status(task_id, status).await
                     {
                         tracing::error!("Controller: marking task as complete failed: {e:?}");
                     }
@@ -296,16 +323,17 @@ impl<C: SP1ProverComponents> SP1LocalNodeBuilder<C> {
                                     }
                                     Err(e) => {
                                         tracing::error!("Failed to generate vk chunk: {:?}", e);
+                                        // Failed, not left pending: its waiter would hang.
+                                        tx.send((proof_id, task_id, TaskStatus::FailedFatal)).ok();
                                     }
                                 }
                             });
                         }
 
-                        Some((proof_id, task_id , status)) = task_rx.recv() => {
-                            assert_eq!(status, TaskStatus::Succeeded);
-                         if let Err(e) = worker_client.complete_task(proof_id, task_id, TaskMetadata { gpu_ms: None }).await {
-                             tracing::error!("Failed to complete vk chunk task: {:?}", e);
-                         }
+                        Some((_proof_id, task_id, status)) = task_rx.recv() => {
+                            if let Err(e) = worker_client.update_task_status(task_id, status).await {
+                                tracing::error!("Failed to complete vk chunk task: {:?}", e);
+                            }
                         }
                         else => {
                             break;
@@ -356,7 +384,13 @@ impl<C: SP1ProverComponents> SP1LocalNodeBuilder<C> {
                         }
 
                         Some(output) = task_rx.recv() => {
-                            output.handle_task_output(&worker_client).await;
+                            // Not awaited here: a retry goes back into this handler's own
+                            // input queue (capacity 1), which only this loop drains, so with the
+                            // queue full the loop waited on itself.
+                            let worker_client = worker_client.clone();
+                            tokio::spawn(async move {
+                                output.handle_task_output(&worker_client).await
+                            });
                         }
                         else => {
                             break;
@@ -404,7 +438,13 @@ impl<C: SP1ProverComponents> SP1LocalNodeBuilder<C> {
                         }
 
                         Some(output) = task_rx.recv() => {
-                            output.handle_task_output(&worker_client).await;
+                            // Not awaited here: a retry goes back into this handler's own
+                            // input queue (capacity 1), which only this loop drains, so with the
+                            // queue full the loop waited on itself.
+                            let worker_client = worker_client.clone();
+                            tokio::spawn(async move {
+                                output.handle_task_output(&worker_client).await
+                            });
                         }
                         else => {
                             break;
@@ -442,7 +482,13 @@ impl<C: SP1ProverComponents> SP1LocalNodeBuilder<C> {
                           );
                         }
                         Some(output) = task_rx.recv() => {
-                            output.handle_task_output(&worker_client).await;
+                            // Not awaited here: a retry goes back into this handler's own
+                            // input queue (capacity 1), which only this loop drains, so with the
+                            // queue full the loop waited on itself.
+                            let worker_client = worker_client.clone();
+                            tokio::spawn(async move {
+                                output.handle_task_output(&worker_client).await
+                            });
                         }
                         else => {
                             break;
@@ -483,7 +529,13 @@ impl<C: SP1ProverComponents> SP1LocalNodeBuilder<C> {
                             TaskOutput::handle_worker_result(Ok(result), &task_tx, proof_id, id, request, TaskType::ShrinkWrap);
                         }
                         Some(output) = task_rx.recv() => {
-                            output.handle_task_output(&worker_client).await;
+                            // Not awaited here: a retry goes back into this handler's own
+                            // input queue (capacity 1), which only this loop drains, so with the
+                            // queue full the loop waited on itself.
+                            let worker_client = worker_client.clone();
+                            tokio::spawn(async move {
+                                output.handle_task_output(&worker_client).await
+                            });
                         }
                         else => {
                             break;
@@ -517,7 +569,13 @@ impl<C: SP1ProverComponents> SP1LocalNodeBuilder<C> {
                             TaskOutput::handle_worker_result(Ok(result), &task_tx, proof_id, id, request, TaskType::PlonkWrap);
                         }
                         Some(output) = task_rx.recv() => {
-                            output.handle_task_output(&worker_client).await;
+                            // Not awaited here: a retry goes back into this handler's own
+                            // input queue (capacity 1), which only this loop drains, so with the
+                            // queue full the loop waited on itself.
+                            let worker_client = worker_client.clone();
+                            tokio::spawn(async move {
+                                output.handle_task_output(&worker_client).await
+                            });
                         }
                         else => {
                             break;
@@ -551,7 +609,12 @@ impl<C: SP1ProverComponents> SP1LocalNodeBuilder<C> {
                             TaskOutput::handle_worker_result(Ok(result), &task_tx, proof_id, id, request, TaskType::Groth16Wrap);
                         }
                         Some(output) = task_rx.recv() => {
-                            output.handle_task_output(worker.worker_client()).await;
+                            // Not awaited here, as in the other handlers (a retry re-enters
+                            // this handler's own input queue).
+                            let worker_client = worker.worker_client().clone();
+                            tokio::spawn(async move {
+                                output.handle_task_output(&worker_client).await
+                            });
                         }
                         else => {
                             break;
@@ -641,6 +704,17 @@ impl TaskOutput {
             }
             Err(e) => {
                 tracing::error!("task panicked: {:?}", e);
+                // Failed, not left pending: the proof waiting on it would hang (a worker that ran
+                // out of memory panics).
+                let task_output = TaskOutput {
+                    proof_id,
+                    task_id,
+                    status: TaskStatus::FailedFatal,
+                    task_metadata: TaskMetadata::default(),
+                    task_data: None,
+                    task_type,
+                };
+                tx.send(task_output).ok();
             }
         }
     }

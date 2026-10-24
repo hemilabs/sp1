@@ -276,7 +276,8 @@ fn test_groth16_e2e_via_in_process_r1cs_solver() {
                         eprintln!(
                             "  iter {iter}: proof DIFFERS at words: {}",
                             if diff_words.is_empty() {
-                                "(none — proof matches reference but verify still failed?)".to_string()
+                                "(none — proof matches reference but verify still failed?)"
+                                    .to_string()
                             } else {
                                 diff_words.join(", ")
                             }

@@ -111,6 +111,10 @@ func hasGroth16Commitments(r constraint.ConstraintSystem) bool {
 // cache ahead of the proof, so that the solve does not wait ~2 s for it. Reading the circuit needs
 // none of the environment variables the solve sets, so this runs without touching the environment
 // (other threads read it concurrently).
+//
+// The prover runs meanwhile; gnark decodes the circuit in 4 goroutines, which bounds the read's
+// share of the CPU. (Lowering GOMAXPROCS for it, as this once did, throttled all other Go work in
+// the process too: another proof's solve or export.)
 func PrefetchGroth16GpuWitnessCircuit(dataDir string, pkDir string) {
 	gpuWitnessCircuit(dataDir, pkDir)
 }

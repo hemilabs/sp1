@@ -176,11 +176,9 @@ fn publish(
         if !entry.file_type()?.is_file() {
             continue;
         }
-        let file = std::fs::File::open(&path)
-            .with_context(|| format!("failed to open {}", path.display()))?;
-        file.sync_all().with_context(|| format!("failed to sync {}", path.display()))?;
+        sync_path(&path)?;
         let name = entry.file_name().to_string_lossy().into_owned();
-        manifest.push_str(&format!("{} {name}\n", file.metadata()?.len()));
+        manifest.push_str(&format!("{} {name}\n", entry.metadata()?.len()));
     }
     // The marker moves into place with the directory, so no reader can observe the cache before
     // the build has finished.
@@ -204,8 +202,17 @@ fn publish(
     Ok(CacheOutcome::Built)
 }
 
+/// Flushes a file, or a directory's entries, to disk. On Windows a flush needs a handle with write
+/// access (a read-only one fails with "Access is denied"), and a directory cannot be flushed: NTFS
+/// journals its entries itself.
 fn sync_path(path: &Path) -> Result<()> {
-    std::fs::File::open(path)
+    if cfg!(windows) && path.is_dir() {
+        return Ok(());
+    }
+    std::fs::OpenOptions::new()
+        .read(true)
+        .write(cfg!(windows))
+        .open(path)
         .and_then(|file| file.sync_all())
         .with_context(|| format!("failed to sync {}", path.display()))
 }
