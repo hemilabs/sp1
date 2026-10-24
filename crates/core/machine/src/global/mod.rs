@@ -12,7 +12,7 @@ use slop_air::{Air, BaseAir, PairBuilder};
 use slop_algebra::PrimeField32;
 use slop_matrix::Matrix;
 use sp1_core_executor::{
-    events::{ByteRecord, GlobalInteractionEvent},
+    events::{ByteRecord, DiscardByteRecord, GlobalInteractionEvent},
     ExecutionRecord, Program,
 };
 use sp1_hypercube::{
@@ -143,51 +143,58 @@ impl<F: PrimeField32> MachineAir<F> for GlobalChip {
             .chunks_mut(chunk_size * NUM_GLOBAL_COLS)
             .collect::<Vec<_>>();
 
-        let point_chunks = chunks
-            .par_iter_mut()
-            .enumerate()
-            .map(|(i, rows)| {
-                let mut point_chunks = Vec::with_capacity(chunk_size * NUM_GLOBAL_COLS + 1);
-                if i == 0 {
-                    point_chunks.push(SepticCurveComplete::Affine(SepticDigest::<F>::zero().0));
-                }
-                let mut blu = Vec::new();
-                rows.chunks_mut(NUM_GLOBAL_COLS).enumerate().for_each(|(j, row)| {
-                    let idx = i * chunk_size + j;
-                    let cols: &mut GlobalCols<F> = row.borrow_mut();
-                    let event: &GlobalInteractionEvent = &events[idx];
-                    cols.message = event.message.map(F::from_canonical_u32);
-                    cols.kind = F::from_canonical_u8(event.kind);
-                    cols.index = F::from_canonical_u32(idx as u32);
-                    cols.interaction.populate(
-                        &mut blu,
-                        event.message,
-                        event.is_receive,
-                        true,
-                        event.kind,
-                    );
-                    cols.is_real = F::one();
-                    if event.is_receive {
-                        cols.is_receive = F::one();
-                        cols.is_send = F::zero();
-                    } else {
-                        cols.is_receive = F::zero();
-                        cols.is_send = F::one();
-                    }
-                    cols.message_0_16bit_limb =
-                        F::from_canonical_u16((event.message[0] & 0xffff) as u16);
-                    cols.message_0_8bit_limb =
-                        F::from_canonical_u8(((event.message[0] >> 16) & 0xff) as u8);
-                    point_chunks.push(SepticCurveComplete::Affine(SepticCurve {
-                        x: SepticExtension(cols.interaction.x_coordinate.0),
-                        y: SepticExtension(cols.interaction.y_coordinate.0),
-                    }));
-                });
-                point_chunks
-            })
-            .collect::<Vec<_>>();
+        // The zero point, then a point per row, written in place by the row's chunk: one
+        // allocation of the size needed.
+        let mut points = if nb_rows == 0 {
+            Vec::new()
+        } else {
+            let mut points = vec![SepticCurveComplete::Infinity; nb_rows + 1];
+            points[0] = SepticCurveComplete::Affine(SepticDigest::<F>::zero().0);
+            points
+        };
+        let mut point_chunks =
+            points.get_mut(1..).unwrap_or_default().chunks_mut(chunk_size).collect::<Vec<_>>();
+        chunks.par_iter_mut().zip(point_chunks.par_iter_mut()).enumerate().for_each(
+            |(i, (rows, points))| {
+                // Counted elsewhere: by `generate_dependencies`, or, with
+                // `global_dependencies_opt`, on the device (the GPU prover's trace generation).
+                let mut blu = DiscardByteRecord;
+                rows.chunks_mut(NUM_GLOBAL_COLS).zip(points.iter_mut()).enumerate().for_each(
+                    |(j, (row, point))| {
+                        let idx = i * chunk_size + j;
+                        let cols: &mut GlobalCols<F> = row.borrow_mut();
+                        let event: &GlobalInteractionEvent = &events[idx];
+                        cols.message = event.message.map(F::from_canonical_u32);
+                        cols.kind = F::from_canonical_u8(event.kind);
+                        cols.index = F::from_canonical_u32(idx as u32);
+                        cols.interaction.populate(
+                            &mut blu,
+                            event.message,
+                            event.is_receive,
+                            true,
+                            event.kind,
+                        );
+                        cols.is_real = F::one();
+                        if event.is_receive {
+                            cols.is_receive = F::one();
+                            cols.is_send = F::zero();
+                        } else {
+                            cols.is_receive = F::zero();
+                            cols.is_send = F::one();
+                        }
+                        cols.message_0_16bit_limb =
+                            F::from_canonical_u16((event.message[0] & 0xffff) as u16);
+                        cols.message_0_8bit_limb =
+                            F::from_canonical_u8(((event.message[0] >> 16) & 0xff) as u8);
+                        *point = SepticCurveComplete::Affine(SepticCurve {
+                            x: SepticExtension(cols.interaction.x_coordinate.0),
+                            y: SepticExtension(cols.interaction.y_coordinate.0),
+                        });
+                    },
+                );
+            },
+        );
 
-        let points = point_chunks.into_iter().flatten().collect::<Vec<_>>();
         let cumulative_sum = points
             .into_par_iter()
             .with_min_len(1 << 15)
