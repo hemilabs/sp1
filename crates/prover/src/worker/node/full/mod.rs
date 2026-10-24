@@ -57,14 +57,12 @@ struct GpuWork;
 fn start_gpu_work() -> anyhow::Result<GpuWork> {
     #[cfg(feature = "native-gnark")]
     {
-        let work = sp1_recursion_gnark_ffi::gpu_proof_started();
-        if sp1_recursion_gnark_ffi::gpu_was_reset() {
-            anyhow::bail!(
+        sp1_recursion_gnark_ffi::gpu_proof_started().ok_or_else(|| {
+            anyhow::anyhow!(
                 "this process reset its GPU before a final wrap (SP1_GPU_RESET_BEFORE_WRAP), which \
                  destroyed its provers' GPU state: restart it to prove again"
-            );
-        }
-        Ok(work)
+            )
+        })
     }
     #[cfg(not(feature = "native-gnark"))]
     Ok(GpuWork)

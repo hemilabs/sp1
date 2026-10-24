@@ -558,12 +558,12 @@ impl PlonkBn254Prover {
             && crate::gpu_device::reset_if_requested("PLONK (GPU)", PLONK_GPU_HELPER_VRAM_BYTES);
 
         // After a reset, give the driver a moment to return the memory. Log the free VRAM a helper
-        // on this card has, so operators can see whether it has room; not after a reset, where
-        // measuring would start a new context on the device, which keeps some of the memory the
-        // helper needs.
+        // on this card has, so operators can see whether it has room; not after a reset (this
+        // attempt's, or an earlier one's in this process), where measuring would start a new
+        // context on the device, which keeps some of the memory the helper needs.
         if reset {
             std::thread::sleep(std::time::Duration::from_millis(500));
-        } else if on_this_card {
+        } else if on_this_card && !crate::gpu_device::was_reset() {
             if let Some(free) = crate::gpu_device::free_memory() {
                 tracing::info!("[plonk] {} MiB of GPU memory is free for the helper", free >> 20);
             }

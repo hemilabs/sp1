@@ -885,8 +885,8 @@ impl<A: ArtifactClient, C: SP1ProverComponents> SP1RecursionProver<A, C> {
             #[cfg(feature = "native-gnark")]
             release_recycled_event_buffers_if_short();
             #[cfg(feature = "native-gnark")]
-            let use_gpu = {
-                use super::groth16_backend::{use_gpu, Groth16Inputs};
+            let (use_gpu, _reset_reservation) = {
+                use super::groth16_backend::{helper_room, use_gpu, Groth16Inputs, HelperRoom};
                 let override_env = std::env::var("SP1_GROTH16_GPU").ok();
                 let helper_available = Groth16Bn254Prover::gpu_helper_available();
                 // The shard prover's memory pool keeps freed memory reserved, which on a 32 GB
@@ -906,17 +906,30 @@ impl<A: ArtifactClient, C: SP1ProverComponents> SP1RecursionProver<A, C> {
                         );
                     }
                 }
-                let (gpu, reason) = use_gpu(&Groth16Inputs {
+                // A reset, where one could make room, is reserved before the choice, and kept only
+                // for a GPU wrap that counts on it, until this wrap ends.
+                let reservation = sp1_recursion_gnark_ffi::gpu_reserve_reset();
+                let inputs = Groth16Inputs {
                     override_env: override_env.as_deref(),
                     card_eligible,
                     helper_available,
                     vram_free: sp1_recursion_gnark_ffi::gpu_free_memory(),
                     vram_total: sp1_recursion_gnark_ffi::gpu_total_memory(),
-                    gpu_reset: sp1_recursion_gnark_ffi::gpu_reset_requested()
-                        && sp1_recursion_gnark_ffi::gpu_reset_available(),
+                    gpu_reset: reservation.is_some(),
                     mem_available: sp1_recursion_gnark_ffi::host_memory::available(),
                     pk_cache_ready: Groth16Bn254Prover::gpu_pk_cache_ready(&build_dir),
-                });
+                };
+                let (gpu, reason) = use_gpu(&inputs);
+                let after_reset = matches!(
+                    helper_room(
+                        super::groth16_backend::GPU_HELPER_VRAM_BYTES,
+                        inputs.vram_free,
+                        inputs.vram_total,
+                        inputs.gpu_reset
+                    ),
+                    HelperRoom::AfterReset(_)
+                );
+                let reservation = reservation.filter(|_| gpu && after_reset);
                 tracing::info!(
                     "Groth16 prover: {} ({reason})",
                     if gpu { "GPU" } else { "gnark CPU" }
@@ -928,7 +941,7 @@ impl<A: ArtifactClient, C: SP1ProverComponents> SP1RecursionProver<A, C> {
                 } else {
                     sp1_recursion_gnark_ffi::prestart::cancel();
                 }
-                gpu
+                (gpu, reservation)
             };
 
             // Wrapped in `prove_with_retry` to harden against transient
@@ -1101,8 +1114,10 @@ impl<A: ArtifactClient, C: SP1ProverComponents> SP1RecursionProver<A, C> {
             // here spares a card or host that cannot fit it the witness export and the helper's
             // start. If it fails, the CPU prover takes over rather than losing the proof.
             #[cfg(feature = "native-gnark")]
-            let use_gpu = plonk_gpu && {
-                use super::groth16_backend::{use_gpu_plonk, PlonkInputs};
+            let (use_gpu, _reset_reservation) = if !plonk_gpu {
+                (false, None)
+            } else {
+                use super::groth16_backend::{helper_room, use_gpu_plonk, HelperRoom, PlonkInputs};
                 use sp1_recursion_gnark_ffi as ffi;
                 let helper_available = PlonkBn254Prover::gpu_helper_available();
                 let helper_routed = ffi::plonk_helper_devices().is_some();
@@ -1117,21 +1132,36 @@ impl<A: ArtifactClient, C: SP1ProverComponents> SP1RecursionProver<A, C> {
                         );
                     }
                 }
-                let (gpu, reason) = use_gpu_plonk(&PlonkInputs {
+                // As for Groth16: a reset that could make room on this card is reserved before the
+                // choice, and kept only for a GPU wrap that counts on it, until this wrap ends.
+                let reservation = (!helper_routed).then(ffi::gpu_reserve_reset).flatten();
+                let inputs = PlonkInputs {
                     helper_available,
                     helper_routed,
                     vram_free: ffi::gpu_free_memory(),
                     vram_total: ffi::gpu_total_memory(),
-                    gpu_reset: ffi::gpu_reset_requested() && ffi::gpu_reset_available(),
+                    gpu_reset: reservation.is_some(),
                     mem_available: ffi::host_memory::available(),
                     pk_cache_ready: PlonkBn254Prover::gpu_pk_cache_ready(&build_dir),
                     server_running: PlonkBn254Prover::gpu_helper_server_running(),
-                });
+                };
+                let (gpu, reason) = use_gpu_plonk(&inputs);
+                let after_reset = !helper_routed
+                    && matches!(
+                        helper_room(
+                            ffi::PLONK_GPU_HELPER_VRAM_BYTES,
+                            inputs.vram_free,
+                            inputs.vram_total,
+                            inputs.gpu_reset
+                        ),
+                        HelperRoom::AfterReset(_)
+                    );
+                let reservation = reservation.filter(|_| gpu && after_reset);
                 tracing::info!(
                     "PLONK prover: {} ({reason})",
                     if gpu { "GPU" } else { "gnark CPU" }
                 );
-                gpu
+                (gpu, reservation)
             };
             #[cfg(feature = "native-gnark")]
             let proof = super::groth16_backend::prove_preferring_gpu(

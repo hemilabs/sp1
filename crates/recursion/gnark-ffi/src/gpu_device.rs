@@ -10,8 +10,8 @@
 //! - [`reset_if_requested`] frees that device with `cudaDeviceReset` or `hipDeviceReset` where the
 //!   helper would not fit otherwise, the card is big enough for it, and no other proof is in flight
 //!   ([`proof_started`]). That destroys every allocation, stream and pinned buffer this process has
-//!   on it, so it cannot prove again (measured: a segfault as the next proof starts; [`was_reset`]
-//!   lets it refuse the proof instead). Stream-ordered allocations (`cudaMallocAsync`'s) outlive a
+//!   on it, so it cannot prove again (measured: a segfault as the next proof starts;
+//!   [`proof_started`] refuses the proof instead). Stream-ordered allocations (`cudaMallocAsync`'s) outlive a
 //!   reset, so the GPU prover frees its own first (`device_caches::free_live_blocks`). Only a process that exits after its wrap can afford it, so
 //!   it happens only with `SP1_GPU_RESET_BEFORE_WRAP=1` (or `true`).
 //!
@@ -20,7 +20,7 @@
 //! Linux the runtime is linked statically, and measuring and trimming use the calls the GPU prover
 //! registers instead (`device_caches::set_runtime`); there is no reset.
 
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Mutex, MutexGuard};
 
 /// A GPU runtime library and the two calls used from it.
 struct Runtime {
@@ -227,8 +227,31 @@ pub fn reset_available() -> bool {
     false
 }
 
-/// Proofs this process is making, which a reset would destroy the GPU state of.
-static PROOFS_IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
+/// The proofs this process is making, which a reset would destroy the GPU state of, and whether
+/// it has reset its GPU or reserved a reset. One lock, so that no proof starts between a reset's
+/// check that its own proof is alone and the reset.
+struct GpuUse {
+    proofs_in_flight: usize,
+    /// Set as a reset starts (see [`reset_to_make_room`]), and cleared only if the reset then turns
+    /// out to be impossible before it touched anything.
+    reset: bool,
+    /// Set while a wrap that counts on a reset holds a [`ResetReservation`].
+    reset_reserved: bool,
+}
+
+impl GpuUse {
+    /// Whether a reset may happen now: none has, and no proof but the caller's is in flight.
+    fn may_reset(&self) -> bool {
+        !self.reset && self.proofs_in_flight <= 1
+    }
+}
+
+static GPU_USE: Mutex<GpuUse> =
+    Mutex::new(GpuUse { proofs_in_flight: 0, reset: false, reset_reserved: false });
+
+fn gpu_use() -> MutexGuard<'static, GpuUse> {
+    GPU_USE.lock().unwrap_or_else(|e| e.into_inner())
+}
 
 /// A proof in flight in this process (see [`proof_started`]), until dropped.
 #[must_use = "the proof counts as in flight only while this is alive"]
@@ -236,24 +259,60 @@ pub struct ProofInFlight(());
 
 impl Drop for ProofInFlight {
     fn drop(&mut self) {
-        PROOFS_IN_FLIGHT.fetch_sub(1, Ordering::Relaxed);
+        gpu_use().proofs_in_flight -= 1;
     }
 }
 
 /// Counts a proof (or other GPU work) as in flight, so that no other proof's wrap resets the GPU
-/// under it (see [`reset_if_requested`]).
-pub fn proof_started() -> ProofInFlight {
-    PROOFS_IN_FLIGHT.fetch_add(1, Ordering::Relaxed);
-    ProofInFlight(())
+/// under it (see [`reset_if_requested`]). `None` once this process has reset its GPU, has started
+/// to, or has reserved a reset for a wrap (`SP1_GPU_RESET_BEFORE_WRAP`): its shard-prover state is
+/// gone, or about to go, and the proof would crash on it.
+#[must_use = "the proof counts as in flight only while the result is alive"]
+pub fn proof_started() -> Option<ProofInFlight> {
+    let mut gpu_use = gpu_use();
+    if gpu_use.reset || gpu_use.reset_reserved {
+        return None;
+    }
+    gpu_use.proofs_in_flight += 1;
+    Some(ProofInFlight(()))
 }
 
-/// Set once [`reset_if_requested`] has reset this process's GPU.
-static RESET: AtomicBool = AtomicBool::new(false);
-
-/// Whether this process has reset its GPU before a wrap helper (`SP1_GPU_RESET_BEFORE_WRAP`). Its
-/// shard-prover state went with it, so another proof would crash: callers refuse to start one.
+/// Whether this process has reset its GPU before a wrap helper (`SP1_GPU_RESET_BEFORE_WRAP`), or
+/// has started to, so that [`proof_started`] refuses proofs for good: to tell that refusal from
+/// other failures. (Cleared again only if the reset then finds nothing to reset with.)
 pub fn was_reset() -> bool {
-    RESET.load(Ordering::Relaxed)
+    gpu_use().reset
+}
+
+/// A reset reserved by a wrap whose helper fits only after one ([`reserve_reset`]): until it is
+/// dropped, no proof starts (it would make the reset refuse), and the wrap's reset does not wait
+/// on anything but the helper's need.
+#[must_use = "the reset is reserved only while this is alive"]
+pub struct ResetReservation(());
+
+impl Drop for ResetReservation {
+    fn drop(&mut self) {
+        gpu_use().reset_reserved = false;
+    }
+}
+
+/// Reserves a reset of this process's GPU for a wrap, if one can happen:
+/// `SP1_GPU_RESET_BEFORE_WRAP` asks for it, a runtime library is loaded to reset with, none has
+/// happened, and no proof but the caller's is in flight. A wrap that would fit only after a reset
+/// is chosen only with one, and holds it until it ends: a proof that started between the choice
+/// and the reset (the PK export and solve take seconds to minutes) would make the reset refuse and
+/// the helper run out of memory.
+#[must_use = "the reset is reserved only while the result is alive"]
+pub fn reserve_reset() -> Option<ResetReservation> {
+    if !reset_requested() || !reset_available() {
+        return None;
+    }
+    let mut gpu_use = gpu_use();
+    if !gpu_use.may_reset() || gpu_use.reset_reserved {
+        return None;
+    }
+    gpu_use.reset_reserved = true;
+    Some(ResetReservation(()))
 }
 
 /// Resets this process's GPU before a wrap helper needing `needed` bytes runs, if
@@ -263,7 +322,9 @@ pub fn was_reset() -> bool {
 /// another proof uses the GPU; see the module docs. Returns whether it reset the GPU. `what` names
 /// the caller in logs.
 pub(crate) fn reset_if_requested(what: &str, needed: u64) -> bool {
-    if !reset_requested() || !reset_available() {
+    // After a reset (a wrap retried in this process), measuring would start a new context on the
+    // device, which keeps some of the memory the helper needs.
+    if !reset_requested() || !reset_available() || was_reset() {
         return false;
     }
     // Where the helper fits beside this process's state, the process keeps it, and can prove again.
@@ -288,8 +349,15 @@ pub(crate) fn reset_after_failed_helper(what: &str, needed: u64) -> bool {
 }
 
 /// The reset of [`reset_if_requested`] and [`reset_after_failed_helper`], unless the card is too
-/// small for the helper even when empty or another proof is in flight.
+/// small for the helper even when empty or another proof is in flight. The reset is marked as
+/// started, which turns new proofs away, under the same lock as the check that no other proof is
+/// in flight.
 fn reset_to_make_room(what: &str, needed: u64) -> bool {
+    // After a reset, measuring would start a new context on the device, which keeps some of the
+    // memory the helper needs; and there is nothing more to reset.
+    if was_reset() {
+        return false;
+    }
     if let Some(total) = total_memory().filter(|&total| total < needed) {
         tracing::info!(
             "{what}: the helper needs {} MiB and this card has {} MiB, so a reset would not make \
@@ -299,43 +367,55 @@ fn reset_to_make_room(what: &str, needed: u64) -> bool {
         );
         return false;
     }
-    let in_flight = PROOFS_IN_FLIGHT.load(Ordering::Relaxed);
-    if in_flight > 1 {
-        tracing::warn!(
-            "{what}: {} other proofs are using the GPU, so SP1_GPU_RESET_BEFORE_WRAP does not reset \
-             it under them",
-            in_flight - 1
-        );
-        return false;
+    {
+        let mut gpu_use = gpu_use();
+        if gpu_use.reset {
+            return false;
+        }
+        if !gpu_use.may_reset() {
+            tracing::warn!(
+                "{what}: {} other proofs are using the GPU, so SP1_GPU_RESET_BEFORE_WRAP does not \
+                 reset it under them",
+                gpu_use.proofs_in_flight - 1
+            );
+            return false;
+        }
+        gpu_use.reset = true;
     }
-    reset(what)
+    let reset = reset(what);
+    if !reset {
+        // Nothing was touched: the process keeps its GPU, and can prove again.
+        gpu_use().reset = false;
+    }
+    reset
 }
 
-/// Resets this process's GPU with `cudaDeviceReset` or `hipDeviceReset`. Returns whether it was
-/// called: the call tears the device's state down even when it reports an earlier error.
+/// Resets this process's GPU with `cudaDeviceReset` or `hipDeviceReset`. Returns whether it got as
+/// far as freeing anything: from there on the device's state is gone, even if the call then
+/// reports an earlier error. `false` only where nothing was touched.
 #[cfg(target_os = "linux")]
 fn reset(what: &str) -> bool {
     let Some((library, runtime)) = loaded() else {
         return false;
+    };
+    // SAFETY: `cudaDeviceReset` and `hipDeviceReset` take nothing and return an error code.
+    let device_reset = match unsafe {
+        library.get::<unsafe extern "C" fn() -> i32>(runtime.device_reset.as_bytes())
+    } {
+        Ok(device_reset) => device_reset,
+        Err(e) => {
+            tracing::warn!("{what}: {} has no {}: {e}", runtime.library, runtime.device_reset);
+            return false;
+        }
     };
     crate::device_caches::release();
     // The reset does not free stream-ordered allocations (`cudaMallocAsync`'s), which hold the
     // provers' keys: they would stay allocated until the process exits (5 GB on an RTX 5090, which
     // the PLONK helper then lacked). The GPU prover frees them first.
     let freed = crate::device_caches::free_live_blocks();
-    // SAFETY: `cudaDeviceReset` and `hipDeviceReset` take nothing and return an error code. The
-    // caller has agreed not to use the GPU again (SP1_GPU_RESET_BEFORE_WRAP), and `was_reset`
-    // turns away the proofs that would.
-    let rc = unsafe {
-        match library.get::<unsafe extern "C" fn() -> i32>(runtime.device_reset.as_bytes()) {
-            Ok(reset) => reset(),
-            Err(e) => {
-                tracing::warn!("{what}: {} has no {}: {e}", runtime.library, runtime.device_reset);
-                return false;
-            }
-        }
-    };
-    RESET.store(true, Ordering::Relaxed);
+    // SAFETY: as above. The caller has agreed not to use the GPU again (SP1_GPU_RESET_BEFORE_WRAP),
+    // and `proof_started` turns away the proofs that would.
+    let rc = unsafe { device_reset() };
     // The Groth16 GPU hooks run on this process's GPU state, which is gone: gnark's CPU prover, if
     // it has to take over, proves without them.
     crate::ffi::set_groth16_gpu_hooks(0, 0, 0);
@@ -365,6 +445,83 @@ fn reset(_what: &str) -> bool {
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
+
+    /// Restores the reset flags when dropped, so that a failed test does not leave them set for
+    /// the others.
+    struct ResetFlags;
+
+    impl Drop for ResetFlags {
+        fn drop(&mut self) {
+            let mut gpu_use = gpu_use();
+            gpu_use.reset = false;
+            gpu_use.reset_reserved = false;
+        }
+    }
+
+    /// A proof is counted, or turned away once a reset has started or is reserved, under the lock
+    /// that a reset checks the count and marks itself started under: no proof slips in between.
+    #[test]
+    fn no_proof_starts_once_a_reset_has_or_is_reserved() {
+        let _env = crate::test_env::lock();
+        let _flags = ResetFlags;
+        let in_flight = || gpu_use().proofs_in_flight;
+        let before = in_flight();
+        let first = proof_started().expect("no reset yet");
+        assert_eq!(in_flight(), before + 1);
+        gpu_use().reset_reserved = true;
+        assert!(proof_started().is_none(), "a proof started while a reset was reserved");
+        gpu_use().reset_reserved = false;
+        gpu_use().reset = true;
+        assert!(was_reset());
+        assert!(proof_started().is_none(), "a proof started during a reset");
+        assert_eq!(in_flight(), before + 1);
+        gpu_use().reset = false;
+        drop(first);
+        assert_eq!(in_flight(), before);
+    }
+
+    /// The reset itself: refused while another proof is in flight, without marking anything, and
+    /// unmarked again where there turns out to be nothing to reset with (no runtime loaded here).
+    #[test]
+    fn a_reset_is_refused_beside_other_proofs_and_unmarked_when_impossible() {
+        let _env = crate::test_env::lock();
+        let _flags = ResetFlags;
+        if loaded().is_some() {
+            // Built with `cuda`, which links a runtime in: this would reset the device.
+            return;
+        }
+        let first = proof_started().unwrap();
+        let second = proof_started().unwrap();
+        assert!(!reset_to_make_room("test", 0));
+        assert!(!was_reset() && proof_started().map(drop).is_some());
+        drop(second);
+        assert!(!reset_to_make_room("test", 0));
+        assert!(!was_reset(), "a reset that found no runtime left the process refusing proofs");
+        drop(first);
+    }
+
+    /// A reservation turns proofs away until dropped, and is not given beside other proofs or
+    /// without SP1_GPU_RESET_BEFORE_WRAP and a runtime to reset with.
+    #[test]
+    fn a_reset_is_reserved_only_where_one_can_happen() {
+        let _env = crate::test_env::lock();
+        let _flags = ResetFlags;
+        std::env::remove_var("SP1_GPU_RESET_BEFORE_WRAP");
+        assert!(reserve_reset().is_none());
+        std::env::set_var("SP1_GPU_RESET_BEFORE_WRAP", "1");
+        let reserved = reserve_reset();
+        assert_eq!(reserved.is_some(), reset_available());
+        if reserved.is_some() {
+            assert!(proof_started().is_none());
+            assert!(reserve_reset().is_none(), "two reservations");
+            drop(reserved);
+            let first = proof_started().unwrap();
+            let second = proof_started().unwrap();
+            assert!(reserve_reset().is_none(), "reserved beside another proof");
+            drop((first, second));
+        }
+        std::env::remove_var("SP1_GPU_RESET_BEFORE_WRAP");
+    }
 
     /// A lookup must not load a runtime the process does not already use. (The code this replaced
     /// loaded ROCm's into a CUDA prover on hosts with both installed, and reset the wrong device.)

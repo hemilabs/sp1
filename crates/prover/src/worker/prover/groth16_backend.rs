@@ -45,7 +45,8 @@ pub(crate) struct Groth16Inputs<'a> {
     /// Total memory of this process's GPU, if known.
     pub vram_total: Option<u64>,
     /// Whether this process may reset its GPU before the helper runs, which frees the card for it:
-    /// `SP1_GPU_RESET_BEFORE_WRAP` where a reset is possible (`gpu_reset_available`).
+    /// `SP1_GPU_RESET_BEFORE_WRAP` where a reset can happen, and is reserved for this wrap
+    /// (`gpu_reserve_reset`: a runtime to reset with, and no other proof in flight).
     pub gpu_reset: bool,
     /// Memory this process can still use (`host_memory::available`: `MemAvailable`, capped by
     /// cgroup v2 limits), if known.
@@ -109,9 +110,10 @@ pub(crate) enum HelperRoom {
 }
 
 /// Whether a helper needing `needed` bytes fits on a card with `free` of `total` bytes free (once
-/// the memory pool's idle reserve is given back), or once this process resets its GPU, if it may
-/// (`gpu_reset`): the same rules `gpu_device::reset_if_requested` resets by, so that a helper
-/// chosen to run after a reset gets one.
+/// the memory pool's idle reserve is given back), or once this process resets its GPU, if a reset
+/// can happen (`gpu_reset`, from a `gpu_device::reserve_reset` reservation): the same rules
+/// `gpu_device::reset_if_requested` resets by, so that a helper chosen to run after a reset gets
+/// one.
 pub(crate) fn helper_room(
     needed: u64,
     free: Option<u64>,
