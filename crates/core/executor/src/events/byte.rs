@@ -219,20 +219,50 @@ impl ByteRecord for MaybeByteLookupCounter<'_, '_> {
     }
 }
 
+/// The most arrays a [`ByteLookupCounts`] keeps (64 MiB): a writer that finishes while this many
+/// are kept (free, or being added into) adds its counts into a free one instead of keeping its
+/// array, and waits for one to come back if none is free. Hosts with up to this many threads never
+/// do; a 192-thread host would otherwise keep 384 MiB per record.
+const MAX_FREE_ARRAYS: usize = 32;
+
 /// Byte lookup multiplicities that the chips of a record add to concurrently.
 ///
 /// `generate_dependencies` of most chips counts its byte lookups here (through a shared reference
 /// to the record), one dense array per concurrent writer, so neither per-chunk hash maps nor
 /// their serial merges are needed. The byte and range chips sum the arrays, once every writer is
 /// done: a sum only sees the arrays no writer holds. Cloning and serializing keep the summed counts.
+/// At most `MAX_FREE_ARRAYS` (32) arrays are kept.
 #[derive(Default)]
 pub struct ByteLookupCounts {
-    /// Arrays of [`BYTE_LOOKUP_SLOTS`] counts not in use by a writer: all of them once the
-    /// writers are done. Summed concurrently (the byte and range chips sum slot ranges in
+    /// The kept arrays. Summed concurrently (the byte and range chips sum slot ranges in
     /// parallel), hence the read-write lock.
-    free: std::sync::RwLock<Vec<Box<[u32]>>>,
+    pool: std::sync::RwLock<Pool>,
     /// Writers holding an array ([`Self::count`]), whose counts a sum would miss.
     writers: std::sync::atomic::AtomicUsize,
+}
+
+/// The arrays a [`ByteLookupCounts`] keeps.
+#[derive(Default)]
+struct Pool {
+    /// Arrays of [`BYTE_LOOKUP_SLOTS`] counts not in use by a writer: all of them once the
+    /// writers are done.
+    free: Vec<Box<[u32]>>,
+    /// Free arrays taken out to add another writer's counts into (see [`ByteLookupCounts::count`]),
+    /// which go back: kept arrays, like the free ones.
+    folding: usize,
+}
+
+impl Pool {
+    fn kept(&self) -> usize {
+        self.free.len() + self.folding
+    }
+}
+
+/// Adds the counts of `from` into `into`, slot by slot.
+fn add_counts(into: &mut [u32], from: &[u32]) {
+    for (into, from) in into.iter_mut().zip(from) {
+        *into += *from;
+    }
 }
 
 /// A writer of [`ByteLookupCounts`], counted while alive.
@@ -250,23 +280,41 @@ impl ByteLookupCounts {
     pub fn count<R>(&self, f: impl FnOnce(&mut ByteLookupCounter) -> R) -> R {
         self.writers.fetch_add(1, std::sync::atomic::Ordering::Acquire);
         let _writer = Writer(&self.writers);
-        let taken = self.free.write().unwrap().pop();
+        let taken = self.pool.write().unwrap().free.pop();
         let mut counts = taken.unwrap_or_else(|| vec![0u32; BYTE_LOOKUP_SLOTS].into_boxed_slice());
         let result = f(&mut ByteLookupCounter(&mut counts));
-        self.free.write().unwrap().push(counts);
+        let mut into = loop {
+            let mut pool = self.pool.write().unwrap();
+            if pool.kept() < MAX_FREE_ARRAYS {
+                pool.free.push(counts);
+                return result;
+            }
+            if let Some(into) = pool.free.pop() {
+                pool.folding += 1;
+                break into;
+            }
+            // Every kept array is being added into: one comes back within a fold's time.
+            drop(pool);
+            std::thread::yield_now();
+        };
+        // Outside the lock; no sum runs while this writer is alive (see `done`).
+        add_counts(&mut into, &counts);
+        let mut pool = self.pool.write().unwrap();
+        pool.free.push(into);
+        pool.folding -= 1;
         result
     }
 
-    /// The arrays to sum. With a writer still counting, its counts would be missing from the sum:
-    /// the chips that count must all be done first.
-    fn done(&self) -> std::sync::RwLockReadGuard<'_, Vec<Box<[u32]>>> {
-        let free = self.free.read().unwrap();
+    /// The arrays to sum (`free`). With a writer still counting, its counts would be missing from
+    /// the sum: the chips that count must all be done first.
+    fn done(&self) -> std::sync::RwLockReadGuard<'_, Pool> {
+        let pool = self.pool.read().unwrap();
         debug_assert_eq!(
             self.writers.load(std::sync::atomic::Ordering::Acquire),
             0,
             "byte lookups read while a chip is still counting them"
         );
-        free
+        pool
     }
 
     /// Runs `f` with a counter of this record's byte lookups if `count`, and with a counter that
@@ -282,17 +330,15 @@ impl ByteLookupCounts {
     /// Whether no byte lookups were counted.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.done().is_empty()
+        self.done().free.is_empty()
     }
 
     /// Writes the summed counts of `slots` into `out` (of the same length). Callers may sum
     /// different slot ranges concurrently.
     pub fn sum_into(&self, slots: std::ops::Range<usize>, out: &mut [u32]) {
         out.fill(0);
-        for counts in self.done().iter() {
-            for (o, c) in out.iter_mut().zip(&counts[slots.clone()]) {
-                *o += *c;
-            }
+        for counts in &self.done().free {
+            add_counts(out, &counts[slots.clone()]);
         }
     }
 
@@ -306,36 +352,49 @@ impl ByteLookupCounts {
         out
     }
 
-    /// Adds the counts of `other` and clears it.
+    /// Adds the counts of `other` and clears it, keeping at most `MAX_FREE_ARRAYS` arrays.
     pub fn append(&mut self, other: &mut ByteLookupCounts) {
-        let mut other = std::mem::take(other.free.get_mut().unwrap());
-        self.free.get_mut().unwrap().append(&mut other);
+        let other = std::mem::take(&mut other.pool.get_mut().unwrap().free);
+        let free = &mut self.pool.get_mut().unwrap().free;
+        for counts in other {
+            if free.len() < MAX_FREE_ARRAYS {
+                free.push(counts);
+            } else {
+                add_counts(&mut free[0], &counts);
+            }
+        }
     }
 
     /// Removes all counts.
     pub fn clear(&mut self) {
-        self.free.get_mut().unwrap().clear();
+        *self.pool.get_mut().unwrap() = Pool::default();
     }
 }
 
 impl Clone for ByteLookupCounts {
     fn clone(&self) -> Self {
         let free = if self.is_empty() { Vec::new() } else { vec![self.sum().into_boxed_slice()] };
-        Self { free: std::sync::RwLock::new(free), writers: Default::default() }
+        Self {
+            pool: std::sync::RwLock::new(Pool { free, folding: 0 }),
+            writers: std::sync::atomic::AtomicUsize::new(0),
+        }
     }
 }
 
 impl std::fmt::Debug for ByteLookupCounts {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let pool = self.pool.read().unwrap();
         f.debug_struct("ByteLookupCounts")
-            .field("arrays", &self.free.read().unwrap().len())
+            .field("arrays", &pool.free.len())
+            .field("writers", &self.writers)
+            .field("folding", &pool.folding)
             .finish()
     }
 }
 
 impl DeepSizeOf for ByteLookupCounts {
     fn deep_size_of_children(&self, _context: &mut deepsize2::Context) -> usize {
-        self.free.read().unwrap().len() * BYTE_LOOKUP_SLOTS * std::mem::size_of::<u32>()
+        self.pool.read().unwrap().free.len() * BYTE_LOOKUP_SLOTS * std::mem::size_of::<u32>()
     }
 }
 
@@ -367,11 +426,24 @@ impl<'de> Deserialize<'de> for ByteLookupCounts {
         }
         let counts = Self::default();
         if !pairs.is_empty() {
-            counts.count(|counter| {
-                for (slot, c) in pairs {
-                    counter.0[slot as usize] += c;
-                }
+            // A slot is written once; a damaged dump may repeat one, and must not overflow it.
+            let overflowed = counts.count(|counter| {
+                pairs.into_iter().find_map(|(slot, c)| {
+                    let count = &mut counter.0[slot as usize];
+                    match count.checked_add(c) {
+                        Some(sum) => {
+                            *count = sum;
+                            None
+                        }
+                        None => Some(slot),
+                    }
+                })
             });
+            if let Some(slot) = overflowed {
+                return Err(serde::de::Error::custom(format!(
+                    "byte lookup slot {slot} counts more lookups than a u32 holds"
+                )));
+            }
         }
         Ok(counts)
     }
@@ -449,5 +521,113 @@ mod tests {
         assert!(bincode::deserialize::<ByteLookupCounts>(&out_of_range).is_err());
         let repeated = bincode::serialize(&vec![(7u32, 1u32), (7, 2)]).unwrap();
         assert_eq!(bincode::deserialize::<ByteLookupCounts>(&repeated).unwrap().sum()[7], 3);
+        let overflowing = bincode::serialize(&vec![(7u32, u32::MAX), (7, 1)]).unwrap();
+        assert!(bincode::deserialize::<ByteLookupCounts>(&overflowing).is_err());
+    }
+
+    /// More concurrent writers than [`MAX_FREE_ARRAYS`] leave exactly that many arrays, and no
+    /// count is lost.
+    ///
+    /// The writers all hold an array at once: those after the first `MAX_FREE_ARRAYS` add their
+    /// counts into the kept arrays. Twice on the same counts, so that the second burst starts from
+    /// kept arrays.
+    #[test]
+    fn many_writers_keep_the_array_cap_and_every_count() {
+        let counts = ByteLookupCounts::default();
+        let writers = MAX_FREE_ARRAYS + 16;
+        let event = |i: usize| ByteLookupEvent::new(ByteOpcode::Range, i as u16, 8, 0);
+        for burst in 1..=2u32 {
+            let started = std::sync::atomic::AtomicUsize::new(0);
+            let abort = std::sync::atomic::AtomicBool::new(false);
+            std::thread::scope(|scope| {
+                for i in 0..writers {
+                    let (counts, started, abort) = (&counts, &started, &abort);
+                    let spawned = std::thread::Builder::new().spawn_scoped(scope, move || {
+                        counts.count(|counter| {
+                            // All of them hold an array at once (unless a spawn failed).
+                            started.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            while started.load(std::sync::atomic::Ordering::SeqCst) < writers
+                                && !abort.load(std::sync::atomic::Ordering::SeqCst)
+                            {
+                                std::thread::yield_now();
+                            }
+                            counter.add_byte_lookup_event(event(i));
+                        });
+                    });
+                    if let Err(e) = spawned {
+                        // Let the writers already started finish, rather than wait for ever.
+                        abort.store(true, std::sync::atomic::Ordering::SeqCst);
+                        panic!("could not start writer {i}: {e}");
+                    }
+                }
+            });
+            let pool = counts.pool.read().unwrap();
+            assert_eq!((pool.free.len(), pool.folding), (MAX_FREE_ARRAYS, 0));
+            drop(pool);
+            let sum = counts.sum();
+            assert_eq!(sum.iter().map(|&c| c as usize).sum::<usize>(), burst as usize * writers);
+            for i in 0..writers {
+                assert_eq!(sum[byte_lookup_slot(&event(i))], burst, "writer {i}'s count");
+            }
+        }
+    }
+
+    /// A writer that finishes while every kept array is being added into waits for one to come
+    /// back, and adds its counts into it.
+    #[test]
+    fn a_writer_waits_while_every_kept_array_is_added_into() {
+        let counts = ByteLookupCounts::default();
+        // As if `MAX_FREE_ARRAYS` writers had each taken a free array out to add into.
+        counts.pool.write().unwrap().folding = MAX_FREE_ARRAYS;
+        let event = ByteLookupEvent::new(ByteOpcode::Range, 7, 8, 0);
+        let counted = std::sync::atomic::AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            let writer = scope.spawn(|| {
+                counts.count(|counter| {
+                    counter.add_byte_lookup_event(event);
+                    counted.store(true, std::sync::atomic::Ordering::SeqCst);
+                });
+            });
+            // Once it has counted, the writer holds an array of its own (none was free): all it
+            // can do now is wait for a kept one.
+            while !counted.load(std::sync::atomic::Ordering::SeqCst) {
+                std::thread::yield_now();
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            assert!(!writer.is_finished(), "the writer kept an array beyond the cap");
+            let mut pool = counts.pool.write().unwrap();
+            pool.folding -= 1;
+            pool.free.push(vec![0u32; BYTE_LOOKUP_SLOTS].into_boxed_slice());
+            drop(pool);
+            writer.join().unwrap();
+        });
+        let mut pool = counts.pool.write().unwrap();
+        assert_eq!((pool.free.len(), pool.folding), (1, MAX_FREE_ARRAYS - 1));
+        pool.folding = 0;
+        drop(pool);
+        assert_eq!(counts.sum()[byte_lookup_slot(&event)], 1);
+    }
+
+    #[test]
+    fn appending_keeps_the_array_cap_and_every_count() {
+        let arrays = |n: usize| {
+            let counts = ByteLookupCounts::default();
+            counts.pool.write().unwrap().free = (0..n)
+                .map(|i| {
+                    let mut array = vec![0u32; BYTE_LOOKUP_SLOTS].into_boxed_slice();
+                    array[i] = 1;
+                    array
+                })
+                .collect();
+            counts
+        };
+        let mut counts = arrays(MAX_FREE_ARRAYS - 1);
+        counts.append(&mut arrays(3));
+        assert_eq!(counts.pool.read().unwrap().free.len(), MAX_FREE_ARRAYS);
+        let sum = counts.sum();
+        // The first array appended is kept; the other two are added into a kept one.
+        let expected = [[2; 3].as_slice(), &[1; MAX_FREE_ARRAYS - 4]].concat();
+        assert_eq!(&sum[..MAX_FREE_ARRAYS - 1], expected.as_slice());
+        assert_eq!(sum.iter().map(|&c| c as usize).sum::<usize>(), MAX_FREE_ARRAYS + 2);
     }
 }

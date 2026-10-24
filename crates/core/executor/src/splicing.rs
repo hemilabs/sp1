@@ -730,7 +730,7 @@ impl<T: MinimalTrace> Serialize for SplicedMinimalTrace<T> {
             let slots = Arc::get_mut(&mut mem_reads_buf).expect("the new slice is not shared");
             let start_mem_reads = self.mem_reads();
             let src_ptr = start_mem_reads.head_raw();
-            std::ptr::copy_nonoverlapping(src_ptr, slots.as_mut_ptr() as *mut MemValue, len);
+            std::ptr::copy_nonoverlapping(src_ptr, slots.as_mut_ptr().cast::<MemValue>(), len);
             mem_reads_buf.assume_init()
         };
 
