@@ -36,9 +36,9 @@ use anyhow::{Context, Result};
 const STDERR_TAIL_BYTES: usize = 4096;
 /// Helper run time when `SP1_GROTH16_HELPER_TIMEOUT_SECS` is unset.
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(1800);
-/// How long to wait for a killed helper to be gone. One stuck in the kernel (a GPU driver hang, say)
-/// never goes, and must not take this thread with it.
-const REAP_WITHIN: Duration = Duration::from_secs(30);
+/// How long to wait for a killed helper to be gone, or a stopped one to exit. One stuck in the
+/// kernel (a GPU driver hang, say) never goes, and must not take this thread with it.
+pub(crate) const REAP_WITHIN: Duration = Duration::from_secs(30);
 
 /// How a helper ended.
 #[derive(Debug)]
@@ -201,19 +201,26 @@ impl KillOnDrop {
 
     /// Kills the helper and waits up to [`REAP_WITHIN`] for it to go. Whether it went.
     fn kill_and_reap(&mut self) -> bool {
-        let Some(mut child) = self.0.take() else {
-            return true;
-        };
-        let _ = child.kill();
-        let deadline = Instant::now() + REAP_WITHIN;
-        loop {
-            match child.try_wait() {
-                Ok(Some(_)) | Err(_) => return true,
-                Ok(None) if Instant::now() >= deadline => return false,
-                Ok(None) => std::thread::sleep(Duration::from_millis(50)),
-            }
+        self.0.take().is_none_or(|mut child| kill_and_reap(&mut child))
+    }
+}
+
+/// Waits up to `within` for `child` to exit. Whether it did (or can no longer be waited for).
+pub(crate) fn exited_within(child: &mut std::process::Child, within: Duration) -> bool {
+    let deadline = Instant::now() + within;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) | Err(_) => return true,
+            Ok(None) if Instant::now() >= deadline => return false,
+            Ok(None) => std::thread::sleep(Duration::from_millis(50)),
         }
     }
+}
+
+/// Kills `child` and waits up to [`REAP_WITHIN`] for it to go. Whether it went.
+pub(crate) fn kill_and_reap(child: &mut std::process::Child) -> bool {
+    let _ = child.kill();
+    exited_within(child, REAP_WITHIN)
 }
 
 impl Drop for KillOnDrop {

@@ -54,7 +54,7 @@ fn shm_named_tempfile() -> tempfile::NamedTempFile {
 /// per-prove tempdir behavior.
 #[cfg(feature = "native")]
 fn pk_cache_dir(vkey_hash_hex: &str) -> Option<std::path::PathBuf> {
-    if std::env::var_os("SP1_GROTH16_PK_CACHE_DISABLE").is_some() {
+    if pk_cache_disabled() {
         return None;
     }
     let root = std::env::var("SP1_GROTH16_PK_CACHE").ok().unwrap_or_else(|| {
@@ -67,6 +67,12 @@ fn pk_cache_dir(vkey_hash_hex: &str) -> Option<std::path::PathBuf> {
     Some(std::path::PathBuf::from(root).join(format!("sp1_groth16_pk_cache_{vkey_hash_hex}")))
 }
 
+/// Whether `SP1_GROTH16_PK_CACHE_DISABLE` gives each proof a proving key export of its own.
+#[cfg(feature = "native")]
+pub(crate) fn pk_cache_disabled() -> bool {
+    std::env::var_os("SP1_GROTH16_PK_CACHE_DISABLE").is_some()
+}
+
 #[cfg(feature = "native")]
 const PK_CACHE_SENTINEL: &str = ".sp1_pk_cache_complete";
 
@@ -77,6 +83,14 @@ pub(crate) struct GpuPk {
     pub(crate) dir: std::path::PathBuf,
     /// Only when the cache is disabled: this proof's private export, removed on drop.
     _private: Option<crate::gpu_cache::ProofDir>,
+}
+
+#[cfg(all(test, unix, feature = "native"))]
+impl GpuPk {
+    /// The key in `dir`, which dropping it leaves.
+    pub(crate) fn at(dir: &Path) -> Self {
+        GpuPk { dir: dir.to_path_buf(), _private: None }
+    }
 }
 
 /// Returns the GPU-format proving key for `build_dir`, exporting it first if no complete cache
@@ -519,6 +533,9 @@ impl Groth16Bn254Prover {
     pub fn prove_isolated_json(witness_json: &Path, build_dir: &Path) -> Result<Groth16Bn254Proof> {
         use anyhow::Context;
 
+        // A helper prestarted for a GPU proof that fell back to this one would otherwise hold the
+        // host memory (and the card) beside it.
+        crate::prestart::discard_before_new_helper();
         let _slot = crate::groth16_queue::acquire("Groth16 (CPU)");
 
         let in_process = cfg!(feature = "groth16-cuda")
@@ -978,8 +995,10 @@ impl Groth16Bn254Prover {
                 return proof;
             }
         }
-        // A new helper loads its key into host memory: hand back the solve's first.
+        // A new helper loads its key into host memory: hand back the solve's first, and kill a
+        // prestarted helper this proof does not use.
         drop(go_memory);
+        crate::prestart::discard_before_new_helper();
 
         // The helper needs ~15 GB of GPU memory, which a prover keeping its shard-prover state on
         // a 24 GB card does not have free. Only a process that exits after this proof may reset
