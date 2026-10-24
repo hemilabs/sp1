@@ -1069,35 +1069,132 @@ impl ByteRecord for ExecutionRecord {
 
 /// The tag a record dump starts with ([`ExecutionRecord::to_dump_bytes`]). Bincode is
 /// positional, so a dump reads back only into a build with the same record layout: change the
-/// version whenever a serialized field is added, removed or reordered. Version 2 added
-/// `byte_lookup_counts` and `dependencies_in_trace`; untagged dumps are older.
-const RECORD_DUMP_TAG: &[u8; 12] = b"sp1-record\x00\x02";
+/// version whenever a serialized field is added, removed or reordered, and whenever an enum the
+/// record holds gets a variant anywhere but at its end, or loses or reorders one (bincode writes a
+/// variant as its index), which the sizes [`DumpLayout`] compares do not show. Version 2 added
+/// `byte_lookup_counts` and `dependencies_in_trace`, version 3 the [`DumpLayout`] after the tag;
+/// untagged dumps are older.
+const RECORD_DUMP_TAG: &[u8; 12] = b"sp1-record\x00\x03";
+
+/// What a record dump means beyond its format version, which a build only reads back if it is its
+/// own: the record's layout where features change it, and which chips' byte lookups a record with
+/// `dependencies_in_trace` leaves to their trace generation. Read before the record, so that a
+/// dump that does not fit is turned away before its gigabyte is parsed.
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct DumpLayout {
+    /// The bytes an empty record serializes to. Features add fields (the `mprotect` feature adds
+    /// 44 bytes to the public values), which positional bincode would read others' bytes into.
+    empty_record_bytes: u64,
+    /// The byte lookup slots the record's counts index (`BYTE_LOOKUP_SLOTS`): more byte opcodes
+    /// would read the counts into other slots.
+    byte_lookup_slots: u64,
+    /// For a record with `dependencies_in_trace`, the chips that count their byte lookups while
+    /// they write their trace, sorted.
+    counted_in_trace: Option<Vec<String>>,
+}
+
+impl DumpLayout {
+    fn of_this_build(dependencies_in_trace: bool, counted_in_trace: &[String]) -> Self {
+        let counted_in_trace = dependencies_in_trace.then(|| {
+            let mut counted_in_trace = counted_in_trace.to_vec();
+            counted_in_trace.sort();
+            counted_in_trace
+        });
+        let empty_record_bytes = bincode::serialized_size(&ExecutionRecord::default())
+            .expect("an empty record serializes");
+        let byte_lookup_slots = crate::events::BYTE_LOOKUP_SLOTS as u64;
+        Self { empty_record_bytes, byte_lookup_slots, counted_in_trace }
+    }
+}
 
 impl ExecutionRecord {
-    /// The record as a dump file's bytes (`SP1_RECORD_WRITE_DIR`): the format tag, then the
-    /// record.
-    pub fn to_dump_bytes(&self) -> bincode::Result<Vec<u8>> {
+    /// The record as a dump file's bytes (`SP1_RECORD_WRITE_DIR`): the format tag, the layout,
+    /// then the record. `counted_in_trace` names the machine's chips that count their byte lookups
+    /// while they write their trace (`Machine::chips_counting_in_trace`).
+    pub fn to_dump_bytes(&self, counted_in_trace: &[String]) -> bincode::Result<Vec<u8>> {
+        self.write_dump(&DumpLayout::of_this_build(self.dependencies_in_trace, counted_in_trace))
+    }
+
+    fn write_dump(&self, layout: &DumpLayout) -> bincode::Result<Vec<u8>> {
         let mut bytes = RECORD_DUMP_TAG.to_vec();
+        bincode::serialize_into(&mut bytes, layout)?;
         bincode::serialize_into(&mut bytes, self)?;
         Ok(bytes)
     }
 
-    /// Reads a record dump ([`Self::to_dump_bytes`]). A dump of another record layout (another
-    /// build's) is an error saying so, not a misread record.
-    pub fn from_dump_bytes(bytes: &[u8]) -> Result<Self, String> {
-        let Some(record) = bytes.strip_prefix(RECORD_DUMP_TAG.as_slice()) else {
+    /// Reads a record dump ([`Self::to_dump_bytes`]), for a machine whose chips named in
+    /// `counted_in_trace` count their byte lookups while they write their trace. A dump of another
+    /// record layout (another build's) is an error saying so, not a misread record.
+    pub fn from_dump_bytes(bytes: &[u8], counted_in_trace: &[String]) -> Result<Self, String> {
+        use bincode::Options;
+        let Some(mut record) = bytes.strip_prefix(RECORD_DUMP_TAG.as_slice()) else {
             return Err(match bytes.strip_prefix(&RECORD_DUMP_TAG[..11]) {
                 Some([version, ..]) => format!(
                     "the record dump has format version {version}, this build reads version {}: \
                      dump it again with this build",
                     RECORD_DUMP_TAG[11]
                 ),
+                _ if bytes.len() < RECORD_DUMP_TAG.len() => {
+                    format!("the record dump is cut off ({} bytes): dump it again", bytes.len())
+                }
                 _ => "the record dump has no format tag: it is from a build before record dumps \
                       had one, so dump it again with this build"
                     .to_string(),
             });
         };
-        bincode::deserialize(record).map_err(|e| format!("failed to deserialize the record: {e}"))
+        // Read from the bytes as a stream (the record follows the layout), bounded by the bytes
+        // there are: a length read from a damaged dump is then an error, not an allocation of that
+        // many bytes.
+        let options = || {
+            bincode::DefaultOptions::new()
+                .with_fixint_encoding()
+                .allow_trailing_bytes()
+                .with_limit(bytes.len() as u64)
+        };
+        let layout: DumpLayout = options()
+            .deserialize_from(&mut record)
+            .map_err(|e| format!("failed to deserialize the record dump's layout: {e}"))?;
+        let ours = DumpLayout::of_this_build(layout.counted_in_trace.is_some(), counted_in_trace);
+        if (layout.empty_record_bytes, layout.byte_lookup_slots)
+            != (ours.empty_record_bytes, ours.byte_lookup_slots)
+        {
+            return Err(format!(
+                "the record dump is from a build with another record layout (an empty record and \
+                 the byte lookup slots take {} bytes and {} slots there, {} and {} here: the \
+                 mprotect feature, say), so dump it again with this build",
+                layout.empty_record_bytes,
+                layout.byte_lookup_slots,
+                ours.empty_record_bytes,
+                ours.byte_lookup_slots
+            ));
+        }
+        if layout.counted_in_trace != ours.counted_in_trace {
+            return Err(format!(
+                "the record dump leaves the byte lookups of the chips {:?} to their trace \
+                 generation, and this build those of {:?}: dump it again with this build",
+                layout.counted_in_trace.unwrap_or_default(),
+                ours.counted_in_trace.unwrap_or_default()
+            ));
+        }
+        let dump: Self = options()
+            .deserialize_from(&mut record)
+            .map_err(|e| format!("failed to deserialize the record: {e}"))?;
+        if !record.is_empty() {
+            return Err(format!(
+                "the record dump does not match its layout ({} bytes after the record): it is \
+                 from a build with another record layout, or damaged, so dump it again with this \
+                 build",
+                record.len()
+            ));
+        }
+        if dump.dependencies_in_trace != layout.counted_in_trace.is_some() {
+            return Err(format!(
+                "the record dump's layout says the record {} its chips' byte lookups to their \
+                 trace generation, and the record says otherwise: it is damaged, so dump it again",
+                if layout.counted_in_trace.is_some() { "leaves" } else { "does not leave" }
+            ));
+        }
+        Ok(dump)
     }
 }
 
@@ -1813,14 +1910,77 @@ mod dump_tests {
     #[test]
     fn a_record_dump_reads_back_and_an_untagged_one_says_why_not() {
         let record = ExecutionRecord::default();
-        let bytes = record.to_dump_bytes().unwrap();
-        assert!(ExecutionRecord::from_dump_bytes(&bytes).is_ok());
+        let bytes = record.to_dump_bytes(&[]).unwrap();
+        assert!(ExecutionRecord::from_dump_bytes(&bytes, &[]).is_ok());
         let untagged = bincode::serialize(&record).unwrap();
-        let e = ExecutionRecord::from_dump_bytes(&untagged).unwrap_err();
+        let e = ExecutionRecord::from_dump_bytes(&untagged, &[]).unwrap_err();
         assert!(e.contains("no format tag"), "{e}");
         let mut other_version = bytes.clone();
         other_version[11] = 1;
-        let e = ExecutionRecord::from_dump_bytes(&other_version).unwrap_err();
+        let e = ExecutionRecord::from_dump_bytes(&other_version, &[]).unwrap_err();
         assert!(e.contains("format version 1"), "{e}");
+        // A file cut off in its tag (left by a dump that did not finish) says so.
+        for cut in [0, 5, 11] {
+            let e = ExecutionRecord::from_dump_bytes(&bytes[..cut], &[]).unwrap_err();
+            assert!(e.contains("cut off"), "{e}");
+        }
+    }
+
+    /// A dump reads back only into a build with its layout (features that add fields) and, for a
+    /// record that leaves byte lookups to trace generation, the same chips doing so.
+    #[test]
+    fn a_record_dump_of_another_layout_or_chip_set_says_why_not() {
+        let fused = ["Lt".to_string(), "Add".to_string()];
+        let mut record = ExecutionRecord::default();
+        let bytes = record.to_dump_bytes(&fused).unwrap();
+        // The order of the names does not matter, and without the flag neither do the names.
+        assert!(ExecutionRecord::from_dump_bytes(&bytes, &["Add".into(), "Lt".into()]).is_ok());
+        assert!(ExecutionRecord::from_dump_bytes(&bytes, &[]).is_ok());
+        record.dependencies_in_trace = true;
+        let bytes = record.to_dump_bytes(&fused).unwrap();
+        assert!(ExecutionRecord::from_dump_bytes(&bytes, &fused).is_ok());
+        assert!(ExecutionRecord::from_dump_bytes(&bytes, &["Add".into(), "Lt".into()]).is_ok());
+        let e = ExecutionRecord::from_dump_bytes(&bytes, &fused[..1]).unwrap_err();
+        assert!(e.contains("byte lookups of the chips"), "{e}");
+        // Another build's empty record size, or slots: the layout right after the tag says so.
+        let changes: [fn(&mut DumpLayout); 2] =
+            [|l| l.empty_record_bytes += 44, |l| l.byte_lookup_slots += 1];
+        for change in changes {
+            let mut layout = DumpLayout::of_this_build(true, &fused);
+            change(&mut layout);
+            let e = ExecutionRecord::from_dump_bytes(&record.write_dump(&layout).unwrap(), &fused)
+                .unwrap_err();
+            assert!(e.contains("another record layout"), "{e}");
+        }
+        // A record whose fields another build lays out differently: here, one shorter.
+        let mut shorter = bytes.clone();
+        shorter.extend_from_slice(&[0; 4]);
+        let e = ExecutionRecord::from_dump_bytes(&shorter, &fused).unwrap_err();
+        assert!(e.contains("4 bytes after the record"), "{e}");
+    }
+
+    /// A damaged length in a dump is an error, not an allocation of that many bytes.
+    #[test]
+    fn a_damaged_record_dump_says_so() {
+        let mut record = ExecutionRecord::default();
+        record.dependencies_in_trace = true;
+        let bytes = record.to_dump_bytes(&["Add".to_string()]).unwrap();
+        // The layout's first chip name's length (after the tag, two u64s and the option tag).
+        let at = RECORD_DUMP_TAG.len() + 8 + 8 + 1 + 8;
+        let mut damaged = bytes.clone();
+        damaged[at..at + 8].copy_from_slice(&(1u64 << 42).to_le_bytes());
+        let e = ExecutionRecord::from_dump_bytes(&damaged, &["Add".to_string()]).unwrap_err();
+        assert!(e.contains("layout"), "{e}");
+        let truncated = &bytes[..bytes.len() - 1];
+        assert!(ExecutionRecord::from_dump_bytes(truncated, &["Add".to_string()]).is_err());
+        // A layout and a record that disagree on whether trace generation counts byte lookups.
+        record.dependencies_in_trace = false;
+        let layout = DumpLayout::of_this_build(true, &["Add".to_string()]);
+        let e = ExecutionRecord::from_dump_bytes(
+            &record.write_dump(&layout).unwrap(),
+            &["Add".to_string()],
+        )
+        .unwrap_err();
+        assert!(e.contains("says otherwise"), "{e}");
     }
 }

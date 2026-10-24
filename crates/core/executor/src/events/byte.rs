@@ -159,7 +159,9 @@ pub const BYTE_LOOKUP_SLOTS: usize = BYTE_TABLE_ROWS * NUM_BYTE_OPS + RANGE_TABL
 /// The multiplicity slot of a byte lookup: where the byte or range table counts it.
 ///
 /// The byte table does not read `a` (it is a function of the opcode, `b` and `c`) and the range
-/// table does not read `c`, so they are not part of the slot.
+/// table does not read `c`, so they are not part of the slot. Record dumps hold counts by slot
+/// (`ExecutionRecord::to_dump_bytes`), and check only the number of slots: a change that keeps it
+/// (reordered opcodes, say) needs a new dump format version (`RECORD_DUMP_TAG`).
 #[inline]
 #[must_use]
 pub fn byte_lookup_slot(event: &ByteLookupEvent) -> usize {
