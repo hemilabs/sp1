@@ -244,6 +244,11 @@ impl GpuUse {
     fn may_reset(&self) -> bool {
         !self.reset && self.proofs_in_flight <= 1
     }
+
+    /// Whether a reset may be reserved now: as [`Self::may_reset`], and none is reserved.
+    fn may_reserve_reset(&self) -> bool {
+        self.may_reset() && !self.reset_reserved
+    }
 }
 
 static GPU_USE: Mutex<GpuUse> =
@@ -299,20 +304,28 @@ impl Drop for ResetReservation {
 /// Reserves a reset of this process's GPU for a wrap, if one can happen:
 /// `SP1_GPU_RESET_BEFORE_WRAP` asks for it, a runtime library is loaded to reset with, none has
 /// happened, and no proof but the caller's is in flight. A wrap that would fit only after a reset
-/// is chosen only with one, and holds it until it ends: a proof that started between the choice
-/// and the reset (the PK export and solve take seconds to minutes) would make the reset refuse and
-/// the helper run out of memory.
+/// is chosen only with one, and holds it until its GPU attempt ends: a proof that started between
+/// the choice and the reset (the PK export and solve take seconds to minutes) would make the reset
+/// refuse and the helper run out of memory.
 #[must_use = "the reset is reserved only while the result is alive"]
 pub fn reserve_reset() -> Option<ResetReservation> {
-    if !reset_requested() || !reset_available() {
-        return None;
-    }
     let mut gpu_use = gpu_use();
-    if !gpu_use.may_reset() || gpu_use.reset_reserved {
+    if !reservable(&gpu_use) {
         return None;
     }
     gpu_use.reset_reserved = true;
     Some(ResetReservation(()))
+}
+
+/// Whether [`reserve_reset`] would reserve a reset now, without reserving one: for a wrap's choice,
+/// which reserves a reset only if it counts on one, so that proofs are turned away only then.
+pub fn reset_possible() -> bool {
+    reservable(&gpu_use())
+}
+
+/// The rule of [`reserve_reset`] and [`reset_possible`].
+fn reservable(gpu_use: &GpuUse) -> bool {
+    reset_requested() && reset_available() && gpu_use.may_reserve_reset()
 }
 
 /// Resets this process's GPU before a wrap helper needing `needed` bytes runs, if
@@ -514,21 +527,24 @@ mod tests {
     fn a_reset_is_reserved_only_where_one_can_happen() {
         let _env = crate::test_env::lock();
         let _flags = ResetFlags;
-        std::env::remove_var("SP1_GPU_RESET_BEFORE_WRAP");
-        assert!(reserve_reset().is_none());
+        // Restored however the test ends.
+        let _requested = crate::test_env::set_var("SP1_GPU_RESET_BEFORE_WRAP", "0");
+        assert!(!reset_possible() && reserve_reset().is_none());
         std::env::set_var("SP1_GPU_RESET_BEFORE_WRAP", "1");
+        assert_eq!(reset_possible(), reset_available());
         let reserved = reserve_reset();
         assert_eq!(reserved.is_some(), reset_available());
         if reserved.is_some() {
             assert!(proof_started().is_none());
-            assert!(reserve_reset().is_none(), "two reservations");
+            assert!(!reset_possible() && reserve_reset().is_none(), "two reservations");
             drop(reserved);
+            assert!(reset_possible());
             let first = proof_started().unwrap();
             let second = proof_started().unwrap();
+            assert!(!reset_possible(), "a reset counted on beside another proof");
             assert!(reserve_reset().is_none(), "reserved beside another proof");
             drop((first, second));
         }
-        std::env::remove_var("SP1_GPU_RESET_BEFORE_WRAP");
     }
 
     /// A lookup must not load a runtime the process does not already use. (The code this replaced

@@ -53,15 +53,23 @@ struct GpuWork;
 /// Starts work that needs the GPU, counting it as in flight while the result is alive. Refused
 /// once this process has reset its GPU before a final wrap (`SP1_GPU_RESET_BEFORE_WRAP`, where the
 /// wrap's helper would not fit otherwise): the reset destroyed the provers' GPU state, and the work
-/// would crash on it.
+/// would crash on it. Refused too while a final wrap's GPU attempt has reserved such a reset, until
+/// it ends.
 fn start_gpu_work() -> anyhow::Result<GpuWork> {
     #[cfg(feature = "native-gnark")]
     {
         sp1_recursion_gnark_ffi::gpu_proof_started().ok_or_else(|| {
-            anyhow::anyhow!(
-                "this process reset its GPU before a final wrap (SP1_GPU_RESET_BEFORE_WRAP), which \
-                 destroyed its provers' GPU state: restart it to prove again"
-            )
+            if sp1_recursion_gnark_ffi::gpu_was_reset() {
+                anyhow::anyhow!(
+                    "this process reset its GPU before a final wrap (SP1_GPU_RESET_BEFORE_WRAP), \
+                     which destroyed its provers' GPU state: restart it to prove again"
+                )
+            } else {
+                anyhow::anyhow!(
+                    "a final wrap in this process may reset its GPU (SP1_GPU_RESET_BEFORE_WRAP), \
+                     which would destroy this work's GPU state: try again once it has ended"
+                )
+            }
         })
     }
     #[cfg(not(feature = "native-gnark"))]

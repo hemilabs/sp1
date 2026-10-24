@@ -45,14 +45,22 @@ pub(crate) struct Groth16Inputs<'a> {
     /// Total memory of this process's GPU, if known.
     pub vram_total: Option<u64>,
     /// Whether this process may reset its GPU before the helper runs, which frees the card for it:
-    /// `SP1_GPU_RESET_BEFORE_WRAP` where a reset can happen, and is reserved for this wrap
-    /// (`gpu_reserve_reset`: a runtime to reset with, and no other proof in flight).
+    /// `SP1_GPU_RESET_BEFORE_WRAP` where a reset can happen (`gpu_reset_possible`: a runtime to
+    /// reset with, and no other proof in flight). A GPU wrap that counts on it reserves it.
     pub gpu_reset: bool,
     /// Memory this process can still use (`host_memory::available`: `MemAvailable`, capped by
     /// cgroup v2 limits), if known.
     pub mem_available: Option<u64>,
     /// Whether the GPU-format proving key is already exported.
     pub pk_cache_ready: bool,
+}
+
+impl Groth16Inputs<'_> {
+    /// Whether the GPU helper fits on this process's card; a GPU wrap reserves the reset it counts
+    /// on where it fits only [`HelperRoom::AfterReset`].
+    pub(crate) fn helper_room(&self) -> HelperRoom {
+        helper_room(GPU_HELPER_VRAM_BYTES, self.vram_free, self.vram_total, self.gpu_reset)
+    }
 }
 
 /// Returns whether to use the GPU prover, and why, for the log.
@@ -73,8 +81,7 @@ pub(crate) fn use_gpu(inputs: &Groth16Inputs<'_>) -> (bool, String) {
                 .into(),
         );
     }
-    match helper_room(GPU_HELPER_VRAM_BYTES, inputs.vram_free, inputs.vram_total, inputs.gpu_reset)
-    {
+    match inputs.helper_room() {
         HelperRoom::Fits(_) | HelperRoom::AfterReset(_) => {}
         HelperRoom::Lacking(reason) => return (false, format!("{reason} the GPU prover's helper")),
         HelperRoom::Unknown => return (false, "free GPU memory is unknown".into()),
@@ -111,7 +118,7 @@ pub(crate) enum HelperRoom {
 
 /// Whether a helper needing `needed` bytes fits on a card with `free` of `total` bytes free (once
 /// the memory pool's idle reserve is given back), or once this process resets its GPU, if a reset
-/// can happen (`gpu_reset`, from a `gpu_device::reserve_reset` reservation): the same rules
+/// can happen (`gpu_reset`, see `gpu_device::reset_possible`): the same rules
 /// `gpu_device::reset_if_requested` resets by, so that a helper chosen to run after a reset gets
 /// one.
 pub(crate) fn helper_room(
@@ -165,7 +172,8 @@ pub(crate) struct PlonkInputs {
     pub vram_free: Option<u64>,
     /// Total memory of this process's GPU, if known.
     pub vram_total: Option<u64>,
-    /// Whether this process may reset its GPU to make room for the helper: as for Groth16.
+    /// Whether this process may reset its GPU to make room for the helper: as for Groth16 (never
+    /// for a routed helper).
     pub gpu_reset: bool,
     /// Memory this process can still use (`host_memory::available`), if known.
     pub mem_available: Option<u64>,
@@ -174,6 +182,19 @@ pub(crate) struct PlonkInputs {
     /// Whether a `SP1_PLONK_GPU_SERVER` helper from an earlier proof still runs, holding most of
     /// the memory the next proof needs.
     pub server_running: bool,
+}
+
+impl PlonkInputs {
+    /// Whether the helper fits on this process's card, as [`Groth16Inputs::helper_room`] (whatever
+    /// the routing, which [`use_gpu_plonk`] looks at first).
+    pub(crate) fn helper_room(&self) -> HelperRoom {
+        helper_room(
+            sp1_recursion_gnark_ffi::PLONK_GPU_HELPER_VRAM_BYTES,
+            self.vram_free,
+            self.vram_total,
+            self.gpu_reset,
+        )
+    }
 }
 
 /// Returns whether to try the GPU PLONK prover that `SP1_PLONK_GPU=1` asks for, and why, for the
@@ -195,12 +216,7 @@ pub(crate) fn use_gpu_plonk(inputs: &PlonkInputs) -> (bool, String) {
     let gpu = if inputs.helper_routed {
         "SP1_PLONK_GPU_HELPER_DEVICES runs its helper on other cards".to_string()
     } else {
-        match helper_room(
-            sp1_recursion_gnark_ffi::PLONK_GPU_HELPER_VRAM_BYTES,
-            inputs.vram_free,
-            inputs.vram_total,
-            inputs.gpu_reset,
-        ) {
+        match inputs.helper_room() {
             HelperRoom::Fits(free) => format!("{} GiB of GPU memory is free", free >> 30),
             HelperRoom::AfterReset(_) => {
                 "SP1_GPU_RESET_BEFORE_WRAP frees this card for its helper".into()

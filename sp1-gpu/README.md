@@ -132,7 +132,9 @@ gnark's CPU Groth16 prover peaks at ~16 GiB on the v6.1.0 circuit. So:
   the helper anyway, and not while another proof uses the GPU. The reset destroys the state the
   prover proves the next proof with, so afterwards the process refuses to prove again; where the
   helper fits without it, as on a 32 GB card, there is no reset and the process keeps proving. A
-  helper that runs out of memory without a reset gets one, once, if the flag is set.
+  wrap that counts on a reset turns new proofs away while it tries the GPU, so that none starts
+  under the reset. A helper that runs out of memory without a reset gets one, once, if the flag is
+  set.
 
 | Variable | Default | Effect |
 | --- | --- | --- |
