@@ -78,6 +78,7 @@ typedef void* nvtxDomainHandle_t;
 #include <algorithm>
 #include <cstdlib>
 #include <mutex>
+#include <utility>
 
 struct CachedBlock {
     void* ptr;
@@ -193,7 +194,8 @@ static bool deviceHeadroom(size_t* headroom) {
 
 // The device memory arena (Linux): the cache below carves its blocks out of a few large
 // allocations, best fit, and merges freed ranges back, instead of calling hipMalloc and hipFree.
-// While proving, no device memory is then mapped or unmapped, except when the arena has to grow.
+// While proving, no device memory is then mapped or unmapped, except when the arena has to grow
+// (or, as a last resort, gives back an allocation that is wholly free to make room for a block).
 //
 // On a Radeon RX 9070 XT (gfx1201, kernel 7.0, ROCm 7.2.4, MES firmware 0x81), mapping and
 // unmapping device memory while kernels run corrupts other memory now and then: with this cache
@@ -212,6 +214,12 @@ static bool deviceHeadroom(size_t* headroom) {
 // off, and it is off where the GPU PLONK helper (SP1_PLONK_GPU=1) runs on this card, unless
 // SP1_GPU_ARENA=1. The memory the arena holds free counts as free for this process
 // (cuda_mem_get_info), not for helper processes.
+//
+// The arena never moves a live block, and gives one of its allocations back to the driver only
+// when all of it is free, and a block that fits nowhere else needs it (arenaReleaseFreeChunksFor).
+// So a block larger than any free range, while live blocks split the free memory of the first
+// allocation (which holds nearly all of it), can only come from the memory outside the arena: the
+// headroom, and what wholly free later allocations give back.
 struct ArenaRange {
     size_t length;
     char* chunk;  // the allocation the range belongs to: ranges never merge across allocations
@@ -295,23 +303,88 @@ static bool arenaGrow(size_t size) {
     return true;
 }
 
-// Reports a block the arena had no room for (the first 10, then every 100th), with the arena as it
-// was. Growing it maps device memory while proving, which the arena is there to avoid (see above),
-// and so does a separate allocation that succeeds: the report lets an invalid shard be matched to
-// one. (When the card has no memory left either, the Rust allocator frees its caches and tries
-// again.)
-static void arenaReportMiss(size_t s, size_t free_b, size_t largest, size_t grown) {
-    static size_t misses = 0;
-    if (++misses > 10 && misses % 100 != 0) return;
+// The bytes of the arena's allocations.
+static size_t arenaBytes() {
     size_t total = 0;
     for (auto& chunk : g_arena_chunks) total += chunk.second;
-    if (grown) total -= grown;
+    return total;
+}
+
+// Gives the driver back allocations of the arena that are wholly free, so that it has room for a
+// block of `s` bytes, which fits in none of the arena's free ranges: the smallest one that makes
+// room alone, else the largest ones until they do; none where all of them would not. Like a
+// growth, this is a mapping change while other threads may launch work (see above), which is why
+// it is a last resort. The caller has waited for the device. Returns the bytes given back.
+static size_t arenaReleaseFreeChunksFor(size_t s) {
+    size_t driver_free = 0, total_b = 0;
+    if (hipMemGetInfo(&driver_free, &total_b) != hipSuccess) {
+        (void)hipGetLastError();
+        return 0;
+    }
+    std::vector<std::pair<size_t, char*>> unused;  // wholly free allocations, by size
+    size_t unused_bytes = 0;
+    for (auto& chunk : g_arena_chunks) {
+        auto range = g_arena_free.find(chunk.first);
+        if (range != g_arena_free.end() && range->second.length == chunk.second) {
+            unused.emplace_back(chunk.second, chunk.first);
+            unused_bytes += chunk.second;
+        }
+    }
+    if (driver_free >= s || driver_free + unused_bytes < s) return 0;
+    std::sort(unused.begin(), unused.end());
+    auto alone = std::find_if(unused.begin(), unused.end(),
+                              [&](const auto& chunk) { return driver_free + chunk.first >= s; });
+    if (alone != unused.end()) {
+        unused = {*alone};
+    } else {
+        std::reverse(unused.begin(), unused.end());
+    }
+    size_t freed = 0;
+    for (const auto& chunk : unused) {
+        const size_t size = chunk.first;
+        char* base = chunk.second;
+        if (driver_free + freed >= s) break;
+        // A failed free leaves the allocation in the arena; the failure must not stay the thread's
+        // last error, which the next checked launch would report as its own.
+        if (hipFree(base) != hipSuccess) {
+            (void)hipGetLastError();
+            continue;
+        }
+        arenaEraseLength(size, base);
+        g_arena_free.erase(base);
+        g_arena_free_bytes -= size;
+        g_arena_chunks.erase(std::find(g_arena_chunks.begin(), g_arena_chunks.end(),
+                                       std::make_pair(base, size)));
+        freed += size;
+    }
+    return freed;
+}
+
+// Reports a block the arena had no room for (the first 10, then every 100th; every one that gave
+// allocations back), with the arena as it was. Growing it maps device memory while proving, which
+// the arena is there to avoid (see above), and so do giving an allocation back and a separate
+// allocation that succeeds: the report lets an invalid shard be matched to one. (When the card has
+// no memory left either, the Rust allocator frees its caches and tries again.)
+static void arenaReportMiss(size_t s, size_t free_b, size_t total, size_t largest, size_t released,
+                            size_t grown) {
+    static size_t misses = 0;
+    if (++misses > 10 && misses % 100 != 0 && released == 0) return;
+    char gave_back[96] = "";
+    if (released) {
+        snprintf(gave_back, sizeof(gave_back),
+                 "gave back %zu MiB of wholly free allocations, then ", released >> 20);
+    }
     fprintf(stderr,
             "sp1-gpu: no room in the device memory arena for a %zu MiB block (%zu of %zu MiB free, "
-            "at most %zu MiB in one range; miss %zu): %s %zu MiB\n",
-            s >> 20, free_b >> 20, total >> 20, largest >> 20, misses,
+            "at most %zu MiB in one range; miss %zu): %s%s %zu MiB\n",
+            s >> 20, free_b >> 20, total >> 20, largest >> 20, misses, gave_back,
             grown ? "grew it by" : "trying a separate allocation of", (grown ? grown : s) >> 20);
 }
+
+// The size of the last block this thread's arena miss found no memory for (it then fails), so that
+// the Rust allocator's retry of it, after the allocator has given back its caches, may give back
+// wholly free allocations of the arena: a mapping change, so only when nothing else made room.
+static thread_local size_t t_failed_miss = 0;
 
 // The first device a CUDA_VISIBLE_DEVICES-style list names, without surrounding whitespace.
 static std::string firstDevice(const char* list) {
@@ -424,6 +497,8 @@ static void evictUntilFits(size_t need, size_t headroom) {
 static hipError_t cachedHipMalloc(void** p, size_t s, hipStream_t stream) {
     if (s == 0) { *p = nullptr; return hipSuccess; }
     s = roundAllocSize(s);
+    // Whatever serves it, this call answers an earlier failure of its size or none.
+    const bool retrying = std::exchange(t_failed_miss, 0) == s;
     std::lock_guard<std::mutex> lock(g_alloc_mutex);
     // Try exact-size match first.
     auto it = g_free_pool.find(s);
@@ -451,7 +526,9 @@ static hipError_t cachedHipMalloc(void** p, size_t s, hipStream_t stream) {
         break; // lower_bound found nothing in range
     }
     // From the arena, if there is one: when it can't fit the block, the cached blocks go back to
-    // it (once the device is idle), and then it grows by an allocation of at least 1 GiB.
+    // it (once the device is idle), and then it grows by an allocation of at least 1 GiB, or of
+    // the block where the driver has less. When the driver has not that either, on the retry of
+    // the block (see t_failed_miss), it gives back wholly free allocations to make room.
     arenaInit();
     if (g_arena_on) {
         void* q = arenaTake(s);
@@ -461,10 +538,17 @@ static hipError_t cachedHipMalloc(void** p, size_t s, hipStream_t stream) {
         }
         if (!q) {
             const size_t free_b = g_arena_free_bytes;
+            const size_t total = arenaBytes();
             const size_t largest = g_arena_by_len.empty() ? 0 : g_arena_by_len.rbegin()->first;
-            const size_t grow = std::max(s, size_t(1) << 30);
-            const bool grew = arenaGrow(grow);
-            arenaReportMiss(s, free_b, largest, grew ? grow : 0);
+            size_t grow = std::max(s, size_t(1) << 30);
+            bool grew = arenaGrow(grow);
+            if (!grew && grow > s) {
+                grow = s;
+                grew = arenaGrow(grow);
+            }
+            const size_t released = !grew && retrying ? arenaReleaseFreeChunksFor(s) : 0;
+            if (released) grew = arenaGrow(grow);
+            arenaReportMiss(s, free_b, total, largest, released, grew ? grow : 0);
             if (grew) q = arenaTake(s);
         }
         if (q) {
@@ -503,12 +587,17 @@ static hipError_t cachedHipMalloc(void** p, size_t s, hipStream_t stream) {
         err = hipMalloc(p, s);
     }
     if (err != hipSuccess) {
-        // OOM: synchronize GPU work, evict all cached entries, and retry
+        // OOM: synchronize GPU work, evict all cached entries, and retry. The failure must not stay
+        // the thread's last error, which the next checked launch would report as its own, if the
+        // retry succeeds.
+        (void)hipGetLastError();
         releaseCachedBlocks();
         err = hipMalloc(p, s);
     }
     if (err == hipSuccess) {
         g_alloc_sizes[*p] = s;
+    } else if (g_arena_on) {
+        t_failed_miss = s;
     }
     return err;
 }
@@ -572,9 +661,7 @@ extern "C" void cuda_release_cached_memory() {
 extern "C" size_t sp1_hip_arena_bytes() {
 #ifdef __HIPCC__
     std::lock_guard<std::mutex> lock(g_alloc_mutex);
-    size_t total = 0;
-    for (auto& chunk : g_arena_chunks) total += chunk.second;
-    return total;
+    return arenaBytes();
 #else
     return 0;
 #endif
