@@ -210,10 +210,10 @@ static bool deviceHeadroom(size_t* headroom) {
 //
 // The first allocation reserves the card's free memory less SP1_GPU_ARENA_HEADROOM_MB (2048) for
 // the driver and kernel scratch, or SP1_GPU_ARENA_MB; a block that doesn't fit after the cached
-// blocks are returned grows it by another allocation, reported on stderr. SP1_GPU_ARENA=0 turns it
-// off, and it is off where the GPU PLONK helper (SP1_PLONK_GPU=1) runs on this card, unless
-// SP1_GPU_ARENA=1. The memory the arena holds free counts as free for this process
-// (cuda_mem_get_info), not for helper processes.
+// blocks are returned grows it by another allocation, reported on stderr. SP1_GPU_ARENA=0 (or
+// false, off, no) turns it off, and it is off where the GPU PLONK helper (SP1_PLONK_GPU=1) runs on
+// this card, unless SP1_GPU_ARENA=1 (or true, on, yes). The memory the arena holds free counts as
+// free for this process (cuda_mem_get_info), not for helper processes.
 //
 // The arena never moves a live block, and gives one of its allocations back to the driver only
 // when all of it is free, and a block that fits nowhere else needs it (arenaReleaseFreeChunksFor).
@@ -416,6 +416,20 @@ static bool plonkHelperOnThisCard(size_t total_b) {
     return !own_listed && helper == "0";
 }
 
+// An on/off setting: 1 for 1, true, on or yes, -1 for 0, false, off or no (in any case), and 0,
+// the default, when unset or anything else (reported).
+static int envSwitch(const char* name) {
+    const char* value = std::getenv(name);
+    if (!value) return 0;
+    std::string v(value);
+    for (char& c : v) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    if (v == "1" || v == "true" || v == "on" || v == "yes") return 1;
+    if (v == "0" || v == "false" || v == "off" || v == "no") return -1;
+    fprintf(stderr, "sp1-gpu: %s=%s is neither on (1, true, on, yes) nor off (0, false, off, no); "
+                    "using the default\n", name, value);
+    return 0;
+}
+
 // Creates the arena on the first allocation (Linux; see above).
 static void arenaInit() {
     static bool tried = false;
@@ -424,8 +438,8 @@ static void arenaInit() {
 #ifdef _WIN32
     return;
 #endif
-    const char* on = std::getenv("SP1_GPU_ARENA");
-    if (on && std::strcmp(on, "0") == 0) return;
+    const int setting = envSwitch("SP1_GPU_ARENA");
+    if (setting < 0) return;
     size_t free_b = 0, total_b = 0;
     if (hipMemGetInfo(&free_b, &total_b) != hipSuccess) {
         (void)hipGetLastError();
@@ -435,7 +449,7 @@ static void arenaInit() {
     // most of the card, which the arena would hold: on a card it fits on (the prover's
     // PLONK_GPU_HELPER_VRAM_BYTES, 23 GiB) and when SP1_PLONK_GPU_HELPER_DEVICES does not send it
     // to other cards.
-    if (!on && plonkHelperOnThisCard(total_b)) return;
+    if (setting == 0 && plonkHelperOnThisCard(total_b)) return;
     size_t want = envMib("SP1_GPU_ARENA_MB", 0);
     if (want == 0) {
         const size_t headroom = envMib("SP1_GPU_ARENA_HEADROOM_MB", 2048ULL << 20);
