@@ -673,6 +673,57 @@ mod tests {
         .await;
     }
 
+    /// The wrap's BN254 Merkle tree against the CPU prover's: commitments, paths and openings, for
+    /// widths that pack into full and partial BN254 elements (8 values each) and fill the sponge's
+    /// rate (2) fully or partly.
+    #[tokio::test]
+    async fn test_poseidon2_bn254() {
+        run_in_place(|scope| async move {
+            let cpu_prover = slop_merkle_tree::BnProver::<SP1Field, SP1ExtensionField>::default();
+            let gpu_prover = Poseidon2Bn254CudaProver::new(&scope);
+            let log_height = 10usize;
+            let height = 1usize << log_height;
+            for width in [1usize, 7, 8, 9, 15, 16, 17, 24, 61, 64, 100] {
+                let value = |row: usize, col: usize| {
+                    SP1Field::from_canonical_u32(
+                        ((row * width + col) as u32).wrapping_mul(2654435761) >> 2,
+                    )
+                };
+                let rows: Vec<SP1Field> = (0..height)
+                    .flat_map(|row| (0..width).map(move |col| value(row, col)))
+                    .collect();
+                let columns: Vec<SP1Field> = (0..width)
+                    .flat_map(|col| (0..height).map(move |row| value(row, col)))
+                    .collect();
+                let cpu_tensor = Tensor::from(rows).reshape([height, width]);
+                let gpu_tensor = sp1_gpu_cudart::DeviceTensor::from_host(
+                    &Tensor::from(columns).reshape([width, height]),
+                    &scope,
+                )
+                .unwrap()
+                .into_inner();
+
+                let message: Message<Tensor<SP1Field>> = vec![cpu_tensor].into();
+                let (cpu_commit, cpu_data) = cpu_prover.commit_tensors(message.clone()).unwrap();
+                let (gpu_commit, gpu_data) = gpu_prover.commit_tensors(&gpu_tensor).unwrap();
+                assert_eq!(gpu_commit, cpu_commit, "width {width}");
+
+                let indices = vec![0, 42, 7, height - 1];
+                let cpu_proof = cpu_prover.prove_openings_at_indices(cpu_data, &indices).unwrap();
+                let gpu_proof =
+                    gpu_prover.prove_openings_at_indices(&gpu_data, &gpu_tensor, &indices).unwrap();
+                assert_eq!(gpu_proof.merkle_root, cpu_proof.merkle_root, "width {width}");
+                assert_eq!(gpu_proof.paths, cpu_proof.paths, "width {width}");
+                assert_eq!(
+                    gpu_prover.compute_openings_at_indices(&gpu_tensor, &indices),
+                    cpu_prover.compute_openings_at_indices(message, &indices),
+                    "width {width}"
+                );
+            }
+        })
+        .await;
+    }
+
     #[tokio::test]
     async fn test_poseidon2_koala_bear_16() {
         let (machine, record, program) =
