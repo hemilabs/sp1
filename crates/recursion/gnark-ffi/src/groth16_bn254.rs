@@ -224,6 +224,18 @@ pub(crate) fn set_gpu_helper_env(cmd: &mut std::process::Command) {
     }
 }
 
+/// Whether the GPU Groth16 helper solves the R1CS itself (the GPU R1CS solver) when
+/// `SP1_GPU_R1CS_SOLVER` is unset or `auto`, on the backend `SP1_GPU_BACKEND` names: everywhere but
+/// Windows HIP. Its runtime has no cooperative launch, which the solver's kernel needs: on an RX
+/// 9060 XT every launch failed, and the proof fell back to gnark's CPU prover after the helper had
+/// started. The solver's per-layer kernels, which do without it, took 9.2 s there against 2.0 s
+/// for gnark's solve.
+#[cfg(feature = "native")]
+fn gpu_r1cs_solver_by_default(backend: Option<&str>, windows: bool) -> bool {
+    let hip = backend.is_some_and(|b| matches!(b.to_lowercase().as_str(), "hip" | "rocm" | "amd"));
+    !(windows && hip)
+}
+
 /// The `groth16_gpu_helper` binary: `SP1_GROTH16_GPU_HELPER` when set (and only there), else next
 /// to this executable, else on `PATH`.
 #[cfg(feature = "native")]
@@ -982,26 +994,26 @@ impl Groth16Bn254Prover {
         //     2026-05-06 — see `project_groth16_r1cs_solver_default_on.md`).
         //     ON for HIP (since 2026-05-10 — see
         //     `project_groth16_r1cs_hip_reattempt.md`; the HIP variant of
-        //     the kernel landed alongside the PLONK SCS HIP port).
+        //     the kernel landed alongside the PLONK SCS HIP port). OFF on
+        //     Windows HIP (`gpu_r1cs_solver_by_default`).
         //   - `gpu`: force the in-process GPU R1CS solver on either backend.
         //   - `cpu`: kill-switch — force gnark.Solve on any backend. Use
         //     this to roll back if the GPU path regresses.
-        let backend_is_cuda = matches!(
-            std::env::var("SP1_GPU_BACKEND").ok().as_deref(),
-            Some("cuda") | Some("nvidia")
-        );
+        let backend = std::env::var("SP1_GPU_BACKEND").ok();
+        let backend_is_cuda = matches!(backend.as_deref(), Some("cuda") | Some("nvidia"));
+        let by_default = gpu_r1cs_solver_by_default(backend.as_deref(), cfg!(windows));
         let solver_env = std::env::var("SP1_GPU_R1CS_SOLVER").ok();
         let solver_choice = solver_env.as_deref().unwrap_or("auto");
         let want_gpu_r1cs = match solver_choice {
             "gpu" => true,
             "cpu" => false,
-            "auto" | "" => true,
+            "auto" | "" => by_default,
             other => {
                 tracing::warn!(
                     "unknown SP1_GPU_R1CS_SOLVER={other:?}; expected one of \
                      gpu / cpu / auto. Falling back to backend-aware default."
                 );
-                true
+                by_default
             }
         };
         // A helper prestarted for this circuit has its key loaded, and maybe uploaded, already, and
@@ -1010,8 +1022,8 @@ impl Groth16Bn254Prover {
         let want_gpu_r1cs = want_gpu_r1cs && !prestarted;
         tracing::info!(
             "[r1cs-solver] choice={} backend_is_cuda={} env={:?} prestarted_helper={} (default-on \
-             for CUDA since 2026-05-06, default-on for HIP since 2026-05-10, unless a helper is \
-             prestarted; set SP1_GPU_R1CS_SOLVER=cpu to roll back)",
+             for CUDA since 2026-05-06, default-on for HIP since 2026-05-10 but not on Windows, \
+             unless a helper is prestarted; set SP1_GPU_R1CS_SOLVER=cpu to roll back)",
             if want_gpu_r1cs { "gpu" } else { "cpu" },
             backend_is_cuda,
             solver_env.as_deref().unwrap_or("<unset>"),
@@ -1210,6 +1222,18 @@ impl Groth16Bn254Prover {
 #[cfg(all(test, feature = "native"))]
 mod pk_cache_tests {
     use super::*;
+
+    #[test]
+    fn the_gpu_r1cs_solver_is_the_default_except_on_windows_hip() {
+        for backend in ["hip", "rocm", "AMD"] {
+            assert!(!gpu_r1cs_solver_by_default(Some(backend), true), "{backend}");
+            assert!(gpu_r1cs_solver_by_default(Some(backend), false), "{backend}");
+        }
+        for backend in [Some("cuda"), Some("nvidia"), Some("sycl"), None] {
+            assert!(gpu_r1cs_solver_by_default(backend, true), "{backend:?}");
+            assert!(gpu_r1cs_solver_by_default(backend, false), "{backend:?}");
+        }
+    }
 
     #[test]
     fn the_solved_circuit_is_kept_only_where_memory_allows_or_when_asked() {

@@ -810,21 +810,22 @@ sp1_r1cs_solver_create(const char* prep_circuit_dir,
     if (const char* env = getenv("SP1_R1CS_PERLAYER")) {
         h->use_perlayer = (atoi(env) != 0);
     }
-    if (h->use_perlayer) {
-        h->layers_host = std::move(h_layers);
-        h->hint_layers_host = std::move(h_hint_layers);
-    }
-
-    // Confirm cooperative-launch is supported on this device when the
-    // cooperative-grid path will be used.
+    // Without cooperative launch (Windows HIP has none) the cooperative-grid
+    // kernel cannot run: its launch fails ("unspecified launch failure" on an
+    // RX 9060 XT), so use the per-layer kernels, which do without it.
     if (!h->use_perlayer) {
         int coop = 0;
         cudaDeviceGetAttribute(&coop, cudaDevAttrCooperativeLaunch, 0);
         if (!coop) {
             fprintf(stderr,
-                "[r1cs-solver:hip] device does NOT advertise CooperativeLaunch; "
-                "kernel launch will likely fail.\n");
+                "[r1cs-solver:hip] device does not advertise CooperativeLaunch; "
+                "using the per-layer kernels\n");
+            h->use_perlayer = true;
         }
+    }
+    if (h->use_perlayer) {
+        h->layers_host = std::move(h_layers);
+        h->hint_layers_host = std::move(h_hint_layers);
     }
 
     fprintf(stderr,
