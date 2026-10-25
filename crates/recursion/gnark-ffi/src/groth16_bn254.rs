@@ -178,6 +178,41 @@ fn memory_available() -> Option<u64> {
 /// margin. A helper that runs out anyway fails, and the CPU prover takes over.
 pub const GROTH16_GPU_HELPER_VRAM_BYTES: u64 = 18 << 30;
 
+/// Free GPU memory the GPU Groth16 prover's helper needs where it streams its G1 point sets
+/// (`SP1_GROTH16_STREAM_SRS`, on by default below [`GROTH16_STREAM_SRS_BELOW_BYTES`]): 6.2 GiB at
+/// peak on a 16 GB RTX 5060 Ti, with the GPU R1CS solver (`r1cs_solve_plan`) or without it
+/// (12,185 MiB in use on the card, sampled every 100 ms, of which the resident shard prover held
+/// 5,471 MiB), plus 1.8 GiB of margin. The card has 10.6 GiB free for it after the pool trim.
+pub const GROTH16_GPU_HELPER_STREAMED_VRAM_BYTES: u64 = 8 << 30;
+
+/// Total GPU memory below which the GPU Groth16 prover streams its G1 point sets by default. Must
+/// match `sp1-gpu-groth16`'s `stream_g1_srs`, which the helper decides by.
+pub const GROTH16_STREAM_SRS_BELOW_BYTES: u64 = 20 << 30;
+
+/// Whether the GPU Groth16 helper streams its G1 point sets on a card with `total` memory:
+/// as `SP1_GROTH16_STREAM_SRS` (`setting`) says, else on cards below
+/// [`GROTH16_STREAM_SRS_BELOW_BYTES`]. An unknown total counts as a card that keeps them.
+pub fn groth16_helper_streams(setting: Option<&str>, total: Option<u64>) -> bool {
+    match setting.map(str::trim) {
+        Some("1" | "true") => true,
+        Some("0" | "false") => false,
+        _ => total.is_some_and(|total| total < GROTH16_STREAM_SRS_BELOW_BYTES),
+    }
+}
+
+/// Free GPU memory the GPU Groth16 helper needs on a card with `total` memory, with
+/// `SP1_GROTH16_STREAM_SRS` read from the environment: [`GROTH16_GPU_HELPER_STREAMED_VRAM_BYTES`]
+/// where it streams its G1 point sets ([`groth16_helper_streams`]), else
+/// [`GROTH16_GPU_HELPER_VRAM_BYTES`].
+pub fn groth16_gpu_helper_vram_bytes(total: Option<u64>) -> u64 {
+    let setting = std::env::var("SP1_GROTH16_STREAM_SRS").ok();
+    if groth16_helper_streams(setting.as_deref(), total) {
+        GROTH16_GPU_HELPER_STREAMED_VRAM_BYTES
+    } else {
+        GROTH16_GPU_HELPER_VRAM_BYTES
+    }
+}
+
 /// The stripped-R1CS cache's marker and file; see `Groth16Bn254Prover::ensure_stripped_r1cs`.
 #[cfg(feature = "native")]
 pub(crate) const R1CS_CACHE_MARKER: &str = ".sp1_r1cs_cache_complete";
@@ -1066,11 +1101,14 @@ impl Groth16Bn254Prover {
         drop(go_memory);
         crate::prestart::discard_before_new_helper();
 
-        // The helper needs ~15 GB of GPU memory, which a prover keeping its shard-prover state on
-        // a 24 GB card does not have free. Only a process that exits after this proof may reset
+        // The helper needs ~15 GB of GPU memory (~7 GB where it streams its G1 point sets, on 16 GB
+        // cards), which a prover keeping its shard-prover state on a 24 GB card does not have free. Only a process that exits after this proof may reset
         // its GPU to make room, and it does only where the helper would not fit otherwise; see
         // `gpu_device`.
-        crate::gpu_device::reset_if_requested("Groth16 (GPU)", GROTH16_GPU_HELPER_VRAM_BYTES);
+        crate::gpu_device::reset_if_requested(
+            "Groth16 (GPU)",
+            groth16_gpu_helper_vram_bytes(crate::gpu_device::total_memory()),
+        );
 
         // GLV defaults:
         // - HIP build: leave SP1_GPU_GLV / SP1_GPU_G2_GLV unset so the
@@ -1107,6 +1145,12 @@ impl Groth16Bn254Prover {
             }
             // CUDA builds need GLV forced off; HIP builds let auto-detect pick.
             set_gpu_helper_env(&mut cmd);
+            // The helper streams its G1 point sets by the rule this process measured its room by,
+            // from this process's view of the card, rather than deciding again from its own.
+            if std::env::var_os("SP1_GROTH16_STREAM_SRS").is_none() {
+                let streams = groth16_helper_streams(None, crate::gpu_device::total_memory());
+                cmd.env("SP1_GROTH16_STREAM_SRS", if streams { "1" } else { "0" });
+            }
             cmd
         };
         // Bound to this prover and its queue slot, and timed out if it hangs; see `subprocess`.
@@ -1121,7 +1165,7 @@ impl Groth16Bn254Prover {
         // out of GPU memory.
         if crate::gpu_device::reset_after_failed_helper(
             "Groth16 (GPU)",
-            GROTH16_GPU_HELPER_VRAM_BYTES,
+            groth16_gpu_helper_vram_bytes(crate::gpu_device::total_memory()),
             &finished,
         ) {
             tracing::warn!(

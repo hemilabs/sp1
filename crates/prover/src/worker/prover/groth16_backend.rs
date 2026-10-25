@@ -5,9 +5,10 @@
 //! The GPU prover's helper needs GPU memory of its own, while the prover that starts it keeps its
 //! shard-prover state on the card between proofs: 21.7 GB of an RTX 4090's 24 GB, and cards above
 //! 24 GiB also keep an 8 GiB memory-pool reserve, which goes back to the driver before the choice.
-//! So the GPU prover is used only where enough is free, which in practice means cards of 32 GB or
-//! more, or where this process resets its GPU first (`SP1_GPU_RESET_BEFORE_WRAP`, for a process
-//! that exits after its proof, on a card big enough for the helper). Its host memory comes
+//! So the GPU prover is used only where enough is free: in practice cards of 32 GB or more, and
+//! 16 GB CUDA cards, where the helper streams its G1 point sets and needs ~7 GB, or where this
+//! process resets its GPU first (`SP1_GPU_RESET_BEFORE_WRAP`, for a process that exits after its
+//! proof, on a card big enough for the helper). Its host memory comes
 //! in two steps: the in-process solve (13.1 GB, released before the helper starts), then the
 //! helper's GPU-format key (12.9 GB). gnark's CPU prover, which the v6.0.0 fork always used, needs
 //! no GPU memory; its helper peaks at ~16 GiB, less under a heap limit.
@@ -20,10 +21,12 @@
 /// then 12.9 GB for the helper (the solve's memory is released first), rounded up for headroom.
 pub(crate) const GPU_MIN_AVAILABLE_BYTES: u64 = 16 << 30;
 
-/// Free GPU memory the GPU prover's helper needs; see
-/// [`sp1_recursion_gnark_ffi::GROTH16_GPU_HELPER_VRAM_BYTES`].
-pub(crate) const GPU_HELPER_VRAM_BYTES: u64 =
-    sp1_recursion_gnark_ffi::GROTH16_GPU_HELPER_VRAM_BYTES;
+/// Free GPU memory the GPU prover's helper needs on a card with `total` memory: less where it
+/// streams its G1 point sets (16 GB cards); see
+/// [`sp1_recursion_gnark_ffi::groth16_gpu_helper_vram_bytes`]. Reads `SP1_GROTH16_STREAM_SRS`.
+pub(crate) fn gpu_helper_vram_bytes(total: Option<u64>) -> u64 {
+    sp1_recursion_gnark_ffi::groth16_gpu_helper_vram_bytes(total)
+}
 
 /// Extra host memory for the one-time proving-key export on a cold cache: ~9 GB of files, written
 /// to RAM-backed `/dev/shm` unless `SP1_GROTH16_PK_CACHE` points elsewhere.
@@ -44,6 +47,8 @@ pub(crate) struct Groth16Inputs<'a> {
     pub vram_free: Option<u64>,
     /// Total memory of this process's GPU, if known.
     pub vram_total: Option<u64>,
+    /// Free GPU memory the helper needs on this card ([`gpu_helper_vram_bytes`]).
+    pub vram_needed: u64,
     /// Whether this process may reset its GPU before the helper runs, which frees the card for it:
     /// `SP1_GPU_RESET_BEFORE_WRAP` where a reset can happen (`gpu_reset_possible`: a runtime to
     /// reset with, and no other proof in flight). A GPU wrap that counts on it reserves it.
@@ -59,7 +64,7 @@ impl Groth16Inputs<'_> {
     /// Whether the GPU helper fits on this process's card; a GPU wrap reserves the reset it counts
     /// on where it fits only [`HelperRoom::AfterReset`].
     pub(crate) fn helper_room(&self) -> HelperRoom {
-        helper_room(GPU_HELPER_VRAM_BYTES, self.vram_free, self.vram_total, self.gpu_reset)
+        helper_room(self.vram_needed, self.vram_free, self.vram_total, self.gpu_reset)
     }
 }
 
@@ -71,7 +76,12 @@ pub(crate) fn use_gpu(inputs: &Groth16Inputs<'_>) -> (bool, String) {
         _ => {}
     }
     if !inputs.card_eligible {
-        return (false, "this worker's card is in the 16 GB tier, or it has no GPU".into());
+        return (
+            false,
+            "this worker's card is not one the GPU prover is for (16 GB HIP or SYCL, smaller, or no \
+             GPU)"
+                .into(),
+        );
     }
     if !inputs.helper_available {
         return (
@@ -364,6 +374,7 @@ pub(crate) fn prove_preferring_gpu<P>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sp1_recursion_gnark_ffi::GROTH16_GPU_HELPER_VRAM_BYTES as GPU_HELPER_VRAM_BYTES;
 
     const GIB: u64 = 1 << 30;
 
@@ -374,6 +385,7 @@ mod tests {
             helper_available: true,
             vram_free: Some(40 * GIB),
             vram_total: Some(48 * GIB),
+            vram_needed: GPU_HELPER_VRAM_BYTES,
             gpu_reset: false,
             mem_available: Some(mem_available),
             pk_cache_ready: true,
@@ -381,7 +393,8 @@ mod tests {
     }
 
     #[test]
-    fn a_16_gb_card_uses_the_cpu_prover_however_much_memory_there_is() {
+    fn an_ineligible_card_uses_the_cpu_prover_however_much_memory_there_is() {
+        // A 16 GB HIP or SYCL card, or one with no GPU.
         let inputs = Groth16Inputs { card_eligible: false, ..big_card(256 * GIB) };
         assert!(!use_gpu(&inputs).0);
     }
@@ -405,14 +418,46 @@ mod tests {
 
     #[test]
     fn a_reset_does_not_make_room_on_a_card_smaller_than_the_helper_needs() {
+        // Below 20 GiB the helper streams its G1 point sets, and needs less.
+        let streamed = sp1_recursion_gnark_ffi::GROTH16_GPU_HELPER_STREAMED_VRAM_BYTES;
         let small = Groth16Inputs {
             vram_free: Some(2 * GIB),
-            vram_total: Some(GPU_HELPER_VRAM_BYTES - 1),
+            vram_total: Some(streamed - 1),
+            vram_needed: streamed,
             gpu_reset: true,
             ..big_card(64 * GIB)
         };
         assert!(!use_gpu(&small).0);
-        assert!(use_gpu(&Groth16Inputs { vram_total: Some(GPU_HELPER_VRAM_BYTES), ..small }).0);
+        assert!(use_gpu(&Groth16Inputs { vram_total: Some(streamed), ..small }).0);
+    }
+
+    #[test]
+    fn a_16_gb_card_streaming_the_helper_needs_less_free_memory() {
+        // An RTX 5060 Ti with the shard prover resident, after the pool trim: 10.6 GiB free.
+        let card = |free| Groth16Inputs {
+            vram_free: Some(free),
+            vram_total: Some(16 * GIB - GIB / 8),
+            vram_needed: sp1_recursion_gnark_ffi::GROTH16_GPU_HELPER_STREAMED_VRAM_BYTES,
+            ..big_card(64 * GIB)
+        };
+        assert!(use_gpu(&card(10 * GIB + 6 * GIB / 10)).0);
+        assert!(use_gpu(&card(sp1_recursion_gnark_ffi::GROTH16_GPU_HELPER_STREAMED_VRAM_BYTES)).0);
+        assert!(!use_gpu(&card(7 * GIB)).0);
+        // The need follows the card: streamed below 20 GiB, unless the setting says otherwise.
+        let streams = sp1_recursion_gnark_ffi::groth16_helper_streams;
+        assert!(streams(None, Some(16 * GIB - GIB / 8)));
+        assert!(!streams(None, Some(24 * GIB - GIB / 2)));
+        assert!(!streams(None, None));
+        assert!(streams(Some("1"), Some(48 * GIB)));
+        assert!(!streams(Some(" false "), Some(16 * GIB)));
+        // A card of 20 GiB or more keeps its point sets and needs the full amount.
+        let big = |free| Groth16Inputs {
+            vram_free: Some(free),
+            vram_total: Some(24 * GIB),
+            ..big_card(64 * GIB)
+        };
+        assert!(!use_gpu(&big(GPU_HELPER_VRAM_BYTES - 1)).0);
+        assert!(use_gpu(&big(GPU_HELPER_VRAM_BYTES)).0);
     }
 
     #[test]
@@ -576,6 +621,11 @@ mod tests {
     #[test]
     fn prestarts_only_where_the_gpu_prover_is_likely_and_the_host_has_room() {
         let base = prestart_inputs();
+        // Only Unix prestarts at all.
+        if !cfg!(unix) {
+            assert!(!should_prestart(&base));
+            return;
+        }
         assert!(should_prestart(&base));
         for off in ["0", "false"] {
             assert!(!should_prestart(&PrestartInputs { prestart_env: Some(off), ..base }));

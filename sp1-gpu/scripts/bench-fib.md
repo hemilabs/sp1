@@ -56,7 +56,8 @@ binary in the directory.
   cp target-bench/release/groth16_gpu_helper bench/main/
   ```
 
-  Without it the wrap silently uses gnark's CPU prover. It is chosen on cards of 32 GB or more.
+  Without it the wrap silently uses gnark's CPU prover. It is chosen on cards of 32 GB or more,
+  and on 16 GB cards (where it streams its proving key's G1 point sets to fit).
 
 ### NVIDIA (CUDA, Windows)
 

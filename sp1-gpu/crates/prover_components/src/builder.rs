@@ -410,13 +410,18 @@ pub async fn cuda_worker_builder_with_machine(
         .await,
     );
 
-    // The GPU Groth16 prover is for cards above the 16 GB tier; 16 GB cards use gnark's CPU
-    // prover, as the v6.0.0 fork always did. Before each proof the recursion prover also checks
-    // that the card has the GPU memory free for the GPU prover's helper (beside this prover's own
-    // state, once its memory pool's idle reserve is given back, that rules out cards below 32 GB
-    // unless SP1_GPU_RESET_BEFORE_WRAP is set) and the host
-    // has the memory, and uses the CPU prover if not.
-    let groth16_gpu = gpu_memory_gb() > 20;
+    // The GPU Groth16 prover is for cards above the 16 GB tier, and for 16 GB CUDA cards, where its
+    // helper streams its G1 point sets (`SP1_GROTH16_STREAM_SRS`) to fit beside this prover: on an
+    // RTX 5060 Ti a Groth16 proof took 13.8 s with it against 18.5 s with gnark's CPU prover.
+    // Other 16 GB cards use gnark's prover, as the v6.0.0 fork always did; on HIP it runs in
+    // process with GPU hooks, which is faster there than the helper (RX 9060 XT: 19.5 s against
+    // 36.9 s). Before each proof the recursion prover also checks that the card has the GPU
+    // memory free for the GPU prover's helper (beside this prover's own state, once its memory
+    // pool's idle reserve is given back) and the host has the memory, and uses the CPU prover if
+    // not.
+    let cuda_16gb_card = sp1_gpu_cudart::sys::BACKEND == "cuda"
+        && cuda_memory_info().is_ok_and(|(_, total)| total >= 15 << 30);
+    let groth16_gpu = gpu_memory_gb() > 20 || cuda_16gb_card;
     // The shrink prover keeps its proving key between proofs only where the card has the memory
     // for it, like the wrap prover above: on a 16 GB Radeon RX 9070 XT the key, held from
     // start-up, left HIP's arena without a 2 GiB range for the next proof's traces, and every

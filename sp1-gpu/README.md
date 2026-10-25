@@ -118,7 +118,11 @@ gnark's CPU Groth16 prover peaks at ~16 GiB on the v6.1.0 circuit. So:
   `sp1-gpu-server --sp1-groth16-cpu-helper --prepare --build-dir ~/.sp1/circuits/groth16/<version>`.
   Exit codes: 0 ready, 64 bad arguments or no circuit there, 65 unreadable circuit, 69 not built.
 - The GPU Groth16 prover is used only where the card has 18 GiB free beside the prover's own state,
-  once its memory pool's idle reserve is given back: in practice cards of 32 GB or more. The GPU
+  once its memory pool's idle reserve is given back: in practice cards of 32 GB or more. On 16 GB
+  CUDA cards its helper streams its G1 point sets (`SP1_GROTH16_STREAM_SRS`) and needs 8 GiB,
+  which they have that way (RTX 5060 Ti: 11.6 s a fib Groth16 proof with `r1cs_solve_plan`, 13.8 s
+  without it, against 18.5 s with gnark's CPU prover); 16 GB HIP and SYCL cards keep gnark's
+  prover. A 16 GB card with `SP1_GPU_RESET_BEFORE_WRAP` may also be reset for it. The GPU
   PLONK prover (`SP1_PLONK_GPU=1`) is tried only where 23 GiB is free that way (a 32 GB card) or
   after a reset, and where the host has 112 GiB of memory available for its helper (126 GiB before
   its key is exported, 24 GiB while a `SP1_PLONK_GPU_SERVER` helper runs); elsewhere gnark's CPU

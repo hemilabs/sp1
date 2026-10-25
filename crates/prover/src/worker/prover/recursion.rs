@@ -86,9 +86,10 @@ pub struct SP1RecursionProverConfig {
     /// The reduce shape
     pub reduce_shape: SP1RecursionProofShape,
     /// Whether this worker's card may use the GPU Groth16 prover. Set by the GPU worker builder for
-    /// cards above the 16 GB tier; false, i.e. gnark's CPU prover, otherwise. Whether it does is
-    /// decided before each proof from the free GPU and host memory (see `groth16_backend`), which
-    /// in practice leaves the CPU prover on cards below 32 GB unless `SP1_GPU_RESET_BEFORE_WRAP`.
+    /// cards above the 16 GB tier and 16 GB CUDA cards; false, i.e. gnark's CPU prover, otherwise.
+    /// Whether it does is decided before each proof from the free GPU and host memory (see
+    /// `groth16_backend`), which in practice leaves the CPU prover on 24 GB cards unless
+    /// `SP1_GPU_RESET_BEFORE_WRAP`.
     pub groth16_gpu: bool,
     /// Whether the shrink prover keeps its proving key between proofs (see `ShrinkProver`), unless
     /// `SP1_SHRINK_PERSISTENT_PK` says otherwise. True by default; the GPU worker builder clears
@@ -1142,7 +1143,9 @@ impl<A: ArtifactClient, C: SP1ProverComponents> SP1RecursionProver<A, C> {
                 };
                 if may_use_gpu && helper_available {
                     if let Some((before, after)) = sp1_recursion_gnark_ffi::gpu_trim_memory_pool(
-                        super::groth16_backend::GPU_HELPER_VRAM_BYTES,
+                        super::groth16_backend::gpu_helper_vram_bytes(
+                            sp1_recursion_gnark_ffi::gpu_total_memory(),
+                        ),
                     ) {
                         tracing::info!(
                             "Groth16: trimmed the GPU memory pool: {} -> {} MiB free",
@@ -1151,12 +1154,14 @@ impl<A: ArtifactClient, C: SP1ProverComponents> SP1RecursionProver<A, C> {
                         );
                     }
                 }
+                let vram_total = sp1_recursion_gnark_ffi::gpu_total_memory();
                 let mut inputs = Groth16Inputs {
                     override_env: override_env.as_deref(),
                     card_eligible,
                     helper_available,
                     vram_free: sp1_recursion_gnark_ffi::gpu_free_memory(),
-                    vram_total: sp1_recursion_gnark_ffi::gpu_total_memory(),
+                    vram_total,
+                    vram_needed: super::groth16_backend::gpu_helper_vram_bytes(vram_total),
                     gpu_reset: sp1_recursion_gnark_ffi::gpu_reset_possible(),
                     mem_available: sp1_recursion_gnark_ffi::host_memory::available(),
                     pk_cache_ready: Groth16Bn254Prover::gpu_pk_cache_ready(&build_dir),
