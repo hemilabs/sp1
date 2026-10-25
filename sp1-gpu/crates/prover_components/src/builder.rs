@@ -285,11 +285,13 @@ pub async fn cuda_worker_builder_with_machine(
     sp1_recursion_gnark_ffi::device_caches::set_live_blocks_freer(|| unsafe {
         sp1_gpu_cudart::sys::runtime::cuda_free_live_blocks() as u64
     });
-    // Measuring and trimming GPU memory for that helper. On Linux the wrap paths find the CUDA
-    // runtime library themselves; on Windows it is linked statically, and without these the GPU
-    // Groth16 prover was never chosen ("free GPU memory is unknown").
+    // Measuring and trimming GPU memory for that helper. On Linux the wrap paths find the CUDA or
+    // HIP runtime library themselves; on Windows it is linked statically, and without these the
+    // GPU Groth16 prover was never chosen ("free GPU memory is unknown"), while the GPU PLONK
+    // prover's helper was started on any HIP or SYCL card, 16 GB ones too, where it ran the host
+    // out of memory. SYCL has no memory pool to trim, so its trim only waits for the device.
     #[cfg(not(target_os = "linux"))]
-    if sp1_gpu_cudart::sys::BACKEND == "cuda" {
+    {
         sp1_recursion_gnark_ffi::device_caches::set_runtime(
             sp1_recursion_gnark_ffi::device_caches::Runtime {
                 mem_get_info: || {
