@@ -285,11 +285,11 @@ enum G1Set {
 }
 
 /// A G1 MSM context: the prover's kept one, or one uploaded for a single MSM and freed when
-/// dropped (`Some` until then).
+/// dropped.
 #[cfg(feature = "cuda")]
 enum G1Ctx<'a> {
     Kept(&'a sp1_gpu_plonk::g1::PersistentMsm),
-    Fresh(Option<sp1_gpu_plonk::g1::PersistentMsm>),
+    Fresh(sp1_gpu_plonk::g1::PersistentMsm),
 }
 
 #[cfg(feature = "cuda")]
@@ -299,26 +299,17 @@ impl std::ops::Deref for G1Ctx<'_> {
     fn deref(&self) -> &Self::Target {
         match self {
             G1Ctx::Kept(ctx) => ctx,
-            G1Ctx::Fresh(ctx) => ctx.as_ref().expect("a G1 context is only taken when dropped"),
+            G1Ctx::Fresh(ctx) => ctx,
         }
     }
 }
 
-#[cfg(feature = "cuda")]
-impl Drop for G1Ctx<'_> {
-    /// Frees a fresh context's buffers, then gives the memory pool's idle memory back to the
-    /// driver: sppark frees most of them into the stream-ordered pool, which keeps it for its own
-    /// allocations, while the G2 MSM after the G1 ones also allocates outside it. Kept there on a
-    /// 16 GB RTX 5060 Ti beside a resident shard prover, the G2 MSM found the card full, and one
-    /// in 15 took 94 s instead of 2 s.
-    fn drop(&mut self) {
-        if let G1Ctx::Fresh(ctx) = self {
-            drop(ctx.take());
-            give_back_pool_memory();
-        }
-    }
-}
-
+/// Called before the G2 MSM when the G1 point sets are streamed: sppark frees the streamed
+/// contexts' buffers into the stream-ordered pool, which keeps the memory for its own
+/// allocations, while the G2 MSM also allocates outside it. Kept there on a 16 GB RTX 5060 Ti
+/// beside a resident shard prover, the G2 MSM found the card full, and one in 15 took 94 s
+/// instead of 2 s. (The G1 contexts allocate mostly from the pool, and reuse it between them.)
+///
 /// Waits for the device and returns the default memory pool's idle memory to the driver, leaving
 /// the pool's release threshold at zero (this process frees its pool memory at each
 /// synchronization from then on). Best effort: failures leave the memory pooled.
@@ -343,23 +334,22 @@ fn give_back_pool_memory() {
 /// circuit). Kept, they save one upload per MSM and its context's set-up (on HIP with GLV, the
 /// endomorphism expansion too), and the HIP path overlaps each MSM's scalar upload with the one
 /// before; streamed, the helper's peak drops by about three sets, which a 16 GB card beside a
-/// resident shard prover needs (~11 GB free there). On by default on cards under 20 GiB (the
-/// 16 GB tier: a 24 GB card reports just under 24 GiB); `SP1_GROTH16_STREAM_SRS` = 1/0 decides.
+/// resident shard prover needs (~11 GB free there). Decided by [`crate::stream::streams`]: on by
+/// default on cards under 20 GiB, `SP1_GROTH16_STREAM_SRS` = 1/0 decides. The process that starts
+/// the helper passes its own decision in that variable, so that both agree on the card.
 #[cfg(feature = "cuda")]
 fn stream_g1_srs() -> bool {
-    match std::env::var("SP1_GROTH16_STREAM_SRS").ok().as_deref().map(str::trim) {
-        Some("1" | "true") => true,
-        Some("0" | "false") => false,
-        _ => {
-            let (mut free, mut total) = (0usize, 0usize);
-            // SAFETY: two valid out-pointers for the call.
-            let ok = unsafe {
-                sp1_gpu_sys::runtime::cuda_mem_get_info(&mut free, &mut total)
-                    == sp1_gpu_sys::runtime::CUDA_SUCCESS_CSL
-            };
-            ok && total < 20 << 30
-        }
-    }
+    let setting = std::env::var("SP1_GROTH16_STREAM_SRS").ok();
+    let total = {
+        let (mut free, mut total) = (0usize, 0usize);
+        // SAFETY: two valid out-pointers for the call.
+        let ok = unsafe {
+            sp1_gpu_sys::runtime::cuda_mem_get_info(&mut free, &mut total)
+                == sp1_gpu_sys::runtime::CUDA_SUCCESS_CSL
+        };
+        ok.then_some(total as u64)
+    };
+    crate::stream::streams(setting.as_deref(), total)
 }
 
 impl Groth16Prover {
@@ -375,7 +365,7 @@ impl Groth16Prover {
         };
         match kept {
             Some(ctx) => G1Ctx::Kept(ctx),
-            None => G1Ctx::Fresh(Some(sp1_gpu_plonk::g1::PersistentMsm::from_bn254_points(points))),
+            None => G1Ctx::Fresh(sp1_gpu_plonk::g1::PersistentMsm::from_bn254_points(points)),
         }
     }
 
@@ -1097,6 +1087,9 @@ impl Groth16Prover {
                 }
             }
 
+            if self.stream_g1 {
+                give_back_pool_memory();
+            }
             let t_g2 = std::time::Instant::now();
             let _g = crate::profile::Scope::new("6_msm_g2");
             let bs2_msm = self
@@ -1190,6 +1183,9 @@ impl Groth16Prover {
                 // Closure that does the G2 work (extracted so it can run
                 // either in a spawned thread or synchronously on main).
                 let g2_compute = || {
+                    if self.stream_g1 {
+                        give_back_pool_memory();
+                    }
                     let bs2_msm = g2_msm_gpu(g2_b, &wire_values_b)
                         .unwrap_or_else(|| g2_msm_ark(&self.data.pk_g2_b_ark, &wire_values_b));
                     if std::env::var("GROTH16_G2_VERIFY").ok().as_deref() == Some("1") {

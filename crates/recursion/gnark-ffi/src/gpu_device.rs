@@ -167,15 +167,19 @@ pub fn trim_memory_pool(needed: u64) -> Option<(u64, u64)> {
     let before = free_memory()?;
     trim_pool()?;
     let mut after = free_memory()?;
-    if after < needed
-        && crate::device_caches::arena_bytes() == 0
-        && total_memory().is_some_and(|total| total >= needed)
-    {
+    if crate::device_caches::arena_bytes() == 0 && release_caches(after, needed, total_memory()) {
         crate::device_caches::release();
         trim_pool()?;
         after = free_memory()?;
     }
     Some((before, after))
+}
+
+/// Whether [`trim_memory_pool`] should release the device caches: the helper still lacks room
+/// (`free` is below `needed`), and the card is big enough for them to make it. An unknown total
+/// releases nothing.
+fn release_caches(free: u64, needed: u64, total: Option<u64>) -> bool {
+    free < needed && total.is_some_and(|total| total >= needed)
 }
 
 /// Synchronizes this process's current GPU and trims its default memory pool to zero.
@@ -482,6 +486,25 @@ fn reset(what: &str) -> bool {
 #[cfg(not(target_os = "linux"))]
 fn reset(_what: &str) -> bool {
     false
+}
+
+#[cfg(test)]
+mod release_tests {
+    use super::release_caches;
+
+    const GIB: u64 = 1 << 30;
+
+    #[test]
+    fn the_caches_go_only_where_they_could_make_room() {
+        // A 32 GB card short of the PLONK helper's 23 GiB: they may make the room.
+        assert!(release_caches(20 * GIB, 23 * GIB, Some(32 * GIB)));
+        // A 16 GB card: the PLONK helper never fits, and the streamed Groth16 helper fits without.
+        assert!(!release_caches(10 * GIB, 23 * GIB, Some(16 * GIB)));
+        assert!(!release_caches(10 * GIB, 8 * GIB, Some(16 * GIB)));
+        // A card just big enough, and a card of unknown size.
+        assert!(release_caches(7 * GIB, 8 * GIB, Some(8 * GIB)));
+        assert!(!release_caches(2 * GIB, 8 * GIB, None));
+    }
 }
 
 #[cfg(all(test, target_os = "linux"))]

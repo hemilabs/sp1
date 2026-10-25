@@ -419,6 +419,8 @@ pub async fn cuda_worker_builder_with_machine(
     // memory free for the GPU prover's helper (beside this prover's own state, once its memory
     // pool's idle reserve is given back) and the host has the memory, and uses the CPU prover if
     // not.
+    // `gpu_memory_gb() > 20` is a total above 16 GiB on any backend (20 GB cards included, which
+    // stream too); this adds the CUDA cards of 15-16 GiB.
     let cuda_16gb_card = sp1_gpu_cudart::sys::BACKEND == "cuda"
         && cuda_memory_info().is_ok_and(|(_, total)| total >= 15 << 30);
     let groth16_gpu = gpu_memory_gb() > 20 || cuda_16gb_card;

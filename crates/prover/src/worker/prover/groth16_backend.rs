@@ -6,7 +6,7 @@
 //! shard-prover state on the card between proofs: 21.7 GB of an RTX 4090's 24 GB, and cards above
 //! 24 GiB also keep an 8 GiB memory-pool reserve, which goes back to the driver before the choice.
 //! So the GPU prover is used only where enough is free: in practice cards of 32 GB or more, and
-//! 16 GB CUDA cards, where the helper streams its G1 point sets and needs ~7 GB, or where this
+//! 16 GB CUDA cards, where the helper streams its G1 point sets and needs 8 GiB, or where this
 //! process resets its GPU first (`SP1_GPU_RESET_BEFORE_WRAP`, for a process that exits after its
 //! proof, on a card big enough for the helper). Its host memory comes
 //! in two steps: the in-process solve (13.1 GB, released before the helper starts), then the
@@ -443,13 +443,6 @@ mod tests {
         assert!(use_gpu(&card(10 * GIB + 6 * GIB / 10)).0);
         assert!(use_gpu(&card(sp1_recursion_gnark_ffi::GROTH16_GPU_HELPER_STREAMED_VRAM_BYTES)).0);
         assert!(!use_gpu(&card(7 * GIB)).0);
-        // The need follows the card: streamed below 20 GiB, unless the setting says otherwise.
-        let streams = sp1_recursion_gnark_ffi::groth16_helper_streams;
-        assert!(streams(None, Some(16 * GIB - GIB / 8)));
-        assert!(!streams(None, Some(24 * GIB - GIB / 2)));
-        assert!(!streams(None, None));
-        assert!(streams(Some("1"), Some(48 * GIB)));
-        assert!(!streams(Some(" false "), Some(16 * GIB)));
         // A card of 20 GiB or more keeps its point sets and needs the full amount.
         let big = |free| Groth16Inputs {
             vram_free: Some(free),

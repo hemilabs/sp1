@@ -1141,11 +1141,10 @@ impl<A: ArtifactClient, C: SP1ProverComponents> SP1RecursionProver<A, C> {
                     Some("0" | "false") => false,
                     _ => card_eligible,
                 };
+                let vram_total = sp1_recursion_gnark_ffi::gpu_total_memory();
                 if may_use_gpu && helper_available {
                     if let Some((before, after)) = sp1_recursion_gnark_ffi::gpu_trim_memory_pool(
-                        super::groth16_backend::gpu_helper_vram_bytes(
-                            sp1_recursion_gnark_ffi::gpu_total_memory(),
-                        ),
+                        super::groth16_backend::gpu_helper_vram_bytes(vram_total),
                     ) {
                         tracing::info!(
                             "Groth16: trimmed the GPU memory pool: {} -> {} MiB free",
@@ -1154,7 +1153,6 @@ impl<A: ArtifactClient, C: SP1ProverComponents> SP1RecursionProver<A, C> {
                         );
                     }
                 }
-                let vram_total = sp1_recursion_gnark_ffi::gpu_total_memory();
                 let mut inputs = Groth16Inputs {
                     override_env: override_env.as_deref(),
                     card_eligible,

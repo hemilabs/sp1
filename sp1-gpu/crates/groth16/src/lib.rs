@@ -16,6 +16,7 @@ pub mod proof;
 pub mod prover;
 #[cfg(feature = "cuda")]
 pub mod r1cs_solver;
+pub mod stream;
 pub mod types;
 
 // Re-export core types from plonk crate
