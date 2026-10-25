@@ -230,28 +230,11 @@ fn store(p: Prestarted) -> bool {
 }
 
 fn start(id: u64, build_dir: &Path) -> Result<Prestarted> {
-    // The helper takes its go-ahead and witness through FIFOs.
-    #[cfg(not(unix))]
-    anyhow::bail!("prestarting the GPU helper needs Unix FIFOs");
-    #[cfg(unix)]
-    start_unix(id, build_dir)
-}
-
-#[cfg(unix)]
-fn start_unix(id: u64, build_dir: &Path) -> Result<Prestarted> {
     let vkey_hash_hex = hex::encode(crate::Groth16Bn254Prover::get_vkey_hash(build_dir));
     let helper = crate::groth16_bn254::find_gpu_helper().context("no groth16_gpu_helper")?;
     let pk = crate::groth16_bn254::gpu_pk(build_dir, &vkey_hash_hex);
     let scratch = crate::gpu_cache::proof_tempdir(None, "sp1_groth16_prestart_")?;
-    let witness_fifo = scratch.path().join("witness");
-    let upload_fifo = scratch.path().join("upload");
-    for fifo in [&witness_fifo, &upload_fifo] {
-        let c = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes())?;
-        // SAFETY: a valid NUL-terminated path.
-        if unsafe { libc::mkfifo(c.as_ptr(), 0o600) } != 0 {
-            anyhow::bail!("mkfifo {}: {}", fifo.display(), std::io::Error::last_os_error());
-        }
-    }
+    let (witness_fifo, upload_fifo) = channels(scratch.path())?;
     let mut cmd = std::process::Command::new(&helper);
     cmd.arg("--gpu-dir")
         .arg(&pk.dir)
@@ -266,7 +249,7 @@ fn start_unix(id: u64, build_dir: &Path) -> Result<Prestarted> {
         .arg(&upload_fifo)
         .arg("--wait-fifo")
         .arg(&witness_fifo)
-        .stdin(std::process::Stdio::null());
+        .stdin(if cfg!(unix) { std::process::Stdio::null() } else { std::process::Stdio::piped() });
     crate::groth16_bn254::set_gpu_helper_env(&mut cmd);
     crate::subprocess::bind_to_parent(&mut cmd);
     let child = cmd.spawn().with_context(|| format!("spawning {}", helper.display()))?;
@@ -283,6 +266,28 @@ fn start_unix(id: u64, build_dir: &Path) -> Result<Prestarted> {
         _scratch: scratch,
         _pk: pk,
     })
+}
+
+/// The witness and upload channels of a helper prestarted with the scratch directory `scratch`:
+/// two FIFOs in it.
+#[cfg(unix)]
+fn channels(scratch: &Path) -> Result<(PathBuf, PathBuf)> {
+    let witness_fifo = scratch.join("witness");
+    let upload_fifo = scratch.join("upload");
+    for fifo in [&witness_fifo, &upload_fifo] {
+        let c = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes())?;
+        // SAFETY: a valid NUL-terminated path.
+        if unsafe { libc::mkfifo(c.as_ptr(), 0o600) } != 0 {
+            anyhow::bail!("mkfifo {}: {}", fifo.display(), std::io::Error::last_os_error());
+        }
+    }
+    Ok((witness_fifo, upload_fifo))
+}
+
+/// Without FIFOs, both are the helper's standard input (`-`), a pipe this process writes.
+#[cfg(not(unix))]
+fn channels(_scratch: &Path) -> Result<(PathBuf, PathBuf)> {
+    Ok((PathBuf::from("-"), PathBuf::from("-")))
 }
 
 /// Reads the R1CS into the solve's Go cache, unless the helper is gone by the time it is read.
@@ -322,8 +327,16 @@ fn send(fifo: &Path, child: &mut Child, msg: &[u8], timeout: Duration) -> Result
 /// Writes `msg` to `fifo` if its reader, `child`, has opened it: whether it did. An error once
 /// `child` has exited.
 #[cfg(not(unix))]
-fn send_if_open(_fifo: &Path, _child: &mut Child, _msg: &[u8]) -> Result<bool> {
-    anyhow::bail!("the GPU helper's FIFOs need Unix")
+fn send_if_open(_fifo: &Path, child: &mut Child, msg: &[u8]) -> Result<bool> {
+    // The helper's standard input: a pipe, which takes a message before the helper reads it (the
+    // go-ahead may then arrive while it still loads its key, which it uploads once loaded).
+    if let Some(status) = child.try_wait()? {
+        anyhow::bail!("the prestarted GPU helper exited early: {status}");
+    }
+    let stdin = child.stdin.as_mut().context("the prestarted GPU helper has no standard input")?;
+    stdin.write_all(msg)?;
+    stdin.flush()?;
+    Ok(true)
 }
 
 #[cfg(unix)]

@@ -72,6 +72,9 @@ pub struct SP1ControllerConfig {
     pub send_splice_input_buffer_size_per_splice: usize,
     pub use_fixed_pk: bool,
     pub global_memory_buffer_size: usize,
+    /// Whether this worker's card may use the GPU Groth16 prover: the recursion prover's
+    /// `groth16_gpu`, which decides whether a Groth16 proof prestarts its helper on a 16 GB card.
+    pub groth16_gpu: bool,
 }
 
 pub struct SP1Controller<A, W> {
@@ -272,7 +275,9 @@ where
         // when this process also runs the Groth16 task, as a local node or GPU server does.
         #[cfg(feature = "native-gnark")]
         let _groth16_prestart = (mode == ProofMode::Groth16)
-            .then(crate::worker::prover::groth16_backend::prestart_gpu_helper)
+            .then(|| {
+                crate::worker::prover::groth16_backend::prestart_gpu_helper(self.config.groth16_gpu)
+            })
             .flatten();
 
         let stdin_download_handle = self

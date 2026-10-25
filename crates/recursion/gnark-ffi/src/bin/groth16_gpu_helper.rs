@@ -69,7 +69,8 @@ struct Args {
     wires_initial: Option<PathBuf>,
     /// Prestarted helper (see `prestart` in sp1-recursion-gnark-ffi): after loading the proving
     /// data, wait on this FIFO for the go-ahead to upload it to the GPU, which the parent sends
-    /// once the GPU has room.
+    /// once the GPU has room. `-` reads it as a line of standard input instead (Windows, which has
+    /// no FIFOs), as does `-` for --wait-fifo.
     #[arg(long)]
     upload_fifo: Option<PathBuf>,
     /// Prestarted helper: then wait on this FIFO for three lines, the witness dir, the witness
@@ -143,13 +144,13 @@ fn main() {
     let mut uploaded = None;
     if let Some(fifo) = args.upload_fifo.take() {
         eprintln!("[groth16-gpu-helper] proving data ready; waiting for room on the GPU");
-        read_fifo(&fifo);
+        read_fifo(&fifo, 1);
         eprintln!("[groth16-gpu-helper] uploading the proving key");
         uploaded = Some(sp1_gpu_groth16::prover::Groth16Prover::new(proving_data.take().unwrap()));
     }
     if let Some(fifo) = args.wait_fifo.take() {
         eprintln!("[groth16-gpu-helper] waiting for the witness");
-        let msg = read_fifo(&fifo);
+        let msg = read_fifo(&fifo, 3);
         let mut lines = msg.lines();
         let (Some(dir), Some(json), Some(out)) = (lines.next(), lines.next(), lines.next()) else {
             eprintln!("[groth16-gpu-helper] bad message on {}: {msg:?}", fifo.display());
@@ -324,8 +325,27 @@ fn try_gpu_r1cs_solver(
     Err(anyhow::anyhow!("GPU R1CS solver requires the cuda feature"))
 }
 
-/// Reads a message from a FIFO the parent writes, blocking until it has.
-fn read_fifo(fifo: &std::path::Path) -> String {
+/// Reads a message from a FIFO the parent writes, blocking until it has; from `-`, its `lines`
+/// lines from standard input, which the parent holds open: closed, the parent is gone, and so is
+/// the proof this helper waits for.
+fn read_fifo(fifo: &std::path::Path, lines: usize) -> String {
+    if fifo == std::path::Path::new("-") {
+        let mut msg = String::new();
+        for _ in 0..lines {
+            match std::io::stdin().read_line(&mut msg) {
+                Ok(0) => {
+                    eprintln!("[groth16-gpu-helper] standard input closed: the parent is gone");
+                    std::process::exit(helper_exit::FILE_ERROR);
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    eprintln!("[groth16-gpu-helper] failed to read standard input: {e}");
+                    std::process::exit(helper_exit::FILE_ERROR);
+                }
+            }
+        }
+        return msg;
+    }
     std::fs::read_to_string(fifo).unwrap_or_else(|e| {
         eprintln!("[groth16-gpu-helper] failed to read {}: {e}", fifo.display());
         std::process::exit(helper_exit::FILE_ERROR);

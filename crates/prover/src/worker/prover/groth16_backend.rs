@@ -260,7 +260,8 @@ pub(crate) fn use_gpu_plonk(inputs: &PlonkInputs) -> (bool, String) {
 }
 
 /// Least total GPU memory for prestarting the GPU helper: above the 30 GB tier, where the pool trim
-/// leaves the helper room beside the resident shard prover (25.5 GB free on a 32 GB card).
+/// leaves the helper room beside the resident shard prover (25.5 GB free on a 32 GB card). Smaller
+/// cards prestart it where it streams its key (16 GB CUDA cards), which needs 8 GiB.
 pub(crate) const PRESTART_MIN_VRAM_BYTES: u64 = 30 << 30;
 
 /// Host memory a proof must have available to prestart the GPU helper: it holds the GPU-format key
@@ -279,6 +280,10 @@ pub(crate) struct PrestartInputs<'a> {
     pub prestart_env: Option<&'a str>,
     /// `SP1_GROTH16_GPU`: forcing the CPU prover rules out the helper.
     pub override_env: Option<&'a str>,
+    /// `SP1_GROTH16_STREAM_SRS`: whether the helper streams its key, by default below 20 GiB.
+    pub stream_env: Option<&'a str>,
+    /// Whether this worker's card may use the GPU prover (`SP1ControllerConfig::groth16_gpu`).
+    pub card_eligible: bool,
     pub helper_available: bool,
     /// Total memory of this process's GPU, if it has one.
     pub vram_total: Option<u64>,
@@ -299,40 +304,53 @@ pub(crate) struct PrestartInputs<'a> {
 /// prestarted helper is a process of its own with its own memory, so `SP1_GPU_RESET_BEFORE_WRAP`
 /// does not rule it out (a proof it serves needs no reset). Nor does `r1cs_solve_plan`: a proof with
 /// a prestarted helper solves with gnark instead of the GPU R1CS solver, which saves less (fib 20M
-/// on an RTX 5090: 13.7 s with the prestart, 16.2 s with the solver, 17.0 s with neither).
-/// Prestarting needs Unix FIFOs.
+/// on an RTX 5090: 13.7 s with the prestart, 16.2 s with the solver, 17.0 s with neither; bench-fib
+/// Groth16 on a 16 GB RTX 5060 Ti under Windows: 9.2 s with the prestart, 10.5 s with the solver).
+/// On cards below [`PRESTART_MIN_VRAM_BYTES`], only where the helper streams its key and the card
+/// may use the GPU prover (or `SP1_GROTH16_GPU` forces it).
 pub(crate) fn should_prestart(inputs: &PrestartInputs<'_>) -> bool {
-    cfg!(unix)
-        && !matches!(inputs.prestart_env, Some("0" | "false"))
+    let gpu_likely = inputs.card_eligible || matches!(inputs.override_env, Some("1" | "true"));
+    let card_has_room = inputs.vram_total.is_some_and(|total| {
+        total >= PRESTART_MIN_VRAM_BYTES
+            || (gpu_likely
+                && sp1_recursion_gnark_ffi::groth16_helper_streams(inputs.stream_env, Some(total)))
+    });
+    !matches!(inputs.prestart_env, Some("0" | "false"))
         && !matches!(inputs.override_env, Some("0" | "false"))
         && inputs.helper_available
         && inputs.circuit_installed
         && (inputs.arena_bytes == 0
-            || inputs
-                .vram_free
-                .is_some_and(|free| free >= GPU_HELPER_VRAM_BYTES + PRESTART_ARENA_MARGIN_BYTES))
-        && inputs.vram_total.is_some_and(|total| total >= PRESTART_MIN_VRAM_BYTES)
+            || inputs.vram_free.is_some_and(|free| {
+                free >= sp1_recursion_gnark_ffi::GROTH16_GPU_HELPER_VRAM_BYTES
+                    + PRESTART_ARENA_MARGIN_BYTES
+            }))
+        && card_has_room
         && inputs.mem_available.is_some_and(|available| available >= PRESTART_MIN_AVAILABLE_BYTES)
 }
 
 /// Prestarts the GPU helper for a Groth16 proof (see `sp1_recursion_gnark_ffi::prestart`) if
 /// [`should_prestart`]. Dropping the result when the proof ends gives back whatever it did not use.
 #[cfg(feature = "native-gnark")]
-pub(crate) fn prestart_gpu_helper() -> Option<sp1_recursion_gnark_ffi::prestart::Prestart> {
+pub(crate) fn prestart_gpu_helper(
+    card_eligible: bool,
+) -> Option<sp1_recursion_gnark_ffi::prestart::Prestart> {
     use sp1_recursion_gnark_ffi::Groth16Bn254Prover;
     let build_dir =
         (!crate::build::use_development_mode()).then(crate::build::groth16_circuit_artifacts_dir);
     let build_dir = build_dir.and_then(Result::ok);
     let prestart_env = std::env::var("SP1_GROTH16_PRESTART").ok();
     let override_env = std::env::var("SP1_GROTH16_GPU").ok();
+    let stream_env = std::env::var("SP1_GROTH16_STREAM_SRS").ok();
     let inputs = PrestartInputs {
         prestart_env: prestart_env.as_deref(),
         override_env: override_env.as_deref(),
+        stream_env: stream_env.as_deref(),
+        card_eligible,
         helper_available: Groth16Bn254Prover::gpu_helper_available(),
         vram_total: sp1_recursion_gnark_ffi::gpu_total_memory(),
         arena_bytes: sp1_recursion_gnark_ffi::device_caches::arena_bytes(),
         vram_free: sp1_recursion_gnark_ffi::gpu_free_memory(),
-        mem_available: sp1_recursion_gnark_ffi::host_memory::available(),
+        mem_available: sp1_recursion_gnark_ffi::host_memory::available_on_any_host(),
         circuit_installed: build_dir
             .as_deref()
             .is_some_and(crate::build::circuit_artifacts_installed),
@@ -602,6 +620,8 @@ mod tests {
         PrestartInputs {
             prestart_env: None,
             override_env: None,
+            stream_env: None,
+            card_eligible: true,
             helper_available: true,
             vram_total: Some(32 * GIB),
             arena_bytes: 0,
@@ -614,11 +634,6 @@ mod tests {
     #[test]
     fn prestarts_only_where_the_gpu_prover_is_likely_and_the_host_has_room() {
         let base = prestart_inputs();
-        // Only Unix prestarts at all.
-        if !cfg!(unix) {
-            assert!(!should_prestart(&base));
-            return;
-        }
         assert!(should_prestart(&base));
         for off in ["0", "false"] {
             assert!(!should_prestart(&PrestartInputs { prestart_env: Some(off), ..base }));
@@ -629,6 +644,19 @@ mod tests {
         assert!(!should_prestart(&PrestartInputs { circuit_installed: false, ..base }));
         assert!(!should_prestart(&PrestartInputs { vram_total: Some(24 * GIB), ..base }));
         assert!(!should_prestart(&PrestartInputs { vram_total: None, ..base }));
+        // A 16 GB card whose helper streams its key, where the card may use the GPU prover or the
+        // setting forces it; not where the helper keeps its key (it then needs 18 GiB).
+        let card_16gb = PrestartInputs { vram_total: Some(15 * GIB + GIB / 2), ..base };
+        assert!(should_prestart(&card_16gb));
+        assert!(!should_prestart(&PrestartInputs { card_eligible: false, ..card_16gb }));
+        assert!(should_prestart(&PrestartInputs {
+            card_eligible: false,
+            override_env: Some("1"),
+            ..card_16gb
+        }));
+        assert!(!should_prestart(&PrestartInputs { stream_env: Some("0"), ..card_16gb }));
+        // Cards of the 30 GB tier prestart whatever the worker's card setting.
+        assert!(should_prestart(&PrestartInputs { card_eligible: false, ..base }));
         // HIP's arena holds most of the card: prestart only where the helper fits beside it.
         assert!(!should_prestart(&PrestartInputs { arena_bytes: 30 * GIB, ..base }));
         let arena = PrestartInputs { arena_bytes: 150 * GIB, vram_total: Some(192 * GIB), ..base };

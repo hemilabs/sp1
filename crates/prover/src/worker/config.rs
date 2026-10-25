@@ -82,6 +82,7 @@ impl SP1WorkerConfig {
             send_splice_input_buffer_size_per_splice,
             use_fixed_pk,
             global_memory_buffer_size,
+            groth16_gpu: false,
         };
 
         // Build the core prover config.

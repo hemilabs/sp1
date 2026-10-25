@@ -446,6 +446,7 @@ pub async fn cuda_worker_builder_with_machine(
             config.prover_config.recursion_prover_config.groth16_gpu = groth16_gpu;
             config.prover_config.recursion_prover_config.shrink_persistent_pk =
                 shrink_persistent_pk;
+            config.controller_config.groth16_gpu = groth16_gpu;
             // A core worker runs tracing, host tracegen, the core proof, its CPU verification and
             // then the shard's normalize (lift) proof before it takes the next shard. With the
             // upstream default of 4 workers all four are often in those CPU phases together and
