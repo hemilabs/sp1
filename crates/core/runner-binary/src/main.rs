@@ -73,6 +73,7 @@ fn main() {
     compiled.memory.open_readwrite(&input.id).expect("initialize memory");
     compiled.with_initial_memory_image(input.program.memory_image.clone());
     compiled.set_input_buffer(input.input.clone());
+    compiled.set_max_chunk_cycles(input.max_chunk_cycles);
 
     if transpiler.tracing() {
         // Tracing mode is on

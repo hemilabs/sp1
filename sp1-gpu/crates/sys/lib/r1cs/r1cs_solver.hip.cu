@@ -48,6 +48,26 @@ using Fr = alt_bn128::fr_mont;
 #define cudaDevAttrCooperativeLaunch      hipDeviceAttributeCooperativeLaunch
 #define cudaLaunchCooperativeKernel       hipLaunchCooperativeKernel
 
+// The prover's stream-ordered allocator (runtime/stream.cu; declared here rather than through
+// runtime/stream.cuh, whose CUDA aliases differ from the ones above). Its blocks come out of the
+// device memory arena where there is one, and not out of the arena's headroom, which kernel
+// scratch needs: the Groth16 prover keeps this solver's ~5 GB between proofs on large cards.
+struct RustCudaError { const char* message; };
+extern "C" const RustCudaError CUDA_SUCCESS_CSL;
+extern "C" RustCudaError cuda_malloc_async(void** devPtr, size_t size, hipStream_t stream);
+extern "C" RustCudaError cuda_free_async(void* devPtr, hipStream_t stream);
+extern "C" void cuda_release_cached_memory();
+extern "C" size_t sp1_hip_arena_bytes();
+
+static bool dev_alloc(void** p, size_t size) {
+    *p = nullptr;
+    return cuda_malloc_async(p, size, nullptr).message == CUDA_SUCCESS_CSL.message;
+}
+
+static void dev_free(void* p) {
+    if (p) cuda_free_async(p, nullptr);
+}
+
 // ============================================================================
 // Wire-format structs (must match Go-side prep-circuit-prod emission).
 // ============================================================================
@@ -710,7 +730,7 @@ sp1_r1cs_solver_create(const char* prep_circuit_dir,
     h->n_layers = nb_layers;
 
     auto cuda_alloc_copy = [](void** dp, size_t sz, const void* src) -> bool {
-        if (cudaMalloc(dp, sz) != cudaSuccess) return false;
+        if (!dev_alloc(dp, sz)) return false;
         if (cudaMemcpy(*dp, src, sz, cudaMemcpyHostToDevice) != cudaSuccess) return false;
         return true;
     };
@@ -735,26 +755,19 @@ sp1_r1cs_solver_create(const char* prep_circuit_dir,
     }
 
     // Per-prove buffers (re-used)
-    if (cudaMalloc((void**)&h->d_wires, h->n_wires * sizeof(Fr)) != cudaSuccess ||
-        cudaMalloc((void**)&h->d_out_a, h->n_constraints * sizeof(Fr)) != cudaSuccess ||
-        cudaMalloc((void**)&h->d_out_b, h->n_constraints * sizeof(Fr)) != cudaSuccess ||
-        cudaMalloc((void**)&h->d_out_c, h->n_constraints * sizeof(Fr)) != cudaSuccess ||
-        cudaMalloc((void**)&h->d_err,   sizeof(int)) != cudaSuccess) {
+    if (!dev_alloc((void**)&h->d_wires, h->n_wires * sizeof(Fr)) ||
+        !dev_alloc((void**)&h->d_out_a, h->n_constraints * sizeof(Fr)) ||
+        !dev_alloc((void**)&h->d_out_b, h->n_constraints * sizeof(Fr)) ||
+        !dev_alloc((void**)&h->d_out_c, h->n_constraints * sizeof(Fr)) ||
+        !dev_alloc((void**)&h->d_err,   sizeof(int))) {
         fprintf(stderr, "[r1cs-solver] per-prove alloc failed\n");
         sp1_r1cs_solver_destroy(h);
         return nullptr;
     }
 
-    // Pinned host buffers for fast D2H (callers may bypass these by
-    // passing their own buffers, but we always have them ready).
-    if (cudaHostAlloc((void**)&h->h_pinned_wires, h->n_wires * sizeof(Fr), cudaHostAllocDefault) != cudaSuccess ||
-        cudaHostAlloc((void**)&h->h_pinned_a,     h->n_constraints * sizeof(Fr), cudaHostAllocDefault) != cudaSuccess ||
-        cudaHostAlloc((void**)&h->h_pinned_b,     h->n_constraints * sizeof(Fr), cudaHostAllocDefault) != cudaSuccess ||
-        cudaHostAlloc((void**)&h->h_pinned_c,     h->n_constraints * sizeof(Fr), cudaHostAllocDefault) != cudaSuccess) {
-        fprintf(stderr, "[r1cs-solver] pinned host alloc failed\n");
-        sp1_r1cs_solver_destroy(h);
-        return nullptr;
-    }
+    // No pinned host staging buffers: solve copies straight into the
+    // caller's buffers, and pinning ~2 GB here cost every create.
+    h->h_pinned_wires = h->h_pinned_a = h->h_pinned_b = h->h_pinned_c = nullptr;
 
     // Determine cooperative grid size. HIP variant skips
     // hipOccupancyMaxActiveBlocksPerMultiprocessor — we always pin BPS=1
@@ -781,7 +794,19 @@ sp1_r1cs_solver_create(const char* prep_circuit_dir,
     // expensive there. Kept as opt-in for future investigation (e.g. fusing
     // small layers, or a hybrid scheme that uses cooperative-grid for
     // skinny-layer runs and per-launch for wide-layer plateaus).
+    // On CDNA (gfx9*, e.g. MI300X with 8 XCDs) grid.sync() is far slower:
+    // coop 14.5 s vs per-layer 4.4 s for the solve, so per-layer is the
+    // default there. SP1_R1CS_PERLAYER=0/1 overrides.
     h->use_perlayer = false;
+    {
+        hipDeviceProp_t prop;
+        int dev = 0;
+        if (hipGetDevice(&dev) == hipSuccess &&
+            hipGetDeviceProperties(&prop, dev) == hipSuccess &&
+            strncmp(prop.gcnArchName, "gfx9", 4) == 0) {
+            h->use_perlayer = true;
+        }
+    }
     if (const char* env = getenv("SP1_R1CS_PERLAYER")) {
         h->use_perlayer = (atoi(env) != 0);
     }
@@ -814,20 +839,24 @@ sp1_r1cs_solver_create(const char* prep_circuit_dir,
 
 extern "C" void sp1_r1cs_solver_destroy(sp1_r1cs_solver_t* h) {
     if (!h) return;
-    if (h->d_coeffs)         cudaFree(h->d_coeffs);
-    if (h->d_terms)          cudaFree(h->d_terms);
-    if (h->d_descs)          cudaFree(h->d_descs);
-    if (h->d_layers)         cudaFree(h->d_layers);
-    if (h->d_hint_layers)    cudaFree(h->d_hint_layers);
-    if (h->d_hint_calls)     cudaFree(h->d_hint_calls);
-    if (h->d_hint_le_offsets) cudaFree(h->d_hint_le_offsets);
-    if (h->d_hint_le_terms)  cudaFree(h->d_hint_le_terms);
-    if (h->d_desc_decl_idx)  cudaFree(h->d_desc_decl_idx);
-    if (h->d_wires)          cudaFree(h->d_wires);
-    if (h->d_out_a)          cudaFree(h->d_out_a);
-    if (h->d_out_b)          cudaFree(h->d_out_b);
-    if (h->d_out_c)          cudaFree(h->d_out_c);
-    if (h->d_err)            cudaFree(h->d_err);
+    dev_free(h->d_coeffs);
+    dev_free(h->d_terms);
+    dev_free(h->d_descs);
+    dev_free(h->d_layers);
+    dev_free(h->d_hint_layers);
+    dev_free(h->d_hint_calls);
+    dev_free(h->d_hint_le_offsets);
+    dev_free(h->d_hint_le_terms);
+    dev_free(h->d_desc_decl_idx);
+    dev_free(h->d_wires);
+    dev_free(h->d_out_a);
+    dev_free(h->d_out_b);
+    dev_free(h->d_out_c);
+    dev_free(h->d_err);
+    // Without an arena (a wrap helper, SP1_GPU_ARENA=0, Windows), the blocks above would stay in
+    // the allocator's cache, out of reach of the MSMs' own hipMallocs: give them back to the
+    // driver, as hipFree did. (With an arena they go back to it either way.)
+    if (sp1_hip_arena_bytes() == 0) cuda_release_cached_memory();
     if (h->h_pinned_wires)   cudaFreeHost(h->h_pinned_wires);
     if (h->h_pinned_a)       cudaFreeHost(h->h_pinned_a);
     if (h->h_pinned_b)       cudaFreeHost(h->h_pinned_b);

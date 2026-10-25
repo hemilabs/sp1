@@ -318,8 +318,18 @@ where
         };
 
         let prep_cache = self.inner.prep_cache.as_ref();
-        let cached = prep_cache.and_then(|c| c.get(&program, &initial_global_cumulative_sum));
-        // Kept to cache the program's preprocessed data after the proof.
+        // A shard of a program another shard is setting up waits for that setup's entry rather
+        // than setting the program up too (see `PrepCache::get_or_claim`).
+        let (cached, claim) = match prep_cache {
+            Some(cache) => {
+                cache
+                    .get_or_claim(&program, &initial_global_cumulative_sum)
+                    .instrument(tracing::debug_span!("get preprocessed data"))
+                    .await
+            }
+            None => (None, None),
+        };
+        // Kept to cache the program's preprocessed data after the setup.
         let cache_program = (cached.is_none() && prep_cache.is_some()).then(|| program.clone());
 
         let buffer = self.inner.get_buffer().await;
@@ -375,6 +385,20 @@ where
 
         let pk = Arc::new(pk);
 
+        // Cached before the shard is proved, so that the shards waiting for this setup (see
+        // `claim`) need not wait for the proof too.
+        if let (Some(program), Some(cache)) = (cache_program, prep_cache) {
+            self.cache_prep_entry(
+                cache,
+                program,
+                initial_global_cumulative_sum,
+                &vk,
+                &pk.preprocessed_data,
+            )
+            .await;
+        }
+        drop(claim);
+
         // `setup_from_preprocessed_data_and_traces` wrapped the freshly-built
         // buffer in a pool of N=1. `full_tracegen_permit` already filled both
         // preprocessed + main slots, so we just need to acquire that one
@@ -416,17 +440,6 @@ where
         // tracing::debug_span!("prove shard with data")
         //     .in_scope(|| self.prove_shard_with_data(shard_data, challenger));
         drop(buffer);
-
-        if let (Some(program), Some(cache)) = (cache_program, prep_cache) {
-            self.cache_prep_entry(
-                cache,
-                program,
-                initial_global_cumulative_sum,
-                &vk,
-                &pk.preprocessed_data,
-            )
-            .await;
-        }
 
         (vk, shard_proof, permit)
     }
@@ -509,8 +522,8 @@ where
     SP1PcsProof<GC>: Into<<PC::C as MultilinearPcsVerifier<GC>>::Proof>,
     TaskScope: sp1_gpu_jagged_assist::BranchingProgramKernel<GC::F, GC::EF, PC::DeviceChallenger>,
 {
-    /// Caches the preprocessed data of `program`, which `data` was just set up from and proved a
-    /// shard with (see [`PrepCache`]).
+    /// Caches the preprocessed data of `program`, which `data` was just set up from (see
+    /// [`PrepCache`]).
     async fn cache_prep_entry(
         &self,
         cache: &PrepCache<GC, PC::Air>,
@@ -523,7 +536,7 @@ where
             let data = data.lock().await;
             (data.shared.clone(), data.trace_buffer_pool.clone())
         };
-        let traces = pool.pop().await.expect("trace buffer of a proved shard");
+        let traces = pool.pop().await.expect("trace buffer of a set-up shard");
         let traces_bytes = preprocessed_copy_bytes(&traces) as u64;
         // A shard of the same program that missed the cache at the same time may have cached it
         // already: then nothing is copied (the device copies would only be dropped again).
@@ -533,8 +546,8 @@ where
         {
             return;
         }
-        // Ordered on the prover's stream after the shard's proof, which leaves the preprocessed
-        // part of its traces as they were set up.
+        // Ordered on the prover's stream after the setup; the shard's proof leaves the
+        // preprocessed part of its traces as they were set up.
         let traces = copy_preprocessed_traces(&traces, &self.inner.backend);
         // The codeword is most of the data (the traces at the FRI blowup, ~2.7x the cached traces
         // of a normalize program) and cheap to encode again when basefold opens it, unlike its

@@ -284,6 +284,7 @@ where
             None => [0u32; PROOF_NONCE_NUM_WORDS],
         };
 
+        let use_fixed_pk = self.config.use_fixed_pk;
         let vkey_download_handle = tokio::spawn({
             let artifact_client_clone = self.artifact_client.clone();
             let worker_client_clone = self.worker_client.clone();
@@ -301,6 +302,58 @@ where
                 drop(lock);
                 let vk = if let Some(vkey) = vkey {
                     tracing::debug!("setup cache hit");
+                    // The vk is known, but this proof's core shards still need the proving key:
+                    // have a setup task build it now, off the first shard's critical path, as on
+                    // a cache miss (a no-op unless the workers run in this process). The shards
+                    // do not use it with a fixed proving key. Best effort: on failure the first
+                    // shard runs the setup itself.
+                    if !use_fixed_pk && reserve_core_proving_keys(&elf_clone) {
+                        tracing::debug!("setup task pre-builds the core proving key");
+                        let artifact_client = artifact_client_clone.clone();
+                        let worker_client = worker_client_clone.clone();
+                        let elf = elf_clone.clone();
+                        let context = context.clone();
+                        tokio::spawn(
+                            async move {
+                                let result: Result<(), TaskError> = async {
+                                    let vk_artifact = artifact_client.create_artifact()?;
+                                    let setup_request = RawTaskRequest {
+                                        inputs: vec![elf],
+                                        outputs: vec![vk_artifact.clone()],
+                                        context: context.clone(),
+                                    };
+                                    let setup_id = worker_client
+                                        .submit_task(TaskType::SetupVkey, setup_request)
+                                        .await?;
+                                    let subscriber = worker_client
+                                        .subscriber(context.proof_id.clone())
+                                        .await?
+                                        .per_task();
+                                    let status = subscriber
+                                        .wait_task(setup_id)
+                                        .await
+                                        .map_err(|e| TaskError::Fatal(e.into()))?;
+                                    let _ = artifact_client
+                                        .try_delete(
+                                            &vk_artifact,
+                                            ArtifactType::UnspecifiedArtifactType,
+                                        )
+                                        .await;
+                                    if status != TaskStatus::Succeeded {
+                                        return Err(TaskError::Fatal(anyhow::anyhow!(
+                                            "setup task failed"
+                                        )));
+                                    }
+                                    Ok::<(), TaskError>(())
+                                }
+                                .await;
+                                if let Err(e) = result {
+                                    tracing::warn!("pre-building the core proving key: {e}");
+                                }
+                            }
+                            .instrument(tracing::debug_span!("prebuild core pk")),
+                        );
+                    }
                     vkey.clone()
                 } else {
                     // Have the setup task leave its proving key for this proof's core shards

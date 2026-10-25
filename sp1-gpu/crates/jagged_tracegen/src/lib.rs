@@ -254,15 +254,17 @@ type HostTraceRef = (String, usize, usize, usize);
 ///
 /// One shard uploads at a time, and the next one starts once this one's traces are in place, so
 /// the extra device memory is at most one shard's host traces. The prefetch is skipped for a
-/// shard whose host traces exceed `SP1_GPU_TRACE_PREFETCH_MIB` (default 4096 on CUDA cards with
-/// more than 24 GiB off Windows, else 0; `0` disables the prefetch). On Windows CUDA it spilled
+/// shard whose host traces exceed `SP1_GPU_TRACE_PREFETCH_MIB` (default 4096 off Windows on CUDA
+/// cards with more than 24 GiB and HIP cards of 64 GiB or more, else 0; `0` disables the
+/// prefetch). On Windows CUDA it spilled
 /// too: on an RTX 5090 most proofs of a 1.44B-cycle program took 35-69 s instead of ~8.7 s, the
 /// memory pool's reserve (outside this limit) pushing the card past its memory, and with it
-/// 144M-cycle proofs were no faster. It is off by default on HIP and SYCL:
+/// 144M-cycle proofs were no faster. It is off by default on SYCL and smaller HIP cards:
 /// their device memory caches hold freed blocks this limit doesn't see, and on an Arc Pro B70
 /// (32 GB, Windows) a third of compressed proofs then spilled to shared system memory (4.3 s ->
 /// 10-26 s), with an occasional device loss, while proofs that didn't spill were no faster than
-/// without the prefetch. The uploads also only use memory the prover
+/// without the prefetch. On an MI300X (192 GB, Linux), core proofs were 2.9% faster with it.
+/// The uploads also only use memory the prover
 /// does not: they keep the live device memory `SP1_GPU_TRACE_PREFETCH_HEADROOM_MIB` (default
 /// 1536) below what the process can use (on an otherwise idle 32 GiB card, the pool's peak then
 /// stays where it was without them), and are dropped when the prover needs that memory (see
@@ -279,22 +281,21 @@ impl TracePrefetcher {
     pub fn new() -> Option<Self> {
         const MIB: usize = 1 << 20;
         let env_mib = |name: &str| std::env::var(name).ok().and_then(|v| v.parse::<usize>().ok());
-        let (free, total) = sp1_gpu_cudart::cuda_memory_info().ok()?;
-        let max_mib = env_mib("SP1_GPU_TRACE_PREFETCH_MIB").unwrap_or(
-            if sp1_gpu_cudart::sys::BACKEND == "cuda" && !cfg!(windows) && total > 24 << 30 {
-                4096
-            } else {
-                0
-            },
-        );
+        let (_, total) = sp1_gpu_cudart::cuda_memory_info().ok()?;
+        let large = match sp1_gpu_cudart::sys::BACKEND {
+            "cuda" => total > 24 << 30,
+            "hip" => total >= 64 << 30,
+            _ => false,
+        };
+        let default_mib = if large && !cfg!(windows) { 4096 } else { 0 };
+        let max_mib = env_mib("SP1_GPU_TRACE_PREFETCH_MIB").unwrap_or(default_mib);
         if max_mib == 0 {
             return None;
         }
-        // The memory this process can use: what it has allocated plus what is free (other
-        // processes may hold some of the card).
-        let usable = free as u64 + sp1_gpu_cudart::vram_current_bytes();
+        // The memory this process can use (with HIP's arena, the arena's).
+        let usable = sp1_gpu_cudart::usable_device_memory().ok()?;
         let headroom = env_mib("SP1_GPU_TRACE_PREFETCH_HEADROOM_MIB").unwrap_or(1536) * MIB;
-        let limit = usable.min(total as u64).saturating_sub(headroom as u64);
+        let limit = usable.saturating_sub(headroom as u64);
         tracing::debug!(limit_mib = limit >> 20, "trace prefetch enabled");
         Some(Self {
             stream: sp1_gpu_cudart::UploadStream::create(limit).ok()?,

@@ -105,7 +105,19 @@ pub fn prove_groth16_bn254(data_dir: &str, witness_path: &str) -> Groth16Bn254Pr
 }
 
 /// The Docker prover runs on the CPU: GPU entry points are not used.
-pub fn set_groth16_gpu_hooks(_compute_h: usize, _msm_g1: usize, _msm_g2: usize) {}
+pub fn set_groth16_gpu_hooks(
+    _compute_h: usize,
+    _msm_g1: usize,
+    _msm_g2: usize,
+    _gpu_total_memory: u64,
+) {
+}
+
+/// The Docker prover runs on the CPU: a GPU R1CS solver is not used.
+pub fn set_groth16_gpu_r1cs_solver(_create: usize, _solve: usize, _destroy: usize) {}
+
+/// The Docker prover runs on the CPU: no GPU R1CS solver is kept.
+pub fn release_groth16_gpu_r1cs_solver() {}
 
 fn build(system: ProofSystem, data_dir: &str) -> Result<()> {
     let circuit_dir = if data_dir.ends_with("dev") { "/circuit_dev" } else { "/circuit" };

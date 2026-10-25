@@ -12,7 +12,6 @@ import (
 	"github.com/consensys/gnark-crypto/ecc"
 	"github.com/consensys/gnark/backend/groth16"
 	"github.com/consensys/gnark/constraint"
-	"github.com/consensys/gnark/frontend"
 )
 
 // ProveGroth16WithR1cs proves with the R1CS at r1csPath and the proving key in dataDir, and keeps
@@ -61,8 +60,7 @@ func ProveGroth16WithR1cs(dataDir string, r1csPath string, witnessPath string) (
 	}
 
 	start = time.Now()
-	assignment := NewCircuit(witnessInput)
-	witness, err := frontend.NewWitness(&assignment, ecc.BN254.ScalarField())
+	witness, err := newWitness(witnessInput)
 	if err != nil {
 		panic(err)
 	}
@@ -125,6 +123,7 @@ func ExportGroth16StrippedR1cs(dataDir string, outputPath string) {
 // not stay that much larger. The next call reloads what it needs.
 func ReleaseCaches() {
 	releaseProverCache()
+	dropGpuSolveBufs()
 	gpuWitnessMutex.Lock()
 	gpuWitnessR1cs = nil
 	gpuWitnessR1csDataDir = ""
@@ -139,6 +138,7 @@ func ReleaseCaches() {
 // (~3 GB, ~5 s of CPU to read again), for a process that will make another GPU Groth16 proof.
 func TrimCaches() {
 	releaseProverCache()
+	dropGpuSolveBufs()
 	gpuWitnessMutex.Lock()
 	gpuWitnessPk = nil
 	gpuWitnessPkDataDir = ""

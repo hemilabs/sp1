@@ -263,6 +263,19 @@ where
         let (splicing_submit_tx, mut splicing_submit_rx) = mpsc::unbounded_channel();
         let span = tracing::debug_span!("minimal executor");
 
+        let new_minimal_executor = || {
+            let mut minimal_executor = MinimalExecutorRunner::new(
+                program.clone(),
+                false,
+                Some(opts.minimal_trace_chunk_threshold),
+                opts.memory_limit,
+                opts.trace_chunk_slots,
+            );
+            // End chunks by cycles too, so splicing and the first shard start before the end of
+            // a compute-bound execution.
+            minimal_executor.set_max_chunk_cycles(Some(opts.minimal_trace_chunk_cycles));
+            minimal_executor
+        };
         // Making the minimal executor blocks the rest of execution anyway, so we initialize it before spawning the rest of the tokio tasks.
         let mut minimal_executor = if let Some(cache) = &self.minimal_executor_cache {
             let mut optional_minimal_executor = cache.lock().await;
@@ -270,22 +283,10 @@ where
                 tracing::info!("minimal executor cache hit");
                 minimal_executor
             } else {
-                MinimalExecutorRunner::new(
-                    program.clone(),
-                    false,
-                    Some(opts.minimal_trace_chunk_threshold),
-                    opts.memory_limit,
-                    opts.trace_chunk_slots,
-                )
+                new_minimal_executor()
             }
         } else {
-            MinimalExecutorRunner::new(
-                program.clone(),
-                false,
-                Some(opts.minimal_trace_chunk_threshold),
-                opts.memory_limit,
-                opts.trace_chunk_slots,
-            )
+            new_minimal_executor()
         };
         join_set.spawn_blocking({
             let program = program.clone();

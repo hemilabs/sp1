@@ -19,6 +19,18 @@ pub fn cuda_memory_info() -> Result<(usize, usize), CudaError> {
     Ok((free, total))
 }
 
+/// The device memory this process can use, in bytes: what it has allocated plus what is free
+/// (other processes may hold some of the card). With HIP's arena, at most the arena: the memory
+/// outside it (`SP1_GPU_ARENA_HEADROOM_MB`) is the driver's and the kernels' scratch, which
+/// staged uploads and device caches must not grow the arena into.
+pub fn usable_device_memory() -> Result<u64, CudaError> {
+    let (free, total) = cuda_memory_info()?;
+    let usable = (free as u64 + crate::vram_current_bytes()).min(total as u64);
+    // SAFETY: takes nothing and reads the arena's size under its lock.
+    let arena = unsafe { sp1_gpu_sys::runtime::sp1_hip_arena_bytes() } as u64;
+    Ok(if arena > 0 { usable.min(arena) } else { usable })
+}
+
 /// Returns the name of the CUDA device the calling thread is bound to, e.g. `"NVIDIA L4"`.
 ///
 /// The name is queried once and cached for the lifetime of the process, because the underlying

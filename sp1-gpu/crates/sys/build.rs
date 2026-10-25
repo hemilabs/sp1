@@ -427,9 +427,15 @@ fn main() {
                 // If clang++ not found, let CMake auto-detect
             }
 
-            // Pass HIP architectures if explicitly set
+            // HIP architectures: HIP_ARCHS if set, else the GPUs this host has (so that an
+            // MI300X host builds gfx942 code without being told), else CMakeLists.txt's default.
             if let Ok(hip_archs) = env::var("HIP_ARCHS") {
                 cmake_config.define("HIP_ARCHS", &hip_archs);
+            } else if let Some(detected) = detect_hip_archs(&rocm_path) {
+                println!(
+                    "cargo:warning=HIP_ARCHS not set; building for this host's GPUs: {detected}"
+                );
+                cmake_config.define("HIP_ARCHS", &detected);
             }
         }
         GpuBackend::Cuda => {
@@ -559,6 +565,31 @@ fn main() {
 
     // Add include directories for compilation if needed
     println!("cargo:include={}", out_include_dir.display());
+}
+
+/// The `gfx` targets of the AMD GPUs on this host, `;`-separated, from ROCm's
+/// `rocm_agent_enumerator` or LLVM's `amdgpu-arch`/`offload-arch`; `None` when no tool runs or
+/// none reports a GPU (a build host without one, or in a container without `/dev/kfd`).
+fn detect_hip_archs(rocm_path: &str) -> Option<String> {
+    let tools = [
+        format!("{rocm_path}/bin/rocm_agent_enumerator"),
+        format!("{rocm_path}/lib/llvm/bin/amdgpu-arch"),
+        format!("{rocm_path}/lib/llvm/bin/offload-arch"),
+    ];
+    tools.iter().find_map(|tool| {
+        let output = std::process::Command::new(tool).output().ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let mut archs: Vec<String> = Vec::new();
+        for arch in String::from_utf8_lossy(&output.stdout).split_whitespace() {
+            // gfx000 is the CPU agent `rocm_agent_enumerator` lists.
+            if arch.starts_with("gfx") && arch != "gfx000" && !archs.iter().any(|a| a == arch) {
+                archs.push(arch.to_string());
+            }
+        }
+        (!archs.is_empty()).then(|| archs.join(";"))
+    })
 }
 
 /// The ROCm installation: `ROCM_PATH`, then `HIP_PATH` (what the Windows HIP SDK sets), then the

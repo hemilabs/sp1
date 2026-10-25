@@ -7,7 +7,6 @@ import (
 
 	"github.com/consensys/gnark-crypto/ecc"
 	"github.com/consensys/gnark/backend/plonk"
-	"github.com/consensys/gnark/frontend"
 )
 
 func ProvePlonk(dataDir string, witnessPath string) Proof {
@@ -59,8 +58,7 @@ func ProvePlonk(dataDir string, witnessPath string) Proof {
 	}
 
 	// Generate the witness.
-	assignment := NewCircuit(witnessInput)
-	witness, err := frontend.NewWitness(&assignment, ecc.BN254.ScalarField())
+	witness, err := newWitness(witnessInput)
 	if err != nil {
 		panic(err)
 	}

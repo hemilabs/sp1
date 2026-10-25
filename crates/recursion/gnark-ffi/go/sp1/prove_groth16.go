@@ -13,7 +13,6 @@ import (
 	"github.com/consensys/gnark-crypto/ecc"
 	"github.com/consensys/gnark/backend/groth16"
 	"github.com/consensys/gnark/constraint"
-	"github.com/consensys/gnark/frontend"
 )
 
 var globalMutex sync.RWMutex
@@ -86,8 +85,7 @@ func ProveGroth16(dataDir string, witnessPath string) Proof {
 
 	start = time.Now()
 	// Generate the witness.
-	assignment := NewCircuit(witnessInput)
-	witness, err := frontend.NewWitness(&assignment, ecc.BN254.ScalarField())
+	witness, err := newWitness(witnessInput)
 	if err != nil {
 		panic(err)
 	}

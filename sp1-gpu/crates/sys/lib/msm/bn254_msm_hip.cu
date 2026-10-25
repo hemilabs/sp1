@@ -8,6 +8,8 @@
 #include <hip/hip_runtime.h>
 #include <hipcub/hipcub.hpp>
 
+#include <mutex>
+
 #include "msm/bn254_msm.cuh"
 #include "runtime/exception.cuh"
 
@@ -820,9 +822,26 @@ void sp1_bn254_msm_destroy(void* ctx_ptr)
 static rustCudaError_t glv_pool_ensure(int max_n);
 static void glv_pool_free();
 
+// Guards `g_glv_pool` (defined below) and everything in it. Every entry point
+// that reads, grows, frees or computes with the pool holds it, for an MSM
+// until its result has been copied back (so the pool's scratch is idle again).
+// Concurrent provers in one process (parallel tests, or the SRS upload thread
+// growing the pool while the prove thread runs an MSM) would otherwise
+// overwrite each other's scratch or free it mid-MSM. Recursive because the
+// entry points nest (invoke -> init_glv_buffers -> glv_pool_ensure, and the G2
+// GLV invoke -> sp1_bn254_glv_pool_reserve).
+static std::recursive_mutex g_glv_pool_mu;
+typedef std::lock_guard<std::recursive_mutex> glv_pool_lock_t;
+
+// Lock / unlock the pool from another translation unit (the G2 GLV invoke in
+// bn254_g2_msm_hip.cu shares the pool's scalar buffers for a whole MSM).
+extern "C" void sp1_bn254_glv_pool_lock() { g_glv_pool_mu.lock(); }
+extern "C" void sp1_bn254_glv_pool_unlock() { g_glv_pool_mu.unlock(); }
+
 extern "C"
 rustCudaError_t sp1_bn254_glv_pool_reserve(size_t max_n) {
     if (max_n == 0) return CUDA_SUCCESS_CSL;
+    glv_pool_lock_t lock(g_glv_pool_mu);
     return glv_pool_ensure((int)max_n);
 }
 
@@ -830,6 +849,7 @@ rustCudaError_t sp1_bn254_glv_pool_reserve(size_t max_n) {
 // process exit, but exposed for tests / long-running daemons).
 extern "C"
 void sp1_bn254_glv_pool_free() {
+    glv_pool_lock_t lock(g_glv_pool_mu);
     glv_pool_free();
 }
 
@@ -845,6 +865,7 @@ extern "C"
 rustCudaError_t sp1_bn254_msm_force_init_glv(void* ctx_ptr) {
     if (!ctx_ptr) return CUDA_SUCCESS_CSL;
     hip_msm_context* ctx = static_cast<hip_msm_context*>(ctx_ptr);
+    glv_pool_lock_t lock(g_glv_pool_mu);
     return init_glv_buffers(ctx);
 }
 
@@ -909,11 +930,14 @@ rustCudaError_t sp1_bn254_gpu_warmup(int spin_us) {
 // largest context can serve all of them. This reclaims ~5.8 GB on 9070 XT
 // (16 GB VRAM) vs the per-context layout and is what makes GLV fit.
 //
-// Thread-safety: the Rust caller serializes all G1 MSM invocations on the
-// same device (the HIP Groth16 path uses sequential G1 MSMs — see
-// groth16/src/prover.rs `use_sequential_g2`). We therefore do not take a
-// lock when using the pool. The one-time growth in `glv_pool_ensure` is
-// also invoked from the serialized prove() path.
+// Thread-safety: one prover runs its MSMs sequentially, but several provers
+// can share the process (parallel PLONK tests, a PLONK SRS upload thread that
+// grows the pool while the prove thread runs an MSM). Every user therefore
+// holds `g_glv_pool_mu` while it touches the pool. A pending async upload
+// (preupload / `next_scalars`) outlives the call that queued it, so it is
+// tagged with the host scalars it carries (`pending_src`, `pending_n`); an
+// invoke only skips its own upload when the pending one carries its scalars,
+// and otherwise waits for it and uploads its own.
 struct hip_g1_glv_pool {
     int alloc_n;   // base point count; buffers sized for 2 * alloc_n
 
@@ -930,6 +954,8 @@ struct hip_g1_glv_pool {
     uint32_t* d_scalars[2];             // N × SCALAR_LIMBS × u32 (32 B/scalar) × 2
     int       cur_buf;                  // 0 or 1: which d_scalars buffer is "current"
     bool      next_upload_pending;      // true if an async upload is in flight
+    const void* pending_src;            // host scalars of that upload (nullptr: GPU gather)
+    size_t    pending_n;                // their count
     hipStream_t copy_stream;            // dedicated SDMA stream for async uploads
     hipEvent_t  upload_done;            // signaled when async upload completes
 
@@ -952,8 +978,25 @@ struct hip_g1_glv_pool {
 
 static hip_g1_glv_pool* g_glv_pool = nullptr;
 
+// Consume the pool's pending async upload, if any (call with g_glv_pool_mu
+// held). Returns true when that upload carried `src` / `n`, i.e.
+// d_scalars[cur_buf] will hold the caller's scalars once upload_done fires.
+// A GPU-gather upload has no host source and matches on `n` alone. Whatever
+// it returns, the caller must order after upload_done before it writes or
+// reads d_scalars[cur_buf], since the upload may still be in flight.
+static bool glv_pool_consume_pending(hip_g1_glv_pool* gp, const void* src, size_t n) {
+    if (!gp->next_upload_pending) return false;
+    gp->next_upload_pending = false;
+    return (gp->pending_src == nullptr || gp->pending_src == src) && gp->pending_n == n;
+}
+
 static void glv_pool_free() {
     if (!g_glv_pool) return;
+    // Don't free d_scalars under an upload still running on copy_stream.
+    if (g_glv_pool->next_upload_pending && g_glv_pool->upload_done) {
+        hipEventSynchronize(g_glv_pool->upload_done);
+        g_glv_pool->next_upload_pending = false;
+    }
     hipFree(g_glv_pool->d_scalars[0]);
     hipFree(g_glv_pool->d_scalars[1]);
     if (g_glv_pool->copy_stream) hipStreamDestroy(g_glv_pool->copy_stream);
@@ -997,6 +1040,9 @@ struct sp1_bn254_glv_scalar_buffers {
 extern "C"
 rustCudaError_t sp1_bn254_glv_pool_get_scalar_buffers(sp1_bn254_glv_scalar_buffers* out) {
     if (!out) return rustCudaError_t{.message = "null out pointer"};
+    // The pointers stay valid only while the caller holds the pool lock
+    // (sp1_bn254_glv_pool_lock), as the G2 GLV invoke does for its whole MSM.
+    glv_pool_lock_t lock(g_glv_pool_mu);
     if (!g_glv_pool) {
         memset(out, 0, sizeof(*out));
         return rustCudaError_t{.message = "G1 GLV pool not reserved"};
@@ -1034,6 +1080,7 @@ extern "C"
 rustCudaError_t sp1_bn254_msm_preupload_scalars(
     const void* scalars, size_t npoints
 ) {
+    glv_pool_lock_t lock(g_glv_pool_mu);
     if (!g_glv_pool) {
         return rustCudaError_t{.message = "GLV pool not reserved — call sp1_bn254_glv_pool_reserve first"};
     }
@@ -1055,6 +1102,8 @@ rustCudaError_t sp1_bn254_msm_preupload_scalars(
                            hipMemcpyHostToDevice, gp->copy_stream));
     CUDA_OK(hipEventRecord(gp->upload_done, gp->copy_stream));
     gp->next_upload_pending = true;
+    gp->pending_src = scalars;
+    gp->pending_n = npoints;
     return CUDA_SUCCESS_CSL;
 }
 
@@ -1064,6 +1113,7 @@ rustCudaError_t sp1_bn254_msm_preupload_scalars(
 /// (GPU-side via hipStreamWaitEvent, NOT host-side hipEventSynchronize).
 extern "C"
 bool sp1_bn254_glv_pool_check_pending(hipEvent_t* out_event) {
+    glv_pool_lock_t lock(g_glv_pool_mu);
     if (!g_glv_pool || !g_glv_pool->next_upload_pending) {
         if (out_event) *out_event = nullptr;
         return false;
@@ -1073,10 +1123,28 @@ bool sp1_bn254_glv_pool_check_pending(hipEvent_t* out_event) {
     return true;
 }
 
+/// Like `sp1_bn254_glv_pool_check_pending`, but only reports the pending
+/// upload as usable when it carries `scalars` / `npoints` (another prover may
+/// have queued it). Consumes it either way and sets *out_event to upload_done
+/// whenever an upload was pending (nullptr otherwise): the caller must make
+/// its stream wait on that event before using d_scalars, and must upload its
+/// own scalars when this returns false. The caller holds the pool lock
+/// (sp1_bn254_glv_pool_lock) across this call and the MSM that follows.
+extern "C"
+bool sp1_bn254_glv_pool_take_pending(const void* scalars, size_t npoints,
+                                     hipEvent_t* out_event) {
+    glv_pool_lock_t lock(g_glv_pool_mu);
+    if (out_event) *out_event = nullptr;
+    if (!g_glv_pool || !g_glv_pool->next_upload_pending) return false;
+    if (out_event) *out_event = g_glv_pool->upload_done;
+    return glv_pool_consume_pending(g_glv_pool, scalars, npoints);
+}
+
 // Lazily allocate or grow the global GLV working-buffer pool so it can serve
 // any context with base point count <= max_n. If the pool already exists and
 // is at least as large as requested, this is a cheap no-op.
 static rustCudaError_t glv_pool_ensure(int max_n) {
+    glv_pool_lock_t lock(g_glv_pool_mu);
     if (g_glv_pool && g_glv_pool->alloc_n >= max_n) {
         return CUDA_SUCCESS_CSL;
     }
@@ -1231,6 +1299,9 @@ rustCudaError_t sp1_bn254_msm_invoke_glv(void* ctx_ptr, void* result,
     int n2 = 2 * n;
     size_t elem32 = sizeof(uint32_t);
 
+    // Hold the shared pool until the result is back (see g_glv_pool_mu).
+    glv_pool_lock_t lock(g_glv_pool_mu);
+
     // Lazily initialize GLV buffers (expand points, allocate working buffers)
     rustCudaError_t glv_err = init_glv_buffers(ctx);
     if (glv_err.message != CUDA_SUCCESS_CSL.message) return glv_err;
@@ -1260,12 +1331,15 @@ rustCudaError_t sp1_bn254_msm_invoke_glv(void* ctx_ptr, void* result,
 
     // If a previous invoke pre-uploaded our scalars via DMA overlap,
     // just wait for that upload to complete (typically already done).
-    // Otherwise, do a synchronous H2D copy.
-    if (gp->next_upload_pending) {
+    // Otherwise, do a synchronous H2D copy. A pending upload of some other
+    // prover's scalars is waited for (it targets this buffer) and replaced.
+    bool pending = gp->next_upload_pending;
+    bool preuploaded = glv_pool_consume_pending(gp, scalars, npoints);
+    if (pending) {
         CUDA_OK(hipEventSynchronize(gp->upload_done));
-        gp->next_upload_pending = false;
-        // Scalars are already in d_scalars[cur_buf] — skip hipMemcpy.
-    } else {
+    }
+    // When preuploaded, the scalars are already in d_scalars[cur_buf].
+    if (!preuploaded) {
         // Normal synchronous upload (first MSM or fallback).
         CUDA_OK(hipMemcpy(my_scalars, scalars, n * SCALAR_LIMBS * elem32, hipMemcpyHostToDevice));
     }
@@ -1350,6 +1424,8 @@ rustCudaError_t sp1_bn254_msm_invoke_glv(void* ctx_ptr, void* result,
         hipEventRecord(gp->upload_done, gp->copy_stream);
         gp->cur_buf = next_buf;  // next invoke will use this buffer
         gp->next_upload_pending = true;
+        gp->pending_src = next_scalars;
+        gp->pending_n = next_n;
     }
 
     // Download result (implicit sync on default stream — compute is done
@@ -1401,6 +1477,9 @@ rustCudaError_t sp1_bn254_msm_invoke_glv_device(void* ctx_ptr, void* result,
     int n2 = 2 * n;
     size_t elem32 = sizeof(uint32_t);
 
+    // Hold the shared pool until the result is back (see g_glv_pool_mu).
+    glv_pool_lock_t lock(g_glv_pool_mu);
+
     rustCudaError_t glv_err = init_glv_buffers(ctx);
     if (glv_err.message != CUDA_SUCCESS_CSL.message) return glv_err;
 
@@ -1438,6 +1517,8 @@ rustCudaError_t sp1_bn254_msm_invoke_glv_device(void* ctx_ptr, void* result,
         hipEventRecord(gp->upload_done, gp->copy_stream);
         gp->cur_buf = next_buf;
         gp->next_upload_pending = true;
+        gp->pending_src = next_host_scalars;
+        gp->pending_n = next_host_n;
     }
 
     // Montgomery conversion
@@ -1510,6 +1591,9 @@ rustCudaError_t sp1_bn254_msm_invoke_glv_device_depad(void* ctx_ptr, void* resul
     int n = (int)npoints;
     int n2 = 2 * n;
     size_t elem32 = sizeof(uint32_t);
+
+    // Hold the shared pool until the result is back (see g_glv_pool_mu).
+    glv_pool_lock_t lock(g_glv_pool_mu);
 
     rustCudaError_t glv_err = init_glv_buffers(ctx);
     if (glv_err.message != CUDA_SUCCESS_CSL.message) return glv_err;

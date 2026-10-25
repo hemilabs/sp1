@@ -697,10 +697,15 @@ where
             let pk = pk_cache
                 .get_or_try_init(|| async {
                     tracing::info!("Initializing fixed PK cache");
-                    checked_core_setup::<C>(&self.core_prover, program.clone(), permits.clone())
-                        .instrument(tracing::debug_span!("core setup"))
-                        .await
-                        .map(|(pk, _)| pk)
+                    checked_core_setup::<C>(
+                        &self.core_prover,
+                        program.clone(),
+                        permits.clone(),
+                        Some(common_input.vk.vk.clone()),
+                    )
+                    .instrument(tracing::debug_span!("core setup"))
+                    .await
+                    .map(|(pk, _)| pk)
                 })
                 .await?;
 
@@ -861,16 +866,35 @@ fn core_setup_checks<C: SP1ProverComponents>() -> usize {
 /// wrong on the device (a GPU fault, a driver bug) would give a wrong key that every shard still
 /// verifies with, and a proof only a verifier holding the program's real vk would reject. Two
 /// independent setups agreeing rules that out; a setup costs tens to hundreds of milliseconds.
+///
+/// `vk_hint` (the proof's vk, when the caller has it) only supplies the initial global cumulative
+/// sum, a deterministic CPU computation over the program's memory image (septic `lift_x` per
+/// word, ~27 ms on all 13 vCPUs of the MI300X host for fibonacci). Without a hint it is computed
+/// by the first setup and reused by the checks: computing it in every setup put it on the
+/// critical path twice per proof (68 ms "core setup", of which ~10 ms is device work). The
+/// checks still compare what the device computes (the preprocessed commitment).
 async fn checked_core_setup<C: SP1ProverComponents>(
     core_prover: &C::CoreProver,
     program: Arc<Program>,
     permits: ProverSemaphore,
+    vk_hint: Option<MachineVerifyingKey<SP1GlobalContext>>,
 ) -> Result<(Arc<CoreProvingKey<C>>, MachineVerifyingKey<SP1GlobalContext>), TaskError> {
     let needed = core_setup_checks::<C>();
     let mut setups: Vec<(Arc<CoreProvingKey<C>>, MachineVerifyingKey<SP1GlobalContext>, usize)> =
         Vec::new();
+    let mut hint = vk_hint;
     for _ in 0..needed + 4 {
-        let (pk, vk) = core_prover.setup(program.clone(), permits.clone()).await;
+        let (preprocessed, vk) = sp1_hypercube::prover::AirProver::setup_from_vk(
+            core_prover,
+            program.clone(),
+            hint.clone(),
+            permits.clone(),
+        )
+        .await;
+        let pk = preprocessed.pk;
+        if hint.is_none() {
+            hint = Some(vk.clone());
+        }
         let index = match setups.iter().position(|(_, seen, _)| *seen == vk) {
             Some(index) => {
                 setups[index].2 += 1;
@@ -1083,14 +1107,14 @@ impl<A: ArtifactClient, C: SP1ProverComponents>
             let pk = cell
                 .get_or_try_init(|| async {
                     tracing::debug!("keeping the core proving key for the proof's shards");
-                    checked_core_setup::<C>(&self.core_prover, program, permits)
+                    checked_core_setup::<C>(&self.core_prover, program, permits, None)
                         .await
                         .map(|(pk, _)| pk)
                 })
                 .await?;
             pk.vk.clone()
         } else {
-            checked_core_setup::<C>(&self.core_prover, program, permits).await?.1
+            checked_core_setup::<C>(&self.core_prover, program, permits, None).await?.1
         };
         tracing::debug!("setup completed for task {}", id);
 

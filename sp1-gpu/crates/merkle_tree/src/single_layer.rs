@@ -636,6 +636,43 @@ mod tests {
         .await;
     }
 
+    /// The BN254 commit and opening paths are the same with the default kernels (the HIP
+    /// register-resident ones) and with the generic ones (`SP1_GPU_MERKLE_GENERIC`). The widths
+    /// cover a single short value, an even and an odd number of packed values, and the heights a
+    /// full and a truncated tree (bottom paths rehashed from the leaves).
+    #[tokio::test]
+    async fn test_poseidon2_bn254_fast_matches_generic() {
+        run_in_place(|scope| async move {
+            for (width, log_height) in [(3usize, 10usize), (16, 12), (37, 16), (64, 15)] {
+                let n = width << log_height;
+                let host: Vec<SP1Field> = (0..n)
+                    .map(|i| SP1Field::from_canonical_u32((i as u32).wrapping_mul(2654435761) >> 2))
+                    .collect();
+                let host = Tensor::from(host).reshape([width, 1 << log_height]);
+                let tensor =
+                    sp1_gpu_cudart::DeviceTensor::from_host(&host, &scope).unwrap().into_inner();
+                let prover = Poseidon2Bn254CudaProver::new(&scope);
+                let indices = vec![0, 42, 7, (1 << log_height) - 1];
+
+                std::env::remove_var("SP1_GPU_MERKLE_GENERIC");
+                let (fast_commit, fast_data) = prover.commit_tensors(&tensor).unwrap();
+                let fast_proof =
+                    prover.prove_openings_at_indices(&fast_data, &tensor, &indices).unwrap();
+
+                std::env::set_var("SP1_GPU_MERKLE_GENERIC", "1");
+                let (generic_commit, generic_data) = prover.commit_tensors(&tensor).unwrap();
+                let generic_proof =
+                    prover.prove_openings_at_indices(&generic_data, &tensor, &indices).unwrap();
+                std::env::remove_var("SP1_GPU_MERKLE_GENERIC");
+
+                assert_eq!(fast_commit, generic_commit, "width {width}, log height {log_height}");
+                assert_eq!(fast_proof.merkle_root, generic_proof.merkle_root);
+                assert_eq!(fast_proof.paths, generic_proof.paths);
+            }
+        })
+        .await;
+    }
+
     #[tokio::test]
     async fn test_poseidon2_koala_bear_16() {
         let (machine, record, program) =

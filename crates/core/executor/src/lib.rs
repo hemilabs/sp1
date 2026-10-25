@@ -87,6 +87,8 @@ pub use state::*;
 pub use utils::*;
 
 pub use sp1_hypercube::SP1RecursionProof;
+/// For a process that exits without running destructors: see [`sp1_jit::shm::unlink_owned_shm`].
+pub use sp1_jit::shm::unlink_owned_shm;
 
 /// The default increment for the program counter. Is used for all instructions except
 /// for branches and jumps.

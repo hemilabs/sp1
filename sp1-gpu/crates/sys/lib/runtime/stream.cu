@@ -8,6 +8,7 @@
 #include <mutex>
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 #ifdef __HIPCC__
 using cudaStream_t = hipStream_t;
@@ -127,15 +128,24 @@ static size_t maxCachedBytes() {
     return cap;
 }
 
-// Make `stream` wait until the block's free has been reached on the stream that freed it, then
-// keep its event for reuse (a wait observes the event as recorded when the wait is queued).
-static hipError_t takeCachedBlock(const CachedBlock& block, hipStream_t stream) {
-    hipError_t err = hipSuccess;
+// Hands out a block of `size` bytes just taken from the pool (`g_cached_bytes` already lowered) in
+// `*p`: make `stream` wait until the block's free has been reached on the stream that freed it,
+// then keep its event for reuse (a wait observes the event as recorded when the wait is queued).
+// If the wait can't be queued, the block goes back to the pool and the error is returned.
+static hipError_t takeCachedBlock(const CachedBlock& block, size_t size, hipStream_t stream,
+                                  void** p) {
     if (block.stream != stream) {
-        err = hipStreamWaitEvent(stream, block.freed, 0);
+        hipError_t err = hipStreamWaitEvent(stream, block.freed, 0);
+        if (err != hipSuccess) {
+            g_free_pool[size].push_back(block);
+            g_cached_bytes += size;
+            *p = nullptr;
+            return err;
+        }
     }
     g_spare_events.push_back(block.freed);
-    return err;
+    *p = block.ptr;
+    return hipSuccess;
 }
 
 // Kept free on top of an allocation when deciding whether it fits (SP1_GPU_ALLOC_MARGIN_MB): 2 GiB.
@@ -211,12 +221,13 @@ static bool deviceHeadroom(size_t* headroom) {
 // With the cache warm the prover rarely maps memory, but it still does when shards change shape
 // on a card whose memory is tight, and invalid shards turned up there about once in 30 proofs.
 //
-// The first allocation reserves the card's free memory less SP1_GPU_ARENA_HEADROOM_MB (2048) for
-// the driver and kernel scratch, or SP1_GPU_ARENA_MB; a block that doesn't fit after the cached
-// blocks are returned grows it by another allocation, reported on stderr. SP1_GPU_ARENA=0 (or
-// false, off, no) turns it off, and it is off where the GPU PLONK helper (SP1_PLONK_GPU=1) runs on
-// this card, unless SP1_GPU_ARENA=1 (or true, on, yes). The memory the arena holds free counts as
-// free for this process (cuda_mem_get_info), not for helper processes.
+// The first allocation reserves the card's free memory less SP1_GPU_ARENA_HEADROOM_MB (2048, or
+// 8192 on cards of 64 GiB or more; see arenaInit) for the driver and kernel scratch, or
+// SP1_GPU_ARENA_MB; a block that doesn't fit after the cached blocks are returned grows it by
+// another allocation, reported on stderr. SP1_GPU_ARENA=0 (or false, off, no) turns it off, and it
+// is off where the GPU PLONK helper (SP1_PLONK_GPU=1) runs on this card, unless SP1_GPU_ARENA=1 (or
+// true, on, yes). The memory the arena holds free counts as free for this process
+// (cuda_mem_get_info), not for helper processes.
 //
 // The arena never moves a live block, and gives one of its allocations back to the driver only
 // when all of it is free, and a block that fits nowhere else needs it (arenaReleaseFreeChunksFor).
@@ -291,16 +302,19 @@ static void* arenaTake(size_t s) {
 // written once and waited for before any block of it is handed out. Other threads can launch
 // kernels meanwhile (launches take no allocator lock), so a growth is still a mapping change while
 // the card may be busy (see above): that is why the first allocation takes nearly all of the card's
-// free memory. False if the driver has no memory for it.
+// free memory. False if the driver has no memory for it, or the device reports an error (left
+// for the next call to report, rather than cleared).
 static bool arenaGrow(size_t size) {
-    hipDeviceSynchronize();
+    if (hipDeviceSynchronize() != hipSuccess) return false;
     void* base = nullptr;
     if (hipMalloc(&base, size) != hipSuccess) {
-        (void)hipGetLastError();
+        (void)hipGetLastError();  // only the failed allocation's error: the device was idle
         return false;
     }
-    hipMemset(base, 0, size);
-    hipDeviceSynchronize();
+    if (hipMemset(base, 0, size) != hipSuccess || hipDeviceSynchronize() != hipSuccess) {
+        hipFree(base);
+        return false;
+    }
     g_arena_chunks.emplace_back(static_cast<char*>(base), size);
     arenaRelease(static_cast<char*>(base), size, static_cast<char*>(base));
     return true;
@@ -462,7 +476,13 @@ static void arenaInit() {
     if (setting == 0 && plonkHelperOnThisCard(total_b)) return;
     size_t want = envMib("SP1_GPU_ARENA_MB", 0);
     if (want == 0) {
-        const size_t headroom = envMib("SP1_GPU_ARENA_HEADROOM_MB", 2048ULL << 20);
+        // Kernel scratch comes out of the headroom, and a large card runs more waves at once, each
+        // with its scratch: on an MI300X (192 GB, 304 CUs) the recursion zerocheck kernel's 2 KiB
+        // per lane did not fit in 2 GiB, and ROCr then reallocated the scratch before most of its
+        // launches (compressed proofs 4.4 s; 2.52 s with 4 GiB, 2.43 s with 8 GiB).
+        const size_t headroom = envMib("SP1_GPU_ARENA_HEADROOM_MB",
+                                       total_b >= (size_t(64) << 30) ? size_t(8192) << 20
+                                                                     : size_t(2048) << 20);
         if (free_b < headroom + (size_t(1) << 30)) return;
         want = (free_b - headroom) & ~((size_t(2) << 20) - 1);
     }
@@ -479,10 +499,11 @@ static void rawFree(void* p, size_t size) {
     }
 }
 
-// Wait for the device, then free every cached block. The caller holds g_alloc_mutex.
+// Wait for the device, then free every cached block. If the wait fails, nothing is freed: the
+// blocks' last uses may not have finished. The caller holds g_alloc_mutex.
 static void releaseCachedBlocks() {
     sp1prof::HostTimer timer("host: release cached blocks (wait + free)");
-    hipDeviceSynchronize();
+    if (hipDeviceSynchronize() != hipSuccess) return;
     for (auto& [sz, blocks] : g_free_pool) {
         for (auto& block : blocks) {
             rawFree(block.ptr, sz);
@@ -509,7 +530,11 @@ static void evictUntilFits(size_t need, size_t headroom) {
         it->second.pop_back();
         const size_t size = it->first;
         if (it->second.empty()) g_free_pool.erase(it);
-        hipEventSynchronize(block.freed);
+        if (hipEventSynchronize(block.freed) != hipSuccess) {
+            // Its last use may not have finished: keep it cached, and stop evicting.
+            g_free_pool[size].push_back(block);
+            return;
+        }
         rawFree(block.ptr, size);
         g_alloc_sizes.erase(block.ptr);
         g_spare_events.push_back(block.freed);
@@ -530,8 +555,7 @@ static hipError_t cachedHipMalloc(void** p, size_t s, hipStream_t stream) {
         CachedBlock block = it->second.back();
         it->second.pop_back();
         g_cached_bytes -= s;
-        *p = block.ptr;
-        return takeCachedBlock(block, stream);
+        return takeCachedBlock(block, s, stream, p);
     }
     // Fallback: try a buffer up to 2x the requested size. This handles the
     // sumcheck halving pattern where each round needs exactly half the previous
@@ -543,9 +567,8 @@ static hipError_t cachedHipMalloc(void** p, size_t s, hipStream_t stream) {
             it2->second.pop_back();
             size_t actual_size = it2->first;
             g_cached_bytes -= actual_size;
-            *p = block.ptr;
-            g_alloc_sizes[*p] = actual_size; // Track actual (larger) size for correct free
-            return takeCachedBlock(block, stream);
+            g_alloc_sizes[block.ptr] = actual_size; // Track actual (larger) size for correct free
+            return takeCachedBlock(block, actual_size, stream, p);
         }
         break; // lower_bound found nothing in range
     }
@@ -598,9 +621,8 @@ static hipError_t cachedHipMalloc(void** p, size_t s, hipStream_t stream) {
                 CachedBlock block = it3->second.back();
                 it3->second.pop_back();
                 g_cached_bytes -= it3->first;
-                *p = block.ptr;
-                g_alloc_sizes[*p] = it3->first;
-                return takeCachedBlock(block, stream);
+                g_alloc_sizes[block.ptr] = it3->first;
+                return takeCachedBlock(block, it3->first, stream, p);
             }
             evictUntilFits(s, headroom);
         }
@@ -1134,9 +1156,66 @@ cuda_mem_copy_host_to_device_async(void* dst, const void* src, size_t count, cud
     return CUDA_SUCCESS_CSL;
 }
 
+#ifdef __HIPCC__
+// Small device-to-host copies into pageable memory go through a pinned staging buffer: a stream-
+// ordered DMA into the pinned buffer, one stream wait, then a host memcpy. A pageable copy instead
+// needs a wait before it (see below), and ROCclr does it as a staging blit plus a host copy; on an
+// MI300X a tiny kernel + 48-byte readback takes 29.7 us that way against 14.3 us via pinned
+// staging (round3/notes/li3). The GKR sumcheck reads back a few field elements every round.
+// The buffers come from a small shared pool, so a thread that exits leaks nothing.
+// SP1_HIP_PINNED_READBACK=0 restores the pageable path.
+static constexpr size_t READBACK_STAGING_BYTES = 64 * 1024;
+
+static bool pinnedReadbackEnabled() {
+    static const bool on = [] {
+        const char* v = getenv("SP1_HIP_PINNED_READBACK");
+        return !(v && v[0] == '0');
+    }();
+    return on;
+}
+
+static std::mutex readbackPoolMutex;
+static std::vector<void*> readbackPool;
+
+static void* takeReadbackStaging() {
+    {
+        std::lock_guard<std::mutex> lock(readbackPoolMutex);
+        if (!readbackPool.empty()) {
+            void* p = readbackPool.back();
+            readbackPool.pop_back();
+            return p;
+        }
+    }
+    void* p = nullptr;
+    if (hipHostMalloc(&p, READBACK_STAGING_BYTES, hipHostMallocDefault) != hipSuccess) {
+        (void)hipGetLastError();
+        return nullptr;
+    }
+    return p;
+}
+
+static void giveReadbackStaging(void* p) {
+    std::lock_guard<std::mutex> lock(readbackPoolMutex);
+    readbackPool.push_back(p);
+}
+#endif
+
 extern "C" rustCudaError_t
 cuda_mem_copy_device_to_host_async(void* dst, const void* src, size_t count, cudaStream_t stream) {
 #ifdef __HIPCC__
+    if (count <= READBACK_STAGING_BYTES && pinnedReadbackEnabled() && !isPinnedHost(dst)) {
+        if (void* staging = takeReadbackStaging()) {
+            void* prof = sp1_profile_begin(stream);
+            hipError_t err = hipMemcpyAsync(staging, src, count, hipMemcpyDeviceToHost, stream);
+            sp1_profile_end(prof, "copy: device to host (pinned staging)", stream);
+            if (err == hipSuccess) err = hipStreamSynchronize(stream);
+            if (err == hipSuccess) memcpy(dst, staging, count);
+            // On an error the copy may still be queued, so the buffer is not reused.
+            if (err == hipSuccess) giveReadbackStaging(staging);
+            CUDA_OK(err);
+            return CUDA_SUCCESS_CSL;
+        }
+    }
     // On Windows (ROCm 7.2) a copy to or from pageable memory did not wait for the kernels queued
     // before it on the same stream: a read back started before the kernel writing the data had
     // finished (zerocheck's jagged evaluation came out wrong, intermittently; AMD_SERIALIZE_COPY=1

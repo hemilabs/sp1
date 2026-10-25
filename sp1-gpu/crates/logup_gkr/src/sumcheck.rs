@@ -182,7 +182,9 @@ fn two_round_sum_as_poly<D: DenseData<TaskScope>>(
         fill_grid_one_wave(height >> 1, BLOCK_SIZE, height.div_ceil(BLOCK_SIZE * STRIDE * 2));
     let mut output = Tensor::<Ext, TaskScope>::with_sizes_in([10, grid_dim], scope.clone());
 
-    let num_tiles = BLOCK_SIZE.checked_div(STRIDE).unwrap_or(1);
+    // One shared slot per 32-wide reduction tile (`partialBlockReduce`), not per STRIDE.
+
+    let num_tiles = BLOCK_SIZE.checked_div(32).unwrap_or(1);
     let shared_mem = num_tiles * std::mem::size_of::<Ext>();
 
     unsafe {
@@ -474,7 +476,9 @@ fn sum_as_poly_first_layer(poly: &FirstLayerPolynomial, claim: Ext) -> Univariat
     let grid_dim = fill_grid(height, BLOCK_SIZE, height.div_ceil(BLOCK_SIZE).div_ceil(STRIDE));
     let mut output = Tensor::<Ext, TaskScope>::with_sizes_in([3, grid_dim], scope.clone());
 
-    let num_tiles = BLOCK_SIZE.checked_div(STRIDE).unwrap_or(1);
+    // One shared slot per 32-wide reduction tile (`partialBlockReduce`), not per STRIDE.
+
+    let num_tiles = BLOCK_SIZE.checked_div(32).unwrap_or(1);
     let shared_mem = num_tiles * std::mem::size_of::<Ext>();
 
     unsafe {
@@ -677,7 +681,9 @@ fn fix_and_sum_first_layer(
     let grid_size = (grid_size_x, 1, 1);
     let block_dim = BLOCK_SIZE;
 
-    let num_tiles = BLOCK_SIZE.checked_div(STRIDE).unwrap_or(1);
+    // One shared slot per 32-wide reduction tile (`partialBlockReduce`), not per STRIDE.
+
+    let num_tiles = BLOCK_SIZE.checked_div(32).unwrap_or(1);
     let shared_mem = num_tiles * std::mem::size_of::<Ext>();
 
     unsafe {
@@ -737,7 +743,8 @@ fn sum_as_poly_materialized_round(
             let grid_dim =
                 fill_grid(height, BLOCK_SIZE, height.div_ceil(BLOCK_SIZE).div_ceil(STRIDE));
             let mut output = Tensor::<Ext, TaskScope>::with_sizes_in([3, grid_dim], scope.clone());
-            let num_tiles = BLOCK_SIZE.checked_div(STRIDE).unwrap_or(1);
+            // One shared slot per 32-wide reduction tile (`partialBlockReduce`), not per STRIDE.
+            let num_tiles = BLOCK_SIZE.checked_div(32).unwrap_or(1);
             let shared_mem = num_tiles * std::mem::size_of::<Ext>();
             unsafe {
                 let kernel = if poly.eq_row.guts().total_len() == 2 {

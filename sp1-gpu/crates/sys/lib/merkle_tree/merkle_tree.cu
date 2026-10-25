@@ -262,6 +262,210 @@ __global__ void recomputeBottomPathsKbFast(
 }
 #endif  // SP1_SYCL
 
+#ifdef __HIPCC__
+// ---- BN254 register-resident paths (HIP; bit-exact with the generic kernels) ----
+// On gfx942 the generic BN254 kernels keep the width-3 Poseidon2 state in scratch: the per-element
+// loops of Hasher::permute (addExtRc, sbox) are not unrolled, so `state[i]` is indexed at run time
+// (compress: 176 B of scratch per lane), and leafHash calls HasherState::absorbRow / finalize out
+// of line through a pointer to the state (368 B). These kernels hold the state in three named
+// values and run the same permutation, with the same operations in the same order, on the same
+// round constants (`hasher.roundConstants`), so the digests are identical. Launch shapes and
+// arguments match the generic kernels. SP1_GPU_MERKLE_GENERIC selects the generic kernels.
+namespace bn254fast {
+using F = bn254_t;
+using P = poseidon2_bn254_3::Bn254;
+using RC = poseidon2::RoundConstants<P>;
+
+__device__ __forceinline__ void externalLayer(F& s0, F& s1, F& s2) {
+    // P::externalLinearLayer
+    F sum = s0 + s1 + s2;
+    s0 += sum;
+    s1 += sum;
+    s2 += sum;
+}
+
+__device__ __forceinline__ void fullRound(F& s0, F& s1, F& s2, const F* rc) {
+    s0 += rc[0];
+    s1 += rc[1];
+    s2 += rc[2];
+    s0 ^= P::D;
+    s1 ^= P::D;
+    s2 ^= P::D;
+    externalLayer(s0, s1, s2);
+}
+
+// Hasher<Bn254>::permute (DEFERRED_PARTIAL_ROUNDS is false for Bn254).
+__device__ __forceinline__ void permute(F& s0, F& s1, F& s2, const RC& rc) {
+    externalLayer(s0, s1, s2);
+    constexpr int HALF = P::ROUNDS_F >> 1;
+#pragma unroll 1
+    for (int i = 0; i < HALF; i++) {
+        fullRound(s0, s1, s2, rc.externalRoundConstants + i * P::WIDTH);
+    }
+#pragma unroll 1
+    for (int i = 0; i < P::ROUNDS_P; i++) {
+        s0 += rc.internalRoundConstants[i];
+        s0 ^= P::D;
+        // P::internalLinearLayer: diagonal (1, 1, 2) plus the sum.
+        F s = s0 + s1 + s2;
+        s0 += s;
+        s1 += s;
+        s2 = s2.dbl() + s;
+    }
+#pragma unroll 1
+    for (int i = HALF; i < P::ROUNDS_F; i++) {
+        fullRound(s0, s1, s2, rc.externalRoundConstants + i * P::WIDTH);
+    }
+}
+
+// poseidon2_bn254_3::reduceKoalaBear(p, nullptr, n, 0, stride, 0) for 1 <= n <= 8, with every
+// limb index a compile-time constant (the generic version indexes `limbs` at run time).
+__device__ __forceinline__ F reduceKoalaBear(const kb31_t* p, size_t stride, int n) {
+    uint32_t limbs[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+#pragma unroll
+    for (int k = 0; k < 8; k++) {
+        if (k < n) {
+            const uint32_t x = p[k * stride].as_canonical_u32();
+            const int bit = 31 * k;
+            const int limb = bit >> 5, shift = bit & 31;
+            limbs[limb] |= x << shift;
+            if (shift > 1) limbs[limb + 1] |= x >> (32 - shift);
+        }
+    }
+    return F(limbs) * F(device::ALT_BN128_rRR);
+}
+
+// The leaf digest of row `row` of a column-major `widths x H` matrix: what a fresh
+// Bn254HasherState computes with absorbRow + finalize. The row is packed into values of 8
+// KoalaBear elements (the last one shorter), absorbed in overwrite mode at rate 2, with a
+// permutation after every second value and after an odd last one.
+__device__ __forceinline__ F leafDigest(
+    const kb31_t* __restrict__ input,
+    size_t row,
+    size_t widths,
+    size_t H,
+    const RC& rc) {
+    constexpr size_t N = poseidon2_bn254_3::N;
+    F s0 = F::zero(), s1 = F::zero(), s2 = F::zero();
+    const kb31_t* col = input + row;
+    size_t j = 0;
+    while (j < widths) {
+        size_t n = widths - j < N ? widths - j : N;
+        s0 = reduceKoalaBear(col + j * H, H, (int)n);
+        j += n;
+        if (j < widths) {
+            n = widths - j < N ? widths - j : N;
+            s1 = reduceKoalaBear(col + j * H, H, (int)n);
+            j += n;
+        }
+        permute(s0, s1, s2, rc);
+    }
+    return s0;
+}
+
+// Hasher<Bn254>::compress: state = (left, right, 0), permute, keep state[0].
+__device__ __forceinline__ F compressPair(const F& left, const F& right, const RC& rc) {
+    F s0 = left, s1 = right, s2 = F::zero();
+    permute(s0, s1, s2, rc);
+    return s0;
+}
+}  // namespace bn254fast
+
+// leafHash<Bn254Hasher, Bn254, Bn254HasherState>, one row per thread.
+__global__ __launch_bounds__(256) void leafHashBn254Fast(
+    poseidon2::Bn254Hasher hasher,
+    kb31_t* input,
+    bn254_t (*digests)[1],
+    size_t widths,
+    size_t tree_height) {
+    const bn254fast::RC rc = hasher.roundConstants;
+    const size_t H = (size_t)1 << tree_height;
+    for (size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x; idx < H;
+         idx += (size_t)blockDim.x * gridDim.x) {
+        digests[idx + (H - 1)][0] = bn254fast::leafDigest(input, idx, widths, H, rc);
+    }
+}
+
+// compress<Bn254Hasher, Bn254, Bn254HasherState>.
+__global__ __launch_bounds__(128, 2) void compressBn254Fast(
+    poseidon2::Bn254Hasher hasher,
+    bn254_t (*digests)[1],
+    size_t layer_height) {
+    const bn254fast::RC rc = hasher.roundConstants;
+    const size_t L = (size_t)1 << layer_height;
+    for (size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x; i < L;
+         i += (size_t)blockDim.x * gridDim.x) {
+        const size_t idx = i + (L - 1);
+        digests[idx][0] = bn254fast::compressPair(digests[2 * idx + 1][0], digests[2 * idx + 2][0], rc);
+    }
+}
+
+// compressBatched<Bn254Hasher, Bn254, Bn254HasherState>: one block, layers start..end.
+__global__ __launch_bounds__(128, 2) void compressBatchedBn254Fast(
+    poseidon2::Bn254Hasher hasher,
+    bn254_t (*digests)[1],
+    size_t start_layer,
+    size_t end_layer) {
+    const bn254fast::RC rc = hasher.roundConstants;
+    for (int k = (int)start_layer; k >= (int)end_layer; k--) {
+        size_t layerLength = 1u << k;
+        if (threadIdx.x < layerLength) {
+            size_t idx = threadIdx.x + (layerLength - 1);
+            digests[idx][0] =
+                bn254fast::compressPair(digests[2 * idx + 1][0], digests[2 * idx + 2][0], rc);
+        }
+        __syncthreads();
+    }
+}
+
+// recomputeBottomPaths<Bn254Hasher, Bn254, Bn254HasherState> (same semantics, launch shape and
+// shared memory layout: one digest slot per subtree node).
+__global__ __launch_bounds__(256) void recomputeBottomPathsBn254Fast(
+    poseidon2::Bn254Hasher hasher,
+    kb31_t* input,
+    bn254_t (*paths)[1],
+    size_t* indices,
+    size_t numIndices,
+    size_t widths,
+    size_t tree_height,
+    size_t bottom_levels) {
+    using FDW_t = poseidon2::FDW_t<poseidon2_bn254_3::Bn254>;
+    static_assert(sizeof(FDW_t) == sizeof(bn254_t), "digest slots must be tightly packed");
+    SP1_EXTERN_SHARED(unsigned char, smemRaw);
+    FDW_t* nodes = reinterpret_cast<FDW_t*>(smemRaw);
+    const bn254fast::RC rc = hasher.roundConstants;
+
+    const size_t H = (size_t)1 << tree_height;
+    const size_t subtreeLeaves = (size_t)1 << bottom_levels;
+    for (size_t q = blockIdx.x; q < numIndices; q += gridDim.x) {
+        const size_t leafIdx = indices[q];
+        const size_t base = (leafIdx >> bottom_levels) << bottom_levels;
+        const size_t local = leafIdx - base;
+        for (size_t t = threadIdx.x; t < subtreeLeaves; t += blockDim.x) {
+            nodes[t].v[0] = bn254fast::leafDigest(input, base + t, widths, H, rc);
+        }
+        __syncthreads();
+        size_t levelBase = 0, levelLen = subtreeLeaves;
+        for (size_t k = 0; k < bottom_levels; k++) {
+            if (threadIdx.x == 0) {
+                paths[q * tree_height + k][0] = nodes[levelBase + ((local >> k) ^ 1)].v[0];
+            }
+            if (k + 1 == bottom_levels) break;
+            const size_t nextBase = levelBase + levelLen;
+            for (size_t t = threadIdx.x; t < (levelLen >> 1); t += blockDim.x) {
+                nodes[nextBase + t].v[0] = bn254fast::compressPair(
+                    nodes[levelBase + 2 * t].v[0], nodes[levelBase + 2 * t + 1].v[0], rc);
+            }
+            __syncthreads();
+            levelBase = nextBase;
+            levelLen >>= 1;
+        }
+        // The next query reuses the shared slots; make sure this query's reads are done.
+        __syncthreads();
+    }
+}
+#endif  // __HIPCC__
+
 extern "C" void* leaf_hash_merkle_tree_koala_bear_16_kernel() {
 #ifndef SP1_SYCL
     if (!getenv("SP1_GPU_MERKLE_GENERIC")) return SP1_KERNEL_PTR(leafHashKbFast);
@@ -270,6 +474,9 @@ extern "C" void* leaf_hash_merkle_tree_koala_bear_16_kernel() {
 }
 
 extern "C" void* leaf_hash_merkle_tree_bn254_kernel() {
+#ifdef __HIPCC__
+    if (!getenv("SP1_GPU_MERKLE_GENERIC")) return SP1_KERNEL_PTR(leafHashBn254Fast);
+#endif
     return SP1_KERNEL_PTR(leafHash<poseidon2::Bn254Hasher, poseidon2_bn254_3::Bn254, poseidon2::Bn254HasherState>);
 }
 
@@ -306,6 +513,9 @@ extern "C" void* compress_merkle_tree_koala_bear_16_kernel() {
 }
 
 extern "C" void* compress_merkle_tree_bn254_kernel() {
+#ifdef __HIPCC__
+    if (!getenv("SP1_GPU_MERKLE_GENERIC")) return SP1_KERNEL_PTR(compressBn254Fast);
+#endif
     return SP1_KERNEL_PTR(compress<poseidon2::Bn254Hasher, poseidon2_bn254_3::Bn254, poseidon2::Bn254HasherState>);
 }
 
@@ -354,6 +564,9 @@ extern "C" void* compress_batched_merkle_tree_koala_bear_16_kernel() {
 }
 
 extern "C" void* compress_batched_merkle_tree_bn254_kernel() {
+#ifdef __HIPCC__
+    if (!getenv("SP1_GPU_MERKLE_GENERIC")) return SP1_KERNEL_PTR(compressBatchedBn254Fast);
+#endif
     return SP1_KERNEL_PTR(compressBatched<
         poseidon2::Bn254Hasher, poseidon2_bn254_3::Bn254, poseidon2::Bn254HasherState>);
 }
@@ -477,6 +690,9 @@ extern "C" void* recompute_bottom_paths_merkle_tree_koala_bear_16_kernel() {
 }
 
 extern "C" void* recompute_bottom_paths_merkle_tree_bn254_kernel() {
+#ifdef __HIPCC__
+    if (!getenv("SP1_GPU_MERKLE_GENERIC")) return SP1_KERNEL_PTR(recomputeBottomPathsBn254Fast);
+#endif
     return SP1_KERNEL_PTR(recomputeBottomPaths<
         poseidon2::Bn254Hasher,
         poseidon2_bn254_3::Bn254,

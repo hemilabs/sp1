@@ -7,7 +7,8 @@
 //! the 256-byte format the SP1 verifier consumes.
 //!
 //! Prerequisites:
-//!   * `~/.sp1/circuits/groth16/v6.0.0/` populated with
+//!   * `~/.sp1/circuits/groth16/<SP1_CIRCUIT_VERSION>/` (or `$SP1_GROTH16_CIRCUIT_PATH/<version>`,
+//!     as the prover resolves it; the version is the repo-root `SP1_CIRCUIT_VERSION`) populated with
 //!     `groth16_witness.json`, `groth16_pk.bin`, `groth16_circuit.bin`,
 //!     `groth16_vk.bin`, `constraints.json`.
 //!   * Build with `--features cuda` on the crate (via sp1-gpu-groth16/cuda
@@ -15,7 +16,8 @@
 //!
 //! This test is `#[ignore]` by default so plain `cargo test` does not try
 //! to spin up a GPU prover; run with `cargo test -- --ignored` to exercise
-//! it. The underlying Groth16 pipeline is known-good on CUDA and AMD HIP
+//! it. Run that way, missing artifacts fail the test rather than skip it, so that a pass means the
+//! proof was really made and verified. The underlying Groth16 pipeline is known-good on CUDA and AMD HIP
 //! (see MEMORY.md:project_groth16_amd_round3); if this test ever fails it
 //! means the proof generation or serialization has regressed.
 //!
@@ -41,13 +43,29 @@ fn decimal_to_be32(s: &str) -> [u8; 32] {
     out
 }
 
-fn groth16_build_dir() -> Option<PathBuf> {
-    let build_dir = dirs::home_dir()?.join(".sp1/circuits/groth16/v6.0.0");
-    if build_dir.exists() {
-        Some(build_dir)
-    } else {
-        None
+/// The circuit version this checkout's prover uses (the repo-root file `sp1_prover` reads too).
+const SP1_CIRCUIT_VERSION: &str = include_str!("../../../../SP1_CIRCUIT_VERSION");
+
+/// The installed Groth16 circuit artifacts for [`SP1_CIRCUIT_VERSION`], resolved as
+/// `sp1_prover::build::groth16_circuit_artifacts_dir` does. Panics if the directory or the files
+/// the tests read are missing: these tests run only when asked for (`--ignored`), and a skip would
+/// report a pass that checked nothing.
+fn groth16_build_dir() -> PathBuf {
+    let base = match std::env::var("SP1_GROTH16_CIRCUIT_PATH") {
+        Ok(path) => PathBuf::from(path),
+        Err(_) => dirs::home_dir().expect("home directory not found").join(".sp1/circuits/groth16"),
+    };
+    let build_dir = base.join(SP1_CIRCUIT_VERSION.trim());
+    for file in ["groth16_witness.json", "groth16_vk.bin"] {
+        assert!(
+            build_dir.join(file).exists(),
+            "{} not found: install the {} Groth16 circuit artifacts (or set \
+             SP1_GROTH16_CIRCUIT_PATH)",
+            build_dir.join(file).display(),
+            SP1_CIRCUIT_VERSION.trim()
+        );
     }
+    build_dir
 }
 
 /// Create a temp directory; prefer /dev/shm on Linux to keep big files off disk.
@@ -63,21 +81,11 @@ fn shm_tempdir() -> tempfile::TempDir {
 }
 
 #[test]
-#[ignore] // Requires GPU + ~/.sp1/circuits/groth16/v6.0.0 artifacts
+#[ignore] // Requires GPU + ~/.sp1/circuits/groth16/<SP1_CIRCUIT_VERSION> artifacts
 fn test_groth16_e2e_gnark_verify() {
-    let Some(build_dir) = groth16_build_dir() else {
-        eprintln!("Skipping: ~/.sp1/circuits/groth16/v6.0.0 not found");
-        return;
-    };
+    let build_dir = groth16_build_dir();
     let witness_path = build_dir.join("groth16_witness.json");
     let vk_path = build_dir.join("groth16_vk.bin");
-    if !witness_path.exists() || !vk_path.exists() {
-        eprintln!(
-            "Skipping: groth16_witness.json or groth16_vk.bin missing in {}",
-            build_dir.display()
-        );
-        return;
-    }
 
     // Parse public inputs from the witness JSON.
     let witness_json = std::fs::read_to_string(&witness_path).expect("read groth16_witness.json");
@@ -169,16 +177,9 @@ fn test_groth16_e2e_via_in_process_r1cs_solver() {
         eprintln!("Skipping: /tmp/r1cs_circuit/ or /tmp/r1cs_prod_data/wires_initial.bin missing");
         return;
     }
-    let Some(build_dir) = groth16_build_dir() else {
-        eprintln!("Skipping: ~/.sp1/circuits/groth16/v6.0.0 not found");
-        return;
-    };
+    let build_dir = groth16_build_dir();
     let witness_path = build_dir.join("groth16_witness.json");
     let vk_path = build_dir.join("groth16_vk.bin");
-    if !witness_path.exists() || !vk_path.exists() {
-        eprintln!("Skipping: groth16_witness.json or groth16_vk.bin missing");
-        return;
-    }
 
     let witness_json = std::fs::read_to_string(&witness_path).expect("read witness");
     let gnark_witness: GnarkWitnessPubs =

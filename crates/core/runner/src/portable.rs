@@ -45,6 +45,10 @@ impl MinimalExecutorRunner {
         }
     }
 
+    /// Accepted for API parity with the native runner: the portable executor splits trace chunks
+    /// on the trace size only.
+    pub fn set_max_chunk_cycles(&mut self, _cycles: Option<u64>) {}
+
     /// Redirect guest output to the configured channels.
     pub fn set_output_consumers(&mut self, consumers: OutputConsumers) {
         self.output_consumers = consumers;

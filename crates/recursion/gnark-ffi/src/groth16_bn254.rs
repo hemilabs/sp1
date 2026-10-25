@@ -232,6 +232,78 @@ fn prep_circuit_cache_dir(vkey_hash_hex: &str) -> Option<std::path::PathBuf> {
 #[cfg(feature = "native")]
 const PREP_CIRCUIT_SENTINEL: &str = ".sp1_prep_circuit_complete";
 
+/// Runs `r1cs_solve_plan` (`r1cs_bin`) with `args`, as `what`.
+#[cfg(feature = "native")]
+fn run_r1cs_solve_plan(
+    r1cs_bin: &Path,
+    args: &[&std::ffi::OsStr],
+    what: &str,
+) -> anyhow::Result<()> {
+    let mut cmd = std::process::Command::new(r1cs_bin);
+    cmd.args(args);
+    let finished = crate::subprocess::run(cmd, what).map_err(|e| {
+        anyhow::anyhow!(
+            "{e:#}. Set SP1_R1CS_SOLVE_PLAN to the r1cs_solve_plan binary or place it next to \
+             the current executable"
+        )
+    })?;
+    if !finished.status.success() {
+        anyhow::bail!("{what} failed using {}: {}", r1cs_bin.display(), finished.describe());
+    }
+    Ok(())
+}
+
+/// Writes the GPU R1CS solver's circuit data for `build_dir` into `out`, with `r1cs_solve_plan
+/// prep-circuit-prod` (`r1cs_bin`).
+#[cfg(feature = "native")]
+fn prep_circuit_prod(r1cs_bin: &Path, build_dir: &Path, out: &Path) -> anyhow::Result<()> {
+    tracing::info!("Running r1cs_solve_plan prep-circuit-prod for {}...", out.display());
+    let t0 = std::time::Instant::now();
+    run_r1cs_solve_plan(
+        r1cs_bin,
+        &["prep-circuit-prod".as_ref(), build_dir.as_os_str(), out.as_os_str()],
+        "prep-circuit-prod",
+    )?;
+    tracing::info!("prep-circuit-prod completed in {:?}", t0.elapsed());
+    Ok(())
+}
+
+/// The GPU R1CS solver's circuit data for `build_dir` in the shared cache, for gnark's prover in
+/// this process, which solves with it where this process registered the solver
+/// (`ffi::set_groth16_gpu_r1cs_solver`). A complete cache is used as is; otherwise
+/// `r1cs_solve_plan` builds it (once per host, ~35-50 s). `None`, and gnark solves on the CPU, with
+/// `SP1_GPU_R1CS_SOLVER=cpu`, with the cache disabled, or when it cannot be built.
+#[cfg(feature = "native")]
+fn in_process_prep_circuit_dir(build_dir: &Path) -> Option<std::path::PathBuf> {
+    if std::env::var("SP1_GPU_R1CS_SOLVER").ok().as_deref() == Some("cpu") {
+        return None;
+    }
+    let vkey_hash_hex = hex::encode(Groth16Bn254Prover::get_vkey_hash(build_dir));
+    let dir = prep_circuit_cache_dir(&vkey_hash_hex)?;
+    if crate::gpu_cache::is_complete(&dir, PREP_CIRCUIT_SENTINEL) {
+        return Some(dir);
+    }
+    // Checked first, as in `try_prepare_gpu_r1cs_inputs`: a failed spawn forks this large process.
+    let Some(r1cs_bin) =
+        crate::cpu_helper::find_executable("r1cs_solve_plan", Some("SP1_R1CS_SOLVE_PLAN"))
+    else {
+        tracing::info!(
+            "r1cs_solve_plan not found (SP1_R1CS_SOLVE_PLAN, next to this binary, or on PATH); \
+             using gnark.Solve"
+        );
+        return None;
+    };
+    match crate::gpu_cache::ensure_built(&dir, PREP_CIRCUIT_SENTINEL, |out| {
+        prep_circuit_prod(&r1cs_bin, build_dir, out)
+    }) {
+        Ok(_) => Some(dir),
+        Err(e) => {
+            tracing::warn!("{e:#}; falling back to gnark.Solve");
+            None
+        }
+    }
+}
+
 /// Inputs for the helper's in-process GPU R1CS solver.
 #[cfg(feature = "native")]
 struct GpuR1csInputs {
@@ -265,30 +337,8 @@ fn try_prepare_gpu_r1cs_inputs(
         );
         return None;
     };
-    let run = |args: &[&std::ffi::OsStr], what: &str| -> anyhow::Result<()> {
-        let mut cmd = std::process::Command::new(&r1cs_bin);
-        cmd.args(args);
-        let finished = crate::subprocess::run(cmd, what).map_err(|e| {
-            anyhow::anyhow!(
-                "{e:#}. Set SP1_R1CS_SOLVE_PLAN to the r1cs_solve_plan binary or place it next \
-                 to the current executable"
-            )
-        })?;
-        if !finished.status.success() {
-            anyhow::bail!("{what} failed using {}: {}", r1cs_bin.display(), finished.describe());
-        }
-        Ok(())
-    };
-    let prep = |out: &Path| -> anyhow::Result<()> {
-        tracing::info!("Running r1cs_solve_plan prep-circuit-prod for {}...", out.display());
-        let t0 = std::time::Instant::now();
-        run(
-            &["prep-circuit-prod".as_ref(), build_dir.as_os_str(), out.as_os_str()],
-            "prep-circuit-prod",
-        )?;
-        tracing::info!("prep-circuit-prod completed in {:?}", t0.elapsed());
-        Ok(())
-    };
+    let run = |args: &[&std::ffi::OsStr], what: &str| run_r1cs_solve_plan(&r1cs_bin, args, what);
+    let prep = |out: &Path| prep_circuit_prod(&r1cs_bin, build_dir, out);
 
     let (prep_dir, prep_private) = match prep_circuit_cache_dir(vkey_hash_hex) {
         Some(dir) => {
@@ -562,6 +612,12 @@ impl Groth16Bn254Prover {
             }
             fn path_str(path: &Path) -> Result<&str> {
                 path.to_str().ok_or_else(|| anyhow::anyhow!("not valid UTF-8: {}", path.display()))
+            }
+            // gnark's prover here solves the circuit on the GPU where this process registered the
+            // GPU R1CS solver and its circuit data can be had.
+            if crate::ffi::groth16_gpu_r1cs_solver_registered() {
+                let prep_dir = in_process_prep_circuit_dir(build_dir);
+                crate::ffi::set_groth16_r1cs_prep_dir(prep_dir.as_deref().and_then(Path::to_str));
             }
             let mut proof = prove_groth16_bn254(path_str(build_dir)?, path_str(witness_json)?);
             proof.groth16_vkey_hash = Self::get_vkey_hash(build_dir);

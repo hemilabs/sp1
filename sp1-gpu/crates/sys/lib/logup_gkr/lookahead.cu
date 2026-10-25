@@ -66,7 +66,7 @@ twoRoundFoldQuad(const DenseData& denseData, size_t baseIdx, ext_t alpha1, ext_t
 // restricted to Y = 0 and Y = 1 respectively: the host needs eq[8] + eq[9] for round 1's
 // padding correction and their alpha_1-interpolation for round 2's.
 template <typename DenseData>
-__global__ void logupGkrTwoRoundSumLayer(
+__global__ __launch_bounds__(256) void logupGkrTwoRoundSumLayer(
     ext_t* __restrict__ result,
     const JaggedMle<DenseData> inputJaggedMle,
     const ext_t* __restrict__ eqRow,

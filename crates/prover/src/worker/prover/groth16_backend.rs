@@ -257,6 +257,11 @@ pub(crate) const PRESTART_MIN_VRAM_BYTES: u64 = 30 << 30;
 /// (~13 GB) and the R1CS (~3 GB) from the start of the proof, beside the solve's own 13 GB later.
 pub(crate) const PRESTART_MIN_AVAILABLE_BYTES: u64 = 32 << 30;
 
+/// Free GPU memory beyond the helper's own that prestarting it beside an arena needs: the arena
+/// grows past its size on a miss (by at least 1 GiB), and HSA's scratch comes out of the same
+/// free memory.
+pub(crate) const PRESTART_ARENA_MARGIN_BYTES: u64 = 2 << 30;
+
 /// What prestarting the GPU helper depends on; see [`should_prestart`].
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct PrestartInputs<'a> {
@@ -268,8 +273,12 @@ pub(crate) struct PrestartInputs<'a> {
     /// Total memory of this process's GPU, if it has one.
     pub vram_total: Option<u64>,
     /// Device memory this process holds in an arena (HIP's), which the helper cannot have: with it
-    /// the GPU prover is never chosen.
+    /// the helper fits only in what the arena leaves free ([`PrestartInputs::vram_free`]).
     pub arena_bytes: u64,
+    /// Free memory on this process's GPU now (outside any arena), if known. Checked only with an
+    /// arena, whose size is fixed for the process's lifetime: prestart then only when the helper
+    /// fits beside it with [`PRESTART_ARENA_MARGIN_BYTES`] to spare.
+    pub vram_free: Option<u64>,
     pub mem_available: Option<u64>,
     /// Whether the circuit artifacts are installed (in release mode, at the default location).
     pub circuit_installed: bool,
@@ -288,7 +297,10 @@ pub(crate) fn should_prestart(inputs: &PrestartInputs<'_>) -> bool {
         && !matches!(inputs.override_env, Some("0" | "false"))
         && inputs.helper_available
         && inputs.circuit_installed
-        && inputs.arena_bytes == 0
+        && (inputs.arena_bytes == 0
+            || inputs
+                .vram_free
+                .is_some_and(|free| free >= GPU_HELPER_VRAM_BYTES + PRESTART_ARENA_MARGIN_BYTES))
         && inputs.vram_total.is_some_and(|total| total >= PRESTART_MIN_VRAM_BYTES)
         && inputs.mem_available.is_some_and(|available| available >= PRESTART_MIN_AVAILABLE_BYTES)
 }
@@ -309,6 +321,7 @@ pub(crate) fn prestart_gpu_helper() -> Option<sp1_recursion_gnark_ffi::prestart:
         helper_available: Groth16Bn254Prover::gpu_helper_available(),
         vram_total: sp1_recursion_gnark_ffi::gpu_total_memory(),
         arena_bytes: sp1_recursion_gnark_ffi::device_caches::arena_bytes(),
+        vram_free: sp1_recursion_gnark_ffi::gpu_free_memory(),
         mem_available: sp1_recursion_gnark_ffi::host_memory::available(),
         circuit_installed: build_dir
             .as_deref()
@@ -554,6 +567,7 @@ mod tests {
             helper_available: true,
             vram_total: Some(32 * GIB),
             arena_bytes: 0,
+            vram_free: None,
             mem_available: Some(64 * GIB),
             circuit_installed: true,
         }
@@ -572,8 +586,15 @@ mod tests {
         assert!(!should_prestart(&PrestartInputs { circuit_installed: false, ..base }));
         assert!(!should_prestart(&PrestartInputs { vram_total: Some(24 * GIB), ..base }));
         assert!(!should_prestart(&PrestartInputs { vram_total: None, ..base }));
-        // HIP's arena holds the card: the GPU prover is never chosen there.
+        // HIP's arena holds most of the card: prestart only where the helper fits beside it.
         assert!(!should_prestart(&PrestartInputs { arena_bytes: 30 * GIB, ..base }));
+        let arena = PrestartInputs { arena_bytes: 150 * GIB, vram_total: Some(192 * GIB), ..base };
+        let fits = GPU_HELPER_VRAM_BYTES + PRESTART_ARENA_MARGIN_BYTES;
+        assert!(!should_prestart(&arena));
+        assert!(!should_prestart(&PrestartInputs { vram_free: Some(fits - 1), ..arena }));
+        assert!(should_prestart(&PrestartInputs { vram_free: Some(fits), ..arena }));
+        // Without an arena free memory is not checked here (the pool trim makes room later).
+        assert!(should_prestart(&PrestartInputs { vram_free: Some(0), ..base }));
         assert!(!should_prestart(&PrestartInputs {
             mem_available: Some(PRESTART_MIN_AVAILABLE_BYTES - 1),
             ..base

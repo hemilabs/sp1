@@ -125,6 +125,7 @@ async fn run() {
                 if sp1_recursion_gnark_ffi::gpu_was_reset() {
                     eprintln!("proof failed: {e:#}");
                     std::io::Write::flush(&mut std::io::stdout()).ok();
+                    sp1_core_executor::unlink_owned_shm();
                     std::process::exit(1);
                 }
             }
@@ -191,9 +192,12 @@ async fn run() {
         // allocator, device buffers, task scope). Letting the scope unwind then
         // runs their `Drop` impls, which call `cudaFree` on dead pointers and
         // segfault. All work is done here, so skip destructors and exit cleanly.
+        // Skipping them would leave the executor shared memory still owned (the one the fixed-PK
+        // mode caches for the next proof) in /dev/shm: unlink it first.
         println!("All {} measurements done", measurements.len());
         std::io::Write::flush(&mut std::io::stdout()).ok();
         unsafe { sp1_gpu_cudart::sys::runtime::sp1_profile_flush() };
+        sp1_core_executor::unlink_owned_shm();
         std::process::exit(0);
         #[allow(unreachable_code)]
         measurements

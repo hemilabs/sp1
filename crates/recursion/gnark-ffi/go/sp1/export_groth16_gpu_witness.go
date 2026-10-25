@@ -22,7 +22,6 @@ import (
 	"github.com/consensys/gnark/constraint"
 	"github.com/consensys/gnark/constraint/solver"
 	fcs "github.com/consensys/gnark/frontend/cs"
-	"github.com/consensys/gnark/frontend"
 )
 
 // Package-level cache for R1CS and PK used by ExportGroth16GpuWitness.
@@ -146,8 +145,7 @@ func ExportGroth16GpuWitness(dataDir string, witnessPath string, pkDir string, o
 	if err := json.Unmarshal(witnessFile, &witnessInput); err != nil {
 		panic(fmt.Sprintf("Failed to unmarshal witness: %v", err))
 	}
-	assignment := NewCircuit(witnessInput)
-	witness, err := frontend.NewWitness(&assignment, ecc.BN254.ScalarField())
+	witness, err := newWitness(witnessInput)
 	if err != nil {
 		panic(fmt.Sprintf("Failed to create witness: %v", err))
 	}

@@ -109,18 +109,44 @@ binary in the directory.
   The image needs `LIBCLANG_PATH=/opt/rocm/llvm/lib`,
   `BINDGEN_EXTRA_CLANG_ARGS="-isystem /opt/rocm/llvm/lib/clang/22/include"` and a `protoc`.
 - `SP1_GPU_BACKEND=hip`, `HIP_ARCHS` and `HIP_VISIBLE_DEVICES` as on Windows (`rocminfo` lists an
-  integrated Ryzen GPU too). A kill timeout for a containerised run belongs inside the container:
-  killing the `docker` client leaves the proof running.
-- The GPU Groth16 prover runs in process; `bench-fib.sh` takes a directory whose `node` is a
-  script that runs the real one in the container.
-- Device memory comes from an arena that takes the card's free memory less 2 GB at the first
-  allocation (`SP1_GPU_ARENA=0` turns it off, `SP1_GPU_ARENA_MB` and
+  integrated Ryzen GPU too). `HIP_ARCHS=gfx942` for an Instinct MI300X (CDNA3). Without
+  `HIP_ARCHS`, the build asks `rocm_agent_enumerator` (or `amdgpu-arch`) for the host's GPUs, and
+  without a GPU in sight it builds `gfx1100;gfx1201;gfx942`; set it when building on another host
+  or in a container without `/dev/kfd`, or the binary may hold no code for your card. A kill
+  timeout for a containerised run belongs inside the container: killing the `docker` client
+  leaves the proof running. `bench-fib.sh` takes a directory whose `node` is a script that runs
+  the real one in the container.
+- The Groth16 wrap has two GPU paths. Where `groth16_gpu_helper` sits next to `node` and the card
+  has 18 GiB free beside the prover (outside the arena below), the whole proof runs in that
+  helper; build it as on NVIDIA, with `SP1_GPU_BACKEND=hip` set:
+
+  ```bash
+  cargo build --release --target-dir target-bench -p sp1-recursion-gnark-ffi \
+      --features native,cuda --bin groth16_gpu_helper
+  cp target-bench/release/groth16_gpu_helper bench/main/
+  ```
+
+  Otherwise gnark proves in `node`'s process with computeH and the G1 MSMs on the GPU; its log
+  then says `Groth16 prover: gnark in-process with GPU hooks`. The G2 MSM runs on the GPU on cards
+  of 64 GiB or more or hosts with fewer than 16 CPUs, otherwise on the CPU
+  (`SP1_GROTH16_G2_ON_CPU=0`/`1` forces it): on an MI300X with 13 vCPUs it took 6.7-6.9 s on the
+  CPU against 0.58 s on the GPU.
+- Device memory comes from an arena that takes the card's free memory less 2 GB (8 GB on cards
+  of 64 GB or more) at the first allocation (`SP1_GPU_ARENA=0` turns it off, `SP1_GPU_ARENA_MB` and
   `SP1_GPU_ARENA_HEADROOM_MB` size it; off with `SP1_PLONK_GPU=1`). On an RX 9070 XT with kernel
   7.0, ROCm 7.2.4 and MES firmware 0x81, mapping device memory while proving corrupted results now
   and then (invalid shards, retried); with the arena nothing is mapped while proving, and proofs
   are 1.5-5% faster. GPU memory use then reads about 14 GB from the first proof on. A block that
   doesn't fit grows the arena, which maps memory while proving: `node` then prints
   `sp1-gpu: no room in the device memory arena ...`.
+- On an Instinct MI300X (gfx942) the default 2 GB headroom is too little: the kernels' scratch
+  memory (allocated by the HSA runtime outside the arena) runs short, and steady compressed
+  proofs took 4.40 s instead of 2.43-2.62 s with `SP1_GPU_ARENA_HEADROOM_MB=8192` (or `24576`;
+  `SP1_GPU_ARENA=0` gave 2.48-2.63 s). Groth16 steady proofs went from 30.7 s to 23.6 s with
+  `SP1_GPU_ARENA_HEADROOM_MB=8192 SP1_GROTH16_G2_ON_CPU=0` (in-process path; 8 GiB leaves the
+  helper no room). With `SP1_GPU_ARENA_HEADROOM_MB=24576` the helper runs instead, which was not
+  faster in steady proofs (+4%, both with the G2 MSM on the CPU). Run MI300X benchmarks with
+  `--env "SP1_GPU_ARENA_HEADROOM_MB=8192 SP1_GROTH16_G2_ON_CPU=0"`.
 
 ### Intel (SYCL, Linux)
 

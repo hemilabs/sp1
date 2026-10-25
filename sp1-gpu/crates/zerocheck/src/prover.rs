@@ -23,8 +23,8 @@ use slop_tensor::Tensor;
 
 use sp1_gpu_air::ir::{
     analyze_constraints, build_dag, chunk_dag, enumerate_lowerings, level_schedule,
-    lower_column_tile, lower_sequential, ChunkBudget, ChunkBytecode, ColumnTileBytecode,
-    DagBuilder, Lowering,
+    lower_column_tile, lower_sequential, rank_registers_by_use, register_overflow_accesses,
+    ChunkBudget, ChunkBytecode, ColumnTileBytecode, DagBuilder, Lowering,
 };
 use sp1_gpu_cudart::sys::kernels::{
     zerocheck_aggregate_partials_kernel, zerocheck_aggregate_partials_strided_kernel,
@@ -38,13 +38,22 @@ use sp1_gpu_cudart::sys::kernels::{
     zerocheck_fused_sequential_bivariate_vec12_kb_128_kernel,
     zerocheck_fused_sequential_bivariate_vec2_kb_128_kernel,
     zerocheck_fused_sequential_bivariate_vec4_kb_128_kernel,
+    zerocheck_fused_sequential_bivariate_vec4_uniform_kb_128_v0_kernel,
+    zerocheck_fused_sequential_bivariate_vec4_uniform_kb_128_v16_kernel,
+    zerocheck_fused_sequential_bivariate_vec4_uniform_kb_128_v32_kernel,
     zerocheck_fused_sequential_coop_ext_kernel, zerocheck_fused_sequential_coop_kb_kernel,
-    zerocheck_fused_sequential_ext_1024_kernel, zerocheck_fused_sequential_ext_128_kernel,
-    zerocheck_fused_sequential_ext_256_kernel, zerocheck_fused_sequential_ext_32_kernel,
-    zerocheck_fused_sequential_ext_512_kernel, zerocheck_fused_sequential_ext_64_kernel,
-    zerocheck_fused_sequential_kb_1024_kernel, zerocheck_fused_sequential_kb_128_kernel,
-    zerocheck_fused_sequential_kb_256_kernel, zerocheck_fused_sequential_kb_32_kernel,
-    zerocheck_fused_sequential_kb_512_kernel, zerocheck_fused_sequential_kb_64_kernel,
+    zerocheck_fused_sequential_coop_wide_ext_kernel,
+    zerocheck_fused_sequential_coop_wide_kb_kernel, zerocheck_fused_sequential_ext_1024_kernel,
+    zerocheck_fused_sequential_ext_128_kernel, zerocheck_fused_sequential_ext_256_kernel,
+    zerocheck_fused_sequential_ext_32_kernel, zerocheck_fused_sequential_ext_512_kernel,
+    zerocheck_fused_sequential_ext_64_kernel, zerocheck_fused_sequential_kb_1024_kernel,
+    zerocheck_fused_sequential_kb_128_kernel, zerocheck_fused_sequential_kb_256_kernel,
+    zerocheck_fused_sequential_kb_32_kernel, zerocheck_fused_sequential_kb_512_kernel,
+    zerocheck_fused_sequential_kb_64_kernel, zerocheck_fused_sequential_uniform_ext_128_v0_kernel,
+    zerocheck_fused_sequential_uniform_ext_128_v16_kernel,
+    zerocheck_fused_sequential_uniform_ext_128_v32_kernel,
+    zerocheck_fused_sequential_uniform_kb_128_v0_kernel,
+    zerocheck_fused_sequential_uniform_kb_128_v32_kernel,
     zerocheck_geq_corrections_bivariate_kernel, zerocheck_geq_corrections_kernel,
     zerocheck_gkr_corner_sweep_kb_kernel, zerocheck_gkr_sweep_ext_kernel,
     zerocheck_gkr_sweep_kb_kernel, zerocheck_pad_adj_1024_kernel, zerocheck_pad_adj_128_kernel,
@@ -150,7 +159,12 @@ where
                         _ => None,
                     })
                     .expect("every chunk must have a Sequential lowering");
-                let bc = lower_sequential(chunk, &infos, &dag, plan);
+                let mut bc = lower_sequential(chunk, &infos, &dag, plan);
+                // The VGPR register file of the wave-uniform kernel holds the
+                // lowest-numbered registers; put the busiest ones there.
+                if zerocheck_uniform_enabled() {
+                    rank_registers_by_use(&mut bc);
+                }
                 // `bc.asserts[*].1` (alpha index) stays chip-relative; the
                 // cluster shift is applied at launch.
                 // The fused sequential kernel templates cap `MAX_REGS` at
@@ -172,12 +186,18 @@ where
                     MAX_FUSED_REGS,
                 );
                 if std::env::var("SP1_GPU_DEBUG_MAXREG").is_ok() {
+                    let (accesses, overflow) =
+                        register_overflow_accesses(&bc, ZEROCHECK_VRF_DEFAULT as u16);
                     eprintln!(
-                        "compile chip={} max_reg={} n_instrs={} n_asserts={}",
+                        "compile chip={} max_reg={} n_instrs={} n_asserts={} n_leaves={} \
+                         regfile_accesses={} overflow_accesses={}",
                         air.name(),
                         bc.max_reg,
                         bc.instrs.len(),
-                        bc.asserts.len()
+                        bc.asserts.len(),
+                        bc.leaves.len(),
+                        accesses,
+                        overflow,
                     );
                 }
                 compiled_chunks.push(CompiledChunk::Sequential(bc));
@@ -849,6 +869,11 @@ pub(crate) struct SeqTierStatic {
     pub coop_max_instrs: u32,
     pub coop_max_levels: u32,
     pub coop_max_phys: u32,
+    /// The same for the chunks the wide cooperative kernel fits
+    /// (`coop_wide_fits`).
+    pub coop_wide_max_instrs: u32,
+    pub coop_wide_max_levels: u32,
+    pub coop_wide_max_phys: u32,
     /// Device buffer holding `static_host`; uploaded once per shard, reused
     /// every round.
     pub static_buf: Option<Buffer<ChunkStaticC, TaskScope>>,
@@ -863,11 +888,17 @@ pub(crate) trait EvalKernels<K: Field> {
     /// tier so each kernel's local register array is sized to its tier's
     /// worst case.
     fn fused_sequential_kernel_for(max_reg_in_tier: u16) -> KernelPtr;
+    /// The wave-uniform interpreter for a tier, if enabled and the tier fits
+    /// its MAX_REGS = 128 template. Same arguments and launch shape as
+    /// `fused_sequential_kernel_for` with block size at most 256.
+    fn fused_sequential_uniform_kernel_for(max_reg_in_tier: u16) -> Option<KernelPtr>;
     /// Per-chip GKR column sweep — one block per (chip, row-tile), warp-
     /// per-row with lane-strided column reduction so wide chips scale.
     fn gkr_sweep_kernel() -> KernelPtr;
     /// Cooperative level-scheduled interpreter for small chunks.
     fn coop_kernel() -> KernelPtr;
+    /// The wide cooperative kernel (`ZC_COOP_WIDE_LANES` lanes per row).
+    fn coop_wide_kernel() -> KernelPtr;
 }
 
 impl EvalKernels<Felt> for TaskScope {
@@ -891,11 +922,25 @@ impl EvalKernels<Felt> for TaskScope {
             }
         }
     }
+    fn fused_sequential_uniform_kernel_for(max_reg_in_tier: u16) -> Option<KernelPtr> {
+        if !zerocheck_uniform_enabled() || max_reg_in_tier > 128 {
+            return None;
+        }
+        Some(unsafe {
+            match zerocheck_vrf_size() {
+                0 => zerocheck_fused_sequential_uniform_kb_128_v0_kernel(),
+                _ => zerocheck_fused_sequential_uniform_kb_128_v32_kernel(),
+            }
+        })
+    }
     fn gkr_sweep_kernel() -> KernelPtr {
         unsafe { zerocheck_gkr_sweep_kb_kernel() }
     }
     fn coop_kernel() -> KernelPtr {
         unsafe { zerocheck_fused_sequential_coop_kb_kernel() }
+    }
+    fn coop_wide_kernel() -> KernelPtr {
+        unsafe { zerocheck_fused_sequential_coop_wide_kb_kernel() }
     }
 }
 
@@ -920,11 +965,26 @@ impl EvalKernels<Ext> for TaskScope {
             }
         }
     }
+    fn fused_sequential_uniform_kernel_for(max_reg_in_tier: u16) -> Option<KernelPtr> {
+        if !zerocheck_uniform_enabled() || max_reg_in_tier > 128 {
+            return None;
+        }
+        Some(unsafe {
+            match zerocheck_vrf_size() {
+                0 => zerocheck_fused_sequential_uniform_ext_128_v0_kernel(),
+                16 => zerocheck_fused_sequential_uniform_ext_128_v16_kernel(),
+                _ => zerocheck_fused_sequential_uniform_ext_128_v32_kernel(),
+            }
+        })
+    }
     fn gkr_sweep_kernel() -> KernelPtr {
         unsafe { zerocheck_gkr_sweep_ext_kernel() }
     }
     fn coop_kernel() -> KernelPtr {
         unsafe { zerocheck_fused_sequential_coop_ext_kernel() }
+    }
+    fn coop_wide_kernel() -> KernelPtr {
+        unsafe { zerocheck_fused_sequential_coop_wide_ext_kernel() }
     }
 }
 
@@ -1164,11 +1224,13 @@ fn chip_uses_decoupled_gkr(main_width: u32, prep_width: u32) -> bool {
 // small rounds are bound by one thread's serial walk over the bytecode, so
 // fewer rows per thread cut their latency, and the large rounds lose nothing.
 const ROWS_PER_THREAD_SEQ: u32 = 1;
-/// Cooperative kernel eligibility: chunks with at most this many rows ...
+/// Cooperative kernel eligibility: chunks with at most this many rows
+/// (`SP1_GPU_ZEROCHECK_COOP_MAX_ROWS`) ...
 const COOP_MAX_ROWS: u32 = 1024;
 /// ... whose serial cost (instructions + 3 per inline GKR column) is at least
-/// this ...
-const COOP_MIN_COST: u32 = 300;
+/// this (`SP1_GPU_ZEROCHECK_COOP_MIN_COST`; 100 measured 21 ms per fib 40M core
+/// proof below 300 on MI300X with the wide cooperative kernel) ...
+const COOP_MIN_COST: u32 = 100;
 /// ... (or have at most this many rows, so that the tiny tail rounds run in a
 /// single cooperative launch) ...
 const COOP_SMALL_ROWS: u32 = 32;
@@ -1182,18 +1244,26 @@ const COOP_MAX_INSTRS: u32 = 4096;
 const COOP_MAX_LEVELS: u32 = 2048;
 fn coop_max_phys() -> u32 {
     static CAP: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
-    *CAP.get_or_init(|| {
-        let cap = unsafe { zerocheck_coop_smem_cap() } as usize;
-        let fixed = coop_smem_bytes(COOP_MAX_INSTRS, COOP_MAX_LEVELS, 0);
-        (cap.saturating_sub(fixed) / (COOP_ROWS as usize * std::mem::size_of::<Ext>())) as u32
-    })
+    *CAP.get_or_init(|| coop_max_phys_for(COOP_ROWS))
+}
+
+/// Value slots per row that fit next to the capped instruction and level
+/// tables when a cooperative block holds `rows` rows.
+fn coop_max_phys_for(rows: u32) -> u32 {
+    let cap = unsafe { zerocheck_coop_smem_cap() } as usize;
+    let fixed = coop_smem_bytes_for(rows, COOP_MAX_INSTRS, COOP_MAX_LEVELS, 0);
+    (cap.saturating_sub(fixed) / (rows as usize * std::mem::size_of::<Ext>())) as u32
 }
 
 fn coop_smem_bytes(max_instrs: u32, max_levels: u32, max_phys: u32) -> usize {
+    coop_smem_bytes_for(COOP_ROWS, max_instrs, max_levels, max_phys)
+}
+
+fn coop_smem_bytes_for(rows: u32, max_instrs: u32, max_levels: u32, max_phys: u32) -> usize {
     32 * std::mem::size_of::<Ext>()
         + max_instrs as usize * 8
         + ((2 * (max_levels as usize + 1) + 15) & !15)
-        + COOP_ROWS as usize * max_phys as usize * std::mem::size_of::<Ext>()
+        + rows as usize * max_phys as usize * std::mem::size_of::<Ext>()
 }
 
 /// Must match `ZC_COOP_THREADS` / `ZC_COOP_ROWS` in sequential.cuh.
@@ -1207,8 +1277,73 @@ fn coop_fits(c: &ChunkStaticC) -> bool {
         && c.coop_n_phys <= coop_max_phys()
 }
 
+/// Must match `ZC_COOP_WIDE_ROWS` in sequential.cuh (`ZC_COOP_THREADS /
+/// ZC_COOP_WIDE_LANES`).
+const COOP_WIDE_ROWS: u32 = 2;
+
+/// Wide cooperative kernel policy (`SP1_GPU_ZEROCHECK_COOP_WIDE`): 0 = off;
+/// 1 = take the cooperative candidates whose level schedule needs too many
+/// value slots for `coop_fits` (e.g. the wide Poseidon2-style chunks of the
+/// Global chip: 21 levels but 440 slots), which otherwise walk their whole
+/// bytecode serially in the thread-per-row kernel in every small round;
+/// 2 (default) = also prefer it over the 8-lane kernel for every candidate it
+/// fits (fib 40M core, per proof: cooperative kernels 240 -> 176 ms).
+/// Same results in every mode.
+const COOP_WIDE_DEFAULT: u32 = 2;
+fn coop_wide_mode() -> u32 {
+    env_u32("SP1_GPU_ZEROCHECK_COOP_WIDE", COOP_WIDE_DEFAULT).min(2)
+}
+
+/// The chunk's level schedule fits the wide cooperative kernel's shared memory.
+fn coop_wide_fits(c: &ChunkStaticC) -> bool {
+    static CAP: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    let max_phys = *CAP.get_or_init(|| coop_max_phys_for(COOP_WIDE_ROWS));
+    c.n_instrs > 0
+        && c.n_instrs <= COOP_MAX_INSTRS
+        && c.coop_n_levels <= COOP_MAX_LEVELS
+        && c.coop_n_phys <= max_phys
+}
+
 fn env_u32(name: &str, default: u32) -> u32 {
     std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+}
+
+/// Whether the MAX_REGS = 128 tier runs the wave-uniform interpreter
+/// (`zerocheck_fused_sequential_uniform`): scalar instruction fetch and
+/// dispatch plus a VGPR register file. `SP1_GPU_ZEROCHECK_UNIFORM=0` restores
+/// the generic kernels (and the unranked register numbering, see
+/// `rank_registers_by_use`). Same results.
+pub(crate) fn zerocheck_uniform_enabled() -> bool {
+    std::env::var("SP1_GPU_ZEROCHECK_UNIFORM").map_or(true, |v| v != "0")
+}
+
+/// Default VGPR register-file size of the wave-uniform bivariate kernel
+/// (4-node registers).
+const ZEROCHECK_BIV_VRF_DEFAULT: u32 = 16;
+
+/// Registers the wave-uniform G = 4 bivariate kernel keeps in VGPRs
+/// (`SP1_GPU_ZEROCHECK_BIV_VRF` ∈ {0, 16, 32}).
+pub(crate) fn zerocheck_biv_vrf_size() -> u32 {
+    match env_u32("SP1_GPU_ZEROCHECK_BIV_VRF", ZEROCHECK_BIV_VRF_DEFAULT) {
+        v @ (0 | 16 | 32) => v,
+        _ => ZEROCHECK_BIV_VRF_DEFAULT,
+    }
+}
+
+/// Default VGPR register-file size of the wave-uniform kernel (ext registers).
+const ZEROCHECK_VRF_DEFAULT: u32 = 32;
+
+/// Registers the wave-uniform kernel keeps in VGPRs (`SP1_GPU_ZEROCHECK_VRF`
+/// ∈ {0, 16, 32}; 0 keeps the whole register file in scratch). 0 when the
+/// wave-uniform kernel is off.
+pub(crate) fn zerocheck_vrf_size() -> u32 {
+    if !zerocheck_uniform_enabled() {
+        return 0;
+    }
+    match env_u32("SP1_GPU_ZEROCHECK_VRF", ZEROCHECK_VRF_DEFAULT) {
+        v @ (0 | 16 | 32) => v,
+        _ => ZEROCHECK_VRF_DEFAULT,
+    }
 }
 
 /// True iff the chip's GKR column sweep rides on a zero-instruction carrier
@@ -1251,6 +1386,9 @@ fn build_seq_tiers(
         coop_max_instrs: 0,
         coop_max_levels: 0,
         coop_max_phys: 0,
+        coop_wide_max_instrs: 0,
+        coop_wide_max_levels: 0,
+        coop_wide_max_phys: 0,
         static_buf: None,
     });
 
@@ -1319,6 +1457,11 @@ fn build_seq_tiers(
             tier.coop_max_instrs = tier.coop_max_instrs.max(c.n_instrs);
             tier.coop_max_levels = tier.coop_max_levels.max(c.coop_n_levels);
             tier.coop_max_phys = tier.coop_max_phys.max(c.coop_n_phys);
+        }
+        for c in tier.static_host.iter().filter(|c| coop_wide_fits(c)) {
+            tier.coop_wide_max_instrs = tier.coop_wide_max_instrs.max(c.n_instrs);
+            tier.coop_wide_max_levels = tier.coop_wide_max_levels.max(c.coop_n_levels);
+            tier.coop_wide_max_phys = tier.coop_wide_max_phys.max(c.coop_n_phys);
         }
         if !tier.static_host.is_empty() {
             tier.static_buf =
@@ -1672,11 +1815,19 @@ where
 
     let trace_ptr = poly.data.as_ref().dense_data.dense.as_ptr();
 
+    // `SP1_GPU_ZEROCHECK_SEQ_BLOCK` (64, 128 or 256) overrides the low-register block size, to
+    // measure spreading the thread-per-row interpreter over more CUs: each thread's `regs[]` lives
+    // in scratch (2 KiB per lane at MAX_REGS=128 over Ext), and the small rounds launch fewer
+    // blocks than a 304-CU MI300X has CUs. Any other value keeps the default.
+    let block_size_low_reg = match env_u32("SP1_GPU_ZEROCHECK_SEQ_BLOCK", BLOCK_SIZE_LOW_REG) {
+        bs @ (64 | 128 | 256) => bs,
+        _ => BLOCK_SIZE_LOW_REG,
+    };
     let block_size_for = |tier: usize| -> u32 {
         if poly.seq_tiers[tier].max_reg > 128 {
             BLOCK_SIZE_HIGH_REG
         } else {
-            BLOCK_SIZE_LOW_REG
+            block_size_low_reg
         }
     };
 
@@ -1727,6 +1878,11 @@ where
     let mut dispatch_tiers: [Vec<BlockDispatchC>; NUM_SEQ_TIERS] = Default::default();
     // Per tier: the dispatch of the chunks that take the cooperative kernel.
     let mut coop_tiers: [Vec<BlockDispatchC>; NUM_SEQ_TIERS] = Default::default();
+    // ... and those that take the wide cooperative kernel.
+    let mut coop_wide_tiers: [Vec<BlockDispatchC>; NUM_SEQ_TIERS] = Default::default();
+    let coop_wide = coop_wide_mode();
+    let coop_max_rows = env_u32("SP1_GPU_ZEROCHECK_COOP_MAX_ROWS", COOP_MAX_ROWS);
+    let coop_min_cost = env_u32("SP1_GPU_ZEROCHECK_COOP_MIN_COST", COOP_MIN_COST);
     let rows_per_thread = env_u32("SP1_GPU_ZEROCHECK_RPT", ROWS_PER_THREAD_SEQ).max(1);
     let coop_budget = env_u32("SP1_GPU_ZEROCHECK_COOP_ROWS", COOP_ROW_BUDGET);
     for (t, tier) in poly.seq_tiers.iter().enumerate() {
@@ -1735,42 +1891,81 @@ where
             |chip_idx: u32| poly.layout_tracker.chip_height_elements(chip_idx as usize) / 2;
         // Cooperative candidates: small row count, long serial walk, costliest
         // first within the per-round row budget.
-        let mut is_coop = vec![false; tier.chip_indices.len()];
+        // 0 = thread-per-row kernel, 1 = cooperative, 2 = wide cooperative.
+        let mut is_coop = vec![0u8; tier.chip_indices.len()];
         if coop_budget > 0 {
-            let mut cand: Vec<(u32, usize)> = Vec::new();
+            let mut cand: Vec<(u32, usize, u8)> = Vec::new();
             for (i, (&chip_idx, c)) in
                 tier.chip_indices.iter().zip(tier.static_host.iter()).enumerate()
             {
                 let rows = rows_of(chip_idx);
                 let cost = c.n_instrs + 3 * (c.gkr_main_width + c.gkr_prep_width);
                 if rows > 0
-                    && rows <= COOP_MAX_ROWS
-                    && (cost >= COOP_MIN_COST || rows <= COOP_SMALL_ROWS)
-                    && coop_fits(c)
+                    && rows <= coop_max_rows
+                    && (cost >= coop_min_cost || rows <= COOP_SMALL_ROWS)
                 {
-                    cand.push((cost, i));
+                    if coop_wide == 2 && coop_wide_fits(c) {
+                        cand.push((cost, i, 2u8));
+                    } else if coop_fits(c) {
+                        cand.push((cost, i, 1u8));
+                    } else if coop_wide >= 1 && coop_wide_fits(c) {
+                        cand.push((cost, i, 2u8));
+                    }
                 }
             }
             cand.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
             let mut used = 0u32;
-            for (_, i) in cand {
+            for (_, i, kind) in cand {
                 let rows = rows_of(tier.chip_indices[i]);
                 if used + rows <= coop_budget {
                     used += rows;
-                    is_coop[i] = true;
+                    is_coop[i] = kind;
                 }
             }
         }
         let tile = bs * rows_per_thread;
+        if std::env::var("SP1_GPU_DEBUG_ZC_DISPATCH").is_ok() {
+            // The thread-per-row kernel's latency floor is its longest chunk.
+            let mut rows_main = 0u32;
+            let mut rows_coop = 0u32;
+            let mut longest = (0u32, 0u32, 0u32, 0usize); // (cost, chip_idx, rows, i)
+            for (i, (&chip_idx, c)) in
+                tier.chip_indices.iter().zip(tier.static_host.iter()).enumerate()
+            {
+                let rows = rows_of(chip_idx);
+                if rows == 0 {
+                    continue;
+                }
+                let cost = c.n_instrs + 3 * (c.gkr_main_width + c.gkr_prep_width);
+                if is_coop[i] != 0 {
+                    rows_coop += rows;
+                } else {
+                    rows_main += rows;
+                    longest = longest.max((cost, chip_idx, rows, i));
+                }
+            }
+            let lc = tier.static_host.get(longest.3);
+            tracing::info!(
+                "zc dispatch tier {t}: main rows {rows_main}, coop rows {rows_coop}, \
+                 longest main chunk cost {} (chip {}, {} rows, coop levels {:?} phys {:?}, \
+                 coop caps instrs {COOP_MAX_INSTRS} levels {COOP_MAX_LEVELS} phys {})",
+                longest.0,
+                longest.1,
+                longest.2,
+                lc.map(|c| c.coop_n_levels),
+                lc.map(|c| c.coop_n_phys),
+                coop_max_phys(),
+            );
+        }
         for (chunk_idx_in_tier, &chip_idx) in tier.chip_indices.iter().enumerate() {
             let row_count = rows_of(chip_idx);
             if row_count == 0 {
                 continue;
             }
-            let (out, tile) = if is_coop[chunk_idx_in_tier] {
-                (&mut coop_tiers[t], COOP_ROWS)
-            } else {
-                (&mut dispatch_tiers[t], tile)
+            let (out, tile) = match is_coop[chunk_idx_in_tier] {
+                1 => (&mut coop_tiers[t], COOP_ROWS),
+                2 => (&mut coop_wide_tiers[t], COOP_WIDE_ROWS),
+                _ => (&mut dispatch_tiers[t], tile),
             };
             let mut row_offset = 0u32;
             while row_offset < row_count {
@@ -1818,12 +2013,15 @@ where
     // ---- Slot allocation in the shared output ----
     let mut tier_slot: [usize; NUM_SEQ_TIERS] = [0; NUM_SEQ_TIERS];
     let mut coop_slot: [usize; NUM_SEQ_TIERS] = [0; NUM_SEQ_TIERS];
+    let mut coop_wide_slot: [usize; NUM_SEQ_TIERS] = [0; NUM_SEQ_TIERS];
     let mut total_slots: usize = 0;
     for t in 0..NUM_SEQ_TIERS {
         tier_slot[t] = total_slots;
         total_slots += dispatch_tiers[t].len() * NUM_EVAL_POINT;
         coop_slot[t] = total_slots;
         total_slots += coop_tiers[t].len() * NUM_EVAL_POINT;
+        coop_wide_slot[t] = total_slots;
+        total_slots += coop_wide_tiers[t].len() * NUM_EVAL_POINT;
     }
     let mut ct_slots: Vec<(usize, u32)> = Vec::with_capacity(ct_launches.len());
     let ct_block_size: u32 = 128; // unchanged for ColumnTile fallback
@@ -1861,19 +2059,29 @@ where
     for t in 0..NUM_SEQ_TIERS {
         let n_main = dispatch_tiers[t].len();
         let n_coop = coop_tiers[t].len();
-        if n_main + n_coop == 0 {
+        let n_coop_wide = coop_wide_tiers[t].len();
+        if n_main + n_coop + n_coop_wide == 0 {
             continue;
         }
         let bs = block_size_for(t);
         let mut all = std::mem::take(&mut dispatch_tiers[t]);
         all.extend_from_slice(&coop_tiers[t]);
+        all.extend_from_slice(&coop_wide_tiers[t]);
         let dispatch_ptr = refill_buffer(&mut poly.cached_seq_dispatch[t], &all, backend).as_ptr();
         let static_ptr = poly.seq_tiers[t].static_buf.as_ref().unwrap().as_ptr();
         let max_reg = poly.seq_tiers[t].max_reg;
         if n_main > 0 {
             let out_ptr = unsafe { shared_output_ptr.add(tier_slot[t]) };
             let shmem_bytes = (bs as usize / 32).max(1) * std::mem::size_of::<Ext>();
-            let kernel = <TaskScope as EvalKernels<K>>::fused_sequential_kernel_for(max_reg);
+            // `__launch_bounds__(256)` on the wave-uniform kernel.
+            let kernel = (bs <= 256)
+                .then(|| {
+                    <TaskScope as EvalKernels<K>>::fused_sequential_uniform_kernel_for(max_reg)
+                })
+                .flatten()
+                .unwrap_or_else(|| {
+                    <TaskScope as EvalKernels<K>>::fused_sequential_kernel_for(max_reg)
+                });
             unsafe {
                 let args = args!(
                     dispatch_ptr,
@@ -1927,6 +2135,44 @@ where
                     .launch_kernel(
                         <TaskScope as EvalKernels<K>>::coop_kernel(),
                         (n_coop as u32, 1, 3),
+                        (COOP_THREADS, 1, 1),
+                        &args,
+                        shmem_bytes,
+                    )
+                    .unwrap();
+            }
+        }
+        if n_coop_wide > 0 {
+            let tier = &poly.seq_tiers[t];
+            let wide_dispatch_ptr = unsafe { dispatch_ptr.add(n_main + n_coop) };
+            let out_ptr = unsafe { shared_output_ptr.add(coop_wide_slot[t]) };
+            let shmem_bytes = coop_smem_bytes_for(
+                COOP_WIDE_ROWS,
+                tier.coop_wide_max_instrs,
+                tier.coop_wide_max_levels,
+                tier.coop_wide_max_phys,
+            );
+            unsafe {
+                let args = args!(
+                    wide_dispatch_ptr,
+                    static_ptr,
+                    chip_layouts_ptr,
+                    trace_ptr,
+                    poly.public_values.as_ptr(),
+                    poly.powers_of_alpha.as_ptr(),
+                    partial_lagrange.as_ptr(),
+                    poly.powers_of_lambda.as_ptr(),
+                    poly.gkr_powers.as_ptr(),
+                    rest_point_dim,
+                    out_ptr,
+                    tier.coop_wide_max_instrs,
+                    tier.coop_wide_max_levels,
+                    tier.coop_wide_max_phys
+                );
+                backend
+                    .launch_kernel(
+                        <TaskScope as EvalKernels<K>>::coop_wide_kernel(),
+                        (n_coop_wide as u32, 1, 3),
                         (COOP_THREADS, 1, 1),
                         &args,
                         shmem_bytes,
@@ -2197,6 +2443,13 @@ fn bivariate_sequential_kernel_for(max_reg_in_tier: u16) -> (KernelPtr, u32) {
         let g = bivariate_nodes_per_pass();
         let kernel = match g {
             2 => Some(unsafe { zerocheck_fused_sequential_bivariate_vec2_kb_128_kernel() }),
+            4 if zerocheck_uniform_enabled() => Some(unsafe {
+                match zerocheck_biv_vrf_size() {
+                    0 => zerocheck_fused_sequential_bivariate_vec4_uniform_kb_128_v0_kernel(),
+                    16 => zerocheck_fused_sequential_bivariate_vec4_uniform_kb_128_v16_kernel(),
+                    _ => zerocheck_fused_sequential_bivariate_vec4_uniform_kb_128_v32_kernel(),
+                }
+            }),
             4 => Some(unsafe { zerocheck_fused_sequential_bivariate_vec4_kb_128_kernel() }),
             12 => Some(unsafe { zerocheck_fused_sequential_bivariate_vec12_kb_128_kernel() }),
             _ => None,

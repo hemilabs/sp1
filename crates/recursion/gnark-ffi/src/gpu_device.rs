@@ -157,12 +157,14 @@ pub fn free_memory() -> Option<u64> {
 /// wrap: on a 32 GB card ~21 GB of the prover's 28 GB "resident" memory was idle reserve. This
 /// synchronizes the device (waiting for its outstanding work) and trims the pool to zero. Live
 /// allocations are untouched; the next proof grows the pool again. The device caches (the GPU
-/// prover's preprocessed data, which later proofs reuse) go only if the helper still lacks room.
+/// prover's preprocessed data, which later proofs reuse) go only if the helper still lacks room,
+/// and not while this process holds an arena (HIP's): what they free goes back to the arena, not
+/// to the driver, so the helper would gain nothing and later proofs would lose the caches.
 pub fn trim_memory_pool(needed: u64) -> Option<(u64, u64)> {
     let before = free_memory()?;
     trim_pool()?;
     let mut after = free_memory()?;
-    if after < needed {
+    if after < needed && crate::device_caches::arena_bytes() == 0 {
         crate::device_caches::release();
         trim_pool()?;
         after = free_memory()?;
@@ -451,7 +453,8 @@ fn reset(what: &str) -> bool {
     let rc = unsafe { device_reset() };
     // The Groth16 GPU hooks run on this process's GPU state, which is gone: gnark's CPU prover, if
     // it has to take over, proves without them.
-    crate::ffi::set_groth16_gpu_hooks(0, 0, 0);
+    crate::ffi::set_groth16_gpu_hooks(0, 0, 0, 0);
+    crate::ffi::set_groth16_gpu_r1cs_solver(0, 0, 0);
     if rc == 0 {
         tracing::info!(
             "{what}: freed this process's {} MiB of live GPU blocks and reset its {} device \

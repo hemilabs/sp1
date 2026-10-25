@@ -20,7 +20,8 @@ pub mod var;
 pub use analysis::{analyze_constraints, ColumnLeaf, ConstraintInfo, ConstraintShape};
 pub use builder::{build_dag, DagBuilder};
 pub use bytecode::{
-    level_schedule, lower_sequential, BcOp, ChunkBytecode, DagInstr, LeafRef, LevelSchedule,
+    level_schedule, lower_sequential, rank_registers_by_use, register_overflow_accesses, BcOp,
+    ChunkBytecode, DagInstr, LeafRef, LevelSchedule,
 };
 pub use chunker::{chunk_dag, Chunk, ChunkBudget};
 pub use column_tile_bytecode::{

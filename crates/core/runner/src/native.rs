@@ -62,11 +62,12 @@ impl MinimalExecutorRunner {
         memory_limit: u64,
         shm_slot_size: usize,
     ) -> Self {
-        let id = format!("sp1_{}", URL_SAFE.encode(uuid::Uuid::new_v4().as_bytes()));
+        let id = new_shm_id();
         let input = Input {
             program,
             is_debug,
             max_trace_size,
+            max_chunk_cycles: None,
             input: VecDeque::new(),
             shm_slot_size,
             id,
@@ -85,6 +86,15 @@ impl MinimalExecutorRunner {
             global_clk: 0,
             clk: 0,
         }
+    }
+
+    /// Also end a trace chunk once it has run `cycles` cycles, not only when its trace buffer is
+    /// full, so a compute-bound program yields its first chunk early. `None` or `Some(0)` splits on
+    /// the trace size only. Execution is unchanged; only where the trace is split differs.
+    pub fn set_max_chunk_cycles(&mut self, cycles: Option<u64>) {
+        // The cap is sent to the child when it starts.
+        assert!(self.process.is_none());
+        self.input.max_chunk_cycles = cycles.filter(|&cycles| cycles > 0);
     }
 
     /// Redirect guest output to the configured channels.
@@ -420,7 +430,14 @@ impl MinimalExecutorRunner {
             child.kill().expect("running child cannot be killed");
         }
         self.output = None;
+        // Like the JIT executor's reset: the next run reads only the input it is given.
+        self.input.input.clear();
 
+        // Recreate the shared memory and the trace ring under a fresh id. Under the old id the
+        // new objects would be the old ones' names, and dropping the old owners (when the fields
+        // are overwritten below, or later by a trace chunk still holding the ring) would unlink
+        // them, so the next child could not open them.
+        self.input.id = new_shm_id();
         let (memory, consumer) = create(&self.input);
         self.memory = memory;
         self.consumer = consumer;
@@ -443,6 +460,11 @@ fn redirect_output(consumers: &OutputConsumers, line: &str) -> bool {
     };
 
     publish_output_line(sender, content)
+}
+
+/// A new, process-unique id for the shared memory objects of an executor.
+fn new_shm_id() -> String {
+    format!("sp1_{}", URL_SAFE.encode(uuid::Uuid::new_v4().as_bytes()))
 }
 
 // Create partial field variables, so the common logic can be shared

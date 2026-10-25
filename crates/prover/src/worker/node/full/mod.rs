@@ -342,12 +342,22 @@ impl SP1LocalNode {
             if status != TaskStatus::Succeeded {
                 return Err(anyhow::anyhow!("shrink wrap task failed"));
             }
+            // The task may have left the proof's verification running; it must pass. With none in
+            // this process, the proof is verified here.
+            let wrap_verify = crate::worker::take_wrap_verify(&output_artifact);
 
             // Download the output proof; the artifacts go with the request's bookkeeping.
-            self.inner
+            let proof = self
+                .inner
                 .artifact_client
                 .download::<SP1WrapProof<SP1OuterGlobalContext, SP1PcsProofOuter>>(&output_artifact)
-                .await
+                .await?;
+            let verified = match wrap_verify {
+                Some(verify) => crate::worker::wait_wrap_verify(verify).await,
+                None => crate::worker::verify_wrap_proof::<crate::CpuSP1ProverComponents>(&proof),
+            };
+            verified.map_err(|e| anyhow::anyhow!("shrink wrap task failed: {e}"))?;
+            Ok(proof)
         };
         self.with_bookkeeping(&proof_id, wrapping).await
     }

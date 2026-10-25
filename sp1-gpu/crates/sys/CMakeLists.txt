@@ -23,8 +23,9 @@ if(USE_HIP)
         string(REPLACE "," ";" HIP_ARCHS_LIST "${HIP_ARCHS}")
         set(CMAKE_HIP_ARCHITECTURES ${HIP_ARCHS_LIST})
     else()
-        # Default: RDNA4 (gfx1201) + RDNA3 (gfx1100)
-        set(CMAKE_HIP_ARCHITECTURES gfx1100 gfx1201)
+        # Default when build.rs found no GPU on the build host: RDNA4 (gfx1201), RDNA3 (gfx1100)
+        # and CDNA3 (gfx942, MI300X).
+        set(CMAKE_HIP_ARCHITECTURES gfx1100 gfx1201 gfx942)
     endif()
 
     # Build type defaults to Release

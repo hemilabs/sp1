@@ -19,16 +19,20 @@ use sp1_hypercube::{air::MachineAir, septic_digest::SepticDigest, MachineVerifyi
 /// The device memory all [`PrepCache`]s may hold together, in bytes.
 ///
 /// `SP1_GPU_PREP_CACHE_MIB` sets it (`0` disables the caches). The default is 2048 MiB on CUDA
-/// cards with more than 24 GiB, else 0. Under memory pressure the caches are emptied (see
-/// [`DeviceCache`]), so the budget only bounds what they hold between shards. It is off by default
-/// on HIP and SYCL, like the trace prefetch: their device memory caches hold freed blocks outside
-/// the live count that pressure is measured by, and on Windows a card over its video memory
-/// budget spills to shared system memory.
+/// cards with more than 24 GiB, 4096 MiB on HIP cards of 64 GiB or more (like the trace prefetch;
+/// on an MI300X compressed proofs were 3.1-5.2% faster with it), else 0. Under memory pressure
+/// the caches are emptied (see [`DeviceCache`]), so the budget only bounds what they hold between
+/// shards. It is off by default on SYCL and smaller HIP cards, like the trace prefetch: their
+/// device memory caches hold freed blocks outside the live count that pressure is measured by,
+/// and on Windows a card over its video memory budget spills to shared system memory. On large
+/// HIP cards those blocks are in the arena, which the pressure limit is measured against (see
+/// [`sp1_gpu_cudart::usable_device_memory`]).
 pub(crate) fn prep_cache_budget() -> u64 {
     static BUDGET: OnceLock<u64> = OnceLock::new();
     *BUDGET.get_or_init(|| {
-        let default_mib = match sp1_gpu_cudart::cuda_memory_info() {
-            Ok((_, total)) if sp1_gpu_cudart::sys::BACKEND == "cuda" && total > 24 << 30 => 2048,
+        let default_mib = match (sp1_gpu_cudart::cuda_memory_info(), sp1_gpu_cudart::sys::BACKEND) {
+            (Ok((_, total)), "cuda") if total > 24 << 30 => 2048,
+            (Ok((_, total)), "hip") if total >= 64 << 30 && !cfg!(windows) => 4096,
             _ => 0,
         };
         let mib = std::env::var("SP1_GPU_PREP_CACHE_MIB")
@@ -93,10 +97,21 @@ impl<GC: IopCtx, Air: MachineAir<GC::F>> PrepEntry<GC, Air> {
     }
 }
 
+/// A build of a program's entry in progress (see [`PrepCache::get_or_claim`]).
+struct PrepBuild<GC: IopCtx, Air: MachineAir<GC::F>> {
+    program: Arc<Air::Program>,
+    initial_global_cumulative_sum: SepticDigest<GC::F>,
+    /// Held by the build's [`PrepClaim`].
+    lock: Arc<tokio::sync::Mutex<()>>,
+}
+
 /// The preprocessed data of the programs a prover set up most recently (see the module docs).
 pub(crate) struct PrepCache<GC: IopCtx, Air: MachineAir<GC::F>> {
     /// Least recently used first.
     entries: Mutex<Vec<Arc<PrepEntry<GC, Air>>>>,
+    /// The programs a shard is building an entry of (see [`PrepCache::get_or_claim`]), each with
+    /// the lock its [`PrepClaim`] holds until it is done.
+    building: Mutex<Vec<PrepBuild<GC, Air>>>,
     /// The prover's task scope, whose stream the cached buffers are freed on.
     scope: TaskScope,
 }
@@ -108,17 +123,21 @@ impl<GC: IopCtx, Air: MachineAir<GC::F>> PrepCache<GC, Air> {
             return None;
         }
         // What "low" means, where the trace prefetch did not set it (off by default on Windows):
-        // the memory this process can use, less the prefetch's headroom.
-        if let Ok((free, total)) = sp1_gpu_cudart::cuda_memory_info() {
+        // the memory this process can use (with HIP's arena, the arena's), less the prefetch's
+        // headroom.
+        if let Ok(usable) = sp1_gpu_cudart::usable_device_memory() {
             let headroom = std::env::var("SP1_GPU_TRACE_PREFETCH_HEADROOM_MIB")
                 .ok()
                 .and_then(|v| v.parse::<u64>().ok())
                 .unwrap_or(1536)
                 << 20;
-            let usable = (free as u64 + sp1_gpu_cudart::vram_current_bytes()).min(total as u64);
             sp1_gpu_cudart::limit_device_memory_if_unset(usable.saturating_sub(headroom));
         }
-        let cache = Arc::new(Self { entries: Mutex::new(Vec::new()), scope });
+        let cache = Arc::new(Self {
+            entries: Mutex::new(Vec::new()),
+            building: Mutex::new(Vec::new()),
+            scope,
+        });
         let weak: std::sync::Weak<dyn DeviceCache> =
             Arc::downgrade(&(cache.clone() as Arc<dyn DeviceCache>));
         sp1_gpu_cudart::register_device_cache(weak);
@@ -139,6 +158,46 @@ impl<GC: IopCtx, Air: MachineAir<GC::F>> PrepCache<GC, Air> {
         let entry = entries.remove(index);
         entries.push(entry.clone());
         Some(entry)
+    }
+
+    /// The entry for `program` set up with `initial_global_cumulative_sum`, if cached, or else a
+    /// claim to build it, unless another shard is building it: then this waits for that build
+    /// and returns its entry, or neither if it was not cached (the shard then builds the data for
+    /// itself, as shards of a program that cannot be cached do, rather than wait again). On a
+    /// first proof the shards of a program start at about the same time, and each built the same
+    /// entry.
+    pub async fn get_or_claim(
+        self: &Arc<Self>,
+        program: &Arc<Air::Program>,
+        initial_global_cumulative_sum: &SepticDigest<GC::F>,
+    ) -> (Option<Arc<PrepEntry<GC, Air>>>, Option<PrepClaim<GC, Air>>) {
+        let lock = {
+            // Held while looking the entry up, so that a build that ends after the lookup is
+            // still in the list (its claim is dropped after its entry is inserted).
+            let mut building = self.building.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(entry) = self.get(program, initial_global_cumulative_sum) {
+                return (Some(entry), None);
+            }
+            match building.iter().find(|b| {
+                Arc::ptr_eq(&b.program, program)
+                    && b.initial_global_cumulative_sum == *initial_global_cumulative_sum
+            }) {
+                Some(build) => build.lock.clone(),
+                None => {
+                    let lock = Arc::new(tokio::sync::Mutex::new(()));
+                    let guard = lock.clone().try_lock_owned().expect("a new lock");
+                    building.push(PrepBuild {
+                        program: program.clone(),
+                        initial_global_cumulative_sum: *initial_global_cumulative_sum,
+                        lock: lock.clone(),
+                    });
+                    let claim = PrepClaim { cache: self.clone(), lock, _guard: guard };
+                    return (None, Some(claim));
+                }
+            }
+        };
+        drop(lock.lock().await);
+        (self.get(program, initial_global_cumulative_sum), None)
     }
 
     /// Whether `program` set up with `initial_global_cumulative_sum` is cached (without making it
@@ -206,6 +265,22 @@ impl<GC: IopCtx, Air: MachineAir<GC::F>> PrepCache<GC, Air> {
     }
 }
 
+/// A shard's claim to build a program's entry (see [`PrepCache::get_or_claim`]). The shards of
+/// the program waiting for it go on when it is dropped, once the entry is inserted or not.
+pub(crate) struct PrepClaim<GC: IopCtx, Air: MachineAir<GC::F>> {
+    cache: Arc<PrepCache<GC, Air>>,
+    lock: Arc<tokio::sync::Mutex<()>>,
+    /// Released after the claim leaves the list (fields drop after `drop`).
+    _guard: tokio::sync::OwnedMutexGuard<()>,
+}
+
+impl<GC: IopCtx, Air: MachineAir<GC::F>> Drop for PrepClaim<GC, Air> {
+    fn drop(&mut self) {
+        let mut building = self.cache.building.lock().unwrap_or_else(|e| e.into_inner());
+        building.retain(|b| !Arc::ptr_eq(&b.lock, &self.lock));
+    }
+}
+
 impl<GC: IopCtx, Air: MachineAir<GC::F>> Drop for PrepCache<GC, Air> {
     fn drop(&mut self) {
         // The process-wide count must not keep the bytes of entries that go with the cache.
@@ -232,5 +307,56 @@ impl<GC: IopCtx, Air: MachineAir<GC::F>> DeviceCache for PrepCache<GC, Air> {
             let _ = self.scope.synchronize_blocking();
         }
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::future::{poll_fn, Future};
+    use std::task::Poll;
+
+    use sp1_core_machine::riscv::RiscvAir;
+    use sp1_gpu_utils::TestGC;
+
+    use super::*;
+
+    /// Shards that miss on a program another shard is setting up wait for that setup instead of
+    /// setting the program up too, and then go on without waiting again.
+    #[tokio::test]
+    async fn test_concurrent_misses_wait_for_the_build() {
+        sp1_gpu_cudart::run_in_place(|scope| async move {
+            let cache = Arc::new(PrepCache::<TestGC, RiscvAir<Felt>> {
+                entries: Mutex::new(Vec::new()),
+                building: Mutex::new(Vec::new()),
+                scope,
+            });
+            let program = Arc::new(Default::default());
+            let sum = SepticDigest::default();
+
+            let (entry, claim) = cache.get_or_claim(&program, &sum).await;
+            assert!(entry.is_none());
+            let claim = claim.expect("the first miss builds the entry");
+
+            // Another program's shards are not held up.
+            let other = Arc::new(Default::default());
+            let (_, other_claim) = cache.get_or_claim(&other, &sum).await;
+            assert!(other_claim.is_some());
+
+            let mut waiter = std::pin::pin!(cache.get_or_claim(&program, &sum));
+            let pending = poll_fn(|cx| Poll::Ready(waiter.as_mut().poll(cx).is_pending())).await;
+            assert!(pending, "a second miss waits for the build");
+
+            // The build ends without an entry (as when it does not fit the budget).
+            drop(claim);
+            let (entry, claim) = waiter.await;
+            assert!(entry.is_none() && claim.is_none(), "it neither waits again nor builds it");
+            assert_eq!(cache.building.lock().unwrap().len(), 1);
+            drop(other_claim);
+            assert!(cache.building.lock().unwrap().is_empty());
+
+            // A later miss builds it again.
+            assert!(cache.get_or_claim(&program, &sum).await.1.is_some());
+        })
+        .await;
     }
 }

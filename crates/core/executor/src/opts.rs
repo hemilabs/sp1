@@ -20,6 +20,14 @@ pub const DEFAULT_FULL_SIZE_SHARDS: bool = false;
 /// [`DEFAULT_TRACE_CHUNK_SLOTS`] slots in the SHM ring buffer, this caps the
 /// trace-ring shared memory at ~5 × 256 MiB × 10/9 ≈ 1.43 GiB.
 pub const MINIMAL_TRACE_CHUNK_THRESHOLD: u64 = 16_777_216;
+/// The most cycles in a minimal trace chunk when proving.
+///
+/// A compute-bound program reads little memory, so [`MINIMAL_TRACE_CHUNK_THRESHOLD`] alone would
+/// leave its whole execution in one chunk and splicing (so the first shard) would wait for the end
+/// of execution. 2^23 cycles is about one core shard of a compute-bound program. A shard that spans
+/// a chunk boundary is carried into the next chunk, so the shards do not change. Not used for gas
+/// estimation, whose result depends on the chunking (see [`GAS_TRACE_CHUNK_THRESHOLD`]).
+pub const MINIMAL_TRACE_CHUNK_CYCLES: u64 = 1 << 23;
 /// The size of a minimal trace chunk used **for gas estimation**, in memory entries.
 ///
 /// Gas estimation treats each trace chunk as a shard for memory-boundary accounting: the
@@ -64,6 +72,10 @@ pub struct ShardingThreshold {
 pub struct SP1CoreOpts {
     /// The maximum size of a minimal trace chunk in terms of memory entries.
     pub minimal_trace_chunk_threshold: u64,
+    /// The most cycles in a minimal trace chunk when proving; 0 for no cap. See
+    /// [`MINIMAL_TRACE_CHUNK_CYCLES`].
+    #[serde(default)]
+    pub minimal_trace_chunk_cycles: u64,
     /// The size of a minimal trace chunk used for gas estimation, in memory entries.
     ///
     /// Decoupled from [`Self::minimal_trace_chunk_threshold`] (which only bounds executor memory)
@@ -101,6 +113,11 @@ impl Default for SP1CoreOpts {
         let minimal_trace_chunk_threshold = env::var("MINIMAL_TRACE_CHUNK_THRESHOLD").map_or_else(
             |_| MINIMAL_TRACE_CHUNK_THRESHOLD,
             |s| s.parse::<u64>().unwrap_or(MINIMAL_TRACE_CHUNK_THRESHOLD),
+        );
+
+        let minimal_trace_chunk_cycles = env::var("MINIMAL_TRACE_CHUNK_CYCLES").map_or_else(
+            |_| MINIMAL_TRACE_CHUNK_CYCLES,
+            |s| s.parse::<u64>().unwrap_or(MINIMAL_TRACE_CHUNK_CYCLES),
         );
 
         let gas_trace_chunk_threshold = env::var("GAS_TRACE_CHUNK_THRESHOLD").map_or_else(
@@ -148,6 +165,7 @@ impl Default for SP1CoreOpts {
 
         Self {
             minimal_trace_chunk_threshold,
+            minimal_trace_chunk_cycles,
             gas_trace_chunk_threshold,
             trace_chunk_slots,
             gas_trace_chunk_slots,

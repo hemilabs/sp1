@@ -113,7 +113,9 @@ fn two_round_sum_as_poly<'a>(poly: &JaggedFirstRoundPoly<'a>) -> [Ext; 8] {
     let mut evaluations =
         Tensor::<Ext, TaskScope>::with_sizes_in([8, grid_size_x], backend.clone());
 
-    let num_tiles = BLOCK_SIZE.checked_div(STRIDE).unwrap_or(1);
+    // One shared slot per 32-wide reduction tile (`partialBlockReduce`), not per STRIDE.
+
+    let num_tiles = BLOCK_SIZE.checked_div(32).unwrap_or(1);
     let shared_mem = num_tiles * std::mem::size_of::<Ext>();
 
     unsafe {
@@ -164,7 +166,9 @@ fn fix_two_and_sum_first_rounds<'a>(
     let mut evaluations =
         Tensor::<Ext, TaskScope>::with_sizes_in([2, grid_size_x], backend.clone());
 
-    let num_tiles = BLOCK_SIZE.checked_div(STRIDE).unwrap_or(1);
+    // One shared slot per 32-wide reduction tile (`partialBlockReduce`), not per STRIDE.
+
+    let num_tiles = BLOCK_SIZE.checked_div(32).unwrap_or(1);
     let shared_mem = num_tiles * std::mem::size_of::<Ext>();
 
     unsafe {

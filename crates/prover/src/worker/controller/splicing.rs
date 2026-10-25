@@ -584,12 +584,13 @@ mod tests {
     /// The clock at each chunk's end, and each shard's range and serialized trace.
     type Splices = (Vec<u64>, Vec<(ShardRange, Vec<u8>)>);
 
-    /// Splices a program's execution with the given trace chunk size, carrying the open shard
-    /// across chunks like the executor does. An error comes with the number of the chunk that
-    /// failed (from 0).
+    /// Splices a program's execution with the given trace chunk size and cycles, carrying the
+    /// open shard across chunks like the executor does. An error comes with the number of the
+    /// chunk that failed (from 0).
     fn splices(
         program: &Arc<Program>,
         chunk_threshold: u64,
+        chunk_cycles: Option<u64>,
     ) -> Result<Splices, (usize, ExecutionError)> {
         // Small shards, so the chunks hold several shards each.
         let opts = SP1CoreOpts {
@@ -606,6 +607,7 @@ mod tests {
             DEFAULT_MEMORY_LIMIT,
             2,
         );
+        runner.set_max_chunk_cycles(chunk_cycles);
         let final_vm_state = FinalVmStateLock::new();
         let (splicing_tx, mut splicing_rx) = mpsc::channel(1 << 16);
         let mut touched_addresses = CompressedMemory::new();
@@ -673,10 +675,10 @@ mod tests {
         let load = Instruction::new(Opcode::LD, 21, 0, 0x2765_4320, false, true);
         let window = (0..8).flat_map(|word| commit(word).into_iter().chain([load; 8])).collect();
         let program = program_after_loads(16, window);
-        let (one_chunk, expected) = splices(&program, 1 << 30).unwrap();
+        let (one_chunk, expected) = splices(&program, 1 << 30, None).unwrap();
         assert_eq!((one_chunk.len(), expected.len()), (1, 1));
         for chunk_threshold in [8, 13] {
-            let (chunk_ends, shards) = splices(&program, chunk_threshold).unwrap();
+            let (chunk_ends, shards) = splices(&program, chunk_threshold, None).unwrap();
             // The loads before the window fill at most 3 chunks: the rest end inside it.
             assert!(chunk_ends.len() > 5, "{} chunks", chunk_ends.len());
             assert_eq!(shards.len(), 1);
@@ -695,7 +697,7 @@ mod tests {
         instructions.extend(program_after_loads(1 << 20, vec![]).instructions.iter().copied());
         // The commit first, then the loop and the halt.
         let program = Arc::new(Program::new(instructions, 0, 0));
-        let (chunk, e) = splices(&program, 1 << 16).unwrap_err();
+        let (chunk, e) = splices(&program, 1 << 16, None).unwrap_err();
         assert!(e.to_string().contains("commit syscall long before it halted"), "{e}");
         assert!(chunk < 4, "failed only at chunk {chunk}");
     }
@@ -703,8 +705,29 @@ mod tests {
     #[test]
     fn shards_carried_across_chunks_match_a_single_chunk() {
         let program = Arc::new(Program::from(&test_artifacts::SSZ_WITHDRAWALS_ELF).unwrap());
-        let (one_chunk, expected) = splices(&program, 1 << 30).unwrap();
-        let (chunk_ends, shards) = splices(&program, 1 << 16).unwrap();
+        let (one_chunk, expected) = splices(&program, 1 << 30, None).unwrap();
+        let (chunk_ends, shards) = splices(&program, 1 << 16, None).unwrap();
+        let (one_chunk, num_chunks) = (one_chunk.len(), chunk_ends.len());
+        assert_eq!(one_chunk, 1);
+        assert!(
+            num_chunks > 4 && expected.len() > 4,
+            "{num_chunks} chunks, {} shards",
+            expected.len()
+        );
+        assert_eq!(shards.len(), expected.len());
+        for ((range, bytes), (expected_range, expected_bytes)) in shards.iter().zip(&expected) {
+            assert_eq!(range, expected_range);
+            assert!(bytes == expected_bytes, "shard {range:?} differs");
+        }
+    }
+
+    /// Chunks ended by cycles, at backward jumps rather than at memory reads, give the same
+    /// shards too.
+    #[test]
+    fn shards_carried_across_cycle_chunks_match_a_single_chunk() {
+        let program = Arc::new(Program::from(&test_artifacts::SSZ_WITHDRAWALS_ELF).unwrap());
+        let (one_chunk, expected) = splices(&program, 1 << 30, None).unwrap();
+        let (chunk_ends, shards) = splices(&program, 1 << 30, Some(1 << 18)).unwrap();
         let (one_chunk, num_chunks) = (one_chunk.len(), chunk_ends.len());
         assert_eq!(one_chunk, 1);
         assert!(

@@ -37,6 +37,24 @@ where
     F: PrimeField64 + Send + Sync,
     P: CryptographicPermutation<[F; WIDTH]> + Send + Sync,
 {
+    grind_duplex_challenger_on_device_chunked(challenger, bits, grind_kernel, u64::MAX, scope).0
+}
+
+/// As [`grind_duplex_challenger_on_device`], with each launch trying at most `max_chunk`
+/// candidates. Also returns the number of launches. A test hook: a small `max_chunk` forces the
+/// later-chunk (`start > 0`) path, which the default chunk size almost never reaches.
+#[doc(hidden)]
+pub fn grind_duplex_challenger_on_device_chunked<F, P, const WIDTH: usize, const RATE: usize>(
+    challenger: &mut slop_challenger::DuplexChallenger<F, P, WIDTH, RATE>,
+    bits: usize,
+    grind_kernel: fn() -> KernelPtr,
+    max_chunk: u64,
+    scope: &TaskScope,
+) -> (F, u64)
+where
+    F: PrimeField64 + Send + Sync,
+    P: CryptographicPermutation<[F; WIDTH]> + Send + Sync,
+{
     let cpu_challenger: DuplexChallenger<F, _> = challenger.clone().into();
 
     let mut result = DeviceBuffer::with_capacity_in(1, scope.clone());
@@ -67,15 +85,16 @@ where
 
     // Each launch tries a bounded range of candidates, at most CANDIDATES_PER_THREAD per thread,
     // and the next range is launched only if it found nothing. A single launch over all of [0, n)
-    // relied on every thread seeing the found flag set by another work-group to stop: on AMD GPUs
-    // it often did not in time, and the threads swept the whole field (~60 ms per grind on an
-    // RX 9070 XT, against well under 1 ms of actual work).
+    // relied on the found flag to stop, and on AMD GPUs the finder's wave set it only after
+    // sweeping its whole share (see `grind_found` in challenger.cuh), so the threads swept the
+    // whole field (~60 ms per grind on an RX 9070 XT, against well under 1 ms of actual work).
     const CANDIDATES_PER_THREAD: u64 = 4;
-    let chunk = (grid_dim * block_dim) as u64 * CANDIDATES_PER_THREAD;
+    let chunk = ((grid_dim * block_dim) as u64 * CANDIDATES_PER_THREAD).min(max_chunk).max(1);
     unsafe {
         result.assume_init();
     }
     let mut start = 0u64;
+    let mut launches = 0u64;
     loop {
         let end = (start + chunk).min(n);
         unsafe {
@@ -90,6 +109,7 @@ where
             );
             scope.launch_kernel(grind_kernel(), (grid_dim, 1, 1), block_dim, &args, 0).unwrap();
         }
+        launches += 1;
         let found = found_flag.to_host().unwrap()[0] != 0;
         if found || end == n {
             break;
@@ -107,7 +127,7 @@ where
     // challenger, and the CPU version of the challenger does this as well. It's also necessary
     // for the security of the protocol.
     assert!(challenger.check_witness(bits, witness));
-    witness
+    (witness, launches)
 }
 
 /// Convenience function to grind a KoalaBear duplex challenger on device.
@@ -135,6 +155,30 @@ where
     PF: PrimeField + Field + Send + Sync,
     P: CryptographicPermutation<[PF; WIDTH]> + Send + Sync,
 {
+    grind_multi_field32_challenger_on_device_chunked(challenger, bits, u64::MAX, scope).0
+}
+
+/// As [`grind_multi_field32_challenger_on_device`], with each launch trying at most `max_chunk`
+/// candidates. Also returns the number of launches. A test hook, as
+/// [`grind_duplex_challenger_on_device_chunked`].
+#[doc(hidden)]
+pub fn grind_multi_field32_challenger_on_device_chunked<
+    F,
+    PF,
+    P,
+    const WIDTH: usize,
+    const RATE: usize,
+>(
+    challenger: &mut slop_challenger::MultiField32Challenger<F, PF, P, WIDTH, RATE>,
+    bits: usize,
+    max_chunk: u64,
+    scope: &TaskScope,
+) -> (F, u64)
+where
+    F: PrimeField64 + PrimeField31 + PrimeField32 + Send + Sync,
+    PF: PrimeField + Field + Send + Sync,
+    P: CryptographicPermutation<[PF; WIDTH]> + Send + Sync,
+{
     let cpu_challenger: MultiField32Challenger<F, PF, _> = challenger.clone().into();
 
     let mut result = DeviceBuffer::with_capacity_in(1, scope.clone());
@@ -152,18 +196,38 @@ where
     let grid_dim: usize = target_threads.div_ceil(block_dim).max(1);
     let n = F::ORDER_U64;
 
+    // Bounded ranges, the next launched only if the last found nothing, as in
+    // `grind_duplex_challenger_on_device`. One launch over all of [0, n) swept the whole field on
+    // an MI300X whatever the witness (8.0 s for a 12-bit grind, 2.0 s for a 22-bit one), since the
+    // finder's wave set the found flag only after sweeping its whole share.
+    const CANDIDATES_PER_THREAD: u64 = 4;
+    let chunk = ((grid_dim * block_dim) as u64 * CANDIDATES_PER_THREAD).min(max_chunk).max(1);
     unsafe {
         result.assume_init();
-        let args = args!(
-            gpu_challenger.as_mut_raw(),
-            result.as_mut_ptr(),
-            bits,
-            n,
-            found_flag.as_mut_ptr() as *mut bool
-        );
-        scope
-            .launch_kernel(multi_field32_grind_kernel(), (grid_dim, 1, 1), block_dim, &args, 0)
-            .unwrap();
+    }
+    let mut start = 0u64;
+    let mut launches = 0u64;
+    loop {
+        let end = (start + chunk).min(n);
+        unsafe {
+            let args = args!(
+                gpu_challenger.as_mut_raw(),
+                result.as_mut_ptr(),
+                bits,
+                start,
+                end,
+                found_flag.as_mut_ptr() as *mut bool
+            );
+            scope
+                .launch_kernel(multi_field32_grind_kernel(), (grid_dim, 1, 1), block_dim, &args, 0)
+                .unwrap();
+        }
+        launches += 1;
+        let found = found_flag.to_host().unwrap()[0] != 0;
+        if found || end == n {
+            break;
+        }
+        start = end;
     }
 
     // Copy result back to host synchronously
@@ -175,7 +239,7 @@ where
     // challenger, and the CPU version of the challenger does this as well. It's also necessary
     // for the security of the protocol.
     assert!(challenger.check_witness(bits, witness));
-    witness
+    (witness, launches)
 }
 
 #[cfg(test)]
@@ -221,6 +285,50 @@ mod tests {
                 assert!(original_challenger_2.input_buffer == challenger_2.input_buffer);
                 assert!(original_challenger_2.output_buffer == challenger_2.output_buffer);
             }
+        })
+        .unwrap();
+    }
+
+    /// The KoalaBear grind over several chunks, as `test_grinding_multi_field32_multi_chunk` in
+    /// sp1-gpu-basefold.
+    #[test]
+    fn test_grinding_multi_chunk() {
+        const CHUNK: u64 = 8;
+        sp1_gpu_cudart::run_sync_in_place(|t| {
+            let mut multi_chunk_grinds = 0;
+            for bits in 1..16 {
+                let mut challenger = KoalaBearDuplexChallenger::new(inner_perm());
+                for j in 0..3 {
+                    challenger.observe(KoalaBear::from_canonical_u32(bits as u32 * 3 + j));
+                }
+                let original = challenger.clone();
+                let (witness, launches) = grind_duplex_challenger_on_device_chunked(
+                    &mut challenger,
+                    bits,
+                    koala_bear_grind_kernel,
+                    CHUNK,
+                    &t,
+                );
+
+                // The witness comes from the last launch's range, and no earlier range holds one.
+                let w = witness.as_canonical_u64();
+                assert!(
+                    (launches - 1) * CHUNK <= w && w < launches * CHUNK,
+                    "{bits}: {w} {launches}"
+                );
+                for c in 0..(launches - 1) * CHUNK {
+                    let candidate = KoalaBear::from_canonical_u64(c);
+                    assert!(!original.clone().check_witness(bits, candidate), "{bits}: missed {c}");
+                }
+
+                let mut expected = original.clone();
+                assert!(expected.check_witness(bits, witness));
+                assert!(expected.sponge_state == challenger.sponge_state);
+                assert!(expected.input_buffer == challenger.input_buffer);
+                assert!(expected.output_buffer == challenger.output_buffer);
+                multi_chunk_grinds += (launches > 1) as usize;
+            }
+            assert!(multi_chunk_grinds > 0);
         })
         .unwrap();
     }

@@ -123,3 +123,62 @@ fn test_write_syscall_to_hint() {
 
     run_test(backend);
 }
+
+/// Runs `program` to the end in chunks, checking that each chunk starts where the previous one
+/// ended. Returns the executor, the number of chunks and all the chunks' memory reads.
+fn run_in_chunks(
+    program: &std::sync::Arc<crate::Program>,
+    max_chunk_cycles: Option<u64>,
+) -> (super::MinimalExecutor<crate::SupervisorMode>, usize, Vec<sp1_jit::MemValue>) {
+    use bincode::serialize;
+    use sp1_jit::MinimalTrace;
+
+    // A trace size no chunk reaches, so only the cycles end a chunk.
+    let mut executor =
+        super::MinimalExecutor::<crate::SupervisorMode>::new(program.clone(), false, Some(1 << 22));
+    executor.set_max_chunk_cycles(max_chunk_cycles);
+    executor.with_input(&serialize(&5_usize).unwrap());
+    for i in 0..5 {
+        executor.with_input(&serialize(&vec![i; i]).unwrap());
+    }
+
+    let (mut clk, mut pc, mut registers) = (1, program.pc_start_abs, executor.registers());
+    let (mut num_chunks, mut mem_reads) = (0, Vec::new());
+    while let Some(chunk) = executor.execute_chunk() {
+        assert_eq!(chunk.clk_start(), clk, "chunk {num_chunks} clk_start mismatch");
+        assert_eq!(chunk.pc_start(), pc, "chunk {num_chunks} pc_start mismatch");
+        assert_eq!(chunk.start_registers(), registers, "chunk {num_chunks} registers mismatch");
+        mem_reads.extend(chunk.mem_reads());
+        (clk, pc, registers) = (chunk.clk_end(), executor.pc(), executor.registers());
+        num_chunks += 1;
+    }
+    (executor, num_chunks, mem_reads)
+}
+
+#[test]
+fn test_chunks_by_cycles_execute_the_same() {
+    use test_artifacts::{KECCAK256_ELF, SSZ_WITHDRAWALS_ELF};
+
+    for elf in [&KECCAK256_ELF, &SSZ_WITHDRAWALS_ELF] {
+        let program = std::sync::Arc::new(crate::Program::from(elf).unwrap());
+        let (whole, one_chunk, expected_reads) = run_in_chunks(&program, None);
+        let (chunked, num_chunks, mem_reads) = run_in_chunks(&program, Some(1 << 12));
+
+        assert_eq!(one_chunk, 1);
+        assert!(
+            num_chunks as u64 > whole.global_clk() >> 13,
+            "{num_chunks} chunks for {} cycles",
+            whole.global_clk()
+        );
+        assert!(chunked.is_done());
+        assert_eq!(chunked.pc(), whole.pc());
+        assert_eq!(chunked.clk(), whole.clk());
+        assert_eq!(chunked.global_clk(), whole.global_clk());
+        assert_eq!(chunked.registers(), whole.registers());
+        assert_eq!(chunked.exit_code(), whole.exit_code());
+        assert_eq!(chunked.public_values_stream(), whole.public_values_stream());
+        assert_eq!(chunked.public_value_digest(), whole.public_value_digest());
+        assert_eq!(chunked.hints(), whole.hints());
+        assert!(mem_reads == expected_reads, "the memory reads differ");
+    }
+}

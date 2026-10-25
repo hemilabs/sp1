@@ -11,6 +11,7 @@ package sp1
 /*
 #include <stdint.h>
 #include <stddef.h>
+#include <stdlib.h>
 
 typedef int32_t (*sp1_g16_msm_fn)(void* out, const void* points, const void* scalars, size_t n);
 typedef int32_t (*sp1_g16_h_fn)(void* h, const void* a, const void* b, const void* c, size_t n_in,
@@ -25,6 +26,27 @@ static int32_t sp1_g16_call_h(uintptr_t f, void* h, const void* a, const void* b
                               size_t n_in, uint32_t lg, const void* consts) {
 	return ((sp1_g16_h_fn)f)(h, a, b, c, n_in, lg, consts);
 }
+
+// The GPU R1CS solver (sp1-gpu's sp1_r1cs_solver_create, _solve and _destroy).
+typedef void* (*sp1_r1cs_create_fn)(const char* prep_dir, uint64_t* n_wires,
+                                    uint64_t* n_constraints);
+typedef int (*sp1_r1cs_solve_fn)(void* h, const void* wires_initial, void* wires_out, void* a,
+                                 void* b, void* c);
+typedef void (*sp1_r1cs_destroy_fn)(void* h);
+
+static void* sp1_g16_call_r1cs_create(uintptr_t f, const char* prep_dir, uint64_t* n_wires,
+                                      uint64_t* n_constraints) {
+	return ((sp1_r1cs_create_fn)f)(prep_dir, n_wires, n_constraints);
+}
+
+static int sp1_g16_call_r1cs_solve(uintptr_t f, void* h, const void* wires_initial,
+                                   void* wires_out, void* a, void* b, void* c) {
+	return ((sp1_r1cs_solve_fn)f)(h, wires_initial, wires_out, a, b, c);
+}
+
+static void sp1_g16_call_r1cs_destroy(uintptr_t f, void* h) {
+	((sp1_r1cs_destroy_fn)f)(h);
+}
 */
 import "C"
 
@@ -35,6 +57,7 @@ import (
 	"os"
 	"runtime"
 	"sort"
+	"sync"
 	"time"
 	"unsafe"
 
@@ -55,13 +78,166 @@ import (
 
 var gpuHooks struct {
 	computeH, msmG1, msmG2 uintptr
+	totalMemory            uint64
 }
 
-// SetGpuHooks registers the GPU's computeH and MSM entry points (C function pointers; 0 unsets).
-func SetGpuHooks(computeH, msmG1, msmG2 uintptr) {
+// SetGpuHooks registers the GPU's computeH and MSM entry points (C function pointers; 0 unsets),
+// and the GPU's total memory in bytes (0 if unknown).
+func SetGpuHooks(computeH, msmG1, msmG2 uintptr, totalMemory uint64) {
 	gpuHooks.computeH = computeH
 	gpuHooks.msmG1 = msmG1
 	gpuHooks.msmG2 = msmG2
+	gpuHooks.totalMemory = totalMemory
+}
+
+// g2MsmOnCpu: whether the G2 MSM runs on the CPU, alongside the G1 MSMs on the GPU, rather than
+// on the GPU after them. SP1_GROTH16_G2_ON_CPU=0 runs it on the GPU and any other value on the
+// CPU. By default it runs on the CPU, where that took about as long as the G1 MSMs (~3 s each on
+// a Radeon RX 9070 XT or an Arc Pro B70, whose G2 MSM takes ~2.7 s more), except on cards of
+// 64 GiB or more and on hosts with fewer than 16 CPUs: on an MI300X with 13 vCPUs the CPU G2 MSM
+// took 6.7-6.9 s and the GPU's 0.58 s (Groth16 proofs 16-18% faster on the GPU).
+func g2MsmOnCpu() bool {
+	if v, ok := os.LookupEnv("SP1_GROTH16_G2_ON_CPU"); ok {
+		return v != "0"
+	}
+	return gpuHooks.totalMemory < 64<<30 && runtime.NumCPU() >= 16
+}
+
+// gpuR1cs is the GPU R1CS solver the host registered (SetGpuR1csSolver) and the directory of
+// the circuit data it reads (SetGpuR1csPrepDir, `r1cs_solve_plan prep-circuit-prod`'s output).
+var gpuR1cs struct {
+	sync.Mutex
+	create, solve, destroy uintptr
+	prepDir                string
+}
+
+// SetGpuR1csSolver registers the GPU R1CS solver's entry points (C function pointers; 0 unsets).
+// The solver kept from earlier proofs goes: destroyed, unless this unregisters the solver, which
+// gnark-ffi does after a device reset, when its memory is gone with the device's state.
+func SetGpuR1csSolver(create, solve, destroy uintptr) {
+	gpuR1cs.Lock()
+	gpuR1cs.create, gpuR1cs.solve, gpuR1cs.destroy = create, solve, destroy
+	gpuR1cs.Unlock()
+	if create == 0 {
+		gpuR1csKept.Lock()
+		gpuR1csKept.h, gpuR1csKept.key = nil, ""
+		gpuR1csKept.Unlock()
+		return
+	}
+	ReleaseGpuR1csSolver()
+}
+
+// gpuR1csKept is the solver gpuSolveR1cs created, with its circuit data (~3 GB on the GPU) and
+// buffers (~2 GB), kept for the next proofs where keepGpuR1csSolver says so: creating it took
+// 2.0-2.3 s of each proof on an MI300X. key names the circuit data it read (gpuR1csPrepKey). Its
+// device memory comes from the prover's allocator, out of the device memory arena where there is
+// one, so it does not take the arena's headroom, which kernel scratch needs. The lock is held
+// through each solve: the solver has one set of buffers.
+var gpuR1csKept struct {
+	sync.Mutex
+	h       unsafe.Pointer
+	destroy uintptr
+	key     string
+}
+
+// ReleaseGpuR1csSolver destroys the solver kept between proofs, if any, giving its device memory
+// back (with the other device caches the host empties).
+func ReleaseGpuR1csSolver() {
+	gpuR1csKept.Lock()
+	defer gpuR1csKept.Unlock()
+	if gpuR1csKept.h != nil {
+		C.sp1_g16_call_r1cs_destroy(C.uintptr_t(gpuR1csKept.destroy), gpuR1csKept.h)
+	}
+	gpuR1csKept.h, gpuR1csKept.key = nil, ""
+}
+
+// keepGpuR1csSolver: whether the GPU R1CS solver stays on the GPU between proofs.
+// SP1_GPU_R1CS_KEEP=0 destroys it after each solve and any other value keeps it; by default it is
+// kept on cards of 64 GiB or more, where its ~5 GB are a small part of the arena.
+func keepGpuR1csSolver() bool {
+	if v, ok := os.LookupEnv("SP1_GPU_R1CS_KEEP"); ok {
+		return v != "0"
+	}
+	return gpuHooks.totalMemory >= 64<<30
+}
+
+// gpuR1csPrepKey identifies the circuit data in prepDir: the directory and the size and
+// modification time of each file the solver reads, so that data rebuilt in place, for another
+// circuit, is read again. "" if a file cannot be read (the solver is then not kept).
+func gpuR1csPrepKey(prepDir string) string {
+	key := prepDir
+	for _, name := range []string{"circuit_meta.txt", "coeffs.bin", "layers_descs.bin",
+		"layers_terms.bin", "layers.idx", "hints.idx", "layers_hints.bin", "hint_in_les.bin",
+		"desc_decl_idx.bin"} {
+		info, err := os.Stat(prepDir + "/" + name)
+		if err != nil {
+			return ""
+		}
+		key += fmt.Sprintf("|%s:%d:%d", name, info.Size(), info.ModTime().UnixNano())
+	}
+	return key
+}
+
+// SetGpuR1csPrepDir names the GPU R1CS solver's circuit data for the next proofs ("" for none:
+// gnark then solves on the CPU).
+func SetGpuR1csPrepDir(dir string) {
+	gpuR1cs.Lock()
+	defer gpuR1cs.Unlock()
+	gpuR1cs.prepDir = dir
+}
+
+// gpuSolveBufs holds the GPU R1CS solve's host buffers between proofs (about 2.5 GB for the
+// SP1 circuit): fresh Go heap pages cost proofs 2+ a page fault each on the first write, as no
+// GC runs between proofs to recycle the last proof's. The initial wires are only ever written
+// in their first nbInputs entries, so the rest stays zero for the next proof.
+var gpuSolveBufs struct {
+	sync.Mutex
+	nbInputs   int
+	wires      []fr.Element
+	w, a, b, c fr.Vector
+}
+
+// takeGpuSolveBufs returns the initial wires (ONE, then vec, then zeros) and the vectors for the
+// solution, the kept ones where their sizes match and fresh ones otherwise.
+func takeGpuSolveBufs(vec fr.Vector, nbWires, nbConstraints int) ([]fr.Element, *cs.R1CSSolution) {
+	nbInputs := len(vec) + 1
+	gpuSolveBufs.Lock()
+	wires := gpuSolveBufs.wires
+	if len(wires) != nbWires || gpuSolveBufs.nbInputs != nbInputs {
+		wires = make([]fr.Element, nbWires)
+	}
+	solution := &cs.R1CSSolution{W: gpuSolveBufs.w, A: gpuSolveBufs.a, B: gpuSolveBufs.b, C: gpuSolveBufs.c}
+	gpuSolveBufs.wires, gpuSolveBufs.w, gpuSolveBufs.a, gpuSolveBufs.b, gpuSolveBufs.c = nil, nil, nil, nil, nil
+	gpuSolveBufs.Unlock()
+	if len(solution.W) != nbWires {
+		solution.W = make(fr.Vector, nbWires)
+	}
+	for _, v := range []*fr.Vector{&solution.A, &solution.B, &solution.C} {
+		if len(*v) != nbConstraints {
+			*v = make(fr.Vector, nbConstraints)
+		}
+	}
+	wires[0].SetOne()
+	copy(wires[1:], vec)
+	return wires, solution
+}
+
+// putGpuSolveBufs keeps the buffers takeGpuSolveBufs returned for the next proof. Nothing may
+// use them after.
+func putGpuSolveBufs(wires []fr.Element, nbInputs int, w, a, b, c fr.Vector) {
+	gpuSolveBufs.Lock()
+	defer gpuSolveBufs.Unlock()
+	gpuSolveBufs.nbInputs = nbInputs
+	gpuSolveBufs.wires, gpuSolveBufs.w, gpuSolveBufs.a, gpuSolveBufs.b, gpuSolveBufs.c = wires, w, a, b, c
+}
+
+// dropGpuSolveBufs lets the GC have the kept buffers (ReleaseCaches, TrimCaches), so a process
+// that hands its Groth16 memory back to the host does not keep them.
+func dropGpuSolveBufs() {
+	gpuSolveBufs.Lock()
+	defer gpuSolveBufs.Unlock()
+	gpuSolveBufs.nbInputs = 0
+	gpuSolveBufs.wires, gpuSolveBufs.w, gpuSolveBufs.a, gpuSolveBufs.b, gpuSolveBufs.c = nil, nil, nil, nil, nil
 }
 
 // useGpuProver: hooks registered, and not turned off with SP1_GROTH16_GPU=0.
@@ -240,13 +416,22 @@ func proveGroth16Gpu(r1cs *cs.R1CS, pk *groth16_bn254.ProvingKey, fullWitness wi
 	}))
 
 	start := time.Now()
-	_solution, err := r1cs.Solve(fullWitness, solverOpts...)
-	if err != nil {
-		return nil, err
+	// On the GPU where the host registered its solver, but not with BSB22 commitments, whose hint
+	// (above) it does not run.
+	var solution *cs.R1CSSolution
+	var releaseSolution func()
+	if len(commitmentInfo) == 0 {
+		solution, releaseSolution = gpuSolveR1cs(r1cs, fullWitness)
+	}
+	if solution == nil {
+		_solution, err := r1cs.Solve(fullWitness, solverOpts...)
+		if err != nil {
+			return nil, err
+		}
+		solution = _solution.(*cs.R1CSSolution)
 	}
 	fmt.Printf("Solving the constraint system took %s\n", time.Since(start))
 
-	solution := _solution.(*cs.R1CSSolution)
 	wireValues := []fr.Element(solution.W)
 
 	start = time.Now()
@@ -345,10 +530,9 @@ func proveGroth16Gpu(r1cs *cs.R1CS, pk *groth16_bn254.ProvingKey, fullWitness wi
 	// computes r[δ], s[δ], kr[δ]
 	deltas := curve.BatchScalarMultiplicationG1(&pk.G1.Delta, []fr.Element{_r, _s, _kr})
 
-	// The G2 MSM on the CPU while the GPU does the G1 ones: about as long as those on a Radeon
-	// RX 9070 XT or an Arc Pro B70 (~3 s each), where the G2 MSM on the GPU after them takes
-	// ~2.7 s more. SP1_GROTH16_G2_ON_CPU=0 runs it on the GPU.
-	g2OnCpu := os.Getenv("SP1_GROTH16_G2_ON_CPU") != "0"
+	// The G2 MSM on the CPU while the GPU does the G1 ones, or on the GPU after them (see
+	// g2MsmOnCpu).
+	g2OnCpu := g2MsmOnCpu()
 	var Bs curve.G2Jac
 	chBs := make(chan error, 1)
 	if g2OnCpu {
@@ -418,7 +602,130 @@ func proveGroth16Gpu(r1cs *cs.R1CS, pk *groth16_bn254.ProvingKey, fullWitness wi
 	fmt.Printf("MSMs took %s\n", time.Since(tMsm))
 
 	fmt.Printf("GPU prover (after solving) took %s\n", time.Since(start))
+	// Everything that read the wire values is done (the goroutines above were waited for).
+	if releaseSolution != nil {
+		releaseSolution()
+	}
 	return proof, nil
+}
+
+// gpuSolveR1cs is r1cs.Solve on the GPU R1CS solver the host registered, reading the circuit
+// data SetGpuR1csPrepDir named: the wire values, and A, B and C, all in gnark's Montgomery form.
+// nil, after saying why, where there is no solver or data, or the solve fails; the caller then
+// solves with gnark. The solver checks the constraints it does not solve for, and the proof is
+// checked against the verifying key before it is used (proveGroth16OnGpu). The solution's
+// vectors are kept for the next proof by the func returned with it, once nothing uses them.
+func gpuSolveR1cs(r1cs *cs.R1CS, fullWitness witness.Witness) (*cs.R1CSSolution, func()) {
+	gpuR1cs.Lock()
+	create, solve, destroy, prepDir := gpuR1cs.create, gpuR1cs.solve, gpuR1cs.destroy, gpuR1cs.prepDir
+	gpuR1cs.Unlock()
+	if create == 0 || solve == 0 || destroy == 0 || prepDir == "" ||
+		os.Getenv("SP1_GPU_R1CS_SOLVER") == "cpu" {
+		return nil, nil
+	}
+	vec, ok := fullWitness.Vector().(fr.Vector)
+	if !ok {
+		return nil, nil
+	}
+	// The wires as gnark's solver starts them: the constant ONE, the witness, then the rest
+	// zero, for the solver to fill in.
+	nbInputs := r1cs.GetNbPublicVariables() + r1cs.GetNbSecretVariables()
+	nbWires := nbInputs + r1cs.GetNbInternalVariables()
+	nbConstraints := r1cs.GetNbConstraints()
+	if len(vec) != nbInputs-1 || nbConstraints == 0 {
+		fmt.Printf("GPU R1CS solver: witness of %d for %d inputs, solving on the CPU\n", len(vec), nbInputs)
+		return nil, nil
+	}
+
+	start := time.Now()
+	keep := keepGpuR1csSolver()
+	key := ""
+	if keep {
+		key = gpuR1csPrepKey(prepDir)
+	}
+	gpuR1csKept.Lock()
+	defer gpuR1csKept.Unlock()
+	h := gpuR1csKept.h
+	reused := h != nil
+	if h != nil && (key == "" || key != gpuR1csKept.key || destroy != gpuR1csKept.destroy) {
+		// Another circuit's data, or not kept any more.
+		C.sp1_g16_call_r1cs_destroy(C.uintptr_t(gpuR1csKept.destroy), h)
+		h, reused = nil, false
+	}
+	gpuR1csKept.h, gpuR1csKept.key = nil, ""
+	if h == nil {
+		cDir := C.CString(prepDir)
+		defer C.free(unsafe.Pointer(cDir))
+		var nW, nC C.uint64_t
+		h = C.sp1_g16_call_r1cs_create(C.uintptr_t(create), cDir, &nW, &nC)
+		if h == nil {
+			fmt.Printf("GPU R1CS solver: no solver for %s, solving on the CPU\n", prepDir)
+			return nil, nil
+		}
+		if int(nW) != nbWires || int(nC) != nbConstraints {
+			C.sp1_g16_call_r1cs_destroy(C.uintptr_t(destroy), h)
+			fmt.Printf("GPU R1CS solver: %s has %d wires and %d constraints, the circuit %d and %d; solving on the CPU\n",
+				prepDir, uint64(nW), uint64(nC), nbWires, nbConstraints)
+			return nil, nil
+		}
+	}
+	// Kept for the next proof only once it has solved this one. Otherwise its circuit data and
+	// buffers go back as soon as the solve is done, for the MSMs.
+	solved := false
+	defer func() {
+		if solved && keep && key != "" {
+			gpuR1csKept.h, gpuR1csKept.destroy, gpuR1csKept.key = h, destroy, key
+		} else {
+			C.sp1_g16_call_r1cs_destroy(C.uintptr_t(destroy), h)
+		}
+	}()
+	setup := time.Since(start)
+
+	wires, solution := takeGpuSolveBufs(vec, nbWires, nbConstraints)
+	w, a, b, c := solution.W, solution.A, solution.B, solution.C
+	release := func() { putGpuSolveBufs(wires, nbInputs, w, a, b, c) }
+	rc := C.sp1_g16_call_r1cs_solve(C.uintptr_t(solve), h, unsafe.Pointer(&wires[0]),
+		unsafe.Pointer(&solution.W[0]), unsafe.Pointer(&solution.A[0]),
+		unsafe.Pointer(&solution.B[0]), unsafe.Pointer(&solution.C[0]))
+	if rc != 0 {
+		fmt.Printf("GPU R1CS solver failed (%d), solving on the CPU\n", int(rc))
+		release()
+		return nil, nil
+	}
+	solved = true
+	// The solver gives A, B and C in canonical form.
+	toMontgomery(solution.A, solution.B, solution.C)
+	if reused {
+		fmt.Printf("GPU R1CS solve took %s (setup %s, solver kept from an earlier proof)\n",
+			time.Since(start), setup)
+	} else {
+		fmt.Printf("GPU R1CS solve took %s (setup %s)\n", time.Since(start), setup)
+	}
+	return solution, release
+}
+
+// toMontgomery converts the canonical values in the vectors to gnark's Montgomery form, in
+// place, on all cores: x·(R² mod q)·R⁻¹ = x·R.
+func toMontgomery(vectors ...fr.Vector) {
+	// The element whose value is R = 2^256 mod q holds R² mod q.
+	var rSquare fr.Element
+	rSquare.SetBigInt(new(big.Int).Lsh(big.NewInt(1), 256))
+	nbTasks := runtime.NumCPU()
+	var wg sync.WaitGroup
+	for _, v := range vectors {
+		chunk := (len(v) + nbTasks - 1) / nbTasks
+		for lo := 0; lo < len(v); lo += chunk {
+			hi := min(lo+chunk, len(v))
+			wg.Add(1)
+			go func(part []fr.Element) {
+				defer wg.Done()
+				for i := range part {
+					part[i].Mul(&part[i], &rSquare)
+				}
+			}(v[lo:hi])
+		}
+	}
+	wg.Wait()
 }
 
 // concatAll concatenates slices (gnark's internal.ConcatAll).
@@ -496,6 +803,8 @@ func proveGroth16OnGpu(
 	}
 	if err := groth16.Verify(proof, vk, publicWitness); err != nil {
 		fmt.Printf("GPU Groth16 proof does not verify (%v), proving on the CPU\n", err)
+		// The next proof creates the GPU R1CS solver anew rather than trust the one kept.
+		ReleaseGpuR1csSolver()
 		return nil
 	}
 	fmt.Printf("Verifying the GPU proof took %s\n", time.Since(start))

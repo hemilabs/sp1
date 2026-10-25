@@ -240,6 +240,10 @@ pub struct JitFunction<M> {
     pub public_value_digest: [u32; context::PUBLIC_VALUE_DIGEST_WORDS],
 
     pub debug_sender: Option<mpsc::SyncSender<Option<debug::State>>>,
+
+    /// The most cycles a tracing call runs before it ends its trace chunk. See
+    /// [`JitFunction::set_max_chunk_cycles`].
+    max_chunk_cycles: Option<u64>,
 }
 
 unsafe impl<M: Send> Send for JitFunction<M> {}
@@ -275,7 +279,18 @@ impl<M: JitMemory> JitFunction<M> {
             debug_sender: None,
             exit_code: 0,
             public_value_digest: [0; context::PUBLIC_VALUE_DIGEST_WORDS],
+            max_chunk_cycles: None,
         })
+    }
+
+    /// Also end a tracing call's trace chunk once it has run `cycles` cycles, not only when its
+    /// trace buffer is full, so a compute-bound program yields its first chunk early.
+    ///
+    /// The chunk ends at the first backward or indirect jump (or ecall) at or after `cycles`
+    /// cycles, and never inside an unconstrained block. Execution is unchanged: only where the
+    /// trace is split differs. `None` (the default) splits on the trace size only.
+    pub fn set_max_chunk_cycles(&mut self, cycles: Option<u64>) {
+        self.max_chunk_cycles = cycles;
     }
 
     /// Write the initial memory image to the JIT memory.
@@ -363,6 +378,10 @@ impl<M: JitMemory> JitFunction<M> {
             clk: self.clk,
             global_clk: self.global_clk,
             is_unconstrained: 0,
+            chunk_global_clk_limit: match self.max_chunk_cycles {
+                Some(cycles) if tracing => self.global_clk.saturating_add(cycles),
+                _ => u64::MAX,
+            },
             tracing,
             debug_sender: self.debug_sender.clone(),
             exit_code: self.exit_code,

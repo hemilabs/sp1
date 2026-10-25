@@ -92,6 +92,12 @@ const CLK_OFFSET: i32 = offset_of!(JitContext, clk) as i32;
 /// The offset of the global clk in the JitContext.
 const GLOBAL_CLK_OFFSET: i32 = offset_of!(JitContext, global_clk) as i32;
 
+/// The offset of the chunk's global clk limit in the JitContext.
+const CHUNK_GLOBAL_CLK_LIMIT_OFFSET: i32 = offset_of!(JitContext, chunk_global_clk_limit) as i32;
+
+/// The offset of `is_unconstrained` in the JitContext.
+const IS_UNCONSTRAINED_OFFSET: i32 = offset_of!(JitContext, is_unconstrained) as i32;
+
 /// The offset of the memory pointer in the JitContext.
 const MEMORY_PTR_OFFSET: i32 = offset_of!(JitContext, memory) as i32;
 
@@ -239,8 +245,6 @@ impl TraceCollector for TranspilerBackend {
 
     /// Write the value at [rs1 + imm] into the trace buffer.
     fn trace_mem_value(&mut self, rs1: RiscRegister, imm: u64) {
-        const IS_UNCONSTRAINED_OFFSET: i32 = offset_of!(JitContext, is_unconstrained) as i32;
-
         // Load the value, assumed to be of a memory read, into TEMP_A.
         self.emit_risc_operand_load(rs1.into(), TEMP_A);
 
@@ -343,7 +347,11 @@ impl TranspilerBackend {
         self.max_trace_size > 0
     }
 
-    fn exit_if_trace_exceeds(&mut self, max_trace_size: u64) {
+    /// Exit if the trace has `max_trace_size` memory reads, setting the pc to `exit_pc` first.
+    ///
+    /// `exit_pc` is `None` after a control flow instruction, which has already written the next
+    /// pc (a branch target, or the pc an ecall handler set) to the context.
+    fn exit_if_trace_exceeds(&mut self, max_trace_size: u64, exit_pc: Option<u64>) {
         // For now, only tracing can trigger early exit
         if !self.tracing() {
             return;
@@ -369,7 +377,9 @@ impl TranspilerBackend {
         }
 
         // Set PC address before exiting
-        self.update_pc(TEMP_A, self.pc_current + 4);
+        if let Some(exit_pc) = exit_pc {
+            self.update_pc(TEMP_A, exit_pc);
+        }
         dynasm! {
             self;
             .arch x64;
@@ -377,6 +387,32 @@ impl TranspilerBackend {
             jmp ->exit;
 
             done:
+        }
+    }
+
+    /// Exit if the chunk has reached its global clk limit, unless in unconstrained mode.
+    ///
+    /// Only called at the end of a control flow instruction, which has already written the next
+    /// pc to the context. An unconstrained block cannot be split: `JitFunction::call` starts each
+    /// call constrained.
+    fn exit_if_chunk_cycles_exceeded(&mut self) {
+        if !self.tracing() {
+            return;
+        }
+
+        dynasm! {
+            self;
+            .arch x64;
+
+            mov Rq(TEMP_A), QWORD [Rq(CONTEXT) + CHUNK_GLOBAL_CLK_LIMIT_OFFSET];
+            cmp Rq(GLOBAL_CLK), Rq(TEMP_A);
+            jb >chunk_continue;
+            mov Rq(TEMP_A), QWORD [Rq(CONTEXT) + IS_UNCONSTRAINED_OFFSET];
+            cmp Rq(TEMP_A), 0;
+            jne >chunk_continue;
+            jmp ->exit;
+
+            chunk_continue:
         }
     }
 
@@ -899,7 +935,13 @@ impl TranspilerBackend {
         // If we have a control flow instruction that may early exit, we need to check if the
         // trace size has been exceeded.
         if self.may_early_exit {
-            self.exit_if_trace_exceeds(self.max_trace_size);
+            self.exit_if_trace_exceeds(self.max_trace_size, None);
+        }
+
+        // A loop must jump backward, jump indirectly or ecall, so checking the chunk's cycles
+        // there bounds every chunk, at no cost on forward jumps.
+        if jump_target.is_none_or(|target| target <= self.pc_current) {
+            self.exit_if_chunk_cycles_exceeded();
         }
 
         let mut handled = false;

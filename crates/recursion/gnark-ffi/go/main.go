@@ -194,11 +194,37 @@ func groth16ProofToC(proof sp1.Proof) *C.C_Groth16Bn254Proof {
 }
 
 // SetGroth16GpuHooks registers the host's GPU entry points for the Groth16 prover (C function
-// pointers, see sp1/groth16_gpu.go; zeros unregister them).
+// pointers, see sp1/groth16_gpu.go; zeros unregister them) and the GPU's total memory in bytes (0
+// if unknown).
 //
 //export SetGroth16GpuHooks
-func SetGroth16GpuHooks(computeH C.uintptr_t, msmG1 C.uintptr_t, msmG2 C.uintptr_t) {
-	sp1.SetGpuHooks(uintptr(computeH), uintptr(msmG1), uintptr(msmG2))
+func SetGroth16GpuHooks(computeH C.uintptr_t, msmG1 C.uintptr_t, msmG2 C.uintptr_t, totalMemory C.uint64_t) {
+	sp1.SetGpuHooks(uintptr(computeH), uintptr(msmG1), uintptr(msmG2), uint64(totalMemory))
+}
+
+// SetGroth16GpuR1csSolver registers the host's GPU R1CS solver for the Groth16 prover (C function
+// pointers for sp1_r1cs_solver_create, _solve and _destroy; zeros unregister it). It solves where
+// SetGroth16R1csPrepDir names its circuit data.
+//
+//export SetGroth16GpuR1csSolver
+func SetGroth16GpuR1csSolver(create C.uintptr_t, solve C.uintptr_t, destroy C.uintptr_t) {
+	sp1.SetGpuR1csSolver(uintptr(create), uintptr(solve), uintptr(destroy))
+}
+
+// ReleaseGroth16GpuR1csSolver destroys the GPU R1CS solver kept between Groth16 proofs, if any,
+// giving its device memory back.
+//
+//export ReleaseGroth16GpuR1csSolver
+func ReleaseGroth16GpuR1csSolver() {
+	sp1.ReleaseGpuR1csSolver()
+}
+
+// SetGroth16R1csPrepDir names the GPU R1CS solver's circuit data (`r1cs_solve_plan
+// prep-circuit-prod`'s output) for the next Groth16 proofs; empty for none.
+//
+//export SetGroth16R1csPrepDir
+func SetGroth16R1csPrepDir(dir *C.char) {
+	sp1.SetGpuR1csPrepDir(C.GoString(dir))
 }
 
 //export FreeGroth16Bn254Proof
