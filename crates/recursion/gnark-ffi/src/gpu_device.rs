@@ -158,13 +158,19 @@ pub fn free_memory() -> Option<u64> {
 /// synchronizes the device (waiting for its outstanding work) and trims the pool to zero. Live
 /// allocations are untouched; the next proof grows the pool again. The device caches (the GPU
 /// prover's preprocessed data, which later proofs reuse) go only if the helper still lacks room,
-/// and not while this process holds an arena (HIP's): what they free goes back to the arena, not
-/// to the driver, so the helper would gain nothing and later proofs would lose the caches.
+/// not while this process holds an arena (HIP's): what they free goes back to the arena, not to
+/// the driver, so the helper would gain nothing and later proofs would lose the caches; and only
+/// if the card is big enough for them to make room: on a card smaller than `needed` (a 16 GB card
+/// and the 23 GiB PLONK helper) the helper is declined anyway, and releasing them would only cost
+/// the next proof its caches.
 pub fn trim_memory_pool(needed: u64) -> Option<(u64, u64)> {
     let before = free_memory()?;
     trim_pool()?;
     let mut after = free_memory()?;
-    if after < needed && crate::device_caches::arena_bytes() == 0 {
+    if after < needed
+        && crate::device_caches::arena_bytes() == 0
+        && total_memory().is_some_and(|total| total >= needed)
+    {
         crate::device_caches::release();
         trim_pool()?;
         after = free_memory()?;

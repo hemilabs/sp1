@@ -1135,11 +1135,12 @@ impl<A: ArtifactClient, C: SP1ProverComponents> SP1RecursionProver<A, C> {
                 // measuring what the helper could get (on an RTX 5090: 4.4 -> 25.5 GB free). A GPU
                 // prover forced on a smaller card needs the room as much: without it, on a 16 GB
                 // RTX 5060 Ti, 3 of 24 G2 MSMs found the card full and took ~90 s instead of 2 s.
-                let forced = matches!(override_env.as_deref(), Some("1" | "true"));
-                if (card_eligible || forced)
-                    && helper_available
-                    && !matches!(override_env.as_deref(), Some("0" | "false"))
-                {
+                let may_use_gpu = match override_env.as_deref() {
+                    Some("1" | "true") => true,
+                    Some("0" | "false") => false,
+                    _ => card_eligible,
+                };
+                if may_use_gpu && helper_available {
                     if let Some((before, after)) = sp1_recursion_gnark_ffi::gpu_trim_memory_pool(
                         super::groth16_backend::GPU_HELPER_VRAM_BYTES,
                     ) {

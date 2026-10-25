@@ -146,6 +146,7 @@ gnark's CPU Groth16 prover peaks at ~16 GiB on the v6.1.0 circuit. So:
 | `SP1_GROTH16_R1CS_CACHE`, `_DISABLE` | beside the circuit directory | Where the stripped circuit (~1.5 GB) is kept; `_DISABLE` (set to anything) turns it off. |
 | `SP1_GROTH16_GPU` | decided per proof | `1`/`true` forces the GPU prover, `0`/`false` the CPU prover. |
 | `SP1_GROTH16_GPU_HELPER` | beside the binary, then `PATH` | `groth16_gpu_helper` (`--features native,cuda`). |
+| `SP1_GROTH16_STREAM_SRS` | on below 20 GiB of GPU memory | `1`/`true`: the GPU prover uploads each G1 point set for its MSM and frees it after, instead of keeping all four (~4 GB) on the card; its peak drops enough to run beside the shard prover on a 16 GB card. `0`/`false` keeps them. |
 | `SP1_GROTH16_PK_CACHE`, `_DISABLE` | `/dev/shm` | The GPU prover's proving key (~9 GB, exported once). |
 | `SP1_GPU_RESET_BEFORE_WRAP` | off | `1`/`true`: reset the GPU before a GPU wrap helper that would not fit otherwise. Only for a process that exits after its proof: after a reset it refuses to prove again. |
 | `GOMEMLIMIT` | set per helper where memory is short | An operator's value is kept, and applies to this process's own Go runtime too. |

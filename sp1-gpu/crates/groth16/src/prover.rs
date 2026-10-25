@@ -181,6 +181,10 @@ pub struct Groth16Prover {
     /// Whether each G1 MSM uploads its points and frees them after ([`stream_g1_srs`]).
     #[cfg(feature = "cuda")]
     stream_g1: bool,
+    /// Which of the four G1 point sets (A, B, K, Z) are registered (pinned) with the runtime,
+    /// which streaming does so that each upload is a DMA; undone in `Drop`.
+    #[cfg(feature = "cuda")]
+    g1_sets_pinned: [bool; 4],
     /// Whether `data.pk_g2_b` is registered (pinned) with the runtime, to undo in `Drop`.
     #[cfg(feature = "cuda")]
     g2_bases_pinned: bool,
@@ -242,7 +246,17 @@ impl Drop for Groth16Prover {
     fn drop(&mut self) {
         // A range freed while still registered fails the next registration over it, in a
         // process that builds another prover.
-        #[cfg(feature = "cuda")]
+        let g1_sets =
+            [&self.data.pk_g1_a, &self.data.pk_g1_b, &self.data.pk_g1_k, &self.data.pk_g1_z];
+        for (set, pinned) in g1_sets.into_iter().zip(&mut self.g1_sets_pinned) {
+            if std::mem::take(pinned) {
+                unsafe {
+                    sp1_gpu_sys::runtime::cuda_host_unregister(
+                        set.as_ptr() as *const std::ffi::c_void
+                    );
+                }
+            }
+        }
         if self.g2_bases_pinned {
             unsafe {
                 sp1_gpu_sys::runtime::cuda_host_unregister(
@@ -326,10 +340,11 @@ fn give_back_pool_memory() {
 
 /// Whether to upload each G1 point set just before its MSM and free it after, rather than keep
 /// all four on the card for the prover's life (~4 GB of points and their MSM buffers for SP1's
-/// circuit). Kept, they save one upload per MSM (~0.1 s each), which pays where a prover makes
-/// several proofs (the helper server) and the card has room; streamed, the helper's peak drops by
-/// about three of them, which a 16 GB card beside a resident shard prover needs. On by default on
-/// cards under 24 GiB; `SP1_GROTH16_STREAM_SRS` = 1/0 decides.
+/// circuit). Kept, they save one upload per MSM and its context's set-up (on HIP with GLV, the
+/// endomorphism expansion too), and the HIP path overlaps each MSM's scalar upload with the one
+/// before; streamed, the helper's peak drops by about three sets, which a 16 GB card beside a
+/// resident shard prover needs (~11 GB free there). On by default on cards under 20 GiB (the
+/// 16 GB tier: a 24 GB card reports just under 24 GiB); `SP1_GROTH16_STREAM_SRS` = 1/0 decides.
 #[cfg(feature = "cuda")]
 fn stream_g1_srs() -> bool {
     match std::env::var("SP1_GROTH16_STREAM_SRS").ok().as_deref().map(str::trim) {
@@ -342,7 +357,7 @@ fn stream_g1_srs() -> bool {
                 sp1_gpu_sys::runtime::cuda_mem_get_info(&mut free, &mut total)
                     == sp1_gpu_sys::runtime::CUDA_SUCCESS_CSL
             };
-            ok && total < 24 << 30
+            ok && total < 20 << 30
         }
     }
 }
@@ -372,7 +387,8 @@ impl Groth16Prover {
     }
 
     /// Create a new Groth16 prover with the given proving data.
-    /// On CUDA, pre-uploads all MSM base-point arrays to GPU.
+    /// On GPU builds, pre-uploads the MSM base-point arrays to the GPU unless the G1 SRS is
+    /// streamed ([`stream_g1_srs`]).
     pub fn new(data: Groth16ProvingData) -> Self {
         #[cfg(feature = "cuda")]
         let stream_g1 = stream_g1_srs();
@@ -413,6 +429,32 @@ impl Groth16Prover {
         // "BN254 MSM invoke failed". The CUDA path keeps using the one-
         // shot g2_msm_gpu (which re-creates/destroys a temporary context
         // per call but doesn't hit the conflict).
+        // Streamed, the G1 point sets are uploaded on every proof: pinned once here, each upload
+        // is a DMA at PCIe speed rather than a copy through a staging buffer. Non-fatal on
+        // failure: a set that could not be pinned uploads pageable. `Drop` unregisters only the
+        // sets registered here (an unregister of any other would leave an error pending).
+        #[cfg(feature = "cuda")]
+        let g1_sets_pinned = if stream_g1 {
+            let t = std::time::Instant::now();
+            let sets = [&data.pk_g1_a, &data.pk_g1_b, &data.pk_g1_k, &data.pk_g1_z];
+            let pinned = sets.map(|set| unsafe {
+                sp1_gpu_sys::runtime::cuda_host_register(
+                    set.as_ptr() as *const std::ffi::c_void,
+                    std::mem::size_of_val(set.as_slice()),
+                ) == sp1_gpu_sys::runtime::CUDA_SUCCESS_CSL
+            });
+            let bytes: usize = sets.iter().map(|set| std::mem::size_of_val(set.as_slice())).sum();
+            if pinned.iter().all(|&p| p) {
+                eprintln!("[groth16] Pinned G1 point sets ({} MB): {:?}", bytes >> 20, t.elapsed());
+            } else {
+                eprintln!(
+                    "[groth16] WARN: pinning G1 point sets failed ({pinned:?}); those upload pageable"
+                );
+            }
+            pinned
+        } else {
+            [false; 4]
+        };
         #[cfg(feature = "cuda")]
         let mut g2_bases_pinned = false;
         #[cfg(feature = "cuda")]
@@ -621,6 +663,8 @@ impl Groth16Prover {
             persistent_g1_z,
             #[cfg(feature = "cuda")]
             stream_g1,
+            #[cfg(feature = "cuda")]
+            g1_sets_pinned,
             #[cfg(feature = "cuda")]
             g2_bases_pinned,
             #[cfg(feature = "cuda")]
@@ -906,8 +950,8 @@ impl Groth16Prover {
         // close the h_join_to_ar gap scope just before the MSM phase begins
         drop(_h_to_ar_gap_scope);
 
-        // 5. MSMs using PersistentMsm (SRS pre-uploaded to GPU at prover init).
-        // Each MSM only uploads per-proof scalars (mont=true, GPU converts).
+        // 5. MSMs using PersistentMsm (SRS pre-uploaded to GPU at prover init, or per MSM when
+        // streamed). Each MSM uploads its per-proof scalars (mont=true, GPU converts).
         // All G1 MSMs first, then G2 — serialized because sppark's gpu_t
         // singleton can't handle concurrent mult_pippenger invocations.
         let t = std::time::Instant::now();
@@ -980,7 +1024,7 @@ impl Groth16Prover {
             // this call: total prove time unchanged (2.95 s).
             let _g = crate::profile::Scope::new("5a_msm_ar");
             let ar_msm =
-                self.g1_ctx(G1Set::A).msm_with_next(&wire_values_a, self.next(&wire_values_b));
+                self.g1_ctx(G1Set::A).msm_with_next(wire_values_a, self.next(wire_values_b));
             let ar = ar_msm.add(&g1_alpha.to_jacobian()).add(&r_delta);
             drop(_g);
             eprintln!(
@@ -993,9 +1037,8 @@ impl Groth16Prover {
             let t = std::time::Instant::now();
             let _g = crate::profile::Scope::new("5b_msm_bs1");
             // Bs1: scalars pre-uploaded during Ar. Pre-upload Krs scalars.
-            let bs1_msm = self
-                .g1_ctx(G1Set::B)
-                .msm_with_next(&wire_values_b, self.next(&filtered_wire_values));
+            let bs1_msm =
+                self.g1_ctx(G1Set::B).msm_with_next(wire_values_b, self.next(filtered_wire_values));
             let bs1 = bs1_msm.add(&g1_beta.to_jacobian()).add(&s_delta);
             drop(_g);
             eprintln!("[T] 5b. Bs1 MSM (N={}): {:?}", wire_values_b.len(), t.elapsed());
@@ -1008,7 +1051,7 @@ impl Groth16Prover {
                 HResult::Host(h) => self.next(&h[..size_h]),
                 HResult::Device(_) => None, // device path doesn't use host upload
             };
-            let krs_msm = self.g1_ctx(G1Set::K).msm_with_next(&filtered_wire_values, krs2_next);
+            let krs_msm = self.g1_ctx(G1Set::K).msm_with_next(filtered_wire_values, krs2_next);
             drop(_g);
             eprintln!("[T] 5c. Krs MSM (N={}): {:?}", filtered_wire_values.len(), t.elapsed());
             g1_msm_ark_verify("Krs", &self.data.pk_g1_k, &filtered_wire_values, &krs_msm);
@@ -1023,7 +1066,7 @@ impl Groth16Prover {
                 HResult::Device(dh) => self.g1_ctx(G1Set::Z).msm_device_with_next(
                     dh.ptr,
                     size_h,
-                    self.next(&wire_values_b),
+                    self.next(wire_values_b),
                 ),
                 HResult::Host(h) => self.g1_ctx(G1Set::Z).msm(&h[..size_h]),
             };
@@ -1123,7 +1166,7 @@ impl Groth16Prover {
                         HotCorrections { corr_b, corr_b2, corr_k }
                     })
                 });
-                let ar_msm = self.g1_ctx(G1Set::A).msm(&wire_values_a);
+                let ar_msm = self.g1_ctx(G1Set::A).msm(wire_values_a);
                 (ar_msm, hot.map(|h| h.join().expect("hot-scalar split panicked")))
             });
             let wire_values_b = self.pinned_b.as_slice();
@@ -1139,8 +1182,10 @@ impl Groth16Prover {
             // produces the same ~4 % residual proof-verify fail rate as the parallel path, so the
             // residual flake (post-Ar-add-safe fix) lives somewhere else.
             // See project_groth16_prover_flake.md.
-            let serialize_g2 =
-                std::env::var("SP1_GROTH16_SERIALIZE_G2").ok().as_deref() != Some("0");
+            // Streamed contexts are created between the G1 MSMs, and each one's drop waits for
+            // the device: G2 runs after them then, whatever SP1_GROTH16_SERIALIZE_G2 says.
+            let serialize_g2 = self.stream_g1
+                || std::env::var("SP1_GROTH16_SERIALIZE_G2").ok().as_deref() != Some("0");
             std::thread::scope(|scope| {
                 // Closure that does the G2 work (extracted so it can run
                 // either in a spawned thread or synchronously on main).
@@ -1175,7 +1220,7 @@ impl Groth16Prover {
                     if serialize_g2 { None } else { Some(scope.spawn(g2_compute)) };
 
                 let t = std::time::Instant::now();
-                let bs1_msm = self.g1_ctx(G1Set::B).msm(&wire_values_b);
+                let bs1_msm = self.g1_ctx(G1Set::B).msm(wire_values_b);
                 let bs1_full = match &hot {
                     Some(h) => bs1_msm.add(&h.corr_b),
                     None => bs1_msm,
@@ -1185,7 +1230,7 @@ impl Groth16Prover {
                 g1_msm_ark_verify("Bs1", &self.data.pk_g1_b, wire_values_b, &bs1_msm);
 
                 let t = std::time::Instant::now();
-                let krs_msm = self.g1_ctx(G1Set::K).msm(&filtered_wire_values);
+                let krs_msm = self.g1_ctx(G1Set::K).msm(filtered_wire_values);
                 eprintln!("[T] 5c. Krs MSM (N={}): {:?}", filtered_wire_values.len(), t.elapsed());
                 g1_msm_ark_verify("Krs", &self.data.pk_g1_k, filtered_wire_values, &krs_msm);
                 let krs_msm = match &hot {
