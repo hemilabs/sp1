@@ -289,7 +289,10 @@ pub async fn cuda_worker_builder_with_machine(
     // HIP runtime library themselves; on Windows it is linked statically, and without these the
     // GPU Groth16 prover was never chosen ("free GPU memory is unknown"), while the GPU PLONK
     // prover's helper was started on any HIP or SYCL card, 16 GB ones too, where it ran the host
-    // out of memory. SYCL has no memory pool to trim, so its trim only waits for the device.
+    // out of memory. HIP and SYCL allocate through their own caching allocator rather than the
+    // memory pool, so their trim gives its cached blocks back instead, the pool's idle reserve on
+    // CUDA: on an RX 9060 XT the pool trim alone freed nothing, and only the device caches'
+    // release, which the next shards then upload again, made room.
     #[cfg(not(target_os = "linux"))]
     {
         sp1_recursion_gnark_ffi::device_caches::set_runtime(
@@ -298,7 +301,14 @@ pub async fn cuda_worker_builder_with_machine(
                     let (free, total) = sp1_gpu_cudart::cuda_memory_info().ok()?;
                     Some((free as u64, total as u64))
                 },
-                trim_memory_pool: || sp1_gpu_cudart::trim_default_mem_pool().is_ok(),
+                trim_memory_pool: || {
+                    if sp1_gpu_cudart::sys::BACKEND != "cuda" {
+                        // SAFETY: takes nothing; waits for the device and frees blocks no one
+                        // holds.
+                        unsafe { sp1_gpu_cudart::sys::runtime::cuda_release_cached_memory() };
+                    }
+                    sp1_gpu_cudart::trim_default_mem_pool().is_ok()
+                },
             },
         );
     }
