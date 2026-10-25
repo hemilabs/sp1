@@ -109,10 +109,10 @@ binary in the directory.
   The image needs `LIBCLANG_PATH=/opt/rocm/llvm/lib`,
   `BINDGEN_EXTRA_CLANG_ARGS="-isystem /opt/rocm/llvm/lib/clang/22/include"` and a `protoc`.
 - `SP1_GPU_BACKEND=hip`, `HIP_ARCHS` and `HIP_VISIBLE_DEVICES` as on Windows (`rocminfo` lists an
-  integrated Ryzen GPU too). `HIP_ARCHS=gfx942` for an Instinct MI300X (CDNA3). Without
-  `HIP_ARCHS`, the build asks `rocm_agent_enumerator` (or `amdgpu-arch`) for the host's GPUs, and
-  without a GPU in sight it builds `gfx1100;gfx1201;gfx942`; set it when building on another host
-  or in a container without `/dev/kfd`, or the binary may hold no code for your card. A kill
+  integrated Ryzen GPU too). An Instinct MI300X (CDNA3) build uses `HIP_ARCHS=gfx942`, or
+  `HIP_ARCHS=native`, which asks `rocm_agent_enumerator` (or `amdgpu-arch`) for the build host's
+  GPUs; such a binary holds code only for those. Without `HIP_ARCHS` the build is a fat binary for
+  `gfx1100;gfx1201;gfx942`, which takes longer to compile. A kill
   timeout for a containerised run belongs inside the container: killing the `docker` client
   leaves the proof running. `bench-fib.sh` takes a directory whose `node` is a script that runs
   the real one in the container.

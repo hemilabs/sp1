@@ -72,3 +72,63 @@ func TestKeepGpuR1csSolver(t *testing.T) {
 		t.Fatal("SP1_GPU_R1CS_KEEP=0 keeps it")
 	}
 }
+
+// The kept GPU R1CS solver is used again only for the same circuit data, solver and sizes: one
+// kept for another circuit, also one with the same circuit data key (the data directory proved
+// before), would write its sizes' wires and constraints into vectors sized for this one.
+func TestGpuR1csKeptFits(t *testing.T) {
+	gpuR1csKept.Lock()
+	defer gpuR1csKept.Unlock()
+	h, destroy, key, nW, nC := gpuR1csKept.h, gpuR1csKept.destroy, gpuR1csKept.key,
+		gpuR1csKept.nW, gpuR1csKept.nC
+	defer func() {
+		gpuR1csKept.h, gpuR1csKept.destroy, gpuR1csKept.key = h, destroy, key
+		gpuR1csKept.nW, gpuR1csKept.nC = nW, nC
+	}()
+	gpuR1csKept.destroy, gpuR1csKept.key, gpuR1csKept.nW, gpuR1csKept.nC = 7, "prep", 100, 90
+	if !gpuR1csKeptFits("prep", 7, 100, 90) {
+		t.Fatal("not used again for the same circuit")
+	}
+	for _, c := range []struct {
+		name          string
+		key           string
+		destroy       uintptr
+		nbWires, nbCs int
+	}{
+		{"fewer wires", "prep", 7, 99, 90},
+		{"more wires", "prep", 7, 101, 90},
+		{"fewer constraints", "prep", 7, 100, 89},
+		{"more constraints", "prep", 7, 100, 91},
+		{"other circuit data", "other", 7, 100, 90},
+		{"not kept", "", 7, 100, 90},
+		{"other solver", "prep", 8, 100, 90},
+	} {
+		if gpuR1csKeptFits(c.key, c.destroy, c.nbWires, c.nbCs) {
+			t.Fatalf("used again with %s", c.name)
+		}
+	}
+}
+
+// The GPU R1CS solver's circuit data is per data directory: a proof of a circuit whose directory
+// has none named solves on the CPU, whatever another circuit's proofs named.
+func TestGpuR1csPrepDirPerCircuit(t *testing.T) {
+	SetGpuR1csPrepDir("/circuits/a", "/prep/a")
+	SetGpuR1csPrepDir("/circuits/b", "/prep/b")
+	defer SetGpuR1csPrepDir("/circuits/a", "")
+	defer SetGpuR1csPrepDir("/circuits/b", "")
+	get := func(dataDir string) string {
+		gpuR1cs.Lock()
+		defer gpuR1cs.Unlock()
+		return gpuR1cs.prepDirs[dataDir]
+	}
+	if get("/circuits/a") != "/prep/a" || get("/circuits/b") != "/prep/b" {
+		t.Fatal("prep dirs are not kept per data directory")
+	}
+	if get("/circuits/c") != "" {
+		t.Fatal("a circuit with no prep dir named has one")
+	}
+	SetGpuR1csPrepDir("/circuits/a", "")
+	if get("/circuits/a") != "" || get("/circuits/b") != "/prep/b" {
+		t.Fatal("clearing one circuit's prep dir changed another's")
+	}
+}

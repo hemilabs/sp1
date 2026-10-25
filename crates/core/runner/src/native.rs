@@ -88,6 +88,9 @@ impl MinimalExecutorRunner {
         }
     }
 
+    /// Whether [`Self::set_max_chunk_cycles`] has an effect: it does with the native executor.
+    pub const SUPPORTS_MAX_CHUNK_CYCLES: bool = true;
+
     /// Also end a trace chunk once it has run `cycles` cycles, not only when its trace buffer is
     /// full, so a compute-bound program yields its first chunk early. `None` or `Some(0)` splits on
     /// the trace size only. Execution is unchanged; only where the trace is split differs.

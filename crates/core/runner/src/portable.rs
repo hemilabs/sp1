@@ -45,6 +45,10 @@ impl MinimalExecutorRunner {
         }
     }
 
+    /// Whether [`Self::set_max_chunk_cycles`] has an effect. The portable executor splits trace
+    /// chunks on the trace size only.
+    pub const SUPPORTS_MAX_CHUNK_CYCLES: bool = false;
+
     /// Accepted for API parity with the native runner: the portable executor splits trace chunks
     /// on the trace size only.
     pub fn set_max_chunk_cycles(&mut self, _cycles: Option<u64>) {}

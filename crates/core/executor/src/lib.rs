@@ -88,7 +88,13 @@ pub use utils::*;
 
 pub use sp1_hypercube::SP1RecursionProof;
 /// For a process that exits without running destructors: see [`sp1_jit::shm::unlink_owned_shm`].
+#[cfg(unix)]
 pub use sp1_jit::shm::unlink_owned_shm;
+
+/// No-op: POSIX shared memory (and so `sp1_jit::shm`) exists only on unix, so there is nothing
+/// to unlink here.
+#[cfg(not(unix))]
+pub fn unlink_owned_shm() {}
 
 /// The default increment for the program counter. Is used for all instructions except
 /// for branches and jumps.

@@ -615,11 +615,15 @@ impl Groth16Bn254Prover {
             }
             // gnark's prover here solves the circuit on the GPU where this process registered the
             // GPU R1CS solver and its circuit data can be had.
+            let build_dir_str = path_str(build_dir)?;
             if crate::ffi::groth16_gpu_r1cs_solver_registered() {
                 let prep_dir = in_process_prep_circuit_dir(build_dir);
-                crate::ffi::set_groth16_r1cs_prep_dir(prep_dir.as_deref().and_then(Path::to_str));
+                crate::ffi::set_groth16_r1cs_prep_dir(
+                    build_dir_str,
+                    prep_dir.as_deref().and_then(Path::to_str),
+                );
             }
-            let mut proof = prove_groth16_bn254(path_str(build_dir)?, path_str(witness_json)?);
+            let mut proof = prove_groth16_bn254(build_dir_str, path_str(witness_json)?);
             proof.groth16_vkey_hash = Self::get_vkey_hash(build_dir);
             return Ok(proof);
         };

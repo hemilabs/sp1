@@ -730,8 +730,11 @@ mod tests {
         let (chunk_ends, shards) = splices(&program, 1 << 30, Some(1 << 18)).unwrap();
         let (one_chunk, num_chunks) = (one_chunk.len(), chunk_ends.len());
         assert_eq!(one_chunk, 1);
+        // The portable executor ignores the cycle cap, so there the run is one chunk and only the
+        // shards are compared.
+        let min_chunks = if MinimalExecutorRunner::SUPPORTS_MAX_CHUNK_CYCLES { 5 } else { 1 };
         assert!(
-            num_chunks > 4 && expected.len() > 4,
+            num_chunks >= min_chunks && expected.len() > 4,
             "{num_chunks} chunks, {} shards",
             expected.len()
         );

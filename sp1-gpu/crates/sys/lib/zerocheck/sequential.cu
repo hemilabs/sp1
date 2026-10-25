@@ -1056,6 +1056,21 @@ extern "C" uint32_t zerocheck_coop_smem_cap() {
 #endif
 }
 
+// 1 on HIP when the device runs 64-wide wavefronts (CDNA, gfx9*: the MI300X the zerocheck
+// defaults in prover.rs were tuned on), else 0: RDNA (wave32), CUDA and SYCL, or no device.
+extern "C" uint32_t zerocheck_hip_wave64() {
+#if defined(__HIPCC__) && !defined(SP1_SYCL)
+    int device = 0, warp_size = 0;
+    if (hipGetDevice(&device) != hipSuccess ||
+        hipDeviceGetAttribute(&warp_size, hipDeviceAttributeWarpSize, device) != hipSuccess) {
+        return 0;
+    }
+    return warp_size == 64 ? 1 : 0;
+#else
+    return 0;
+#endif
+}
+
 template <typename K, uint32_t LANES>
 static void* coop_kernel_with_smem_limit() {
     static const bool once = [] {

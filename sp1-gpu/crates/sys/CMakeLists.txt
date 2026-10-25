@@ -19,12 +19,14 @@ if(USE_HIP)
     set(CMAKE_HIP_STANDARD_REQUIRED ON)
 
     # GPU architecture selection
-    if(DEFINED HIP_ARCHS)
+    # build.rs always passes HIP_ARCHS, empty when it is unset, so that a value cached by an
+    # earlier configure does not persist.
+    if(HIP_ARCHS)
         string(REPLACE "," ";" HIP_ARCHS_LIST "${HIP_ARCHS}")
         set(CMAKE_HIP_ARCHITECTURES ${HIP_ARCHS_LIST})
     else()
-        # Default when build.rs found no GPU on the build host: RDNA4 (gfx1201), RDNA3 (gfx1100)
-        # and CDNA3 (gfx942, MI300X).
+        # Default, a portable fat binary: RDNA4 (gfx1201), RDNA3 (gfx1100) and CDNA3 (gfx942,
+        # MI300X).
         set(CMAKE_HIP_ARCHITECTURES gfx1100 gfx1201 gfx942)
     endif()
 

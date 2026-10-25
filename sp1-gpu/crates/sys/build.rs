@@ -427,16 +427,25 @@ fn main() {
                 // If clang++ not found, let CMake auto-detect
             }
 
-            // HIP architectures: HIP_ARCHS if set, else the GPUs this host has (so that an
-            // MI300X host builds gfx942 code without being told), else CMakeLists.txt's default.
-            if let Ok(hip_archs) = env::var("HIP_ARCHS") {
-                cmake_config.define("HIP_ARCHS", &hip_archs);
-            } else if let Some(detected) = detect_hip_archs(&rocm_path) {
-                println!(
-                    "cargo:warning=HIP_ARCHS not set; building for this host's GPUs: {detected}"
-                );
-                cmake_config.define("HIP_ARCHS", &detected);
-            }
+            // HIP architectures: HIP_ARCHS, where `native` means the GPUs this host has (opt-in,
+            // as such a binary runs only on those), else CMakeLists.txt's portable default list.
+            // Always passed, empty when unset, so that an earlier configure's value cached by
+            // CMake does not persist.
+            let hip_archs = match env::var("HIP_ARCHS").ok().filter(|archs| !archs.is_empty()) {
+                Some(archs) if archs == "native" => {
+                    let detected = detect_hip_archs(&rocm_path).unwrap_or_else(|| {
+                        panic!(
+                            "HIP_ARCHS=native, but neither rocm_agent_enumerator nor amdgpu-arch \
+                             found an AMD GPU on this host; set HIP_ARCHS to the gfx targets"
+                        )
+                    });
+                    println!("cargo:warning=HIP_ARCHS=native: building for {detected}");
+                    detected
+                }
+                Some(archs) => archs,
+                None => String::new(),
+            };
+            cmake_config.define("HIP_ARCHS", &hip_archs);
         }
         GpuBackend::Cuda => {
             // Pass CUDA architectures to CMake only if explicitly set
@@ -567,9 +576,9 @@ fn main() {
     println!("cargo:include={}", out_include_dir.display());
 }
 
-/// The `gfx` targets of the AMD GPUs on this host, `;`-separated, from ROCm's
-/// `rocm_agent_enumerator` or LLVM's `amdgpu-arch`/`offload-arch`; `None` when no tool runs or
-/// none reports a GPU (a build host without one, or in a container without `/dev/kfd`).
+/// The `gfx` targets of the AMD GPUs on this host (for `HIP_ARCHS=native`), `;`-separated, from
+/// ROCm's `rocm_agent_enumerator` or LLVM's `amdgpu-arch`/`offload-arch`; `None` when no tool runs
+/// or none reports a GPU (a build host without one, or in a container without `/dev/kfd`).
 fn detect_hip_archs(rocm_path: &str) -> Option<String> {
     let tools = [
         format!("{rocm_path}/bin/rocm_agent_enumerator"),

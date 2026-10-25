@@ -60,10 +60,12 @@ pub fn release_groth16_gpu_r1cs_solver() {
 }
 
 /// Names the GPU R1CS solver's circuit data (`r1cs_solve_plan prep-circuit-prod`'s output) for the
-/// next Groth16 proofs in this process; `None` has gnark solve on the CPU.
-pub fn set_groth16_r1cs_prep_dir(dir: Option<&str>) {
+/// Groth16 proofs in this process of the circuit in `data_dir` (as passed to
+/// [`prove_groth16_bn254`]); `None` has gnark solve them on the CPU.
+pub fn set_groth16_r1cs_prep_dir(data_dir: &str, dir: Option<&str>) {
+    let data_dir = CString::new(data_dir).expect("CString::new failed");
     let dir = CString::new(dir.unwrap_or("")).expect("CString::new failed");
-    unsafe { SetGroth16R1csPrepDir(dir.as_ptr() as *mut c_char) }
+    unsafe { SetGroth16R1csPrepDir(data_dir.as_ptr() as *mut c_char, dir.as_ptr() as *mut c_char) }
 }
 
 enum ProofSystem {

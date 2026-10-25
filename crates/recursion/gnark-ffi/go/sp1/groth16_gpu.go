@@ -103,12 +103,14 @@ func g2MsmOnCpu() bool {
 	return gpuHooks.totalMemory < 64<<30 && runtime.NumCPU() >= 16
 }
 
-// gpuR1cs is the GPU R1CS solver the host registered (SetGpuR1csSolver) and the directory of
-// the circuit data it reads (SetGpuR1csPrepDir, `r1cs_solve_plan prep-circuit-prod`'s output).
+// gpuR1cs is the GPU R1CS solver the host registered (SetGpuR1csSolver) and, for each circuit's
+// data directory, the directory of the circuit data the solver reads for it (SetGpuR1csPrepDir,
+// `r1cs_solve_plan prep-circuit-prod`'s output). Per data directory, so that a proof of one
+// circuit never solves with another's data, whatever the host proved before or proves meanwhile.
 var gpuR1cs struct {
 	sync.Mutex
 	create, solve, destroy uintptr
-	prepDir                string
+	prepDirs               map[string]string
 }
 
 // SetGpuR1csSolver registers the GPU R1CS solver's entry points (C function pointers; 0 unsets).
@@ -129,7 +131,9 @@ func SetGpuR1csSolver(create, solve, destroy uintptr) {
 
 // gpuR1csKept is the solver gpuSolveR1cs created, with its circuit data (~3 GB on the GPU) and
 // buffers (~2 GB), kept for the next proofs where keepGpuR1csSolver says so: creating it took
-// 2.0-2.3 s of each proof on an MI300X. key names the circuit data it read (gpuR1csPrepKey). Its
+// 2.0-2.3 s of each proof on an MI300X. key names the circuit data it read (gpuR1csPrepKey), and
+// nW and nC are its numbers of wires and constraints, which size what a solve writes back: it is
+// used only for a circuit of the same sizes. Its
 // device memory comes from the prover's allocator, out of the device memory arena where there is
 // one, so it does not take the arena's headroom, which kernel scratch needs. The lock is held
 // through each solve: the solver has one set of buffers.
@@ -138,6 +142,16 @@ var gpuR1csKept struct {
 	h       unsafe.Pointer
 	destroy uintptr
 	key     string
+	nW, nC  int
+}
+
+// gpuR1csKeptFits: whether the kept solver (gpuR1csKept, locked by the caller) can solve the
+// circuit with the circuit data key names (gpuR1csPrepKey; "" when the solver is not to be kept),
+// with nbWires wires and nbConstraints constraints, for the registered destroy. A solver for
+// other sizes would write past the end of the vectors sized for this circuit.
+func gpuR1csKeptFits(key string, destroy uintptr, nbWires, nbConstraints int) bool {
+	return key != "" && key == gpuR1csKept.key && destroy == gpuR1csKept.destroy &&
+		nbWires == gpuR1csKept.nW && nbConstraints == gpuR1csKept.nC
 }
 
 // ReleaseGpuR1csSolver destroys the solver kept between proofs, if any, giving its device memory
@@ -178,12 +192,19 @@ func gpuR1csPrepKey(prepDir string) string {
 	return key
 }
 
-// SetGpuR1csPrepDir names the GPU R1CS solver's circuit data for the next proofs ("" for none:
-// gnark then solves on the CPU).
-func SetGpuR1csPrepDir(dir string) {
+// SetGpuR1csPrepDir names the GPU R1CS solver's circuit data for the proofs of the circuit in
+// dataDir ("" for none: gnark then solves them on the CPU).
+func SetGpuR1csPrepDir(dataDir, dir string) {
 	gpuR1cs.Lock()
 	defer gpuR1cs.Unlock()
-	gpuR1cs.prepDir = dir
+	if dir == "" {
+		delete(gpuR1cs.prepDirs, dataDir)
+		return
+	}
+	if gpuR1cs.prepDirs == nil {
+		gpuR1cs.prepDirs = make(map[string]string)
+	}
+	gpuR1cs.prepDirs[dataDir] = dir
 }
 
 // gpuSolveBufs holds the GPU R1CS solve's host buffers between proofs (about 2.5 GB for the
@@ -367,8 +388,9 @@ func gpuComputeH(a, b, c []fr.Element, domain *fft.Domain) ([]fr.Element, error)
 	return h, nil
 }
 
-// proveGroth16Gpu is gnark's groth16_bn254.Prove with the GPU doing computeH and the MSMs.
-func proveGroth16Gpu(r1cs *cs.R1CS, pk *groth16_bn254.ProvingKey, fullWitness witness.Witness, opts ...backend.ProverOption) (*groth16_bn254.Proof, error) {
+// proveGroth16Gpu is gnark's groth16_bn254.Prove with the GPU doing computeH and the MSMs, for
+// the circuit in dataDir.
+func proveGroth16Gpu(dataDir string, r1cs *cs.R1CS, pk *groth16_bn254.ProvingKey, fullWitness witness.Witness, opts ...backend.ProverOption) (*groth16_bn254.Proof, error) {
 	opt, err := backend.NewProverConfig(opts...)
 	if err != nil {
 		return nil, fmt.Errorf("new prover config: %w", err)
@@ -421,7 +443,7 @@ func proveGroth16Gpu(r1cs *cs.R1CS, pk *groth16_bn254.ProvingKey, fullWitness wi
 	var solution *cs.R1CSSolution
 	var releaseSolution func()
 	if len(commitmentInfo) == 0 {
-		solution, releaseSolution = gpuSolveR1cs(r1cs, fullWitness)
+		solution, releaseSolution = gpuSolveR1cs(dataDir, r1cs, fullWitness)
 	}
 	if solution == nil {
 		_solution, err := r1cs.Solve(fullWitness, solverOpts...)
@@ -610,14 +632,15 @@ func proveGroth16Gpu(r1cs *cs.R1CS, pk *groth16_bn254.ProvingKey, fullWitness wi
 }
 
 // gpuSolveR1cs is r1cs.Solve on the GPU R1CS solver the host registered, reading the circuit
-// data SetGpuR1csPrepDir named: the wire values, and A, B and C, all in gnark's Montgomery form.
+// data SetGpuR1csPrepDir named for dataDir: the wire values, and A, B and C, all in gnark's Montgomery form.
 // nil, after saying why, where there is no solver or data, or the solve fails; the caller then
 // solves with gnark. The solver checks the constraints it does not solve for, and the proof is
 // checked against the verifying key before it is used (proveGroth16OnGpu). The solution's
 // vectors are kept for the next proof by the func returned with it, once nothing uses them.
-func gpuSolveR1cs(r1cs *cs.R1CS, fullWitness witness.Witness) (*cs.R1CSSolution, func()) {
+func gpuSolveR1cs(dataDir string, r1cs *cs.R1CS, fullWitness witness.Witness) (*cs.R1CSSolution, func()) {
 	gpuR1cs.Lock()
-	create, solve, destroy, prepDir := gpuR1cs.create, gpuR1cs.solve, gpuR1cs.destroy, gpuR1cs.prepDir
+	create, solve, destroy := gpuR1cs.create, gpuR1cs.solve, gpuR1cs.destroy
+	prepDir := gpuR1cs.prepDirs[dataDir]
 	gpuR1cs.Unlock()
 	if create == 0 || solve == 0 || destroy == 0 || prepDir == "" ||
 		os.Getenv("SP1_GPU_R1CS_SOLVER") == "cpu" {
@@ -647,8 +670,8 @@ func gpuSolveR1cs(r1cs *cs.R1CS, fullWitness witness.Witness) (*cs.R1CSSolution,
 	defer gpuR1csKept.Unlock()
 	h := gpuR1csKept.h
 	reused := h != nil
-	if h != nil && (key == "" || key != gpuR1csKept.key || destroy != gpuR1csKept.destroy) {
-		// Another circuit's data, or not kept any more.
+	if h != nil && !gpuR1csKeptFits(key, destroy, nbWires, nbConstraints) {
+		// Another circuit's data or sizes, or not kept any more.
 		C.sp1_g16_call_r1cs_destroy(C.uintptr_t(gpuR1csKept.destroy), h)
 		h, reused = nil, false
 	}
@@ -675,6 +698,7 @@ func gpuSolveR1cs(r1cs *cs.R1CS, fullWitness witness.Witness) (*cs.R1CSSolution,
 	defer func() {
 		if solved && keep && key != "" {
 			gpuR1csKept.h, gpuR1csKept.destroy, gpuR1csKept.key = h, destroy, key
+			gpuR1csKept.nW, gpuR1csKept.nC = nbWires, nbConstraints
 		} else {
 			C.sp1_g16_call_r1cs_destroy(C.uintptr_t(destroy), h)
 		}
@@ -779,7 +803,7 @@ func proveGroth16OnGpu(
 	if !ok {
 		return nil
 	}
-	proof, err := proveGroth16Gpu(r1cs, pk, fullWitness)
+	proof, err := proveGroth16Gpu(dataDir, r1cs, pk, fullWitness)
 	if err != nil {
 		fmt.Printf("GPU Groth16 prover failed, proving on the CPU: %v\n", err)
 		return nil

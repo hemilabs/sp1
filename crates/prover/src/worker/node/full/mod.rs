@@ -333,31 +333,50 @@ impl SP1LocalNode {
         };
 
         let wrapping = async {
-            let task_id =
-                self.inner.worker_client.submit_task(TaskType::ShrinkWrap, request).await?;
-            // Wait for the task to finish
             let subscriber =
                 self.inner.worker_client.subscriber(proof_id.clone()).await?.per_task();
-            let status = subscriber.wait_task(task_id).await?;
-            if status != TaskStatus::Succeeded {
-                return Err(anyhow::anyhow!("shrink wrap task failed"));
-            }
-            // The task may have left the proof's verification running; it must pass. With none in
-            // this process, the proof is verified here.
-            let wrap_verify = crate::worker::take_wrap_verify(&output_artifact);
+            let mut retries = 0;
+            loop {
+                let task_id = self
+                    .inner
+                    .worker_client
+                    .submit_task(TaskType::ShrinkWrap, request.clone())
+                    .await?;
+                // Wait for the task to finish
+                let status = subscriber.wait_task(task_id).await?;
+                if status != TaskStatus::Succeeded {
+                    return Err(anyhow::anyhow!("shrink wrap task failed"));
+                }
+                // The task may have left the proof's verification running; it must pass. With
+                // none in this process, the proof is verified here.
+                let wrap_verify = crate::worker::take_wrap_verify(&output_artifact);
 
-            // Download the output proof; the artifacts go with the request's bookkeeping.
-            let proof = self
-                .inner
-                .artifact_client
-                .download::<SP1WrapProof<SP1OuterGlobalContext, SP1PcsProofOuter>>(&output_artifact)
-                .await?;
-            let verified = match wrap_verify {
-                Some(verify) => crate::worker::wait_wrap_verify(verify).await,
-                None => crate::worker::verify_wrap_proof::<crate::CpuSP1ProverComponents>(&proof),
-            };
-            verified.map_err(|e| anyhow::anyhow!("shrink wrap task failed: {e}"))?;
-            Ok(proof)
+                // Download the output proof; the artifacts go with the request's bookkeeping.
+                let proof = self
+                    .inner
+                    .artifact_client
+                    .download::<SP1WrapProof<SP1OuterGlobalContext, SP1PcsProofOuter>>(
+                        &output_artifact,
+                    )
+                    .await?;
+                let verified = match wrap_verify {
+                    Some(pending) => crate::worker::wait_wrap_verify(pending.verify).await,
+                    None => {
+                        crate::worker::verify_wrap_proof::<crate::CpuSP1ProverComponents>(&proof)
+                    }
+                };
+                let Err(e) = verified else { return Ok(proof) };
+                // A proof that fails verification is made again (the verification forgot the
+                // kept wrap proving key), within the retry budget of a task that failed it
+                // itself, as the shrink-wrap task was retried when it verified the proof.
+                if retries >= crate::worker::MAX_LOCAL_TASK_RETRIES {
+                    return Err(anyhow::anyhow!("shrink wrap task failed: {e}"));
+                }
+                retries += 1;
+                tracing::warn!("proving the wrap again: {e}");
+                tokio::task::spawn_blocking(sp1_recursion_gnark_ffi::device_caches::release)
+                    .await?;
+            }
         };
         self.with_bookkeeping(&proof_id, wrapping).await
     }

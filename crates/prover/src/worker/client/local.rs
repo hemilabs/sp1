@@ -45,7 +45,7 @@ pub struct LocalWorkerClientInner {
     ended_proofs: std::sync::Mutex<lru::LruCache<ProofId, ()>>,
 }
 
-const MAX_LOCAL_TASK_RETRIES: u8 = 3;
+pub(crate) const MAX_LOCAL_TASK_RETRIES: u8 = 3;
 
 /// How many completed proofs [`LocalWorkerClientInner::ended_proofs`] remembers.
 const ENDED_PROOFS: std::num::NonZeroUsize = std::num::NonZeroUsize::new(4096).unwrap();

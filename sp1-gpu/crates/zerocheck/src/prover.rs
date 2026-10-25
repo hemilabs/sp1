@@ -56,9 +56,9 @@ use sp1_gpu_cudart::sys::kernels::{
     zerocheck_fused_sequential_uniform_kb_128_v32_kernel,
     zerocheck_geq_corrections_bivariate_kernel, zerocheck_geq_corrections_kernel,
     zerocheck_gkr_corner_sweep_kb_kernel, zerocheck_gkr_sweep_ext_kernel,
-    zerocheck_gkr_sweep_kb_kernel, zerocheck_pad_adj_1024_kernel, zerocheck_pad_adj_128_kernel,
-    zerocheck_pad_adj_256_kernel, zerocheck_pad_adj_32_kernel, zerocheck_pad_adj_512_kernel,
-    zerocheck_pad_adj_64_kernel, zerocheck_pad_adj_coop_kernel,
+    zerocheck_gkr_sweep_kb_kernel, zerocheck_hip_wave64, zerocheck_pad_adj_1024_kernel,
+    zerocheck_pad_adj_128_kernel, zerocheck_pad_adj_256_kernel, zerocheck_pad_adj_32_kernel,
+    zerocheck_pad_adj_512_kernel, zerocheck_pad_adj_64_kernel, zerocheck_pad_adj_coop_kernel,
 };
 use sp1_gpu_cudart::sys::runtime::KernelPtr;
 use sp1_gpu_cudart::{args, DeviceBuffer, DeviceCopy, DevicePoint, TaskScope};
@@ -1228,9 +1228,16 @@ const ROWS_PER_THREAD_SEQ: u32 = 1;
 /// (`SP1_GPU_ZEROCHECK_COOP_MAX_ROWS`) ...
 const COOP_MAX_ROWS: u32 = 1024;
 /// ... whose serial cost (instructions + 3 per inline GKR column) is at least
-/// this (`SP1_GPU_ZEROCHECK_COOP_MIN_COST`; 100 measured 21 ms per fib 40M core
-/// proof below 300 on MI300X with the wide cooperative kernel) ...
-const COOP_MIN_COST: u32 = 100;
+/// this (`SP1_GPU_ZEROCHECK_COOP_MIN_COST`; by default 100 on wave64 HIP, which
+/// measured 21 ms per fib 40M core proof below 300 on MI300X with the wide
+/// cooperative kernel, and 300 elsewhere, where 100 is not measured) ...
+fn coop_min_cost_default() -> u32 {
+    if hip_wave64() {
+        100
+    } else {
+        300
+    }
+}
 /// ... (or have at most this many rows, so that the tiny tail rounds run in a
 /// single cooperative launch) ...
 const COOP_SMALL_ROWS: u32 = 32;
@@ -1286,12 +1293,23 @@ const COOP_WIDE_ROWS: u32 = 2;
 /// value slots for `coop_fits` (e.g. the wide Poseidon2-style chunks of the
 /// Global chip: 21 levels but 440 slots), which otherwise walk their whole
 /// bytecode serially in the thread-per-row kernel in every small round;
-/// 2 (default) = also prefer it over the 8-lane kernel for every candidate it
-/// fits (fib 40M core, per proof: cooperative kernels 240 -> 176 ms).
-/// Same results in every mode.
-const COOP_WIDE_DEFAULT: u32 = 2;
+/// 2 = also prefer it over the 8-lane kernel for every candidate it fits (fib
+/// 40M core on MI300X, per proof: cooperative kernels 240 -> 176 ms).
+/// Same results in every mode. By default 2 on wave64 HIP, where it was
+/// measured, and 0 elsewhere.
 fn coop_wide_mode() -> u32 {
-    env_u32("SP1_GPU_ZEROCHECK_COOP_WIDE", COOP_WIDE_DEFAULT).min(2)
+    let default = if hip_wave64() { 2 } else { 0 };
+    env_u32("SP1_GPU_ZEROCHECK_COOP_WIDE", default).min(2)
+}
+
+/// Whether the device is a HIP one with 64-wide wavefronts (CDNA, gfx9*), where
+/// the zerocheck defaults above and `zerocheck_uniform_enabled` were tuned (on
+/// an MI300X). Elsewhere (RDNA, CUDA, SYCL) they default to the kernels as
+/// they were before that tuning; the env overrides work everywhere.
+fn hip_wave64() -> bool {
+    static WAVE64: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    // SAFETY: takes nothing and only reads the current device's attributes.
+    *WAVE64.get_or_init(|| unsafe { zerocheck_hip_wave64() } != 0)
 }
 
 /// The chunk's level schedule fits the wide cooperative kernel's shared memory.
@@ -1310,11 +1328,13 @@ fn env_u32(name: &str, default: u32) -> u32 {
 
 /// Whether the MAX_REGS = 128 tier runs the wave-uniform interpreter
 /// (`zerocheck_fused_sequential_uniform`): scalar instruction fetch and
-/// dispatch plus a VGPR register file. `SP1_GPU_ZEROCHECK_UNIFORM=0` restores
-/// the generic kernels (and the unranked register numbering, see
-/// `rank_registers_by_use`). Same results.
+/// dispatch plus a VGPR register file. By default on wave64 HIP only: elsewhere
+/// it compiles to a scratch register array without the scalar path, and is not
+/// measured. `SP1_GPU_ZEROCHECK_UNIFORM=0` restores the generic kernels (and the
+/// unranked register numbering, see `rank_registers_by_use`), and any other
+/// value turns it on. Same results.
 pub(crate) fn zerocheck_uniform_enabled() -> bool {
-    std::env::var("SP1_GPU_ZEROCHECK_UNIFORM").map_or(true, |v| v != "0")
+    std::env::var("SP1_GPU_ZEROCHECK_UNIFORM").map_or_else(|_| hip_wave64(), |v| v != "0")
 }
 
 /// Default VGPR register-file size of the wave-uniform bivariate kernel
@@ -1882,7 +1902,7 @@ where
     let mut coop_wide_tiers: [Vec<BlockDispatchC>; NUM_SEQ_TIERS] = Default::default();
     let coop_wide = coop_wide_mode();
     let coop_max_rows = env_u32("SP1_GPU_ZEROCHECK_COOP_MAX_ROWS", COOP_MAX_ROWS);
-    let coop_min_cost = env_u32("SP1_GPU_ZEROCHECK_COOP_MIN_COST", COOP_MIN_COST);
+    let coop_min_cost = env_u32("SP1_GPU_ZEROCHECK_COOP_MIN_COST", coop_min_cost_default());
     let rows_per_thread = env_u32("SP1_GPU_ZEROCHECK_RPT", ROWS_PER_THREAD_SEQ).max(1);
     let coop_budget = env_u32("SP1_GPU_ZEROCHECK_COOP_ROWS", COOP_ROW_BUDGET);
     for (t, tier) in poly.seq_tiers.iter().enumerate() {
@@ -3460,5 +3480,53 @@ mod layout_tracker_tests {
         let (tracker, column_heights) = synthetic(&[(2, 3, 10, 10)], &[], &[]);
         assert_eq!(tracker.total_length_pair(), column_heights.iter().sum::<u32>());
         assert_eq!(tracker.total_length_pair(), 2 * 10 + 3 * 10);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serial_test::serial;
+
+    /// The MI300X-tuned zerocheck defaults apply on wave64 HIP only, and the env overrides work
+    /// on every device.
+    #[test]
+    #[serial]
+    #[allow(clippy::print_stdout)]
+    fn zerocheck_tuned_defaults_only_on_wave64_hip() {
+        const VARS: [&str; 3] = [
+            "SP1_GPU_ZEROCHECK_UNIFORM",
+            "SP1_GPU_ZEROCHECK_COOP_WIDE",
+            "SP1_GPU_ZEROCHECK_COOP_MIN_COST",
+        ];
+        let saved: Vec<_> = VARS.iter().map(std::env::var_os).collect();
+        for var in VARS {
+            std::env::remove_var(var);
+        }
+
+        let wave64 = hip_wave64();
+        println!("wave64 HIP device: {wave64}");
+        if !sp1_gpu_cudart::sys::is_hip_backend() {
+            assert!(!wave64, "wave64 HIP reported on another backend");
+        }
+        assert_eq!(zerocheck_uniform_enabled(), wave64);
+        assert_eq!(coop_wide_mode(), if wave64 { 2 } else { 0 });
+        assert_eq!(coop_min_cost_default(), if wave64 { 100 } else { 300 });
+
+        std::env::set_var("SP1_GPU_ZEROCHECK_UNIFORM", "1");
+        std::env::set_var("SP1_GPU_ZEROCHECK_COOP_WIDE", "1");
+        assert!(zerocheck_uniform_enabled());
+        assert_eq!(coop_wide_mode(), 1);
+        std::env::set_var("SP1_GPU_ZEROCHECK_UNIFORM", "0");
+        std::env::set_var("SP1_GPU_ZEROCHECK_COOP_WIDE", "0");
+        assert!(!zerocheck_uniform_enabled());
+        assert_eq!(coop_wide_mode(), 0);
+
+        for (var, value) in VARS.iter().zip(saved) {
+            match value {
+                Some(value) => std::env::set_var(var, value),
+                None => std::env::remove_var(var),
+            }
+        }
     }
 }

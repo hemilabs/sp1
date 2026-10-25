@@ -220,11 +220,11 @@ func ReleaseGroth16GpuR1csSolver() {
 }
 
 // SetGroth16R1csPrepDir names the GPU R1CS solver's circuit data (`r1cs_solve_plan
-// prep-circuit-prod`'s output) for the next Groth16 proofs; empty for none.
+// prep-circuit-prod`'s output) for the Groth16 proofs of the circuit in dataDir; empty for none.
 //
 //export SetGroth16R1csPrepDir
-func SetGroth16R1csPrepDir(dir *C.char) {
-	sp1.SetGpuR1csPrepDir(C.GoString(dir))
+func SetGroth16R1csPrepDir(dataDir *C.char, dir *C.char) {
+	sp1.SetGpuR1csPrepDir(C.GoString(dataDir), C.GoString(dir))
 }
 
 //export FreeGroth16Bn254Proof

@@ -455,10 +455,53 @@ pub(crate) enum WrapVerify {
     Running(tokio::task::JoinHandle<Result<(), TaskError>>),
     /// Passed before the shrink-wrap task ended (SP1_WRAP_VERIFY_OVERLAP=0).
     Passed,
+    /// Failed while a final wrap read the proof. That task is retried, and its retry proves the
+    /// wrap again first ([`SP1RecursionProver::wrap_proof_to_read`]), as the shrink-wrap task was
+    /// retried when it verified the proof itself.
+    Failed,
 }
+
+/// A wrap proof's verification, with the shrink-wrap task that made the proof (None where it is
+/// not known), to make it again should the proof fail verification.
+pub(crate) struct PendingWrapVerify {
+    pub(crate) verify: WrapVerify,
+    shrink_wrap: Option<RawTaskRequest>,
+}
+
 static WRAP_VERIFIES: std::sync::LazyLock<
-    std::sync::Mutex<std::collections::HashMap<String, WrapVerify>>,
+    std::sync::Mutex<std::collections::HashMap<String, PendingWrapVerify>>,
 > = std::sync::LazyLock::new(Default::default);
+
+fn put_wrap_verify(artifact: &impl ArtifactId, pending: PendingWrapVerify) {
+    WRAP_VERIFIES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(artifact.id().to_string(), pending);
+}
+
+/// Test injection: with SP1_WRAP_VERIFY_FAIL_INJECT=N, the next N wrap proof verifications fail
+/// with a synthetic error whatever the verifier says, to exercise the path that proves the wrap
+/// again. It can only fail a verification, never pass one.
+fn take_wrap_verify_fail_inject() -> bool {
+    static REMAINING: std::sync::LazyLock<std::sync::atomic::AtomicU32> =
+        std::sync::LazyLock::new(|| {
+            std::sync::atomic::AtomicU32::new(
+                std::env::var("SP1_WRAP_VERIFY_FAIL_INJECT")
+                    .ok()
+                    .and_then(|v| v.trim().parse().ok())
+                    .unwrap_or(0),
+            )
+        });
+    use std::sync::atomic::Ordering::SeqCst;
+    let mut remaining = REMAINING.load(SeqCst);
+    while remaining > 0 {
+        match REMAINING.compare_exchange(remaining, remaining - 1, SeqCst, SeqCst) {
+            Ok(_) => return true,
+            Err(now) => remaining = now,
+        }
+    }
+    false
+}
 
 /// Whether the shrink-wrap task leaves the wrap proof's verification running for the task that
 /// reads the proof (default), rather than finishing it before it ends (SP1_WRAP_VERIFY_OVERLAP=0).
@@ -468,30 +511,58 @@ fn overlap_wrap_verify() -> bool {
 
 /// Takes this process's verification of the wrap proof uploaded to `artifact`. None when this
 /// process did not make that proof (a `WorkerClient` that runs the shrink-wrap task in another
-/// process) or its verification was already taken (a retried task): the caller must then verify
-/// the proof itself, with [`verify_wrap_proof`].
-pub(crate) fn take_wrap_verify(artifact: &impl ArtifactId) -> Option<WrapVerify> {
+/// process): the caller must then verify the proof itself, with [`verify_wrap_proof`].
+pub(crate) fn take_wrap_verify(artifact: &impl ArtifactId) -> Option<PendingWrapVerify> {
     WRAP_VERIFIES.lock().unwrap_or_else(|e| e.into_inner()).remove(artifact.id())
 }
 
-/// Waits for a verification taken with [`take_wrap_verify`]. A failed verification is fatal: the
-/// proof it checked is already the shrink-wrap task's output, and running the task that reads it
-/// again would read the same proof.
+/// Waits for a verification taken with [`take_wrap_verify`]. A failed verification is retryable:
+/// the wrap is to be proved again (with the kept wrap proving key forgotten, as the verification
+/// does on failure), by whoever reads the proof ([`SP1RecursionProver::wrap_proof_to_read`],
+/// `SP1LocalNode::shrink_wrap`).
 pub(crate) async fn wait_wrap_verify(verify: WrapVerify) -> Result<(), TaskError> {
     let pending = match verify {
         WrapVerify::Running(pending) => pending,
         WrapVerify::Passed => return Ok(()),
+        WrapVerify::Failed => {
+            return Err(TaskError::Retryable(anyhow::anyhow!("wrap proof failed verification")))
+        }
     };
     match pending.await {
-        Ok(Ok(())) => Ok(()),
-        Ok(Err(TaskError::Retryable(e) | TaskError::Fatal(e))) => Err(TaskError::Fatal(e)),
-        Ok(Err(e)) => Err(e),
+        Ok(result) => result,
         Err(e) => Err(TaskError::Fatal(anyhow::anyhow!("wrap proof verification panicked: {e}"))),
     }
 }
 
+/// [`wait_wrap_verify`] for the final wrap (Groth16 or PLONK) task that reads the proof uploaded
+/// to `artifact`. If the verification fails and the shrink-wrap task that made the proof is known,
+/// it is recorded as failed, for the task's retry to prove the wrap again, and the error is
+/// retryable; else it is fatal, as no retry of this task could read another proof.
+pub(crate) async fn finish_wrap_verify(
+    artifact: &impl ArtifactId,
+    pending: PendingWrapVerify,
+) -> Result<(), TaskError> {
+    let PendingWrapVerify { verify, shrink_wrap } = pending;
+    // A verification that failed, not one that panicked (fatal, as in the shrink-wrap task).
+    let error = match wait_wrap_verify(verify).await {
+        Ok(()) => return Ok(()),
+        Err(TaskError::Retryable(e)) => e,
+        Err(e) => return Err(e),
+    };
+    match shrink_wrap {
+        Some(shrink_wrap) => {
+            put_wrap_verify(
+                artifact,
+                PendingWrapVerify { verify: WrapVerify::Failed, shrink_wrap: Some(shrink_wrap) },
+            );
+            Err(TaskError::Retryable(error.context("the wrap is proved again on the retry")))
+        }
+        None => Err(TaskError::Fatal(error)),
+    }
+}
+
 /// Verifies a wrap proof, for a task that reads one this process has no verification of (see
-/// [`take_wrap_verify`]). A failure is fatal, as in [`wait_wrap_verify`].
+/// [`take_wrap_verify`]). A failure is fatal: the task cannot make the proof again.
 pub(crate) fn verify_wrap_proof<C: SP1ProverComponents>(
     wrapped_proof: &SP1WrapProof<SP1OuterGlobalContext, SP1PcsProofOuter>,
 ) -> Result<(), TaskError> {
@@ -842,6 +913,8 @@ impl<A: ArtifactClient, C: SP1ProverComponents> SP1RecursionProver<A, C> {
         &self,
         request: RawTaskRequest,
     ) -> Result<TaskMetadata, TaskError> {
+        // Kept with the proof's verification left running, to make the proof again should it fail.
+        let shrink_wrap = request.clone();
         let RawTaskRequest { inputs, outputs, .. } = request;
         let [compress_proof_artifact] = inputs.try_into().unwrap();
         let [wrap_proof_artifact] = outputs.try_into().unwrap();
@@ -909,17 +982,19 @@ impl<A: ArtifactClient, C: SP1ProverComponents> SP1RecursionProver<A, C> {
                 .instrument(tracing::debug_span!("upload wrap proof"))
                 .await?;
 
-            WRAP_VERIFIES
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .insert(wrap_proof_artifact.id().to_string(), WrapVerify::Passed);
+            put_wrap_verify(
+                &wrap_proof_artifact,
+                PendingWrapVerify { verify: WrapVerify::Passed, shrink_wrap: None },
+            );
             return Ok(metrics.to_metadata());
         }
 
         // The proof is verified on a blocking thread while it is uploaded and while the task that
         // reads it (Groth16, PLONK, or `SP1LocalNode::shrink_wrap`) runs, which waits for the
-        // verification (`wait_wrap_verify`) before it gives its own result: a failed verification
-        // still fails the proof, but no longer holds up the final wrap's witness and solve.
+        // verification (`wait_wrap_verify`) before it gives its own result. A failed verification
+        // fails that task retryably, and its retry proves the wrap again with this task's request,
+        // as this task was retried when it verified the proof itself. So the verification no
+        // longer holds up the final wrap's witness and solve.
         let wrap_proof = Arc::new(wrap_proof);
         let verify = tokio::task::spawn_blocking({
             let span = tracing::debug_span!("verify wrap proof");
@@ -936,27 +1011,56 @@ impl<A: ArtifactClient, C: SP1ProverComponents> SP1RecursionProver<A, C> {
             .instrument(tracing::debug_span!("upload wrap proof"))
             .await?;
 
-        WRAP_VERIFIES
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(wrap_proof_artifact.id().to_string(), WrapVerify::Running(verify));
+        put_wrap_verify(
+            &wrap_proof_artifact,
+            PendingWrapVerify {
+                verify: WrapVerify::Running(verify),
+                shrink_wrap: Some(shrink_wrap),
+            },
+        );
 
         Ok(metrics.to_metadata())
     }
 
-    /// The verification of the wrap proof a final wrap reads: the one this process left running
-    /// or finished, or, if it has none, one done here and now, before the wrap is proved.
-    fn take_or_verify_wrap_proof(
+    /// The wrap proof a final wrap reads, from `artifact`, with its verification: the one this
+    /// process left running or finished, or, if it has none, one done here and now, before the
+    /// wrap is proved. If the proof failed verification in an earlier attempt of the task
+    /// ([`finish_wrap_verify`]), the wrap is proved again first, by the shrink-wrap task that made
+    /// it, as when that task was retried for it.
+    async fn wrap_proof_to_read(
         &self,
-        artifact: &impl ArtifactId,
-        wrap_proof: &SP1WrapProof<SP1OuterGlobalContext, SP1PcsProofOuter>,
-    ) -> Result<WrapVerify, TaskError> {
-        if let Some(verify) = take_wrap_verify(artifact) {
-            return Ok(verify);
+        artifact: &Artifact,
+    ) -> Result<(SP1WrapProof<SP1OuterGlobalContext, SP1PcsProofOuter>, PendingWrapVerify), TaskError>
+    {
+        let mut pending = take_wrap_verify(artifact);
+        if let Some(PendingWrapVerify { verify: WrapVerify::Failed, shrink_wrap: Some(request) }) =
+            pending
+        {
+            tracing::warn!("proving the wrap again: its last proof failed verification");
+            if let Err(e) = self.run_shrink_wrap(request.clone()).await {
+                // Still to be proved again, by the next retry.
+                put_wrap_verify(
+                    artifact,
+                    PendingWrapVerify { verify: WrapVerify::Failed, shrink_wrap: Some(request) },
+                );
+                return Err(e);
+            }
+            pending = take_wrap_verify(artifact);
         }
-        tracing::debug_span!("verify wrap proof")
-            .in_scope(|| verify_wrap_proof::<C>(wrap_proof))?;
-        Ok(WrapVerify::Passed)
+        let wrap_proof: SP1WrapProof<SP1OuterGlobalContext, SP1PcsProofOuter> = self
+            .artifact_client
+            .download(artifact)
+            .instrument(tracing::debug_span!("download wrap proof"))
+            .await?;
+        let pending = match pending {
+            Some(pending) => pending,
+            None => {
+                tracing::debug_span!("verify wrap proof")
+                    .in_scope(|| verify_wrap_proof::<C>(&wrap_proof))?;
+                PendingWrapVerify { verify: WrapVerify::Passed, shrink_wrap: None }
+            }
+        };
+        Ok((wrap_proof, pending))
     }
 
     pub async fn run_groth16(&self, request: RawTaskRequest) -> Result<(), TaskError> {
@@ -964,12 +1068,7 @@ impl<A: ArtifactClient, C: SP1ProverComponents> SP1RecursionProver<A, C> {
         let [wrap_proof_artifact] = inputs.try_into().unwrap();
         let [groth16_proof_artifact] = outputs.try_into().unwrap();
 
-        let wrap_proof: SP1WrapProof<SP1OuterGlobalContext, SP1PcsProofOuter> = self
-            .artifact_client
-            .download(&wrap_proof_artifact)
-            .instrument(tracing::debug_span!("download wrap proof"))
-            .await?;
-        let wrap_verify = self.take_or_verify_wrap_proof(&wrap_proof_artifact, &wrap_proof)?;
+        let (wrap_proof, wrap_verify) = self.wrap_proof_to_read(&wrap_proof_artifact).await?;
 
         let build_dir = try_build_groth16_artifacts_dir(&wrap_proof.vk, &wrap_proof.proof)
             .await
@@ -1171,8 +1270,10 @@ impl<A: ArtifactClient, C: SP1ProverComponents> SP1RecursionProver<A, C> {
         })
         .instrument(tracing::info_span!("prove groth16"));
         // The wrap proof's verification, if the shrink-wrap task left it running, runs alongside
-        // the witness and the solve; a failed verification fails this proof.
-        let (groth16_proof, wrap_verified) = tokio::join!(prove, wait_wrap_verify(wrap_verify));
+        // the witness and the solve; a failed verification fails this attempt retryably, and the
+        // retry proves the wrap again.
+        let (groth16_proof, wrap_verified) =
+            tokio::join!(prove, finish_wrap_verify(&wrap_proof_artifact, wrap_verify));
         wrap_verified?;
         let groth16_proof = groth16_proof
             .map_err(|e| TaskError::Fatal(anyhow::anyhow!("Groth16 proof task panicked: {}", e)))?
@@ -1189,12 +1290,7 @@ impl<A: ArtifactClient, C: SP1ProverComponents> SP1RecursionProver<A, C> {
         let RawTaskRequest { inputs, outputs, .. } = request;
         let [wrap_proof_artifact] = inputs.try_into().unwrap();
         let [plonk_proof_artifact] = outputs.try_into().unwrap();
-        let wrap_proof: SP1WrapProof<SP1OuterGlobalContext, SP1PcsProofOuter> = self
-            .artifact_client
-            .download(&wrap_proof_artifact)
-            .instrument(tracing::debug_span!("download wrap proof"))
-            .await?;
-        let wrap_verify = self.take_or_verify_wrap_proof(&wrap_proof_artifact, &wrap_proof)?;
+        let (wrap_proof, wrap_verify) = self.wrap_proof_to_read(&wrap_proof_artifact).await?;
 
         let build_dir = try_build_plonk_artifacts_dir(&wrap_proof.vk, &wrap_proof.proof).await?;
 
@@ -1370,8 +1466,10 @@ impl<A: ArtifactClient, C: SP1ProverComponents> SP1RecursionProver<A, C> {
         })
         .instrument(tracing::info_span!("prove plonk"));
         // The wrap proof's verification, if the shrink-wrap task left it running, runs alongside
-        // the witness and the solve; a failed verification fails this proof.
-        let (plonk_proof, wrap_verified) = tokio::join!(prove, wait_wrap_verify(wrap_verify));
+        // the witness and the solve; a failed verification fails this attempt retryably, and the
+        // retry proves the wrap again.
+        let (plonk_proof, wrap_verified) =
+            tokio::join!(prove, finish_wrap_verify(&wrap_proof_artifact, wrap_verify));
         wrap_verified?;
         let plonk_proof = plonk_proof
             .map_err(|e| TaskError::Fatal(anyhow::anyhow!("Plonk proof task panicked: {}", e)))?
@@ -2001,6 +2099,11 @@ impl<C: SP1ProverComponents> WrapProver<C> {
         &self,
         wrapped_proof: &SP1WrapProof<SP1OuterGlobalContext, SP1PcsProofOuter>,
     ) -> Result<(), TaskError> {
+        if take_wrap_verify_fail_inject() {
+            return Err(TaskError::Retryable(anyhow::anyhow!(
+                "synthetic wrap verify failure (SP1_WRAP_VERIFY_FAIL_INJECT)"
+            )));
+        }
         let SP1WrapProof { vk, proof } = wrapped_proof;
         let mut challenger = SP1OuterGlobalContext::default_challenger();
         vk.observe_into(&mut challenger);
@@ -2075,5 +2178,70 @@ mod tests {
         });
         assert_eq!(setups.load(Ordering::SeqCst), 2);
         assert!(vk == vk_number(7));
+    }
+
+    fn shrink_wrap_request(output: &Artifact) -> RawTaskRequest {
+        RawTaskRequest {
+            inputs: vec![Artifact("compressed".to_string())],
+            outputs: vec![output.clone()],
+            context: TaskContext {
+                proof_id: crate::worker::ProofId::new("proof"),
+                parent_id: None,
+                parent_context: None,
+                requester_id: crate::worker::RequesterId::new("test"),
+            },
+        }
+    }
+
+    /// A wrap proof whose verification fails while a final wrap reads it fails that task
+    /// retryably, and is recorded for the retry to prove the wrap again with the shrink-wrap task
+    /// that made it; a retry that cannot (no such task known) fails fatally; a passing one passes.
+    #[tokio::test]
+    async fn a_failed_wrap_verification_is_retried_by_proving_the_wrap_again() {
+        let artifact = Artifact("wrap proof: failed verification".to_string());
+        let failing = tokio::task::spawn_blocking(|| {
+            Err(TaskError::Retryable(anyhow::anyhow!("wrap verify failed")))
+        });
+        let pending = PendingWrapVerify {
+            verify: WrapVerify::Running(failing),
+            shrink_wrap: Some(shrink_wrap_request(&artifact)),
+        };
+        let result = finish_wrap_verify(&artifact, pending).await;
+        assert!(matches!(result, Err(TaskError::Retryable(_))), "{result:?}");
+        match take_wrap_verify(&artifact) {
+            Some(PendingWrapVerify { verify: WrapVerify::Failed, shrink_wrap: Some(request) }) => {
+                assert_eq!(request.outputs, vec![artifact.clone()]);
+                assert_eq!(request.inputs, vec![Artifact("compressed".to_string())]);
+            }
+            _ => panic!("the failed verification is not recorded with its shrink-wrap task"),
+        }
+        // The recorded failure still fails whoever waits on it.
+        assert!(matches!(wait_wrap_verify(WrapVerify::Failed).await, Err(TaskError::Retryable(_))));
+
+        // Without the shrink-wrap task, no retry could read another proof.
+        let failing = tokio::task::spawn_blocking(|| {
+            Err(TaskError::Retryable(anyhow::anyhow!("wrap verify failed")))
+        });
+        let pending = PendingWrapVerify { verify: WrapVerify::Running(failing), shrink_wrap: None };
+        let result = finish_wrap_verify(&artifact, pending).await;
+        assert!(matches!(result, Err(TaskError::Fatal(_))), "{result:?}");
+        assert!(take_wrap_verify(&artifact).is_none());
+
+        // A panicking verification is fatal, a passing one passes and records nothing.
+        let panicking = tokio::task::spawn_blocking(|| -> Result<(), TaskError> {
+            panic!("the verifier panicked")
+        });
+        let pending = PendingWrapVerify {
+            verify: WrapVerify::Running(panicking),
+            shrink_wrap: Some(shrink_wrap_request(&artifact)),
+        };
+        assert!(matches!(finish_wrap_verify(&artifact, pending).await, Err(TaskError::Fatal(_))));
+        let passing = tokio::task::spawn_blocking(|| Ok(()));
+        let pending = PendingWrapVerify {
+            verify: WrapVerify::Running(passing),
+            shrink_wrap: Some(shrink_wrap_request(&artifact)),
+        };
+        assert!(finish_wrap_verify(&artifact, pending).await.is_ok());
+        assert!(take_wrap_verify(&artifact).is_none());
     }
 }
