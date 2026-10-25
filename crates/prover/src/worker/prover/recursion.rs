@@ -9,8 +9,8 @@ use crate::{
     shapes::{SP1RecursionProofShape, DEFAULT_ARITY},
     verify::WRAP_VK_BYTES,
     worker::{
-        CommonProverInput, DeferredInputs, ProverMetrics, RangeProofs, RawTaskRequest, TaskContext,
-        TaskError, TaskMetadata, WrapAirProverInit,
+        parse_env_bool, CommonProverInput, DeferredInputs, ProverMetrics, RangeProofs,
+        RawTaskRequest, TaskContext, TaskError, TaskMetadata, WrapAirProverInit,
     },
     RecursionSC, SP1CircuitWitness, SP1ProverComponents, WrapSC,
 };
@@ -90,6 +90,10 @@ pub struct SP1RecursionProverConfig {
     /// decided before each proof from the free GPU and host memory (see `groth16_backend`), which
     /// in practice leaves the CPU prover on cards below 32 GB unless `SP1_GPU_RESET_BEFORE_WRAP`.
     pub groth16_gpu: bool,
+    /// Whether the shrink prover keeps its proving key between proofs (see `ShrinkProver`), unless
+    /// `SP1_SHRINK_PERSISTENT_PK` says otherwise. True by default; the GPU worker builder clears
+    /// it for cards below 24 GiB, as it turns off the wrap prover's kept key there.
+    pub shrink_persistent_pk: bool,
 }
 
 impl SP1RecursionProverConfig {
@@ -118,6 +122,7 @@ impl SP1RecursionProverConfig {
             vk_map_file: None,
             reduce_shape,
             groth16_gpu: false,
+            shrink_persistent_pk: true,
         }
     }
     #[cfg(feature = "experimental")]
@@ -458,10 +463,7 @@ static WRAP_VERIFIES: std::sync::LazyLock<
 /// Whether the shrink-wrap task leaves the wrap proof's verification running for the task that
 /// reads the proof (default), rather than finishing it before it ends (SP1_WRAP_VERIFY_OVERLAP=0).
 fn overlap_wrap_verify() -> bool {
-    !matches!(
-        std::env::var("SP1_WRAP_VERIFY_OVERLAP").ok().as_deref(),
-        Some("0" | "false" | "FALSE" | "False")
-    )
+    std::env::var("SP1_WRAP_VERIFY_OVERLAP").ok().and_then(|v| parse_env_bool(&v)).unwrap_or(true)
 }
 
 /// Takes this process's verification of the wrap proof uploaded to `artifact`. None when this
@@ -1633,8 +1635,11 @@ pub struct ShrinkProver<C: SP1ProverComponents> {
     /// The proving key from the setup in [`Self::new`], kept to prove with (like the wrap
     /// prover's): the shrink program is the same for every proof, and setting it up again for
     /// each one regenerates and commits its preprocessed traces (~130 ms of a ~0.32 s shrink on an
-    /// MI300X). None with SP1_SHRINK_PERSISTENT_PK=0, or once a proof made with it has failed
-    /// verification (see [`Self::forget_proving_key`]).
+    /// MI300X). None on cards below 24 GiB or with SP1_SHRINK_PERSISTENT_PK=0 (see
+    /// [`SP1RecursionProverConfig::shrink_persistent_pk`]), or once a proof made with it has failed
+    /// verification (see [`Self::forget_proving_key`]). On a 16 GB Radeon RX 9070 XT the key, held
+    /// from start-up, left HIP's arena without a 2 GiB range for the next proof's traces, and every
+    /// second compressed proof of a process failed out of device memory.
     proving_key: std::sync::Mutex<Option<Arc<CompressProvingKey<C>>>>,
     prover_data: Arc<RecursionProverData<C>>,
     pub shrink_shape: BTreeMap<String, usize>,
@@ -1674,7 +1679,10 @@ impl<C: SP1ProverComponents> ShrinkProver<C> {
         });
         // The setup's permit is released here (as when the key was dropped): proving takes its own.
         let pk = unsafe { pk.into_inner() };
-        let keep = std::env::var("SP1_SHRINK_PERSISTENT_PK").map(|v| v != "0").unwrap_or(true);
+        let keep = std::env::var("SP1_SHRINK_PERSISTENT_PK")
+            .ok()
+            .and_then(|v| parse_env_bool(&v))
+            .unwrap_or(config.shrink_persistent_pk);
         let proving_key = keep.then(|| pk.clone());
         let shrink_shape = {
             let (tx, rx) = oneshot::channel();
@@ -1882,7 +1890,10 @@ impl<C: SP1ProverComponents> WrapProver<C> {
             });
             rx.blocking_recv().unwrap()
         };
-        let keep = std::env::var("SP1_WRAP_PERSISTENT_PK").map(|v| v != "0").unwrap_or(true);
+        let keep = std::env::var("SP1_WRAP_PERSISTENT_PK")
+            .ok()
+            .and_then(|v| parse_env_bool(&v))
+            .unwrap_or(true);
         let vk_known = known_vk.is_some();
         let (verifying_key, proving_key) = if keep {
             let (mut preprocessed, mut verifying_key) = setup();

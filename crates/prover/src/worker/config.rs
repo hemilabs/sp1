@@ -200,9 +200,10 @@ fn checked_max_reduce_arity(requested: Option<usize>, max_compose_arity: usize) 
     }
 }
 
-/// Parses a boolean `SP1_WORKER_*` setting: `true`/`false` (any case), `1`/`0`, `yes`/`no` and
-/// `on`/`off`. Anything else is ignored with a warning, so the default applies.
-fn parse_env_bool(value: &str) -> Option<bool> {
+/// Parses a boolean setting (`SP1_WORKER_*`, and the recursion prover's): `true`/`false` (any
+/// case), `1`/`0`, `yes`/`no` and `on`/`off`. Anything else is ignored with a warning, so the
+/// default applies.
+pub(crate) fn parse_env_bool(value: &str) -> Option<bool> {
     match value.trim().to_ascii_lowercase().as_str() {
         "1" | "true" | "yes" | "on" => Some(true),
         "0" | "false" | "no" | "off" => Some(false),

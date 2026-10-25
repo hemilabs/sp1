@@ -415,11 +415,18 @@ pub async fn cuda_worker_builder_with_machine(
     // unless SP1_GPU_RESET_BEFORE_WRAP is set) and the host
     // has the memory, and uses the CPU prover if not.
     let groth16_gpu = gpu_memory_gb() > 20;
+    // The shrink prover keeps its proving key between proofs only where the card has the memory
+    // for it, like the wrap prover above: on a 16 GB Radeon RX 9070 XT the key, held from
+    // start-up, left HIP's arena without a 2 GiB range for the next proof's traces, and every
+    // second compressed proof of a process failed out of device memory.
+    let shrink_persistent_pk = !cuda_memory_info().is_ok_and(|(_, total)| total < 24 << 30);
 
     let base_builder = SP1WorkerBuilder::new_with_machine(machine)
         .with_core_opts(opts)
         .with_config(|config| {
             config.prover_config.recursion_prover_config.groth16_gpu = groth16_gpu;
+            config.prover_config.recursion_prover_config.shrink_persistent_pk =
+                shrink_persistent_pk;
             // A core worker runs tracing, host tracegen, the core proof, its CPU verification and
             // then the shard's normalize (lift) proof before it takes the next shard. With the
             // upstream default of 4 workers all four are often in those CPU phases together and
