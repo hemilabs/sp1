@@ -110,12 +110,33 @@ fn main() {
             _ => Some(std::thread::available_parallelism().map_or(2, |n| (n.get() / 8).max(2))),
         }
     });
-    let proving_data =
-        sp1_gpu_groth16::types::Groth16ProvingData::load_with_threads(gpu_dir_str, load_threads)
+    let load_proving_data = |threads| {
+        sp1_gpu_groth16::types::Groth16ProvingData::load_with_threads(gpu_dir_str, threads)
             .unwrap_or_else(|e| {
                 eprintln!("[groth16-gpu-helper] failed to load Groth16ProvingData: {e}");
                 std::process::exit(helper_exit::FILE_ERROR);
-            });
+            })
+    };
+    let witness_data_from = |args: &Args| {
+        let witness_dir = args.witness_dir.as_deref().unwrap_or(&args.gpu_dir);
+        load_witness_data(
+            witness_dir.to_str().expect("--witness-dir is not valid UTF-8"),
+            args.prep_circuit_dir.as_deref(),
+            args.wires_initial.as_deref(),
+        )
+    };
+    // Not prestarted, the helper has its witness from the start: it loads the proving data while
+    // it solves or reads the witness, which needs none of it (RTX 5060 Ti: 1.7 s of loading beside
+    // 3.2 s of GPU R1CS solving, one after the other before).
+    let (proving_data, witness_data) = if args.upload_fifo.is_none() && args.wait_fifo.is_none() {
+        std::thread::scope(|s| {
+            let loading = s.spawn(|| load_proving_data(None));
+            let witness_data = witness_data_from(&args);
+            (loading.join().expect("loading the proving data panicked"), Some(witness_data))
+        })
+    } else {
+        (load_proving_data(load_threads), None)
+    };
 
     // A prestarted helper uploads the key as soon as the GPU has room, then waits for its proof.
     let mut proving_data = Some(proving_data);
@@ -139,12 +160,7 @@ fn main() {
         args.out = PathBuf::from(out);
     }
 
-    let witness_dir = args.witness_dir.as_deref().unwrap_or(&args.gpu_dir);
-    let witness_data = load_witness_data(
-        witness_dir.to_str().expect("--witness-dir is not valid UTF-8"),
-        args.prep_circuit_dir.as_deref(),
-        args.wires_initial.as_deref(),
-    );
+    let witness_data = witness_data.unwrap_or_else(|| witness_data_from(&args));
 
     eprintln!("[groth16-gpu-helper] reading public inputs from {}", args.witness_json.display());
     let witness_json = std::fs::read_to_string(&args.witness_json).unwrap_or_else(|e| {
