@@ -415,11 +415,15 @@ class MultiField32Challenger {
         return sample_bits(bits) == 0;
     }
 
-    // As DuplexChallenger::grind_found: an atomic load on SYCL. The grind loop below depends on it
-    // being a volatile or atomic load, as described there.
+    // As DuplexChallenger::grind_found: an atomic load on SYCL and HIP. The grind loop below depends
+    // on it being a volatile or atomic load, as described there. With the plain load on HIP, the
+    // wrap's grinding took 1.2 s a search on an RX 9060 XT against 12 ms on an RTX 5060 Ti: the
+    // other work-groups kept searching after the hit.
     static __device__ __forceinline__ bool grind_found(volatile bool* found_flag) {
 #ifdef SP1_SYCL
         return ::sp1sycl::device_atomic<int>(*(int*)found_flag).load() != 0;
+#elif defined(__HIPCC__)
+        return __hip_atomic_load((int*)found_flag, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT) != 0;
 #else
         return *found_flag;
 #endif

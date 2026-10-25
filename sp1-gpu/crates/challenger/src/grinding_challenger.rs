@@ -199,7 +199,8 @@ where
     // Bounded ranges, the next launched only if the last found nothing, as in
     // `grind_duplex_challenger_on_device`. One launch over all of [0, n) swept the whole field on
     // an MI300X whatever the witness (8.0 s for a 12-bit grind, 2.0 s for a 22-bit one), since the
-    // finder's wave set the found flag only after sweeping its whole share.
+    // finder's wave set the found flag only after sweeping its whole share. (On an RX 9060 XT the
+    // wrap's grinding also needs the flag read atomically: see `grind_found`.)
     const CANDIDATES_PER_THREAD: u64 = 4;
     let chunk = ((grid_dim * block_dim) as u64 * CANDIDATES_PER_THREAD).min(max_chunk).max(1);
     unsafe {

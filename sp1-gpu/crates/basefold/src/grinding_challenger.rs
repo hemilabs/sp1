@@ -108,7 +108,7 @@ mod tests {
         };
 
         sp1_gpu_cudart::run_sync_in_place(|t| {
-            for bits in 1..10 {
+            for bits in 1..20 {
                 let perm = outer_perm();
                 let mut challenger = slop_challenger::MultiField32Challenger::<
                     SP1Field,
