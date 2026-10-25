@@ -55,6 +55,9 @@ pub struct HostPhaseTracegen<A> {
     pub device_preps: Vec<Option<PreprocessedPrep>>,
     /// Pinned copy of the input of each of `device_airs`, if staged (see [`InputStager`]).
     pub device_staged: Vec<Option<StagedInput>>,
+    /// Signals that the packed inputs among `device_staged` are written (they are packed by rayon
+    /// jobs, see [`CudaTracegenAir::pack_main_device_input`]).
+    pub device_staged_ready: Vec<futures::channel::oneshot::Receiver<()>>,
 }
 
 /// Whether device-tracegen inputs are staged in pinned memory (`SP1_GPU_STAGE_INPUTS=0` turns it
@@ -116,6 +119,24 @@ impl InputStager {
         self.staged_bytes += input.len();
         // SAFETY: the buffer is pinned and outlives the upload (see the type docs).
         Some(unsafe { StagedInput::new(dst, input.len()) })
+    }
+
+    /// Reserves `len` bytes of the buffer for an input written later, or returns `None` if they
+    /// do not fit (the input is then packed and uploaded by its device tracegen).
+    fn reserve(&mut self, len: usize) -> Option<StagedInput> {
+        if len == 0 || !stage_inputs() {
+            return None;
+        }
+        let start = self.end.next_multiple_of(Self::ALIGN);
+        if start + len > self.capacity {
+            self.unstaged_bytes += len;
+            return None;
+        }
+        self.end = start + len;
+        self.staged_bytes += len;
+        // SAFETY: the buffer is pinned and outlives the upload (see the type docs); the reserved
+        // bytes are written before the upload (`device_staged_ready`).
+        Some(unsafe { StagedInput::new((self.base + start) as *const u8, len) })
     }
 
     /// End of the used part of the buffer, in felts.
@@ -311,12 +332,29 @@ impl TracePrefetcher {
 
     /// Waits for the prefetch slot, then uploads the shard's host traces as they are generated.
     /// The slot is released when the returned permit is dropped.
+    ///
+    /// The packed inputs of the device tracegens (`packed_inputs`, written once `ready`) go first.
     async fn prefetch(
         &self,
         host_traces: impl futures::Stream<Item = HostTraceRef>,
+        packed_inputs: Vec<Option<StagedInput>>,
+        ready: Vec<futures::channel::oneshot::Receiver<()>>,
     ) -> (PrefetchedTraces, tokio::sync::OwnedSemaphorePermit) {
         let slot = self.slot.clone().acquire_owned().await.unwrap();
-        let mut prefetched = PrefetchedTraces { uploads: Vec::new(), rest: Vec::new() };
+        for ready in ready {
+            ready.await.expect("packing a device tracegen input failed");
+        }
+        let inputs = packed_inputs
+            .into_iter()
+            .map(|input| {
+                // Packed inputs are whole 8-byte words (`CudaTracegenAir::pack_main_device_input`).
+                let input = input.filter(|input| input.len() % 8 == 0)?;
+                // SAFETY: the input lives in the shard's pinned buffer, which the shard holds until
+                // its proof is done, after the upload.
+                unsafe { self.stream.upload(input.as_ptr() as *const u64, input.len() / 8) }
+            })
+            .collect();
+        let mut prefetched = PrefetchedTraces { uploads: Vec::new(), rest: Vec::new(), inputs };
         let mut host_traces = pin!(host_traces);
         while let Some(host_trace_ref) = host_traces.next().await {
             let (_, ptr, height, width) = host_trace_ref;
@@ -336,6 +374,8 @@ struct PrefetchedTraces {
     uploads: Vec<(HostTraceRef, Arc<sp1_gpu_cudart::StagedUpload>)>,
     /// The traces that could not be uploaded.
     rest: Vec<HostTraceRef>,
+    /// The uploads of the device tracegens' packed inputs, by device chip.
+    inputs: Vec<Option<Arc<sp1_gpu_cudart::StagedUpload>>>,
 }
 
 impl PrefetchedTraces {
@@ -344,6 +384,7 @@ impl PrefetchedTraces {
     fn into_traces(self, backend: &TaskScope) -> (Vec<(String, Trace)>, Vec<HostTraceRef>) {
         let mut uploaded = Vec::new();
         let mut rest = self.rest;
+        assert!(self.inputs.is_empty(), "take the packed inputs first");
         for (host_trace_ref, upload) in self.uploads {
             match upload.take::<Felt>(backend).unwrap() {
                 Some(storage) => {
@@ -858,7 +899,13 @@ async fn host_preprocessed_tracegen<A: CudaTracegenAir<Felt>>(
         .unwrap();
 
     (
-        HostPhaseTracegen { device_airs, host_traces, device_preps, device_staged: Vec::new() },
+        HostPhaseTracegen {
+            device_airs,
+            host_traces,
+            device_preps,
+            device_staged: Vec::new(),
+            device_staged_ready: Vec::new(),
+        },
         total_size,
     )
 }
@@ -869,7 +916,7 @@ async fn device_preprocessed_tracegen<A: CudaTracegenAir<Felt>>(
     host_phase_tracegen: HostPhaseTracegen<A>,
     backend: &TaskScope,
 ) -> BTreeMap<String, Trace<TaskScope>> {
-    let HostPhaseTracegen { device_airs, host_traces, device_preps, device_staged } =
+    let HostPhaseTracegen { device_airs, host_traces, device_preps, device_staged, .. } =
         host_phase_tracegen;
     let mut device_preps = device_preps.into_iter();
     let mut device_staged = device_staged.into_iter();
@@ -1044,6 +1091,7 @@ async fn copy_main_jagged_traces(
     log_stacking_height: u32,
     max_log_row_count: u32,
     global_dependencies_opt: bool,
+    lookup_counts: Option<Buffer<u32, TaskScope>>,
 ) {
     // At this point, all traces are on device. Now we need to copy them into the Jagged MLE struct.
     let JaggedMle {
@@ -1101,6 +1149,27 @@ async fn copy_main_jagged_traces(
 
     if main_table_index.contains_key("Global") && global_dependencies_opt {
         update_global_dependencies(dense_data, main_table_index);
+    }
+
+    // The byte lookups the device traces counted, as the host traces count theirs into the
+    // record before the Byte and Range traces are generated.
+    if let Some(counts) = lookup_counts {
+        let byte = main_table_index.get("Byte").expect("the Byte trace counts the lookups");
+        let range = main_table_index.get("Range").expect("the Range trace counts the lookups");
+        assert_eq!(byte.num_polys * byte.poly_size, byte.dense_offset.len());
+        assert_eq!(range.num_polys * range.poly_size, range.dense_offset.len());
+        assert_eq!(range.poly_size, 1 << 17);
+        unsafe {
+            sp1_gpu_tracegen::add_lookup_counts_to_traces(
+                dense_data.as_mut_ptr().add(byte.dense_offset.start),
+                byte.poly_size,
+                dense_data.as_mut_ptr().add(range.dense_offset.start),
+                counts.as_ptr(),
+                &backend,
+            );
+        }
+        // Freed in stream order, after the kernel.
+        drop(counts);
     }
 
     // Shrink the len of the dense data to match the actual size.
@@ -1304,6 +1373,7 @@ where
         shard_chips,
         host_traces_len,
         device_staged,
+        device_staged_ready,
         staged_end,
     ) = tokio::task::spawn_blocking(move || {
         // Set of chips we need to generate traces for.
@@ -1334,6 +1404,40 @@ where
         let mut stager = InputStager::new(buffer_ptr, buffer_len, total_size);
         let staging_record = stage_inputs().then(|| record.clone());
 
+        // Pack the inputs of the device chips that upload packed events, first: rayon runs jobs
+        // spawned from outside the pool in order, so the packing is done well before the permit.
+        let mut packed_staged = vec![None; device_airs.len()];
+        let mut device_staged_ready = Vec::new();
+        if let Some(record) = &staging_record {
+            for (air, packed_staged) in device_airs.iter().zip(packed_staged.iter_mut()) {
+                let Some(staged) =
+                    air.packed_main_device_input_len(record).and_then(|len| stager.reserve(len))
+                else {
+                    continue;
+                };
+                *packed_staged = Some(staged);
+                let (ready_tx, ready_rx) = futures::channel::oneshot::channel();
+                device_staged_ready.push(ready_rx);
+                let air = air.clone();
+                let record = record.clone();
+                let span = tracing::trace_span!(parent: &outer_span, "pack device tracegen input", chip = %air.name());
+                rayon::spawn(move || {
+                    span.in_scope(|| {
+                        // SAFETY: the bytes are reserved for this input in the shard's pinned
+                        // buffer, which outlives its upload.
+                        let out = unsafe {
+                            std::slice::from_raw_parts_mut(
+                                staged.as_ptr() as *mut MaybeUninit<u8>,
+                                staged.len(),
+                            )
+                        };
+                        air.pack_main_device_input(&record, out);
+                    });
+                    let _ = ready_tx.send(());
+                });
+            }
+        }
+
         // Generate the traces on the CPU, one rayon task per chip. `host_traces` is a futures
         // Stream that will immediately begin buffering traces.
         let (host_traces_tx, host_traces) = futures::channel::mpsc::unbounded();
@@ -1356,9 +1460,13 @@ where
         }
 
         let device_staged: Vec<_> = match staging_record {
-            Some(record) => {
-                device_airs.iter().map(|air| stager.stage(air.main_device_input(&record))).collect()
-            }
+            Some(record) => device_airs
+                .iter()
+                .zip(packed_staged)
+                .map(|(air, packed)| {
+                    packed.or_else(|| stager.stage(air.main_device_input(&record)))
+                })
+                .collect(),
             None => Vec::new(),
         };
         stager.log("main");
@@ -1371,6 +1479,7 @@ where
             shard_chips,
             total_size - start_idx,
             device_staged,
+            device_staged_ready,
             staged_end,
         )
     })
@@ -1390,24 +1499,66 @@ where
     let host_phase_shape_info =
         HostPhaseShapeInfo { traces_by_name: initial_traces, chip_set, host_traces_len };
 
-    let host_phase_tracegen =
-        HostPhaseTracegen { device_airs, host_traces, device_preps: Vec::new(), device_staged };
+    let host_phase_tracegen = HostPhaseTracegen {
+        device_airs,
+        host_traces,
+        device_preps: Vec::new(),
+        device_staged,
+        device_staged_ready,
+    };
 
     (host_phase_tracegen, host_phase_shape_info, staged_end)
 }
 
-/// Puts traces on device. Returns (traces, public values).
+/// The staged inputs of the device chips, and the signals that their packed ones are written.
+type DeviceInputs = (Vec<Option<StagedInput>>, Vec<futures::channel::oneshot::Receiver<()>>);
+
+/// The traces, the public values, and the byte lookups the device traces counted (to add into the
+/// Byte and Range traces).
+type DeviceMainTraces = (BTreeMap<String, Trace>, Vec<Felt>, Option<Buffer<u32, TaskScope>>);
+
+/// Puts traces on device. Returns (traces, public values, device lookup counts).
 #[instrument(skip_all, level = "debug")]
 async fn device_main_tracegen<A: CudaTracegenAir<Felt>>(
     device_airs: Vec<Arc<A>>,
     host_traces: impl futures::Stream<Item = HostTraceRef>,
-    device_staged: Vec<Option<StagedInput>>,
+    (device_staged, device_staged_ready): DeviceInputs,
     prefetched: Option<PrefetchedTraces>,
     record: Arc<<A as MachineAir<Felt>>::Record>,
     initial_traces: BTreeMap<String, Trace>,
     backend: &TaskScope,
-) -> (BTreeMap<String, Trace>, Vec<Felt>) {
+) -> DeviceMainTraces {
+    // The device chips' byte lookups that the Byte and Range traces must count, if any.
+    let mut lookup_counts =
+        device_airs.iter().any(|air| air.device_trace_counts_lookups(&record)).then(|| {
+            let mut counts = Buffer::<u32, TaskScope>::with_capacity_in(
+                sp1_gpu_tracegen::BYTE_LOOKUP_SLOTS,
+                backend.clone(),
+            );
+            unsafe {
+                backend
+                    .write_bytes(
+                        counts.as_mut_ptr() as *mut u8,
+                        0u8,
+                        sp1_gpu_tracegen::BYTE_LOOKUP_SLOTS * std::mem::size_of::<u32>(),
+                    )
+                    .unwrap();
+                counts.set_len(sp1_gpu_tracegen::BYTE_LOOKUP_SLOTS);
+            }
+            counts
+        });
+    let counts_ptr = lookup_counts
+        .as_mut()
+        .map(|counts| unsafe { sp1_gpu_tracegen::DeviceLookupCounts::new(counts.as_mut_ptr()) });
+    // The packed inputs must be written before they are uploaded.
+    for ready in device_staged_ready {
+        ready.await.expect("packing a device tracegen input failed");
+    }
+
     let mut all_traces = initial_traces;
+    let mut prefetched = prefetched;
+    let mut input_uploads =
+        prefetched.as_mut().map(|p| std::mem::take(&mut p.inputs)).unwrap_or_default().into_iter();
     let (uploaded, rest) = prefetched.map(|p| p.into_traces(backend)).unwrap_or_default();
     all_traces.extend(uploaded);
     let host_traces = host_traces.chain(futures::stream::iter(rest));
@@ -1448,10 +1599,20 @@ async fn device_main_tracegen<A: CudaTracegenAir<Felt>>(
             // We want to borrow the record and move the chip.
             let record = record.as_ref();
             let outer_span = outer_span.clone();
-            let staged = device_staged.next().flatten();
+            let staged = sp1_gpu_tracegen::StagedDeviceInput {
+                pinned: device_staged.next().flatten(),
+                uploaded: input_uploads.next().flatten(),
+            };
+            let counts = counts_ptr.filter(|_| air.device_trace_counts_lookups(record));
             async move {
                 let trace = air
-                    .generate_trace_device_staged(record, &mut A::Record::default(), staged, backend)
+                    .generate_trace_device_counted(
+                        record,
+                        &mut A::Record::default(),
+                        staged,
+                        counts,
+                        backend,
+                    )
                     .instrument(tracing::trace_span!(parent: &outer_span, "device chip tracegen", chip = %air.name()))
                     .await
                     .unwrap();
@@ -1480,7 +1641,7 @@ async fn device_main_tracegen<A: CudaTracegenAir<Felt>>(
         }
     });
 
-    (all_traces, public_values)
+    (all_traces, public_values, lookup_counts)
 }
 
 /// Corresponds to `generate_main_traces`.
@@ -1514,7 +1675,9 @@ pub async fn main_tracegen<GC: IopCtx<F = Felt>, A: CudaTracegenAir<Felt>>(
     // (env-gated, future) it lets shard N+1's tracegen begin while shard N's
     // prove still holds its buffer.
     let pool = jagged_traces.lock().await.trace_buffer_pool.clone();
-    let HostPhaseTracegen { device_airs, host_traces, device_staged, .. } = host_phase_tracegen;
+    let HostPhaseTracegen {
+        device_airs, host_traces, device_staged, mut device_staged_ready, ..
+    } = host_phase_tracegen;
 
     // If another shard holds the trace buffer, it is being proved: upload this shard's host traces
     // meanwhile (see `TracePrefetcher`). Otherwise copy them as they are generated. The next
@@ -1524,8 +1687,17 @@ pub async fn main_tracegen<GC: IopCtx<F = Felt>, A: CudaTracegenAir<Felt>>(
     let (trace_buffer, host_traces, prefetched) = match (pool.clone().try_pop(), prefetcher) {
         (Ok(trace_buffer), _) => (Ok(trace_buffer), host_traces.left_stream(), None),
         (Err(_), Some(prefetcher)) if prefetcher.accepts(host_traces_len) => {
+            // The packed inputs of the device chips, uploaded with the host traces.
+            let packed_inputs = device_airs
+                .iter()
+                .zip(device_staged.iter().chain(std::iter::repeat(&None)))
+                .map(|(air, staged)| {
+                    staged.filter(|_| air.packed_main_device_input_len(&record).is_some())
+                })
+                .collect();
+            let ready = std::mem::take(&mut device_staged_ready);
             let (prefetched, prefetch_slot) = prefetcher
-                .prefetch(host_traces)
+                .prefetch(host_traces, packed_inputs, ready)
                 .instrument(tracing::debug_span!("prefetch host traces"))
                 .await;
             slot = Some(prefetch_slot);
@@ -1549,10 +1721,10 @@ pub async fn main_tracegen<GC: IopCtx<F = Felt>, A: CudaTracegenAir<Felt>>(
     // Now that the permit is acquired, we can begin the following two tasks:
     // - Copying host traces to the device.
     // - Generating traces on the device.
-    let (traces, public_values) = device_main_tracegen(
+    let (traces, public_values, lookup_counts) = device_main_tracegen(
         device_airs,
         host_traces,
-        device_staged,
+        (device_staged, device_staged_ready),
         prefetched,
         record,
         initial_traces,
@@ -1568,6 +1740,7 @@ pub async fn main_tracegen<GC: IopCtx<F = Felt>, A: CudaTracegenAir<Felt>>(
         log_stacking_height,
         max_log_row_count,
         global_dependencies_opt,
+        lookup_counts,
     )
     .await;
     drop(slot);
@@ -1651,12 +1824,12 @@ pub async fn full_tracegen<A: CudaTracegenAir<Felt>>(
     // - Copying host traces to the device.
     // - Generating traces on the device.
 
-    let (preprocessed_traces, (main_traces, public_values)) = join!(
+    let (preprocessed_traces, (main_traces, public_values, lookup_counts)) = join!(
         device_preprocessed_tracegen(program, prep_host_phase_tracegen, backend),
         device_main_tracegen(
             main_host_phase_tracegen.device_airs,
             main_host_phase_tracegen.host_traces,
-            main_host_phase_tracegen.device_staged,
+            (main_host_phase_tracegen.device_staged, main_host_phase_tracegen.device_staged_ready),
             None,
             record,
             initial_traces,
@@ -1681,6 +1854,7 @@ pub async fn full_tracegen<A: CudaTracegenAir<Felt>>(
         log_stacking_height,
         max_log_row_count,
         global_dependencies_opt,
+        lookup_counts,
     )
     .await;
 
@@ -1817,10 +1991,10 @@ pub async fn full_tracegen_permit<A: CudaTracegenAir<Felt>>(
     let permit =
         prover_permits.acquire().instrument(tracing::debug_span!("acquire")).await.unwrap();
 
-    let (main_traces, public_values) = device_main_tracegen(
+    let (main_traces, public_values, lookup_counts) = device_main_tracegen(
         main_host_phase_tracegen.device_airs,
         main_host_phase_tracegen.host_traces,
-        main_host_phase_tracegen.device_staged,
+        (main_host_phase_tracegen.device_staged, main_host_phase_tracegen.device_staged_ready),
         None,
         record,
         initial_traces,
@@ -1839,6 +2013,7 @@ pub async fn full_tracegen_permit<A: CudaTracegenAir<Felt>>(
         log_stacking_height,
         max_log_row_count,
         global_dependencies_opt,
+        lookup_counts,
     )
     .await;
 

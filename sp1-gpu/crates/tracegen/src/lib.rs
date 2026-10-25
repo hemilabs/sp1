@@ -1,6 +1,11 @@
 mod recursion;
 mod riscv;
 
+pub use riscv::{
+    device_main_tracegen_enabled, AluEventPacked, BranchColOffsets, MulColOffsets, MulEventPacked,
+    ShiftRightColOffsets, SimpleAlu, SimpleAluColOffsets, DEVICE_MAIN_TRACEGEN_CHIPS,
+};
+
 use core::future::{ready, Future};
 use core::pin::pin;
 use std::collections::BTreeSet;
@@ -387,7 +392,87 @@ impl StagedInput {
     pub unsafe fn new(ptr: *const u8, len: usize) -> Self {
         Self { ptr: ptr as usize, len }
     }
+
+    /// The address of the pinned copy.
+    pub fn as_ptr(&self) -> *const u8 {
+        self.ptr as *const u8
+    }
+
+    /// The size of the copy in bytes.
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
 }
+
+/// Where a device main tracegen finds its input before it is generated: a pinned copy, and the
+/// device copy uploaded from it ahead of the prover permit (see `TracePrefetcher`), if any.
+#[derive(Clone, Default)]
+pub struct StagedDeviceInput {
+    pub pinned: Option<StagedInput>,
+    pub uploaded: Option<std::sync::Arc<sp1_gpu_cudart::StagedUpload>>,
+}
+
+impl From<Option<StagedInput>> for StagedDeviceInput {
+    fn from(pinned: Option<StagedInput>) -> Self {
+        Self { pinned, uploaded: None }
+    }
+}
+
+/// A device array of byte lookup multiplicities, in the slot layout of
+/// `sp1_core_executor::events::byte_lookup_slot` (`BYTE_LOOKUP_SLOTS` `u32`s), that device
+/// tracegens add their lookups into. Its owner keeps it alive until the kernels that write it are
+/// done (stream order).
+#[derive(Clone, Copy, Debug)]
+pub struct DeviceLookupCounts {
+    ptr: usize,
+}
+
+impl DeviceLookupCounts {
+    /// # Safety
+    /// `ptr` must point to `BYTE_LOOKUP_SLOTS` `u32`s of device memory that outlive every kernel
+    /// launched with it.
+    pub unsafe fn new(ptr: *mut u32) -> Self {
+        Self { ptr: ptr as usize }
+    }
+
+    pub fn as_mut_ptr(self) -> *mut u32 {
+        self.ptr as *mut u32
+    }
+}
+
+/// Adds the device-counted byte lookups `counts` into the Byte trace (column-major, at
+/// `byte_trace`, with `byte_height` rows) and the Range trace (at `range_trace`).
+///
+/// # Safety
+/// The pointers must be device pointers to traces of those shapes and to `BYTE_LOOKUP_SLOTS`
+/// counts.
+pub unsafe fn add_lookup_counts_to_traces(
+    byte_trace: *mut F,
+    byte_height: usize,
+    range_trace: *mut F,
+    counts: *const u32,
+    scope: &TaskScope,
+) {
+    assert_eq!(byte_height, sp1_core_executor::events::BYTE_TABLE_ROWS);
+    let args = sp1_gpu_cudart::args!(byte_trace, byte_height, range_trace, counts);
+    const BLOCK_DIM: usize = 256;
+    let grid_dim = BYTE_LOOKUP_SLOTS.div_ceil(BLOCK_DIM).min(1024);
+    scope
+        .launch_kernel(
+            sp1_gpu_cudart::sys::tracegen::riscv_add_lookup_counts_kernel_ptr(),
+            grid_dim,
+            BLOCK_DIM,
+            &args,
+            0,
+        )
+        .unwrap();
+}
+
+pub use sp1_core_executor::events::BYTE_LOOKUP_SLOTS;
 
 /// The bytes of a slice of events or instructions (which are uploaded as they are), for staging.
 pub(crate) fn input_bytes<T>(input: &[T]) -> &[MaybeUninit<u8>] {
@@ -524,6 +609,45 @@ pub trait CudaTracegenAir<F: Field>: MachineAir<F> {
     /// can stage them in pinned memory before taking the prover permit.
     fn main_device_input<'a>(&self, _record: &'a Self::Record) -> Option<&'a [MaybeUninit<u8>]> {
         None
+    }
+
+    /// The size in bytes of the input that [`CudaTracegenAir::pack_main_device_input`] writes for
+    /// `record`, for an AIR whose device main tracegen uploads a packed copy of its events (rather
+    /// than the events as they are, see [`CudaTracegenAir::main_device_input`]).
+    fn packed_main_device_input_len(&self, _record: &Self::Record) -> Option<usize> {
+        None
+    }
+
+    /// Writes the packed input of the device main tracegen of `record` into `out`, of
+    /// [`CudaTracegenAir::packed_main_device_input_len`] bytes. Its callers stage it in pinned
+    /// memory before taking the prover permit; [`CudaTracegenAir::generate_trace_device_staged`]
+    /// then uploads it from there.
+    fn pack_main_device_input(&self, _record: &Self::Record, _out: &mut [MaybeUninit<u8>]) {
+        unimplemented!()
+    }
+
+    /// Whether the device main tracegen of this AIR counts the byte lookups of `record` (see
+    /// [`CudaTracegenAir::generate_trace_device_counted`]): the device counterpart of
+    /// [`CudaTracegenAir::host_trace_generates_dependencies`].
+    fn device_trace_counts_lookups(&self, _record: &Self::Record) -> bool {
+        false
+    }
+
+    /// Like [`CudaTracegenAir::generate_trace_device_staged`], and with `lookup_counts` (when
+    /// [`CudaTracegenAir::device_trace_counts_lookups`]), also adds the byte lookups of the trace
+    /// into those device counts, as the host trace counts them into the record's
+    /// `byte_lookup_counts`. The trace is identical.
+    fn generate_trace_device_counted(
+        &self,
+        input: &Self::Record,
+        output: &mut Self::Record,
+        staged: StagedDeviceInput,
+        lookup_counts: Option<DeviceLookupCounts>,
+        scope: &TaskScope,
+    ) -> impl Future<Output = Result<DeviceMle<F>, CopyError>> + Send {
+        assert!(lookup_counts.is_none(), "{} does not count its byte lookups", self.name());
+        assert!(staged.uploaded.is_none(), "{} has no packed input", self.name());
+        self.generate_trace_device_staged(input, output, staged.pinned, scope)
     }
 
     /// Like [`CudaTracegenAir::generate_trace_device`], but uploads the input from `staged` (a
