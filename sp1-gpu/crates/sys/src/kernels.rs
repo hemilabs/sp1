@@ -66,7 +66,6 @@ extern "C" {
     pub fn zerocheck_fused_sequential_coop_wide_ext_kernel() -> KernelPtr;
     pub fn zerocheck_pad_adj_coop_kernel() -> KernelPtr;
     pub fn zerocheck_coop_smem_cap() -> u32;
-    pub fn zerocheck_hip_wave64() -> u32;
 
     // zerocheck (DAG-native): bivariate variants for the fused
     // first-two-rounds evaluation. Eval nodes on blockIdx.z (12 non-boolean

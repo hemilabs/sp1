@@ -56,9 +56,9 @@ use sp1_gpu_cudart::sys::kernels::{
     zerocheck_fused_sequential_uniform_kb_128_v32_kernel,
     zerocheck_geq_corrections_bivariate_kernel, zerocheck_geq_corrections_kernel,
     zerocheck_gkr_corner_sweep_kb_kernel, zerocheck_gkr_sweep_ext_kernel,
-    zerocheck_gkr_sweep_kb_kernel, zerocheck_hip_wave64, zerocheck_pad_adj_1024_kernel,
-    zerocheck_pad_adj_128_kernel, zerocheck_pad_adj_256_kernel, zerocheck_pad_adj_32_kernel,
-    zerocheck_pad_adj_512_kernel, zerocheck_pad_adj_64_kernel, zerocheck_pad_adj_coop_kernel,
+    zerocheck_gkr_sweep_kb_kernel, zerocheck_pad_adj_1024_kernel, zerocheck_pad_adj_128_kernel,
+    zerocheck_pad_adj_256_kernel, zerocheck_pad_adj_32_kernel, zerocheck_pad_adj_512_kernel,
+    zerocheck_pad_adj_64_kernel, zerocheck_pad_adj_coop_kernel,
 };
 use sp1_gpu_cudart::sys::runtime::KernelPtr;
 use sp1_gpu_cudart::{args, DeviceBuffer, DeviceCopy, DevicePoint, TaskScope};
@@ -1228,11 +1228,11 @@ const ROWS_PER_THREAD_SEQ: u32 = 1;
 /// (`SP1_GPU_ZEROCHECK_COOP_MAX_ROWS`) ...
 const COOP_MAX_ROWS: u32 = 1024;
 /// ... whose serial cost (instructions + 3 per inline GKR column) is at least
-/// this (`SP1_GPU_ZEROCHECK_COOP_MIN_COST`; by default 100 on wave64 HIP, which
-/// measured 21 ms per fib 40M core proof below 300 on MI300X with the wide
-/// cooperative kernel, and 300 elsewhere, where 100 is not measured) ...
+/// this (`SP1_GPU_ZEROCHECK_COOP_MIN_COST`; by default 100 where
+/// `tuned_defaults` holds: the MI300X measured 21 ms per fib 40M core proof
+/// below 300 with the wide cooperative kernel; 300 on CUDA) ...
 fn coop_min_cost_default() -> u32 {
-    if hip_wave64() {
+    if tuned_defaults() {
         100
     } else {
         300
@@ -1295,21 +1295,20 @@ const COOP_WIDE_ROWS: u32 = 2;
 /// bytecode serially in the thread-per-row kernel in every small round;
 /// 2 = also prefer it over the 8-lane kernel for every candidate it fits (fib
 /// 40M core on MI300X, per proof: cooperative kernels 240 -> 176 ms).
-/// Same results in every mode. By default 2 on wave64 HIP, where it was
-/// measured, and 0 elsewhere.
+/// Same results in every mode. By default 2 where `tuned_defaults` holds, and
+/// 0 on CUDA.
 fn coop_wide_mode() -> u32 {
-    let default = if hip_wave64() { 2 } else { 0 };
+    let default = if tuned_defaults() { 2 } else { 0 };
     env_u32("SP1_GPU_ZEROCHECK_COOP_WIDE", default).min(2)
 }
 
-/// Whether the device is a HIP one with 64-wide wavefronts (CDNA, gfx9*), where
-/// the zerocheck defaults above and `zerocheck_uniform_enabled` were tuned (on
-/// an MI300X). Elsewhere (RDNA, CUDA, SYCL) they default to the kernels as
-/// they were before that tuning; the env overrides work everywhere.
-fn hip_wave64() -> bool {
-    static WAVE64: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    // SAFETY: takes nothing and only reads the current device's attributes.
-    *WAVE64.get_or_init(|| unsafe { zerocheck_hip_wave64() } != 0)
+/// Whether the zerocheck defaults above and `zerocheck_uniform_enabled` take
+/// their tuned values: on HIP and SYCL, where they were measured (tuned on an
+/// MI300X; together also faster on an RX 9070 XT and an Arc Pro B70, rsp
+/// compressed by 2% and 11%). CUDA, where they are not measured, keeps the
+/// kernels as they were before that tuning. The env overrides work everywhere.
+fn tuned_defaults() -> bool {
+    sp1_gpu_cudart::sys::BACKEND != "cuda"
 }
 
 /// The chunk's level schedule fits the wide cooperative kernel's shared memory.
@@ -1328,13 +1327,13 @@ fn env_u32(name: &str, default: u32) -> u32 {
 
 /// Whether the MAX_REGS = 128 tier runs the wave-uniform interpreter
 /// (`zerocheck_fused_sequential_uniform`): scalar instruction fetch and
-/// dispatch plus a VGPR register file. By default on wave64 HIP only: elsewhere
-/// it compiles to a scratch register array without the scalar path, and is not
-/// measured. `SP1_GPU_ZEROCHECK_UNIFORM=0` restores the generic kernels (and the
+/// dispatch plus a VGPR register file. By default where `tuned_defaults` holds
+/// (off on CUDA; on SYCL it compiles to a scratch register array without the
+/// scalar path). `SP1_GPU_ZEROCHECK_UNIFORM=0` restores the generic kernels (and the
 /// unranked register numbering, see `rank_registers_by_use`), and any other
 /// value turns it on. Same results.
 pub(crate) fn zerocheck_uniform_enabled() -> bool {
-    std::env::var("SP1_GPU_ZEROCHECK_UNIFORM").map_or_else(|_| hip_wave64(), |v| v != "0")
+    std::env::var("SP1_GPU_ZEROCHECK_UNIFORM").map_or_else(|_| tuned_defaults(), |v| v != "0")
 }
 
 /// Default VGPR register-file size of the wave-uniform bivariate kernel
@@ -3488,12 +3487,11 @@ mod tests {
     use super::*;
     use serial_test::serial;
 
-    /// The MI300X-tuned zerocheck defaults apply on wave64 HIP only, and the env overrides work
-    /// on every device.
+    /// The tuned zerocheck defaults apply on HIP and SYCL but not on CUDA, and the env overrides
+    /// work on every backend.
     #[test]
     #[serial]
-    #[allow(clippy::print_stdout)]
-    fn zerocheck_tuned_defaults_only_on_wave64_hip() {
+    fn zerocheck_tuned_defaults_apply_on_hip_and_sycl() {
         const VARS: [&str; 3] = [
             "SP1_GPU_ZEROCHECK_UNIFORM",
             "SP1_GPU_ZEROCHECK_COOP_WIDE",
@@ -3504,14 +3502,11 @@ mod tests {
             std::env::remove_var(var);
         }
 
-        let wave64 = hip_wave64();
-        println!("wave64 HIP device: {wave64}");
-        if !sp1_gpu_cudart::sys::is_hip_backend() {
-            assert!(!wave64, "wave64 HIP reported on another backend");
-        }
-        assert_eq!(zerocheck_uniform_enabled(), wave64);
-        assert_eq!(coop_wide_mode(), if wave64 { 2 } else { 0 });
-        assert_eq!(coop_min_cost_default(), if wave64 { 100 } else { 300 });
+        let tuned = matches!(sp1_gpu_cudart::sys::BACKEND, "hip" | "sycl");
+        assert_eq!(tuned_defaults(), tuned);
+        assert_eq!(zerocheck_uniform_enabled(), tuned);
+        assert_eq!(coop_wide_mode(), if tuned { 2 } else { 0 });
+        assert_eq!(coop_min_cost_default(), if tuned { 100 } else { 300 });
 
         std::env::set_var("SP1_GPU_ZEROCHECK_UNIFORM", "1");
         std::env::set_var("SP1_GPU_ZEROCHECK_COOP_WIDE", "1");
