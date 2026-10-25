@@ -26,6 +26,10 @@ extern "C" {
     /// The device memory HIP's arena holds, free or not (0 without an arena, and on CUDA and SYCL).
     pub fn sp1_hip_arena_bytes() -> usize;
 
+    /// The video memory budget Windows grants this process on its device (DXGI), in bytes: 0
+    /// where unknown, which is everywhere but HIP on Windows.
+    pub fn sp1_video_memory_budget() -> u64;
+
     /// Frees every block `cuda_malloc_async` handed out that is still live, once the device is
     /// idle, and makes `cuda_free_async` a no-op from then on; returns the bytes freed. Only for a
     /// process about to reset its device and use it no more: `cudaDeviceReset` does not free

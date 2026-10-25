@@ -728,6 +728,21 @@ extern "C" size_t sp1_hip_arena_bytes() {
 #endif
 }
 
+// The video memory budget Windows grants this process on the current device (DXGI, which counts
+// what other processes and the desktop hold), in bytes; 0 where unknown (elsewhere than HIP on
+// Windows).
+extern "C" uint64_t sp1_video_memory_budget() {
+#if defined(__HIPCC__) && defined(_WIN32)
+    if (IDXGIAdapter3* adapter = currentDxgiAdapter()) {
+        DXGI_QUERY_VIDEO_MEMORY_INFO info;
+        if (SUCCEEDED(adapter->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &info))) {
+            return info.Budget;
+        }
+    }
+#endif
+    return 0;
+}
+
 // The device memory the arena still has free (HIP), which `cuda_mem_get_info` counts as free.
 extern "C" size_t sp1_hip_arena_free_bytes() {
 #ifdef __HIPCC__

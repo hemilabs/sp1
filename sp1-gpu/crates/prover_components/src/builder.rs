@@ -74,6 +74,14 @@ use crate::{
     SP1CudaProverComponents,
 };
 
+/// Least video memory budget (DXGI) at which a 16 GB AMD card on Windows takes the 16 GB tier
+/// rather than the one below it (see `local_gpu_opts`). An RX 9060 XT driving no display has 15.1
+/// GiB, and at the 16 GB tier proved in 8 shards instead of 15: bench-fib core 7.04 -> 5.83 s,
+/// compressed 14.67 -> 10.35 s, a 1.44B-cycle Groth16 proof 164 -> 115 s, with shared memory no
+/// higher than at the tier below (its allocator fills the budget either way: 14.2 and 14.6 GiB at
+/// peak). An RX 9070 XT that Windows granted ~12.5 GB spilled at the 16 GB tier.
+const HIP_WINDOWS_16GB_TIER_MIN_BUDGET: u64 = 14 << 30;
+
 /// The card's memory as the tiers below see it: `ceil(total GiB) + 4`, so a 16 GB card reports 20
 /// and a 24 GB card 28.
 fn gpu_memory_gb() -> usize {
@@ -109,11 +117,16 @@ pub fn local_gpu_opts() -> SP1CoreOpts {
     // Shard threshold tiers based on GPU memory. `gpu_memory_gb` = ceil(actual GiB) + 4, so a 16 GB
     // card reports 20 and a 24 GB card 28.
     let tier_threshold =
-        if gpu_memory_gb <= 20 && cfg!(windows) && sp1_gpu_cudart::sys::BACKEND == "hip" {
-            // 16GB AMD GPUs on Windows: the video memory budget Windows grants a process is ~12.5 GB of
-            // the 16, and past it WDDM moves allocations into shared system memory rather than failing
-            // them, which slowed every kernel touching them (an RX 9070 XT proved a 144M-cycle program in
-            // 15-17 s at the tier below and 12.7-13.5 s at this one).
+        if gpu_memory_gb <= 20 && cfg!(windows) && sp1_gpu_cudart::sys::BACKEND == "hip" && {
+            // SAFETY: takes nothing and queries DXGI for the current device.
+            let budget = unsafe { sp1_gpu_cudart::sys::runtime::sp1_video_memory_budget() };
+            tracing::debug!("video memory budget: {:.1} GiB", budget as f64 / (1u64 << 30) as f64);
+            budget < HIP_WINDOWS_16GB_TIER_MIN_BUDGET
+        } {
+            // 16GB AMD GPUs on Windows with a tight video memory budget: Windows granted a process
+            // ~12.5 GB of an RX 9070 XT's 16, and past it WDDM moves allocations into shared system
+            // memory rather than failing them, which slowed every kernel touching them (it proved a
+            // 144M-cycle program in 15-17 s at the tier below and 12.7-13.5 s at this one).
             1 << 26
         } else if gpu_memory_gb <= 20 {
             // 16 GB cards (e.g. RTX 5080, RX 9070 XT): ~134M elements per shard to fit in VRAM.
