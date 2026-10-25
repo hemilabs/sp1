@@ -284,7 +284,16 @@ static char* arenaChunkOf(const void* p) {
     return nullptr;
 }
 
-// The smallest free range that fits `s` bytes (a multiple of 4 KiB), or null.
+// Blocks smaller than this come from the end of the free range they are taken from (arenaTake).
+static constexpr size_t ARENA_SMALL_BLOCK = size_t(32) << 20;
+
+// The smallest free range that fits `s` bytes (a multiple of 4 KiB), or null. A block smaller than
+// ARENA_SMALL_BLOCK is carved from the end of the range, a larger one from its start, so that the
+// small blocks, many of them long-lived, gather at the ends of the free ranges instead of splitting
+// them where the next large block would go. With every block from the start, back-to-back fib 20M
+// Groth16 proofs on an RX 9070 XT failed about 1 run in 4 for want of 2 GiB in one range with 8 GiB
+// free; replayed through a model of this allocator, the allocations of such runs fit in an arena
+// 1.3-1.8 GiB smaller with the small blocks at the ends.
 static void* arenaTake(size_t s) {
     auto it = g_arena_by_len.lower_bound(s);
     if (it == g_arena_by_len.end()) return nullptr;
@@ -294,7 +303,13 @@ static void* arenaTake(size_t s) {
     g_arena_by_len.erase(it);
     g_arena_free.erase(at);
     g_arena_free_bytes -= length;
-    if (length > s) arenaRelease(at + s, length - s, chunk);
+    if (length > s) {
+        if (s < ARENA_SMALL_BLOCK) {
+            arenaRelease(at, length - s, chunk);
+            return at + (length - s);
+        }
+        arenaRelease(at + s, length - s, chunk);
+    }
     return at;
 }
 

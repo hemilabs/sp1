@@ -20,6 +20,8 @@ extern "C" {
 #[test]
 fn arena_outlives_releasing_the_cached_blocks() {
     const SIZE: usize = 64 << 20;
+    // Under ARENA_SMALL_BLOCK (32 MiB).
+    const SMALL: usize = 4 << 20;
     unsafe {
         let mut stream = CudaStreamHandle(ptr::null_mut());
         assert!(cuda_stream_create(&mut stream) == CUDA_SUCCESS_CSL);
@@ -49,6 +51,19 @@ fn arena_outlives_releasing_the_cached_blocks() {
         assert!(cuda_malloc_async(&mut block, SIZE, stream) == CUDA_SUCCESS_CSL);
         assert_eq!(sp1_hip_arena_free_bytes(), rest);
         assert!(cuda_free_async(block, stream) == CUDA_SUCCESS_CSL);
+        // With the arena one free range again, a small block between two large ones comes from its
+        // end, so that it doesn't split the free memory the second large block takes.
+        cuda_release_cached_memory();
+        let mut blocks = [ptr::null_mut::<c_void>(); 3];
+        for (block, size) in blocks.iter_mut().zip([SIZE, SMALL, SIZE]) {
+            assert!(cuda_malloc_async(block, size, stream) == CUDA_SUCCESS_CSL);
+        }
+        let [first, small, second] = blocks.map(|block| block.addr());
+        assert_eq!(second, first + SIZE, "the small block split the free range");
+        assert!(small >= second + SIZE, "the small block is not at the end of the range");
+        for block in blocks {
+            assert!(cuda_free_async(block, stream) == CUDA_SUCCESS_CSL);
+        }
         assert!(cuda_stream_destroy(stream) == CUDA_SUCCESS_CSL);
     }
 }
