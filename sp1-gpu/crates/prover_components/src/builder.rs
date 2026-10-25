@@ -77,9 +77,10 @@ use crate::{
 /// Least video memory budget (DXGI) at which a 16 GB AMD card on Windows takes the 16 GB tier
 /// rather than the one below it (see `local_gpu_opts`). An RX 9060 XT driving no display has 15.1
 /// GiB, and at the 16 GB tier proved in 8 shards instead of 15: bench-fib core 7.04 -> 5.83 s,
-/// compressed 14.67 -> 10.35 s, a 1.44B-cycle Groth16 proof 164 -> 115 s, with shared memory no
-/// higher than at the tier below (its allocator fills the budget either way: 14.2 and 14.6 GiB at
-/// peak). An RX 9070 XT that Windows granted ~12.5 GB spilled at the 16 GB tier.
+/// compressed 14.67 -> 10.35 s, a 1.44B-cycle Groth16 proof 164 -> 115 s, an RSP block (21000000)
+/// compressed 317 -> 186 s, with shared memory no higher than at the tier below (its allocator
+/// fills the budget either way: 14.2 and 14.6 GiB at peak). An RX 9070 XT that Windows granted
+/// ~12.5 GB spilled at the 16 GB tier.
 const HIP_WINDOWS_16GB_TIER_MIN_BUDGET: u64 = 14 << 30;
 
 /// The card's memory as the tiers below see it: `ceil(total GiB) + 4`, so a 16 GB card reports 20
@@ -128,8 +129,15 @@ pub fn local_gpu_opts() -> SP1CoreOpts {
             // memory rather than failing them, which slowed every kernel touching them (it proved a
             // 144M-cycle program in 15-17 s at the tier below and 12.7-13.5 s at this one).
             1 << 26
+        } else if gpu_memory_gb <= 20 && sp1_gpu_cudart::sys::BACKEND == "cuda" {
+            // 16 GB CUDA cards: 2^28 elements a shard, below the 24 GB tier's. An RTX 5060 Ti
+            // driving the desktop peaked at 12.3 GB (Windows), and proved in fewer shards than at
+            // 2^27: an RSP block (21000000) compressed in 65.0 s instead of 91.0, keccak over 20 MB
+            // in 74.3 s instead of 99.7, bench-fib compressed in 4.12 s instead of 5.05 (2^28 +
+            // 2^26 was faster still, 60.1 s for the block, but peaked at 13.9 GB).
+            1 << 28
         } else if gpu_memory_gb <= 20 {
-            // 16 GB cards (e.g. RTX 5080, RX 9070 XT): ~134M elements per shard to fit in VRAM.
+            // 16 GB cards (e.g. RX 9070 XT): ~134M elements per shard to fit in VRAM.
             ELEMENT_THRESHOLD - (1 << 28)
         } else if !opts.full_size_shards && gpu_memory_gb <= 30 {
             ELEMENT_THRESHOLD - (1 << 26) - (1 << 25) - (1 << 24)
