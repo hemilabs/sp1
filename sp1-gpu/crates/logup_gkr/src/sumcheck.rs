@@ -64,17 +64,23 @@ pub(crate) fn fill_grid(iters: usize, block: usize, old: usize) -> usize {
 /// One wave took ~11% less kernel time on an RTX 5090 (rsp-compressed: 412 -> 368 ms), with fewer
 /// per-block partials to sum. `fixAndSumCircuitLayer` was unchanged within noise, and the
 /// two-round fix-and-sum and jagged sumcheck kernels got slower, so they keep their grids.
-/// Not on HIP: one 256-thread block per compute unit left too few waves to hide memory latency on
-/// an RX 9060 XT (32 CUs), where the kernel ran ~7x as long as on an RTX 5060 Ti; without the cap,
-/// bench-fib core took 5.84 -> 5.53 s and compressed 10.34 -> 9.80 s (an RTX 5060 Ti was
-/// unchanged either way). `SP1_GPU_REDUCE_BLOCKS_PER_SM=<n>` sets the blocks per SM, `0` removes
-/// the cap (A/B switch).
+/// Not on RDNA (HIP with 32-wide waves): one 256-thread block per compute unit left too few waves
+/// to hide memory latency on an RX 9060 XT (32 CUs), where the kernel ran ~7x as long as on an RTX
+/// 5060 Ti; without the cap, bench-fib core took 5.84 -> 5.53 s and compressed 10.34 -> 9.80 s (an
+/// RTX 5060 Ti was unchanged either way). Wave64 HIP (CDNA, the MI300X) keeps the cap it was
+/// measured with.
+/// `SP1_GPU_REDUCE_BLOCKS_PER_SM=<n>` sets the blocks per SM, `0` removes the cap (A/B switch).
 fn fill_grid_one_wave(iters: usize, block: usize, old: usize) -> usize {
     static CAP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     let cap = *CAP.get_or_init(|| {
         match std::env::var("SP1_GPU_REDUCE_BLOCKS_PER_SM").ok().and_then(|v| v.parse().ok()) {
             Some(0) => usize::MAX,
-            None if sp1_gpu_cudart::sys::BACKEND == "hip" => usize::MAX,
+            // SAFETY: takes nothing and only reads the current device's attributes.
+            None if sp1_gpu_cudart::sys::BACKEND == "hip"
+                && unsafe { sp1_gpu_cudart::sys::runtime::sp1_hip_wave64() } == 0 =>
+            {
+                usize::MAX
+            }
             per_sm => per_sm.unwrap_or(1) * sp1_gpu_cudart::cuda_sm_count_cached(),
         }
     });

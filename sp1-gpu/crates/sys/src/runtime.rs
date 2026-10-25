@@ -30,6 +30,10 @@ extern "C" {
     /// where unknown, which is everywhere but HIP on Windows.
     pub fn sp1_video_memory_budget() -> u64;
 
+    /// 1 on HIP when the device runs 64-wide wavefronts (CDNA, e.g. the MI300X), else 0: RDNA,
+    /// CUDA, SYCL, or no device.
+    pub fn sp1_hip_wave64() -> u32;
+
     /// Frees every block `cuda_malloc_async` handed out that is still live, once the device is
     /// idle, and makes `cuda_free_async` a no-op from then on; returns the bytes freed. Only for a
     /// process about to reset its device and use it no more: `cudaDeviceReset` does not free

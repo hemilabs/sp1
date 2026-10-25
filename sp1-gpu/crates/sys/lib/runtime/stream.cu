@@ -743,6 +743,22 @@ extern "C" uint64_t sp1_video_memory_budget() {
     return 0;
 }
 
+// 1 on HIP when the current device runs 64-wide wavefronts (CDNA, gfx9*, e.g. the MI300X), else
+// 0: RDNA (wave32), CUDA, or no device.
+extern "C" uint32_t sp1_hip_wave64() {
+#ifdef __HIPCC__
+    int device = 0, warp_size = 0;
+    if (hipGetDevice(&device) != hipSuccess ||
+        hipDeviceGetAttribute(&warp_size, hipDeviceAttributeWarpSize, device) != hipSuccess) {
+        (void)hipGetLastError();
+        return 0;
+    }
+    return warp_size == 64 ? 1 : 0;
+#else
+    return 0;
+#endif
+}
+
 // The device memory the arena still has free (HIP), which `cuda_mem_get_info` counts as free.
 extern "C" size_t sp1_hip_arena_free_bytes() {
 #ifdef __HIPCC__
