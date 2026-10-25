@@ -536,17 +536,22 @@ impl PlonkBn254Prover {
     /// Whether a `SP1_PLONK_GPU_SERVER` helper from an earlier proof still runs (or proves now)
     /// that this circuit's next proof would use, so that it holds most of the host memory that
     /// proof needs. A kept helper that proof cannot use is shut down, so that the memory the proof
-    /// measures next is not held for nothing: one for another key, or any with the GPU cache off,
-    /// where each proof's key is in a directory of its own, and needs a new server.
+    /// measures next is not held for nothing: one for another key (server mode needs the GPU
+    /// cache: each proof's key would otherwise be in a directory of its own).
     #[cfg(feature = "native")]
     pub fn keep_usable_gpu_helper_server(build_dir: &Path) -> bool {
         if !crate::plonk_helper_server::enabled() {
             return false;
         }
-        let cache = std::fs::read(build_dir.join("plonk_vk.bin"))
-            .ok()
-            .and_then(|vk| plonk_gpu_cache_dir(&hex::encode(Sha256::digest(vk))));
-        crate::plonk_helper_server::keep_only_for(cache.as_deref())
+        crate::plonk_helper_server::keep_only_for(gpu_cache_dir_of(build_dir).as_deref())
+    }
+
+    /// Shuts down a kept `SP1_PLONK_GPU_SERVER` helper: for a proof that goes to gnark's CPU
+    /// prover, which needs the ~71 GB of host memory the helper holds. A helper another proof is
+    /// proving with stays, as a proof deciding meanwhile may count on it.
+    #[cfg(feature = "native")]
+    pub fn shut_down_gpu_helper_server() {
+        crate::plonk_helper_server::keep_only_for(None);
     }
 
     /// Subprocess-isolated GPU PLONK prove. Spawns the `plonk_gpu_helper`
@@ -673,7 +678,9 @@ impl PlonkBn254Prover {
         // keeps the helper subprocess alive across multiple proves in the
         // same parent process, amortising PK + PlonkProver + Phase H SCS
         // state init. Falls back to one-shot subprocess on any error.
-        if crate::plonk_helper_server::enabled() {
+        // Not with the GPU cache off, where the key is in this proof's scratch directory: no later
+        // proof could use the server.
+        if crate::plonk_helper_server::enabled() && cache.is_some() {
             let mut extra_env: Vec<(String, String)> = Vec::new();
             if std::env::var_os("SP1_GPU_GLV").is_none() {
                 extra_env.push(("SP1_GPU_GLV".to_string(), "0".to_string()));
@@ -708,11 +715,6 @@ impl PlonkBn254Prover {
                         outcome.proof_size,
                         t0.elapsed(),
                     );
-                    if cache.is_none() {
-                        // Its key goes with this proof's scratch directory: no later proof can use
-                        // it, and it holds ~71 GB of host memory.
-                        crate::plonk_helper_server::keep_only_for(None);
-                    }
                     let proof_bytes = std::fs::read(&out_path).unwrap();
                     return serde_json::from_slice(&proof_bytes).unwrap_or_else(|e| {
                         panic!("failed to parse helper's PlonkBn254Proof JSON: {e}");

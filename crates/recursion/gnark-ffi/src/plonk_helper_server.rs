@@ -300,14 +300,14 @@ impl Drop for PlonkHelperServer {
     }
 }
 
-/// Process-global singleton.
-pub fn singleton() -> &'static Mutex<Option<PlonkHelperServer>> {
+/// Process-global singleton. Changed only through [`replace`], which keeps [`SERVER_KEY`] with it.
+fn singleton() -> &'static Mutex<Option<PlonkHelperServer>> {
     static SERVER: OnceLock<Mutex<Option<PlonkHelperServer>>> = OnceLock::new();
     SERVER.get_or_init(|| Mutex::new(None))
 }
 
-/// The key of the server in the singleton, for [`keep_only_for`] while a proof holds the
-/// singleton's lock.
+/// The key of the server in the singleton, or of the one being started for it, for
+/// [`keep_only_for`] while a proof holds the singleton's lock.
 static SERVER_KEY: Mutex<Option<ServerKey>> = Mutex::new(None);
 
 /// Puts `server` in the singleton, whose lock `kept` is, and returns the one it held.
@@ -398,7 +398,10 @@ pub fn with_server(
     if guard.is_none() {
         let t0 = std::time::Instant::now();
         tracing::info!("[plonk-server] spawning long-lived helper (one-time PK + circuit load)");
+        // A proof deciding meanwhile counts on this server.
+        *SERVER_KEY.lock().unwrap_or_else(|e| e.into_inner()) = Some(key.clone());
         let s = PlonkHelperServer::spawn(helper_path, gpu_dir, prep_circuit_dir, extra_env)
+            .inspect_err(|_| *SERVER_KEY.lock().unwrap_or_else(|e| e.into_inner()) = None)
             .context("spawn plonk_gpu_helper --server")?;
         tracing::info!(
             "[plonk-server] server ready in {:?} (server-reported initial_setup={} ms)",

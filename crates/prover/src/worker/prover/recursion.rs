@@ -1104,6 +1104,9 @@ impl<A: ArtifactClient, C: SP1ProverComponents> SP1RecursionProver<A, C> {
             // gnark's CPU prover verifies internally.
             let cpu = || -> Result<_, anyhow::Error> {
                 let _ = (&vkey_bn, &cvd_bn, &exit_bn, &vk_root_bn, &proof_nonce_bn);
+                // gnark's CPU prover needs the host memory a kept GPU helper server holds.
+                #[cfg(feature = "native-gnark")]
+                PlonkBn254Prover::shut_down_gpu_helper_server();
                 Ok(prover.prove(witness.clone(), &build_dir))
             };
             // The GPU prover first, when asked for and its helper fits: it needs ~23 GiB of GPU
@@ -1121,6 +1124,9 @@ impl<A: ArtifactClient, C: SP1ProverComponents> SP1RecursionProver<A, C> {
                 use sp1_recursion_gnark_ffi as ffi;
                 let helper_available = PlonkBn254Prover::gpu_helper_available();
                 let helper_routed = ffi::plonk_helper_routed();
+                // Before memory is trimmed and measured: a kept server the proof cannot use is shut
+                // down.
+                let server_running = PlonkBn254Prover::keep_usable_gpu_helper_server(&build_dir);
                 if helper_available && !helper_routed {
                     if let Some((before, after)) =
                         ffi::gpu_trim_memory_pool(ffi::PLONK_GPU_HELPER_VRAM_BYTES)
@@ -1133,8 +1139,6 @@ impl<A: ArtifactClient, C: SP1ProverComponents> SP1RecursionProver<A, C> {
                     }
                 }
                 PlonkBn254Prover::remove_stale_gpu_witness(&build_dir);
-                // Before host memory is measured: a kept server the proof cannot use is shut down.
-                let server_running = PlonkBn254Prover::keep_usable_gpu_helper_server(&build_dir);
                 let mut inputs = PlonkInputs {
                     helper_available,
                     helper_routed,
