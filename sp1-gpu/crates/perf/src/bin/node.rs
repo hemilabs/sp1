@@ -108,7 +108,6 @@ async fn run() -> Result<(), String> {
 
         // Skip separate execute() — the Controller re-executes internally anyway.
         // We'll get cycles from the proof's public values after proving.
-        let execute_time = std::time::Duration::ZERO;
 
         let time = tokio::time::Instant::now();
         let vk = client.setup(&elf).await.unwrap();
