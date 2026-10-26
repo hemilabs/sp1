@@ -22,7 +22,7 @@ use crate::{
     shapes::DEFAULT_ARITY,
     worker::{
         LocalWorkerClient, ProofId, RawTaskRequest, RequesterId, SP1NodeCore, TaskContext,
-        TaskError, VkeyMapControllerInput, VkeyMapControllerOutput, WorkerClient,
+        TaskError, VkeyMapControllerInput, VkeyMapControllerOutput, WorkerClient, WrapTaskTimes,
     },
 };
 
@@ -38,6 +38,18 @@ pub(crate) struct SP1NodeInner {
 #[derive(Debug, thiserror::Error)]
 #[error("the proof failed with a retryable error")]
 struct RetryableProofFailure;
+
+/// When a Groth16 or PLONK proof's final wrap started, and how long its tasks took, in the attempt
+/// that produced the proof.
+#[derive(Debug, Clone, Copy)]
+pub struct FinalWrapTimes {
+    /// When the compressed proof was done: the shrink-wrap task was submitted.
+    pub compressed: std::time::Instant,
+    /// The shrink-wrap task: the shrink and wrap STARK proofs.
+    pub shrink_wrap: std::time::Duration,
+    /// The Groth16 or PLONK task.
+    pub snark: std::time::Duration,
+}
 
 pub struct SP1LocalNode {
     inner: Arc<SP1NodeInner>,
@@ -236,7 +248,6 @@ impl SP1LocalNode {
         self.with_bookkeeping(&proof_id, building).await
     }
 
-    #[instrument(name = "prove", skip_all, fields(mode = ?mode))]
     pub async fn prove_with_mode(
         &self,
         elf: &[u8],
@@ -244,6 +255,19 @@ impl SP1LocalNode {
         context: SP1Context<'static>,
         mode: ProofMode,
     ) -> anyhow::Result<ProofFromNetwork> {
+        self.prove_with_mode_timed(elf, stdin, context, mode).await.map(|(proof, _)| proof)
+    }
+
+    /// [`Self::prove_with_mode`], with how long a Groth16 or PLONK proof's final wrap took on top
+    /// of its compressed proof (`None` in the other modes).
+    #[instrument(name = "prove", skip_all, fields(mode = ?mode))]
+    pub async fn prove_with_mode_timed(
+        &self,
+        elf: &[u8],
+        stdin: SP1Stdin,
+        context: SP1Context<'static>,
+        mode: ProofMode,
+    ) -> anyhow::Result<(ProofFromNetwork, Option<FinalWrapTimes>)> {
         let _gpu_work = start_gpu_work()?;
         // A proof that failed with a retryable error (its executor child killed by the memory
         // monitor or the host, say) is proven again from the start, as a new proof, at most
@@ -264,14 +288,14 @@ impl SP1LocalNode {
         }
     }
 
-    /// One attempt of [`Self::prove_with_mode`], under its own proof id.
+    /// One attempt of [`Self::prove_with_mode_timed`], under its own proof id.
     async fn prove_once(
         &self,
         elf: &[u8],
         stdin: SP1Stdin,
         context: &SP1Context<'static>,
         mode: ProofMode,
-    ) -> anyhow::Result<ProofFromNetwork> {
+    ) -> anyhow::Result<(ProofFromNetwork, Option<FinalWrapTimes>)> {
         // Allocate the per-proof artifacts and id up front so the cleanup below
         // can always reach them, regardless of how the proving body exits.
         let elf_artifact = self.inner.artifact_client.create_artifact()?;
@@ -322,9 +346,23 @@ impl SP1LocalNode {
                 }
                 _ => return Err(anyhow::anyhow!("controller task failed")),
             }
+            // The controller submits the shrink-wrap task once the compressed proof is done.
+            let final_wrap = match self.inner.worker_client.take_wrap_times(&proof_id) {
+                WrapTaskTimes {
+                    shrink_wrap: Some((compressed, shrink_wrap_end)),
+                    snark: Some((snark_start, snark_end)),
+                } => Some(FinalWrapTimes {
+                    compressed,
+                    shrink_wrap: shrink_wrap_end.saturating_duration_since(compressed),
+                    snark: snark_end.saturating_duration_since(snark_start),
+                }),
+                _ => None,
+            };
 
             // Download the output proof.
-            self.inner.artifact_client.download::<ProofFromNetwork>(&output_artifact).await
+            let proof =
+                self.inner.artifact_client.download::<ProofFromNetwork>(&output_artifact).await?;
+            Ok((proof, final_wrap))
         };
         // A failed attempt's bookkeeping is released before the next one starts.
         self.with_bookkeeping(&proof_id, proving).await

@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, sync::Arc};
+use std::{collections::BTreeMap, sync::Arc, time::Instant};
 
 use hashbrown::{HashMap, HashSet};
 use mti::prelude::{MagicTypeIdExt, V7};
@@ -15,6 +15,24 @@ use crate::worker::{
 struct MessageChannelState {
     tx: mpsc::UnboundedSender<Vec<u8>>,
     rx: Option<mpsc::UnboundedReceiver<Vec<u8>>>,
+}
+
+/// A task of a proof's final wrap, and when it was submitted and last ended.
+struct WrapTask {
+    proof_id: ProofId,
+    kind: TaskType,
+    submitted: Instant,
+    ended: Option<Instant>,
+}
+
+/// When a proof's final-wrap tasks ran, each from its submission to its end: `None` for a task the
+/// proof did not have, or that did not end.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct WrapTaskTimes {
+    /// The shrink-wrap task: the shrink and wrap STARK proofs of the compressed proof.
+    pub shrink_wrap: Option<(Instant, Instant)>,
+    /// The Groth16 or PLONK task.
+    pub snark: Option<(Instant, Instant)>,
 }
 
 type LocalDb =
@@ -43,6 +61,11 @@ pub struct LocalWorkerClientInner {
     /// straggling work (its executor after the proof failed) runs far sooner. Marked under the
     /// `proof_index` lock, which `submit_task` checks it under.
     ended_proofs: std::sync::Mutex<lru::LruCache<ProofId, ()>>,
+    /// The final-wrap tasks (shrink-wrap, then Groth16 or PLONK), recorded by `submit_task` and
+    /// `update_task_status`, for the node to report how long the wrap took on top of the
+    /// compressed proof ([`LocalWorkerClient::take_wrap_times`]). `complete_proof` drops a proof's
+    /// that are left.
+    wrap_tasks: std::sync::Mutex<HashMap<TaskId, WrapTask>>,
 }
 
 pub(crate) const MAX_LOCAL_TASK_RETRIES: u8 = 3;
@@ -90,6 +113,7 @@ impl LocalWorkerClientInner {
             task_channels,
             retry_counts: RwLock::new(HashMap::new()),
             ended_proofs: std::sync::Mutex::new(lru::LruCache::new(ENDED_PROOFS)),
+            wrap_tasks: std::sync::Mutex::new(HashMap::new()),
         };
         (inner, LocalWorkerClientChannels { task_receivers: task_outputs })
     }
@@ -161,9 +185,33 @@ impl LocalWorkerClient {
             TaskStatus::Succeeded | TaskStatus::FailedFatal | TaskStatus::FailedRetryable
         ) {
             self.inner.task_channels.write().await.remove(&task_id);
+            // A retried task ends again: its last end counts.
+            if let Some(task) =
+                self.inner.wrap_tasks.lock().unwrap_or_else(|e| e.into_inner()).get_mut(&task_id)
+            {
+                task.ended = Some(Instant::now());
+            }
         }
 
         Ok(())
+    }
+
+    /// Takes the times of `proof_id`'s final-wrap tasks. Call it before the proof completes
+    /// ([`WorkerClient::complete_proof`] drops them).
+    pub fn take_wrap_times(&self, proof_id: &ProofId) -> WrapTaskTimes {
+        let mut times = WrapTaskTimes::default();
+        self.inner.wrap_tasks.lock().unwrap_or_else(|e| e.into_inner()).retain(|_, task| {
+            if &task.proof_id != proof_id {
+                return true;
+            }
+            let span = task.ended.map(|ended| (task.submitted, ended));
+            match task.kind {
+                TaskType::ShrinkWrap => times.shrink_wrap = span,
+                _ => times.snark = span,
+            }
+            false
+        });
+        times
     }
 
     /// Re-submits a retryable task under its original id (see [`retry_task`](Self::retry_task)),
@@ -263,6 +311,17 @@ impl WorkerClient for LocalWorkerClient {
             // Create a db entry for the task.
             let (tx, rx) = watch::channel(TaskStatus::Pending);
             self.inner.db.write().await.insert(task_id.clone(), (tx, rx));
+            if matches!(kind, TaskType::ShrinkWrap | TaskType::Groth16Wrap | TaskType::PlonkWrap) {
+                self.inner.wrap_tasks.lock().unwrap_or_else(|e| e.into_inner()).insert(
+                    task_id.clone(),
+                    WrapTask {
+                        proof_id: task.context.proof_id.clone(),
+                        kind,
+                        submitted: Instant::now(),
+                        ended: None,
+                    },
+                );
+            }
         }
         // Send the task to the input queue.
         let proof_id = task.context.proof_id.clone();
@@ -326,6 +385,12 @@ impl WorkerClient for LocalWorkerClient {
             let mut channels = self.inner.task_channels.write().await;
             for task_id in &tasks {
                 channels.remove(task_id);
+            }
+        }
+        {
+            let mut wrap_tasks = self.inner.wrap_tasks.lock().unwrap_or_else(|e| e.into_inner());
+            for task_id in &tasks {
+                wrap_tasks.remove(task_id);
             }
         }
         Ok(())
@@ -581,5 +646,51 @@ mod tests {
         }
         assert!(!client.proof_ended(&proof_id));
         assert!(client.proof_ended(&ProofId::new(format!("p{}", ENDED_PROOFS.get() - 1))));
+    }
+
+    /// A proof's final-wrap tasks are timed from their submission to their last end, and taken
+    /// once; those not taken go when the proof completes.
+    #[tokio::test]
+    async fn wrap_tasks_are_timed() {
+        let (client, mut channels) = LocalWorkerClient::init();
+        let proof_id = ProofId::new("proof");
+        let mut ids = Vec::new();
+        for kind in [TaskType::ShrinkWrap, TaskType::Groth16Wrap] {
+            ids.push(client.submit_task(kind, controller_request(&proof_id, &[])).await.unwrap());
+            channels.task_receivers.get_mut(&kind).unwrap().recv().await.unwrap();
+        }
+        // A retried task ends twice: the last end counts.
+        client.update_task_status(ids[0].clone(), TaskStatus::FailedRetryable).await.unwrap();
+        let first_end = client.inner.wrap_tasks.lock().unwrap()[&ids[0]].ended.unwrap();
+        client.update_task_status(ids[0].clone(), TaskStatus::Succeeded).await.unwrap();
+        client.update_task_status(ids[1].clone(), TaskStatus::Succeeded).await.unwrap();
+
+        let times = client.take_wrap_times(&proof_id);
+        let (submitted, ended) = times.shrink_wrap.unwrap();
+        assert!(submitted <= first_end && first_end <= ended);
+        let (submitted, ended) = times.snark.unwrap();
+        assert!(submitted <= ended);
+        let again = client.take_wrap_times(&proof_id);
+        assert!(again.shrink_wrap.is_none() && again.snark.is_none());
+
+        // A task that has not ended has no time.
+        let pending = ProofId::new("pending");
+        let kind = TaskType::ShrinkWrap;
+        client.submit_task(kind, controller_request(&pending, &[])).await.unwrap();
+        channels.task_receivers.get_mut(&kind).unwrap().recv().await.unwrap();
+        assert!(client.take_wrap_times(&pending).shrink_wrap.is_none());
+
+        // Times not taken go when their proof completes.
+        let other = ProofId::new("other");
+        let kind = TaskType::PlonkWrap;
+        let id = client.submit_task(kind, controller_request(&other, &[])).await.unwrap();
+        channels.task_receivers.get_mut(&kind).unwrap().recv().await.unwrap();
+        client.update_task_status(id, TaskStatus::Succeeded).await.unwrap();
+        client
+            .complete_proof(other.clone(), None, ProofRequestStatus::Completed, "")
+            .await
+            .unwrap();
+        assert!(client.inner.wrap_tasks.lock().unwrap().is_empty());
+        assert!(client.take_wrap_times(&other).snark.is_none());
     }
 }

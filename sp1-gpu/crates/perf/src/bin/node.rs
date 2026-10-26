@@ -122,7 +122,8 @@ async fn run() -> Result<(), String> {
             let context = context.clone();
             let time = tokio::time::Instant::now();
             tracing::info!("proving with mode: {mode:?}");
-            let proof = match client.prove_with_mode(&elf, stdin, context, mode).await {
+            let proved = client.prove_with_mode_timed(&elf, stdin, context, mode).await;
+            let (proof, final_wrap) = match proved {
                 Ok(proof) => proof,
                 // A proof refused because an earlier one reset the GPU (SP1_GPU_RESET_BEFORE_WRAP):
                 // exit as below, since unwinding would run destructors that segfault on it.
@@ -138,6 +139,19 @@ async fn run() -> Result<(), String> {
             };
             let proof_time = time.elapsed();
             tracing::info!("proof time: {:?}", proof_time);
+            // A Groth16 or PLONK proof's time until its compressed proof was done.
+            let compressed_time = final_wrap.map(|wrap| {
+                let compressed =
+                    tokio::time::Instant::from_std(wrap.compressed).saturating_duration_since(time);
+                tracing::info!(
+                    "final wrap: {:?} on top of the compressed proof ({compressed:?}): shrink and \
+                     wrap {:?}, {mode:?} {:?}",
+                    proof_time.saturating_sub(compressed),
+                    wrap.shrink_wrap,
+                    wrap.snark,
+                );
+                compressed
+            });
 
             let (num_shards, cycles) = if let SP1Proof::Core(ref shard_proofs) = &proof.proof {
                 use sp1_hypercube::air::PublicValues;
@@ -173,8 +187,17 @@ async fn run() -> Result<(), String> {
             let (core_time, compress_time, shrink_time, wrap_time) = match mode {
                 ProofMode::Core => (Some(proof_time), None, Duration::ZERO, Duration::ZERO),
                 ProofMode::Compressed => (None, Some(proof_time), Duration::ZERO, Duration::ZERO),
-                ProofMode::Groth16 => (None, None, Duration::ZERO, proof_time),
-                ProofMode::Plonk => (None, None, Duration::ZERO, proof_time),
+                // Compress Time: until the compressed proof was done; Wrap Time: the final wrap on
+                // top of it (the shrink and wrap STARKs, then the Groth16 or PLONK proof).
+                ProofMode::Groth16 | ProofMode::Plonk => match compressed_time {
+                    Some(compressed) => (
+                        None,
+                        Some(compressed),
+                        Duration::ZERO,
+                        proof_time.saturating_sub(compressed),
+                    ),
+                    None => (None, None, Duration::ZERO, proof_time),
+                },
                 _ => panic!("invalid proof mode: {mode:?}"),
             };
             let measurement = Measurement {
