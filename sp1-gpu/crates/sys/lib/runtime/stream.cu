@@ -1209,13 +1209,22 @@ cuda_mem_copy_host_to_device_async(void* dst, const void* src, size_t count, cud
 // MI300X a tiny kernel + 48-byte readback takes 29.7 us that way against 14.3 us via pinned
 // staging (round3/notes/li3). The GKR sumcheck reads back a few field elements every round.
 // The buffers come from a small shared pool, so a thread that exits leaks nothing.
-// SP1_HIP_PINNED_READBACK=0 restores the pageable path.
+// SP1_HIP_PINNED_READBACK=0 restores the pageable path, and =1 forces this one.
+//
+// Off by default on Windows: there, an RX 9060 XT (ROCm 7.2) read back wrong GKR sumcheck values
+// through it, and failed a shard's verification ("GKR verification failed: cumulative sum
+// mismatch") in 18 of 156 core proofs, waiting for the stream before the copy or not; with the
+// pageable path, 0 of 80.
 static constexpr size_t READBACK_STAGING_BYTES = 64 * 1024;
 
 static bool pinnedReadbackEnabled() {
     static const bool on = [] {
         const char* v = getenv("SP1_HIP_PINNED_READBACK");
+#ifdef _WIN32
+        return v && v[0] == '1';
+#else
         return !(v && v[0] == '0');
+#endif
     }();
     return on;
 }
