@@ -1644,6 +1644,11 @@ async fn device_main_tracegen<A: CudaTracegenAir<Felt>>(
     (all_traces, public_values, lookup_counts)
 }
 
+/// The public values, the shard's chips, the prover permit, and the trace buffer holding the main
+/// traces.
+type MainTraces<A> =
+    (Vec<Felt>, BTreeSet<Chip<Felt, A>>, ProverPermit, Worker<JaggedTraceMle<Felt, TaskScope>>);
+
 /// Corresponds to `generate_main_traces`.
 /// Pops a trace buffer from the per-PK pool, fills its main slots, and
 /// returns the owned `Worker` handle alongside the public values. The
@@ -1661,7 +1666,7 @@ pub async fn main_tracegen<GC: IopCtx<F = Felt>, A: CudaTracegenAir<Felt>>(
     prover_permit: ProverSemaphore,
     global_dependencies_opt: bool,
     prefetcher: Option<&TracePrefetcher>,
-) -> (Vec<Felt>, BTreeSet<Chip<Felt, A>>, ProverPermit, Worker<JaggedTraceMle<Felt, TaskScope>>) {
+) -> MainTraces<A> {
     // Start generating traces on host.
     let (host_phase_tracegen, host_phase_shape_info, _) =
         host_main_tracegen(machine, buffer.as_ptr() as usize, buffer.capacity(), 0, record.clone())
@@ -1736,7 +1741,7 @@ pub async fn main_tracegen<GC: IopCtx<F = Felt>, A: CudaTracegenAir<Felt>>(
 
     copy_main_jagged_traces(
         traces,
-        &mut *trace_buffer,
+        &mut trace_buffer,
         log_stacking_height,
         max_log_row_count,
         global_dependencies_opt,
