@@ -1,7 +1,10 @@
+//go:build !icicle
+
 package sp1
 
 import (
 	"bufio"
+	"encoding/binary"
 	"os"
 	"path/filepath"
 	"testing"
@@ -147,6 +150,26 @@ func TestReadR1csMetaRejectsBadFiles(t *testing.T) {
 	}
 	body[off] = 0x80 | (body[off] & 31)
 	cases["not a map"] = body
+	// NbInternalVariables = 999 put first in the body's map, under its name or in lower case:
+	// gnark's decoder takes a field from the first key that names it, ignoring case, so it reads
+	// 999 there, where the later, exact key says the real count.
+	if data[off]>>5 != 5 || data[off]&31 >= 23 {
+		t.Fatalf("body map head %#x", data[off])
+	}
+	fieldFirst := func(key string) []byte {
+		le := binary.LittleEndian
+		bodyLen := le.Uint64(data[56:])
+		extra := append(append([]byte{0x60 | byte(len(key))}, key...), 0x19, 0x03, 0xe7)
+		out := append([]byte{}, data[:off]...)
+		out = append(out, data[off]+1)
+		out = append(out, extra...)
+		out = append(out, data[off+1:]...)
+		le.PutUint64(out[0:], le.Uint64(data[0:])+uint64(len(extra)))
+		le.PutUint64(out[56:], bodyLen+uint64(len(extra)))
+		return out
+	}
+	cases["field named twice"] = fieldFirst("NbInternalVariables")
+	cases["field named in another case"] = fieldFirst("nbinternalvariables")
 	for name, bad := range cases {
 		path := filepath.Join(dir, "bad.bin")
 		if err := os.WriteFile(path, bad, 0o644); err != nil {

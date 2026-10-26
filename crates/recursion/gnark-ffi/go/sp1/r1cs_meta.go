@@ -20,6 +20,7 @@ import (
 	"io"
 	"os"
 	"reflect"
+	"strings"
 
 	"github.com/blang/semver/v4"
 	"github.com/consensys/gnark-crypto/ecc"
@@ -208,7 +209,9 @@ var r1csMetaFields = map[string]bool{
 // returns the encoded values of the keys in want, skipping the others without decoding them:
 // fxamacker/cbor's decoder took 5.3 s to skip the 0.9 GB of debug information in the v6.1.0
 // circuit's body. Indefinite lengths, which gnark's deterministic encoder does not write, are an
-// error.
+// error, and so is a key in want named twice or a key naming one in another case: gnark's decoder
+// takes a field from the first key that names it, ignoring case, which need not be the value
+// read here. gnark's encoder writes each field once, under its name.
 func readCborMapFields(r io.Reader, size int64, want map[string]bool) (map[string][]byte, error) {
 	s := &cborSkipper{r: r, buf: make([]byte, 0, 4<<20)}
 	major, n, err := s.head()
@@ -232,6 +235,11 @@ func readCborMapFields(r io.Reader, size int64, want map[string]bool) (map[strin
 		}
 		key := string(s.buf[s.pos : s.pos+int(l)])
 		s.pos += int(l)
+		for name := range want {
+			if _, seen := fields[name]; strings.EqualFold(key, name) && (key != name || seen) {
+				return nil, fmt.Errorf("map key %s: %s named twice or in another case", key, name)
+			}
+		}
 		if want[key] {
 			s.capture = new(bytes.Buffer)
 			s.captureFrom = s.pos
