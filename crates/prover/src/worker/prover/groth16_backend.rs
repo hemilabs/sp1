@@ -24,6 +24,7 @@ pub(crate) const GPU_MIN_AVAILABLE_BYTES: u64 = 16 << 30;
 /// Free GPU memory the GPU prover's helper needs on a card with `total` memory: less where it
 /// streams its G1 point sets (16 GB cards); see
 /// [`sp1_recursion_gnark_ffi::groth16_gpu_helper_vram_bytes`]. Reads `SP1_GROTH16_STREAM_SRS`.
+#[cfg(feature = "native-gnark")]
 pub(crate) fn gpu_helper_vram_bytes(total: Option<u64>) -> u64 {
     sp1_recursion_gnark_ffi::groth16_gpu_helper_vram_bytes(total)
 }
