@@ -342,19 +342,20 @@ fn record_gate() -> &'static tokio::sync::Semaphore {
     gate_of(&GATE, "SP1_WORKER_RECORD_TURNS", || {
         default_record_turns(
             std::thread::available_parallelism().ok().map(|n| n.get()),
-            sp1_recursion_gnark_ffi::host_memory::available(),
+            sp1_recursion_gnark_ffi::host_memory::available_on_any_host(),
         )
     })
 }
 
-/// Available memory per record turn when the gate is made: a turn above 2 needs this much each.
+/// Available memory each record turn needs when the gate is made: 3 turns need 24 GiB, 4 need
+/// 32 GiB (there are always at least 2).
 ///
 /// A turn holds one shard record while it is traced. On rsp (21M cycles) the node's peak RSS rose
 /// from 32-35 GB with 2 turns to 36 GB with 3, so a turn costs a few GB; 8 GiB leaves twice that.
 const RECORD_TURN_BYTES: u64 = 8 << 30;
 
 /// The default number of record turns, from the core count and the memory this process can still
-/// use (`None`: unknown).
+/// use (`None`: unknown; on Windows, the physical memory available).
 ///
 /// One per 4 cores, at most 3, or one per 8 cores where that is more; at least 2, and no more
 /// turns than [`RECORD_TURN_BYTES`] fit in the available memory (again at least 2, the previous
@@ -365,7 +366,8 @@ const RECORD_TURN_BYTES: u64 = 8 << 30;
 /// on every first proof. Measured there with 3 turns (`SP1_WORKER_RECORD_TURNS=3`, 2-4 runs each):
 /// rsp core steady 13.82 -> 13.19 s, first proof 15.39 -> 13.66 s; fib core first proof
 /// 12.84 -> 12.05 s, steady unchanged (11.07 vs 10.91 s, within noise). 4 turns were no better, so
-/// hosts with 12-31 cores get 3 and hosts with 32 or more keep one per 8 cores.
+/// hosts with 12-31 cores get 3 and hosts with 32 or more keep one per 8 cores, as far as the
+/// memory allows.
 fn default_record_turns(cores: Option<usize>, available: Option<u64>) -> usize {
     let Some(cores) = cores else { return 2 };
     let by_cores = (cores / 8).max((cores / 4).min(3)).max(2);
