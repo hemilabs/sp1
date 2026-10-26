@@ -469,15 +469,19 @@ pub(crate) struct PendingWrapVerify {
     shrink_wrap: Option<RawTaskRequest>,
 }
 
+/// At most this many wrap proofs' verifications are kept, the least recently put going first.
+/// One whose reader runs in another process, fails before it takes the verification, or never
+/// runs (a cancelled proof) is never taken. The reader of one that went verifies the proof itself
+/// ([`take_wrap_verify`]), and a failure is then fatal rather than proved again; like the local
+/// client's ended proofs, the bound is far above the wrap proofs a process has waiting.
+const MAX_WRAP_VERIFIES: std::num::NonZeroUsize = std::num::NonZeroUsize::new(4096).unwrap();
+
 static WRAP_VERIFIES: std::sync::LazyLock<
-    std::sync::Mutex<std::collections::HashMap<String, PendingWrapVerify>>,
-> = std::sync::LazyLock::new(Default::default);
+    std::sync::Mutex<lru::LruCache<String, PendingWrapVerify>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(lru::LruCache::new(MAX_WRAP_VERIFIES)));
 
 fn put_wrap_verify(artifact: &impl ArtifactId, pending: PendingWrapVerify) {
-    WRAP_VERIFIES
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .insert(artifact.id().to_string(), pending);
+    WRAP_VERIFIES.lock().unwrap_or_else(|e| e.into_inner()).put(artifact.id().to_string(), pending);
 }
 
 /// Test injection: with SP1_WRAP_VERIFY_FAIL_INJECT=N, the next N wrap proof verifications fail
@@ -512,9 +516,10 @@ fn overlap_wrap_verify() -> bool {
 
 /// Takes this process's verification of the wrap proof uploaded to `artifact`. None when this
 /// process did not make that proof (a `WorkerClient` that runs the shrink-wrap task in another
-/// process): the caller must then verify the proof itself, with [`verify_wrap_proof`].
+/// process), or its verification was evicted ([`MAX_WRAP_VERIFIES`]): the caller must then verify
+/// the proof itself, with [`verify_wrap_proof`].
 pub(crate) fn take_wrap_verify(artifact: &impl ArtifactId) -> Option<PendingWrapVerify> {
-    WRAP_VERIFIES.lock().unwrap_or_else(|e| e.into_inner()).remove(artifact.id())
+    WRAP_VERIFIES.lock().unwrap_or_else(|e| e.into_inner()).pop(artifact.id())
 }
 
 /// Waits for a verification taken with [`take_wrap_verify`]. A failed verification is retryable:
@@ -1053,15 +1058,26 @@ impl<A: ArtifactClient, C: SP1ProverComponents> SP1RecursionProver<A, C> {
             .download(artifact)
             .instrument(tracing::debug_span!("download wrap proof"))
             .await?;
-        let pending = match pending {
-            Some(pending) => pending,
+        match pending {
+            Some(pending) => Ok((wrap_proof, pending)),
             None => {
-                tracing::debug_span!("verify wrap proof")
-                    .in_scope(|| verify_wrap_proof::<C>(&wrap_proof))?;
-                PendingWrapVerify { verify: WrapVerify::Passed, shrink_wrap: None }
+                // On a blocking thread, as the shrink-wrap task's verification is: it takes ~0.6 s.
+                let span = tracing::debug_span!("verify wrap proof");
+                let (wrap_proof, verified) = tokio::task::spawn_blocking(move || {
+                    let verified = span.in_scope(|| verify_wrap_proof::<C>(&wrap_proof));
+                    (wrap_proof, verified)
+                })
+                .await
+                .map_err(|e| {
+                    TaskError::Fatal(anyhow::anyhow!("wrap proof verification panicked: {e}"))
+                })?;
+                verified?;
+                Ok((
+                    wrap_proof,
+                    PendingWrapVerify { verify: WrapVerify::Passed, shrink_wrap: None },
+                ))
             }
-        };
-        Ok((wrap_proof, pending))
+        }
     }
 
     pub async fn run_groth16(&self, request: RawTaskRequest) -> Result<(), TaskError> {

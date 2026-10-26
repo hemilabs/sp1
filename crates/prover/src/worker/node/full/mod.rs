@@ -22,7 +22,7 @@ use crate::{
     shapes::DEFAULT_ARITY,
     worker::{
         LocalWorkerClient, ProofId, RawTaskRequest, RequesterId, SP1NodeCore, TaskContext,
-        VkeyMapControllerInput, VkeyMapControllerOutput, WorkerClient,
+        TaskError, VkeyMapControllerInput, VkeyMapControllerOutput, WorkerClient,
     },
 };
 
@@ -398,12 +398,26 @@ impl SP1LocalNode {
                     )
                     .await?;
                 let verified = match wrap_verify {
-                    Some(pending) => crate::worker::wait_wrap_verify(pending.verify).await,
-                    None => {
-                        crate::worker::verify_wrap_proof::<crate::CpuSP1ProverComponents>(&proof)
+                    Some(pending) => {
+                        crate::worker::wait_wrap_verify(pending.verify).await.map(|()| proof)
                     }
+                    // On a blocking thread, as the task's own verification is: it takes ~0.6 s.
+                    // A panic is an error like the task's own verification's.
+                    None => tokio::task::spawn_blocking(move || {
+                        crate::worker::verify_wrap_proof::<crate::CpuSP1ProverComponents>(&proof)
+                            .map(|()| proof)
+                    })
+                    .await
+                    .unwrap_or_else(|e| {
+                        Err(TaskError::Fatal(anyhow::anyhow!(
+                            "wrap proof verification panicked: {e}"
+                        )))
+                    }),
                 };
-                let Err(e) = verified else { return Ok(proof) };
+                let e = match verified {
+                    Ok(proof) => return Ok(proof),
+                    Err(e) => e,
+                };
                 // A proof that fails verification is made again (the verification forgot the
                 // kept wrap proving key), within the retry budget of a task that failed it
                 // itself, as the shrink-wrap task was retried when it verified the proof.
