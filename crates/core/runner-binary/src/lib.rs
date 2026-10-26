@@ -9,6 +9,8 @@ pub struct Input {
     pub max_trace_size: Option<u64>,
     /// The most cycles in a trace chunk, see `JitFunction::set_max_chunk_cycles`.
     pub max_chunk_cycles: Option<u64>,
+    /// The stdin buffers, each serialized as one byte buffer.
+    #[serde(with = "sp1_primitives::serde_bytes::vec_deque")]
     pub input: VecDeque<Vec<u8>>,
     pub shm_slot_size: usize,
     pub id: String,

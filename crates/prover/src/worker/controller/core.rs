@@ -129,8 +129,8 @@ impl CoreExecuteTaskRequest {
 
 #[derive(Serialize, Deserialize)]
 pub enum TraceData {
-    /// A core record to be proven.
-    Core(Vec<u8>),
+    /// A core record to be proven: a bincode-encoded `TraceChunk`, sent as one byte buffer.
+    Core(#[serde(with = "sp1_primitives::serde_bytes::vec")] Vec<u8>),
     // Precompile data. Several `PrecompileArtifactSlice`s, and the type of precompile.
     Precompile(Vec<PrecompileArtifactSlice>, SyscallCode),
     /// Memory data.
@@ -788,5 +788,35 @@ mod classify_chunk_error_tests {
         assert!(!is_retryable(ExecutionError::TooMuchMemory()));
         assert!(!is_retryable(ExecutionError::Other("boom".to_string())));
         assert!(!is_retryable(ExecutionError::Unimplemented()));
+    }
+}
+
+#[cfg(test)]
+mod trace_data_encoding_tests {
+    use super::TraceData;
+
+    /// `TraceData` as it was before `Core` was serialized as bytes.
+    #[derive(serde::Serialize, serde::Deserialize)]
+    enum PlainTraceData {
+        Core(Vec<u8>),
+    }
+
+    /// `TraceData::Core` keeps its bincode encoding (variant 0, `u64` length, raw bytes), so
+    /// records written before the change read back after it and the other way around.
+    #[test]
+    fn core_encoding_unchanged() {
+        let chunk: Vec<u8> = (0..100_000u32).map(|i| (i * 7 + 3) as u8).collect();
+        let new = bincode::serialize(&TraceData::Core(chunk.clone())).unwrap();
+        let old = bincode::serialize(&PlainTraceData::Core(chunk.clone())).unwrap();
+        assert_eq!(new, old);
+        assert_eq!(&new[..4], &0u32.to_le_bytes());
+        assert_eq!(&new[4..12], &(chunk.len() as u64).to_le_bytes());
+        assert_eq!(&new[12..], &chunk[..]);
+        match bincode::deserialize::<TraceData>(&old).unwrap() {
+            TraceData::Core(bytes) => assert_eq!(bytes, chunk),
+            _ => panic!("expected a core record"),
+        }
+        let PlainTraceData::Core(bytes) = bincode::deserialize(&new).unwrap();
+        assert_eq!(bytes, chunk);
     }
 }

@@ -269,6 +269,27 @@ func useGpuProver() bool {
 	return os.Getenv("SP1_GROTH16_GPU") != "0"
 }
 
+// gpuR1csSolverArmed: whether gpuSolveR1cs will solve the proofs of the circuit in dataDir on
+// the GPU R1CS solver, as far as can be told before a proof: the GPU prover is used
+// (useGpuProver), the host registered the solver and named the circuit data for dataDir, all of
+// whose files are there (gpuR1csPrepKey), and SP1_GPU_R1CS_SOLVER is not cpu. ProveGroth16 then
+// reads only the R1CS's metadata (readR1csMeta), not the R1CS, which only gnark's CPU solver
+// needs. SP1_GROTH16_FULL_R1CS=1 has it read the R1CS anyway, as it did before.
+func gpuR1csSolverArmed(dataDir string) bool {
+	if !useGpuProver() || os.Getenv("SP1_GPU_R1CS_SOLVER") == "cpu" ||
+		os.Getenv("SP1_GROTH16_FULL_R1CS") == "1" {
+		return false
+	}
+	gpuR1cs.Lock()
+	create, solve, destroy := gpuR1cs.create, gpuR1cs.solve, gpuR1cs.destroy
+	prepDir := gpuR1cs.prepDirs[dataDir]
+	gpuR1cs.Unlock()
+	if create == 0 || solve == 0 || destroy == 0 || prepDir == "" {
+		return false
+	}
+	return gpuR1csPrepKey(prepDir) != ""
+}
+
 // checkGpu: SP1_GROTH16_GPU_CHECK=1 compares every GPU result with gnark's CPU computation.
 func checkGpu() bool { return os.Getenv("SP1_GROTH16_GPU_CHECK") == "1" }
 
@@ -388,9 +409,47 @@ func gpuComputeH(a, b, c []fr.Element, domain *fft.Domain) ([]fr.Element, error)
 	return h, nil
 }
 
+// groth16Circuit is the circuit ProveGroth16 proves: its metadata (wire counts, commitment
+// info), and the parsed R1CS, which only gnark's CPU solver needs. Where the GPU R1CS solver is
+// armed (gpuR1csSolverArmed) ProveGroth16 reads only the metadata, and the R1CS is parsed
+// (loadR1cs) only if a proof falls back to the CPU solver after all.
+type groth16Circuit struct {
+	dataDir string
+	meta    *r1csMeta
+	r1cs    *cs.R1CS
+	// loadR1cs parses the R1CS (when r1cs is nil).
+	loadR1cs func() (*cs.R1CS, error)
+}
+
+// fullR1cs is the parsed R1CS, parsed now if it was not, and checked against the metadata.
+func (c *groth16Circuit) fullR1cs() (*cs.R1CS, error) {
+	if c.r1cs != nil {
+		return c.r1cs, nil
+	}
+	if c.loadR1cs == nil {
+		return nil, fmt.Errorf("no R1CS for %s", c.dataDir)
+	}
+	start := time.Now()
+	r1cs, err := c.loadR1cs()
+	if err != nil {
+		return nil, err
+	}
+	meta, err := r1csMetaOf(r1cs)
+	if err != nil {
+		return nil, err
+	}
+	if !meta.equal(c.meta) {
+		return nil, fmt.Errorf("the R1CS read for %s (%+v) is not the one proved with (%+v)", c.dataDir, *meta, *c.meta)
+	}
+	fmt.Printf("Reading R1CS for the CPU solver took %s\n", time.Since(start))
+	c.r1cs = r1cs
+	return r1cs, nil
+}
+
 // proveGroth16Gpu is gnark's groth16_bn254.Prove with the GPU doing computeH and the MSMs, for
 // the circuit in dataDir.
-func proveGroth16Gpu(dataDir string, r1cs *cs.R1CS, pk *groth16_bn254.ProvingKey, fullWitness witness.Witness, opts ...backend.ProverOption) (*groth16_bn254.Proof, error) {
+func proveGroth16Gpu(circuit *groth16Circuit, pk *groth16_bn254.ProvingKey, fullWitness witness.Witness, opts ...backend.ProverOption) (*groth16_bn254.Proof, error) {
+	dataDir, meta := circuit.dataDir, circuit.meta
 	opt, err := backend.NewProverConfig(opts...)
 	if err != nil {
 		return nil, fmt.Errorf("new prover config: %w", err)
@@ -399,7 +458,7 @@ func proveGroth16Gpu(dataDir string, r1cs *cs.R1CS, pk *groth16_bn254.ProvingKey
 		opt.HashToFieldFn = hash_to_field.New([]byte(constraint.CommitmentDst))
 	}
 
-	commitmentInfo := r1cs.CommitmentInfo.(constraint.Groth16Commitments)
+	commitmentInfo := meta.commitments
 
 	proof := &groth16_bn254.Proof{Commitments: make([]curve.G1Affine, len(commitmentInfo))}
 
@@ -443,9 +502,14 @@ func proveGroth16Gpu(dataDir string, r1cs *cs.R1CS, pk *groth16_bn254.ProvingKey
 	var solution *cs.R1CSSolution
 	var releaseSolution func()
 	if len(commitmentInfo) == 0 {
-		solution, releaseSolution = gpuSolveR1cs(dataDir, r1cs, fullWitness)
+		solution, releaseSolution = gpuSolveR1cs(dataDir, meta, fullWitness)
 	}
 	if solution == nil {
+		// gnark's solver, on the parsed R1CS: read now if ProveGroth16 read only the metadata.
+		r1cs, err := circuit.fullR1cs()
+		if err != nil {
+			return nil, err
+		}
 		_solution, err := r1cs.Solve(fullWitness, solverOpts...)
 		if err != nil {
 			return nil, err
@@ -511,7 +575,7 @@ func proveGroth16Gpu(dataDir string, r1cs *cs.R1CS, pk *groth16_bn254.ProvingKey
 	go func() {
 		toRemove := commitmentInfo.GetPrivateCommitted()
 		toRemove = append(toRemove, commitmentInfo.CommitmentIndexes())
-		kWireValues = filterSorted(wireValues[r1cs.GetNbPublicVariables():], r1cs.GetNbPublicVariables(), concatAll(toRemove...))
+		kWireValues = filterSorted(wireValues[meta.nbPublic:], meta.nbPublic, concatAll(toRemove...))
 		close(chKWireValues)
 	}()
 
@@ -631,13 +695,14 @@ func proveGroth16Gpu(dataDir string, r1cs *cs.R1CS, pk *groth16_bn254.ProvingKey
 	return proof, nil
 }
 
-// gpuSolveR1cs is r1cs.Solve on the GPU R1CS solver the host registered, reading the circuit
-// data SetGpuR1csPrepDir named for dataDir: the wire values, and A, B and C, all in gnark's Montgomery form.
+// gpuSolveR1cs is r1cs.Solve, for the R1CS meta describes, on the GPU R1CS solver the host
+// registered, reading the circuit data SetGpuR1csPrepDir named for dataDir: the wire values, and
+// A, B and C, all in gnark's Montgomery form.
 // nil, after saying why, where there is no solver or data, or the solve fails; the caller then
 // solves with gnark. The solver checks the constraints it does not solve for, and the proof is
 // checked against the verifying key before it is used (proveGroth16OnGpu). The solution's
 // vectors are kept for the next proof by the func returned with it, once nothing uses them.
-func gpuSolveR1cs(dataDir string, r1cs *cs.R1CS, fullWitness witness.Witness) (*cs.R1CSSolution, func()) {
+func gpuSolveR1cs(dataDir string, meta *r1csMeta, fullWitness witness.Witness) (*cs.R1CSSolution, func()) {
 	gpuR1cs.Lock()
 	create, solve, destroy := gpuR1cs.create, gpuR1cs.solve, gpuR1cs.destroy
 	prepDir := gpuR1cs.prepDirs[dataDir]
@@ -646,15 +711,20 @@ func gpuSolveR1cs(dataDir string, r1cs *cs.R1CS, fullWitness witness.Witness) (*
 		os.Getenv("SP1_GPU_R1CS_SOLVER") == "cpu" {
 		return nil, nil
 	}
+	if os.Getenv("SP1_GPU_R1CS_SOLVER") == "fail" {
+		// For testing the fallback: armed (gpuR1csSolverArmed), then failing as a solve can.
+		fmt.Printf("GPU R1CS solver: failing as SP1_GPU_R1CS_SOLVER=fail says, solving on the CPU\n")
+		return nil, nil
+	}
 	vec, ok := fullWitness.Vector().(fr.Vector)
 	if !ok {
 		return nil, nil
 	}
 	// The wires as gnark's solver starts them: the constant ONE, the witness, then the rest
 	// zero, for the solver to fill in.
-	nbInputs := r1cs.GetNbPublicVariables() + r1cs.GetNbSecretVariables()
-	nbWires := nbInputs + r1cs.GetNbInternalVariables()
-	nbConstraints := r1cs.GetNbConstraints()
+	nbInputs := meta.nbPublic + meta.nbSecret
+	nbWires := meta.nbWires()
+	nbConstraints := meta.nbConstraints
 	if len(vec) != nbInputs-1 || nbConstraints == 0 {
 		fmt.Printf("GPU R1CS solver: witness of %d for %d inputs, solving on the CPU\n", len(vec), nbInputs)
 		return nil, nil
@@ -786,24 +856,20 @@ func filterSorted(slice []fr.Element, sliceFirstIndex int, toRemove []int) []fr.
 	return r
 }
 
-// proveGroth16OnGpu proves with proveGroth16Gpu (with the R1CS and key ProveGroth16 read under
-// its lock) and verifies the proof against the verifying key in
-// dataDir; nil if either fails (the caller then proves on the CPU).
+// proveGroth16OnGpu proves with proveGroth16Gpu (with the circuit and key ProveGroth16 read under
+// its lock) and verifies the proof against the verifying key in the circuit's data directory;
+// nil if either fails (the caller then proves on the CPU, with the parsed R1CS).
 func proveGroth16OnGpu(
-	dataDir string,
-	r1csIface constraint.ConstraintSystem,
+	circuit *groth16Circuit,
 	pkIface groth16.ProvingKey,
 	fullWitness witness.Witness,
 ) groth16.Proof {
-	r1cs, ok := r1csIface.(*cs.R1CS)
-	if !ok {
-		return nil
-	}
+	dataDir := circuit.dataDir
 	pk, ok := pkIface.(*groth16_bn254.ProvingKey)
 	if !ok {
 		return nil
 	}
-	proof, err := proveGroth16Gpu(dataDir, r1cs, pk, fullWitness)
+	proof, err := proveGroth16Gpu(circuit, pk, fullWitness)
 	if err != nil {
 		fmt.Printf("GPU Groth16 prover failed, proving on the CPU: %v\n", err)
 		return nil

@@ -19,6 +19,8 @@ fn main() {
     // changes, our runner also gets rebuild.
     println!("cargo:rerun-if-changed=../executor");
     println!("cargo:rerun-if-changed=../jit");
+    // The runner binary's `Input` uses `sp1_primitives::serde_bytes`.
+    println!("cargo:rerun-if-changed=../../primitives");
 
     sp1_core_executor::build::detect_executor();
 

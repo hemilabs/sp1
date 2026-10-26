@@ -6,7 +6,7 @@ use sp1_core_executor::{events::ByteRecord, ByteOpcode};
 use sp1_hypercube::air::SP1AirBuilder;
 use sp1_primitives::consts::u64_to_u16_limbs;
 
-use super::{IsZeroOperation, IsZeroOperationInput};
+use super::{small_int_inverse, IsZeroOperation, IsZeroOperationInput};
 use crate::air::{SP1Operation, SP1OperationBuilder};
 
 /// A set of columns needed to validate the address and return the aligned address.
@@ -31,7 +31,9 @@ impl<F: PrimeField32> SyscallAddrOperation<F> {
         self.addr[0] = F::from_canonical_u16(addr_limbs[0]);
         self.addr[1] = F::from_canonical_u16(addr_limbs[1]);
         self.addr[2] = F::from_canonical_u16(addr_limbs[2]);
-        self.top_two_limb_min = sum_top_two_limb.inverse();
+        // The sum of two u16 limbs is in `[0, 2^17 - 2]`, inside the inverse table.
+        self.top_two_limb_min =
+            small_int_inverse(u32::from(addr_limbs[1]) + u32::from(addr_limbs[2]));
         let is_max = self.top_two_limb_max.populate_from_field_element(
             sum_top_two_limb - F::from_canonical_u16(u16::MAX) * F::two(),
         );

@@ -306,11 +306,20 @@ fn turns_gate(
     env: &str,
     cores_per_turn: usize,
 ) -> &'static tokio::sync::Semaphore {
+    gate_of(gate, env, || {
+        std::thread::available_parallelism().map_or(2, |n| (n.get() / cores_per_turn).max(2))
+    })
+}
+
+/// A gate of `env` turns (`0`: no limit), `default()` when `env` is unset or not a number.
+fn gate_of(
+    gate: &'static std::sync::OnceLock<tokio::sync::Semaphore>,
+    env: &str,
+    default: impl FnOnce() -> usize,
+) -> &'static tokio::sync::Semaphore {
     gate.get_or_init(|| {
-        let default =
-            std::thread::available_parallelism().map_or(2, |n| (n.get() / cores_per_turn).max(2));
         let turns =
-            std::env::var(env).ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(default);
+            std::env::var(env).ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or_else(default);
         tokio::sync::Semaphore::new(if turns == 0 {
             tokio::sync::Semaphore::MAX_PERMITS
         } else {
@@ -326,11 +335,44 @@ fn turns_gate(
 /// other down (the first shard took 0.7 s instead of 0.4 s), and they crowd out the first shard's
 /// trace generation, which the GPU waits for. In turns the oldest shards finish first; later in a
 /// proof few records are traced at once, so the gate rarely waits. The records are unchanged.
-/// `SP1_WORKER_RECORD_TURNS` sets how many shards run at once (default: one per 8 cores, at
-/// least 2; `0` lets them all run).
+/// `SP1_WORKER_RECORD_TURNS` sets how many shards run at once (default: [`default_record_turns`];
+/// `0` lets them all run).
 fn record_gate() -> &'static tokio::sync::Semaphore {
     static GATE: std::sync::OnceLock<tokio::sync::Semaphore> = std::sync::OnceLock::new();
-    turns_gate(&GATE, "SP1_WORKER_RECORD_TURNS", 8)
+    gate_of(&GATE, "SP1_WORKER_RECORD_TURNS", || {
+        default_record_turns(
+            std::thread::available_parallelism().ok().map(|n| n.get()),
+            sp1_recursion_gnark_ffi::host_memory::available(),
+        )
+    })
+}
+
+/// Available memory per record turn when the gate is made: a turn above 2 needs this much each.
+///
+/// A turn holds one shard record while it is traced. On rsp (21M cycles) the node's peak RSS rose
+/// from 32-35 GB with 2 turns to 36 GB with 3, so a turn costs a few GB; 8 GiB leaves twice that.
+const RECORD_TURN_BYTES: u64 = 8 << 30;
+
+/// The default number of record turns, from the core count and the memory this process can still
+/// use (`None`: unknown).
+///
+/// One per 4 cores, at most 3, or one per 8 cores where that is more; at least 2, and no more
+/// turns than [`RECORD_TURN_BYTES`] fit in the available memory (again at least 2, the previous
+/// default for every host under 24 cores).
+///
+/// The old default, one per 8 cores, gave 2 turns on a 13-vCPU MI300X host. Since trace
+/// generation moved to the GPU the CPU has idle time, and the gate became the bottleneck on rsp and
+/// on every first proof. Measured there with 3 turns (`SP1_WORKER_RECORD_TURNS=3`, 2-4 runs each):
+/// rsp core steady 13.82 -> 13.19 s, first proof 15.39 -> 13.66 s; fib core first proof
+/// 12.84 -> 12.05 s, steady unchanged (11.07 vs 10.91 s, within noise). 4 turns were no better, so
+/// hosts with 12-31 cores get 3 and hosts with 32 or more keep one per 8 cores.
+fn default_record_turns(cores: Option<usize>, available: Option<u64>) -> usize {
+    let Some(cores) = cores else { return 2 };
+    let by_cores = (cores / 8).max((cores / 4).min(3)).max(2);
+    let by_memory = available.map_or(usize::MAX, |bytes| {
+        usize::try_from(bytes / RECORD_TURN_BYTES).unwrap_or(usize::MAX)
+    });
+    by_cores.min(by_memory).max(2)
 }
 
 impl<A, W, C> AsyncWorker<CoreProvingTask, Result<TaskMetadata, TaskError>> for CoreWorker<A, W, C>
@@ -1298,6 +1340,33 @@ mod tests {
 
     fn elf(id: &str) -> Artifact {
         Artifact(id.to_string())
+    }
+
+    #[test]
+    fn record_turns_default() {
+        const GB: u64 = 1 << 30;
+        let plenty = Some(190 * GB);
+        // 13 vCPUs (the MI300X host): 3 turns, measured faster than 2.
+        assert_eq!(default_record_turns(Some(13), plenty), 3);
+        assert_eq!(default_record_turns(Some(12), plenty), 3);
+        assert_eq!(default_record_turns(Some(31), plenty), 3);
+        // Small hosts keep 2.
+        assert_eq!(default_record_turns(Some(1), plenty), 2);
+        assert_eq!(default_record_turns(Some(8), plenty), 2);
+        assert_eq!(default_record_turns(Some(11), plenty), 2);
+        // Large hosts keep one per 8 cores.
+        assert_eq!(default_record_turns(Some(32), plenty), 4);
+        assert_eq!(default_record_turns(Some(64), plenty), 8);
+        // Unknown core count: 2.
+        assert_eq!(default_record_turns(None, plenty), 2);
+        // Memory caps the turns, never below 2.
+        assert_eq!(default_record_turns(Some(13), Some(23 * GB)), 2);
+        assert_eq!(default_record_turns(Some(13), Some(24 * GB)), 3);
+        assert_eq!(default_record_turns(Some(64), Some(40 * GB)), 5);
+        assert_eq!(default_record_turns(Some(64), Some(GB)), 2);
+        assert_eq!(default_record_turns(Some(13), Some(0)), 2);
+        // Unknown memory: by cores only.
+        assert_eq!(default_record_turns(Some(13), None), 3);
     }
 
     #[test]

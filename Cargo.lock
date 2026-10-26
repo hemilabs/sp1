@@ -6799,6 +6799,7 @@ dependencies = [
  "itertools 0.14.0",
  "p3-merkle-tree",
  "rand 0.8.6",
+ "rayon",
  "serde",
  "slop-algebra 6.8.1",
  "slop-alloc",
@@ -7205,6 +7206,7 @@ dependencies = [
  "serde",
  "sp1-core-executor",
  "sp1-jit",
+ "sp1-primitives 6.8.1",
  "tracing-subscriber 0.3.23",
 ]
 

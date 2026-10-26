@@ -10,7 +10,7 @@ use struct_reflection::{StructReflection, StructReflectionHelper};
 
 use crate::air::{SP1Operation, SP1OperationBuilder};
 
-use super::{AddrAddOperation, AddrAddOperationInput};
+use super::{small_int_inverse, AddrAddOperation, AddrAddOperationInput};
 
 /// A set of columns needed to validate the address and return the aligned address.
 #[derive(
@@ -39,9 +39,9 @@ impl<F: PrimeField32> AddressOperation<F> {
         let memory_addr = b.wrapping_add(c);
         let addr_limbs = u64_to_u16_limbs(memory_addr);
         self.addr_operation.populate(record, b, c);
-        let sum_top_two_limb =
-            F::from_canonical_u16(addr_limbs[1]) + F::from_canonical_u16(addr_limbs[2]);
-        self.top_two_limb_inv = sum_top_two_limb.inverse();
+        // The sum of two u16 limbs is in `[0, 2^17 - 2]`, inside the inverse table.
+        self.top_two_limb_inv =
+            small_int_inverse(u32::from(addr_limbs[1]) + u32::from(addr_limbs[2]));
         record.add_bit_range_check(addr_limbs[0] / 8, 13);
         memory_addr
     }
