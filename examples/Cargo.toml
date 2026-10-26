@@ -21,6 +21,8 @@ members = [
   "fibonacci/script",
   "mixed-ops/program",
   "mixed-ops/script",
+  "general-compute/program",
+  "general-compute/script",
   "fibonacci-cuda/script",
   "fibonacci-cuda/program",
   "groth16/program",
