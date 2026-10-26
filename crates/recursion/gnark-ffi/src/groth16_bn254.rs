@@ -224,12 +224,12 @@ pub(crate) fn set_gpu_helper_env(cmd: &mut std::process::Command) {
     }
 }
 
-/// Whether the GPU Groth16 helper solves the R1CS itself (the GPU R1CS solver) when
-/// `SP1_GPU_R1CS_SOLVER` is unset or `auto`, on the backend `SP1_GPU_BACKEND` names: everywhere but
-/// Windows HIP. Its runtime has no cooperative launch, which the solver's kernel needs: on an RX
-/// 9060 XT every launch failed, and the proof fell back to gnark's CPU prover after the helper had
-/// started. The solver's per-layer kernels, which do without it, took 9.2 s there against 2.0 s
-/// for gnark's solve.
+/// Whether the GPU R1CS solver solves the circuit (in the GPU Groth16 helper, or for gnark's prover
+/// in this process) when `SP1_GPU_R1CS_SOLVER` is unset or `auto`, on the backend `SP1_GPU_BACKEND`
+/// names: everywhere but Windows HIP. Its runtime has no cooperative launch, which the solver's
+/// kernel needs: on an RX 9060 XT every launch failed, and the proof fell back to gnark's CPU
+/// prover after the helper had started. The solver's per-layer kernels, which do without it, took
+/// 8-9 s there against 2.0-2.5 s for gnark's solve.
 #[cfg(feature = "native")]
 fn gpu_r1cs_solver_by_default(backend: Option<&str>, windows: bool) -> bool {
     let hip = backend.is_some_and(|b| matches!(b.to_lowercase().as_str(), "hip" | "rocm" | "amd"));
@@ -651,9 +651,17 @@ impl Groth16Bn254Prover {
                 path.to_str().ok_or_else(|| anyhow::anyhow!("not valid UTF-8: {}", path.display()))
             }
             // gnark's prover here solves the circuit on the GPU where this process registered the
-            // GPU R1CS solver and its circuit data can be had.
+            // GPU R1CS solver and its circuit data can be had, and `SP1_GPU_R1CS_SOLVER` wants it
+            // (by default not on Windows HIP: see `gpu_r1cs_solver_by_default`; on an RX 9060 XT
+            // the solve took 8.2 s there against 2.5 s for gnark's).
             let build_dir_str = path_str(build_dir)?;
-            if crate::ffi::groth16_gpu_r1cs_solver_registered() {
+            let backend = std::env::var("SP1_GPU_BACKEND").ok();
+            let gpu_solve = match std::env::var("SP1_GPU_R1CS_SOLVER").ok().as_deref() {
+                Some("gpu") => true,
+                Some("cpu") => false,
+                _ => gpu_r1cs_solver_by_default(backend.as_deref(), cfg!(windows)),
+            };
+            if gpu_solve && crate::ffi::groth16_gpu_r1cs_solver_registered() {
                 let prep_dir = in_process_prep_circuit_dir(build_dir);
                 crate::ffi::set_groth16_r1cs_prep_dir(
                     build_dir_str,
