@@ -137,7 +137,7 @@ impl<C: SP1ProverComponents> SP1LocalNodeBuilder<C> {
                         async move { run_worker.controller().run(task).await }.instrument(span),
                     )
                     .await;
-                    let status = task_status("Controller", result);
+                    let status = execution_task_status("Controller", result);
 
                     // Complete the task, as failed if it failed: whoever waits on it must not
                     // go on to read outputs that were never written.
@@ -181,7 +181,7 @@ impl<C: SP1ProverComponents> SP1LocalNodeBuilder<C> {
                                         .instrument(span),
                                 )
                                 .await;
-                                task_status("CoreExecute", result)
+                                execution_task_status("CoreExecute", result)
                             }
                             Err(e) => {
                                 tracing::error!("CoreExecute: failed to parse request: {e:?}");
@@ -636,6 +636,23 @@ fn task_status<T, E: std::fmt::Debug>(
     }
 }
 
+/// [`task_status`] for the tasks of a proof's execution (`Controller`, `CoreExecute`): one that
+/// failed with a retryable error ends [`TaskStatus::FailedRetryable`], so the proof is run again
+/// ([`SP1LocalNode::prove_with_mode`]). The task itself is not resubmitted: an execution has sent
+/// shards to be proven by the time it fails, and would send them again.
+fn execution_task_status<T>(
+    what: &str,
+    result: Result<Result<T, TaskError>, TaskJoinError>,
+) -> TaskStatus {
+    match result {
+        Ok(Err(TaskError::Retryable(e))) => {
+            tracing::error!("{what}: task failed: {:?}", TaskError::Retryable(e));
+            TaskStatus::FailedRetryable
+        }
+        result => task_status(what, result),
+    }
+}
+
 impl TaskOutput {
     fn handle_worker_result(
         result: Result<Result<TaskMetadata, TaskError>, TaskJoinError>,
@@ -793,6 +810,23 @@ mod catching_panics_tests {
             run_catching_panics(async { Err::<(), _>(TaskError::Fatal(anyhow::anyhow!("no"))) })
                 .await;
         assert_eq!(task_status("test", failed), TaskStatus::FailedFatal);
+    }
+
+    /// An execution that failed with a retryable error (its executor child killed) fails its
+    /// task as retryable, for the proof to be run again; any other failure stays fatal.
+    #[tokio::test]
+    async fn an_execution_killed_fails_retryable_and_others_fatal() {
+        let killed = run_catching_panics(async {
+            Err::<(), _>(TaskError::Retryable(anyhow::anyhow!("executor child killed")))
+        })
+        .await;
+        assert_eq!(execution_task_status("test", killed), TaskStatus::FailedRetryable);
+        let failed =
+            run_catching_panics(async { Err::<(), _>(TaskError::Fatal(anyhow::anyhow!("no"))) })
+                .await;
+        assert_eq!(execution_task_status("test", failed), TaskStatus::FailedFatal);
+        let finished = run_catching_panics(async { Ok::<(), TaskError>(()) }).await;
+        assert_eq!(execution_task_status("test", finished), TaskStatus::Succeeded);
     }
 
     /// A wrap handler fails a task that panics, and goes on to run the next.

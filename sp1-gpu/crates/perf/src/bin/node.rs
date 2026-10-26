@@ -41,13 +41,19 @@ fn main() {
     // First: when started as its own Groth16 CPU helper, prove and exit here. See
     // `sp1_recursion_gnark_ffi::run_groth16_cpu_helper_if_requested`.
     sp1_recursion_gnark_ffi::run_groth16_cpu_helper_if_requested();
-    run();
+    // A failed proof ends the run with its error and exit code 1, once the runtime is down:
+    // exiting while its tasks still use the GPU crashes in the runtime's teardown.
+    if let Err(e) = run() {
+        eprintln!("proof failed: {e}");
+        sp1_core_executor::unlink_owned_shm();
+        std::process::exit(1);
+    }
 }
 
 #[tokio::main]
 #[allow(clippy::field_reassign_with_default)]
 #[allow(clippy::print_stdout)]
-async fn run() {
+async fn run() -> Result<(), String> {
     let args = Args::parse();
 
     // Load the environment variables.
@@ -117,19 +123,20 @@ async fn run() {
             let context = context.clone();
             let time = tokio::time::Instant::now();
             tracing::info!("proving with mode: {mode:?}");
-            let proof = client.prove_with_mode(&elf, stdin, context, mode).await;
-            // A proof refused because an earlier one reset the GPU (SP1_GPU_RESET_BEFORE_WRAP):
-            // exit as below, since a panic would unwind through destructors that segfault on it.
-            #[cfg(feature = "native-gnark")]
-            if let Err(e) = &proof {
-                if sp1_recursion_gnark_ffi::gpu_was_reset() {
+            let proof = match client.prove_with_mode(&elf, stdin, context, mode).await {
+                Ok(proof) => proof,
+                // A proof refused because an earlier one reset the GPU (SP1_GPU_RESET_BEFORE_WRAP):
+                // exit as below, since unwinding would run destructors that segfault on it.
+                #[cfg(feature = "native-gnark")]
+                Err(e) if sp1_recursion_gnark_ffi::gpu_was_reset() => {
                     eprintln!("proof failed: {e:#}");
                     std::io::Write::flush(&mut std::io::stdout()).ok();
                     sp1_core_executor::unlink_owned_shm();
                     std::process::exit(1);
                 }
-            }
-            let proof = proof.unwrap();
+                // Failed with its retries, if any, spent: end the run (see `main`), not panic.
+                Err(e) => return Err(format!("{e:#}")),
+            };
             let proof_time = time.elapsed();
             tracing::info!("proof time: {:?}", proof_time);
 
@@ -200,14 +207,15 @@ async fn run() {
         sp1_core_executor::unlink_owned_shm();
         std::process::exit(0);
         #[allow(unreachable_code)]
-        measurements
+        Ok(measurements)
     })
     .await
-    .unwrap();
+    .unwrap()?;
 
     if args.telemetry {
         tokio::task::spawn_blocking(opentelemetry::global::shutdown_tracer_provider).await.unwrap();
     }
 
     println!("All {} measurements done", measurements.len());
+    Ok(())
 }

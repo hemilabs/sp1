@@ -576,8 +576,15 @@ where
                     .wait_task(executor_task_id)
                     .instrument(tracing::debug_span!("wait executor"))
                     .await?;
-                if status != TaskStatus::Succeeded {
-                    return Err(TaskError::Fatal(anyhow::anyhow!("CoreExecute task failed")));
+                match status {
+                    TaskStatus::Succeeded => {}
+                    // The executor child was killed (by the memory monitor or the host).
+                    TaskStatus::FailedRetryable => {
+                        return Err(TaskError::Retryable(anyhow::anyhow!(
+                            "CoreExecute task failed with a retryable error"
+                        )))
+                    }
+                    _ => return Err(TaskError::Fatal(anyhow::anyhow!("CoreExecute task failed"))),
                 }
                 Ok(())
             });

@@ -33,6 +33,12 @@ pub(crate) struct SP1NodeInner {
     _tasks: JoinSet<()>,
 }
 
+/// A proof's controller ended [`TaskStatus::FailedRetryable`]: it failed for a cause that proving
+/// it again need not meet (its executor child killed, say).
+#[derive(Debug, thiserror::Error)]
+#[error("the proof failed with a retryable error")]
+struct RetryableProofFailure;
+
 pub struct SP1LocalNode {
     inner: Arc<SP1NodeInner>,
 }
@@ -239,6 +245,33 @@ impl SP1LocalNode {
         mode: ProofMode,
     ) -> anyhow::Result<ProofFromNetwork> {
         let _gpu_work = start_gpu_work()?;
+        // A proof that failed with a retryable error (its executor child killed by the memory
+        // monitor or the host, say) is proven again from the start, as a new proof, at most
+        // MAX_LOCAL_TASK_RETRIES times: its shards were already on their way, so its execution
+        // cannot be resumed or resubmitted.
+        let mut retries = 0;
+        loop {
+            match self.prove_once(elf, stdin.clone(), &context, mode).await {
+                Err(e)
+                    if e.is::<RetryableProofFailure>()
+                        && retries < crate::worker::MAX_LOCAL_TASK_RETRIES =>
+                {
+                    retries += 1;
+                    tracing::warn!("proving again ({retries}): {e:#}");
+                }
+                result => return result,
+            }
+        }
+    }
+
+    /// One attempt of [`Self::prove_with_mode`], under its own proof id.
+    async fn prove_once(
+        &self,
+        elf: &[u8],
+        stdin: SP1Stdin,
+        context: &SP1Context<'static>,
+        mode: ProofMode,
+    ) -> anyhow::Result<ProofFromNetwork> {
         // Allocate the per-proof artifacts and id up front so the cleanup below
         // can always reach them, regardless of how the proving body exits.
         let elf_artifact = self.inner.artifact_client.create_artifact()?;
@@ -282,13 +315,18 @@ impl SP1LocalNode {
             let subscriber =
                 self.inner.worker_client.subscriber(proof_id.clone()).await?.per_task();
             let status = subscriber.wait_task(task_id).await?;
-            if status != TaskStatus::Succeeded {
-                return Err(anyhow::anyhow!("controller task failed"));
+            match status {
+                TaskStatus::Succeeded => {}
+                TaskStatus::FailedRetryable => {
+                    return Err(anyhow::Error::new(RetryableProofFailure));
+                }
+                _ => return Err(anyhow::anyhow!("controller task failed")),
             }
 
             // Download the output proof.
             self.inner.artifact_client.download::<ProofFromNetwork>(&output_artifact).await
         };
+        // A failed attempt's bookkeeping is released before the next one starts.
         self.with_bookkeeping(&proof_id, proving).await
     }
 

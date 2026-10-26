@@ -1,6 +1,9 @@
 use std::{
     marker::PhantomData,
-    sync::{Arc, OnceLock},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, OnceLock,
+    },
 };
 
 use futures::{prelude::*, stream::FuturesUnordered};
@@ -252,6 +255,9 @@ where
 
         // Create a join set in order to be able to cancel all tasks
         let mut join_set = JoinSet::<Result<(), TaskError>>::new();
+        // Set once the executor child was killed, before the executor stops: the tasks that wait
+        // on the executor then fail too (no final vm state, say), maybe first.
+        let child_killed = Arc::new(AtomicBool::new(false));
 
         // Start the minimal executor.
         let (memory_tx, memory_rx) = oneshot::channel::<UnsafeMemory>();
@@ -297,6 +303,7 @@ where
             let final_vm_state = final_vm_state.clone();
             let opts = opts.clone();
             let splicing_engine = self.splicing_engine.clone();
+            let child_killed = child_killed.clone();
 
             move || {
                 let _guard = span.enter();
@@ -315,9 +322,13 @@ where
                 let mut chunk_count = 0;
                 // Hands the shard left open at the end of the previous chunk to the next splicer.
                 let mut carry_rx: Option<oneshot::Receiver<Option<OpenShard>>> = None;
-                while let Some(chunk) =
-                    minimal_executor.try_execute_chunk().map_err(classify_chunk_error)?
-                {
+                while let Some(chunk) = minimal_executor.try_execute_chunk().map_err(|e| {
+                    let e = classify_chunk_error(e);
+                    if matches!(e, TaskError::Retryable(_)) {
+                        child_killed.store(true, Ordering::SeqCst);
+                    }
+                    e
+                })? {
                     tracing::debug!(
                         trace_chunk = chunk_count,
                         "mem reads chunk size bytes {}, program is done?: {}",
@@ -511,7 +522,16 @@ where
 
         // Wait for tasks to finish
         while let Some(result) = join_set.join_next().await {
-            result.map_err(|e| TaskError::Fatal(e.into()))??;
+            match result.map_err(|e| TaskError::Fatal(e.into())).and_then(|result| result) {
+                Ok(()) => {}
+                // The kill is the cause, and retryable, whichever task failed first.
+                Err(e) if child_killed.load(Ordering::SeqCst) => {
+                    return Err(TaskError::Retryable(anyhow::anyhow!(
+                        "the executor child was killed (first failure: {e})"
+                    )))
+                }
+                Err(e) => return Err(e),
+            }
         }
 
         let output = output_rx.await.map_err(|_| anyhow::anyhow!("failed to receive output"))?;
