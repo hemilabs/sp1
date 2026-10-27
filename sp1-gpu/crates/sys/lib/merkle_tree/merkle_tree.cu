@@ -5,6 +5,7 @@
 #include "poseidon2/poseidon2.cuh"
 #include "poseidon2/poseidon2_bn254_3.cuh"
 #include "poseidon2/poseidon2_kb31_16_fast.cuh"
+#include "poseidon2/poseidon2_kb31_16_rdna.cuh"
 
 template <typename Hasher_t, typename HashParams, typename HasherState_t>
 __global__ __launch_bounds__(256, 2) void leafHash(
@@ -80,7 +81,21 @@ __global__ void leafHashPacked(
 // SP1_GPU_MERKLE_GENERIC selects the generic kernels.
 namespace kbfast = poseidon2_kb31_16_fast;
 
+// The one-thread-per-state kernels' permutation: on HIP with Rdna, poseidon2_kb31_16_rdna's (fewer 32-bit
+// multiplies), else poseidon2_kb31_16_fast's.
+template <bool Rdna>
+__device__ __forceinline__ void permuteKb(uint32_t (&s)[16]) {
+#ifdef __HIPCC__
+    if (Rdna) {
+        poseidon2_kb31_16_rdna::permute(s);
+        return;
+    }
+#endif
+    kbfast::permute(s);
+}
+
 // Same layout and semantics as leafHashPacked<KoalaBearHasher, KoalaBear>: overwrite-mode sponge, rate 8.
+template <bool Rdna>
 __global__ __launch_bounds__(256) void leafHashKbFast(
     poseidon2::KoalaBearHasher,
     const kb31_t* __restrict__ input_,
@@ -99,7 +114,7 @@ __global__ __launch_bounds__(256) void leafHashKbFast(
         for (; j + 8 <= widths; j += 8) {
 #pragma unroll
             for (int k = 0; k < 8; k++) s[k] = __ldg(col + (j + k) * H);
-            kbfast::permute(s);
+            permuteKb<Rdna>(s);
         }
         const size_t rem = widths - j;
         if (rem != 0) {
@@ -107,7 +122,7 @@ __global__ __launch_bounds__(256) void leafHashKbFast(
             for (int k = 0; k < 8; k++) {
                 if ((size_t)k < rem) s[k] = __ldg(col + (j + k) * H);
             }
-            kbfast::permute(s);
+            permuteKb<Rdna>(s);
         }
         uint4* out = reinterpret_cast<uint4*>(digests[idx + (H - 1)]);
         out[0] = make_uint4(s[0], s[1], s[2], s[3]);
@@ -115,24 +130,26 @@ __global__ __launch_bounds__(256) void leafHashKbFast(
     }
 }
 
+template <bool Rdna>
 __device__ __forceinline__ void compressNodeKbFast(uint32_t (*d)[8], size_t idx) {
     const uint4* a = reinterpret_cast<const uint4*>(d[2 * idx + 1]);  // left, right adjacent
     uint4 a0 = a[0], a1 = a[1], b0 = a[2], b1 = a[3];
     uint32_t s[16] = {a0.x, a0.y, a0.z, a0.w, a1.x, a1.y, a1.z, a1.w,
                       b0.x, b0.y, b0.z, b0.w, b1.x, b1.y, b1.z, b1.w};
-    kbfast::permute(s);
+    permuteKb<Rdna>(s);
     uint4* o = reinterpret_cast<uint4*>(d[idx]);
     o[0] = make_uint4(s[0], s[1], s[2], s[3]);
     o[1] = make_uint4(s[4], s[5], s[6], s[7]);
 }
 
 // One thread per node (large layers).
+template <bool Rdna>
 __global__ void compressKbFast(poseidon2::KoalaBearHasher, kb31_t (*digests)[8], size_t layer_height) {
     uint32_t(*d)[8] = reinterpret_cast<uint32_t(*)[8]>(digests);
     const size_t L = (size_t)1 << layer_height;
     for (size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x; i < L;
          i += (size_t)blockDim.x * gridDim.x) {
-        compressNodeKbFast(d, i + (L - 1));
+        compressNodeKbFast<Rdna>(d, i + (L - 1));
     }
 }
 
@@ -190,6 +207,7 @@ __global__ void compressBatchedKbQuad(
 }
 
 // recomputeBottomPaths<KoalaBear> with the fast permutation (same semantics and launch shape).
+template <bool Rdna>
 __global__ void recomputeBottomPathsKbFast(
     poseidon2::KoalaBearHasher,
     kb31_t* input_,
@@ -217,14 +235,14 @@ __global__ void recomputeBottomPathsKbFast(
             for (; j + 8 <= widths; j += 8) {
 #pragma unroll
                 for (int k = 0; k < 8; k++) s[k] = col[(j + k) * H];
-                kbfast::permute(s);
+                permuteKb<Rdna>(s);
             }
             if (j < widths) {
 #pragma unroll
                 for (int k = 0; k < 8; k++) {
                     if (j + k < widths) s[k] = col[(j + k) * H];
                 }
-                kbfast::permute(s);
+                permuteKb<Rdna>(s);
             }
 #pragma unroll
             for (int i = 0; i < 8; i++) nodes[t][i] = s[i];
@@ -247,7 +265,7 @@ __global__ void recomputeBottomPathsKbFast(
                     s[i] = nodes[levelBase + 2 * t][i];
                     s[8 + i] = nodes[levelBase + 2 * t + 1][i];
                 }
-                kbfast::permute(s);
+                permuteKb<Rdna>(s);
 #pragma unroll
                 for (int i = 0; i < 8; i++) nodes[nextBase + t][i] = s[i];
             }
@@ -464,9 +482,23 @@ __global__ __launch_bounds__(256) void recomputeBottomPathsBn254Fast(
 }
 #endif  // __HIPCC__
 
+#ifdef __HIPCC__
+// Whether the one-thread-per-state KoalaBear kernels use poseidon2_kb31_16_rdna's permutation, unless
+// SP1_GPU_POSEIDON2_RDNA=0.
+static bool kbRdnaEnabled() {
+    const char* v = getenv("SP1_GPU_POSEIDON2_RDNA");
+    return !(v && v[0] == '0');
+}
+#endif
+
 extern "C" void* leaf_hash_merkle_tree_koala_bear_16_kernel() {
 #ifndef SP1_SYCL
-    if (!getenv("SP1_GPU_MERKLE_GENERIC")) return SP1_KERNEL_PTR(leafHashKbFast);
+    if (!getenv("SP1_GPU_MERKLE_GENERIC")) {
+#ifdef __HIPCC__
+        if (kbRdnaEnabled()) return SP1_KERNEL_PTR(leafHashKbFast<true>);
+#endif
+        return SP1_KERNEL_PTR(leafHashKbFast<false>);
+    }
 #endif
     return SP1_KERNEL_PTR(leafHashPacked<poseidon2::KoalaBearHasher, poseidon2_kb31_16::KoalaBear>);
 }
@@ -502,7 +534,12 @@ void compress(
 
 extern "C" void* compress_merkle_tree_koala_bear_16_kernel() {
 #ifndef SP1_SYCL
-    if (!getenv("SP1_GPU_MERKLE_GENERIC")) return SP1_KERNEL_PTR(compressKbFast);
+    if (!getenv("SP1_GPU_MERKLE_GENERIC")) {
+#ifdef __HIPCC__
+        if (kbRdnaEnabled()) return SP1_KERNEL_PTR(compressKbFast<true>);
+#endif
+        return SP1_KERNEL_PTR(compressKbFast<false>);
+    }
 #endif
     return SP1_KERNEL_PTR(compress<
         poseidon2::KoalaBearHasher,
@@ -679,7 +716,12 @@ extern "C" void* compute_paths_merkle_tree_bn254_kernel() {
 
 extern "C" void* recompute_bottom_paths_merkle_tree_koala_bear_16_kernel() {
 #ifndef SP1_SYCL
-    if (!getenv("SP1_GPU_MERKLE_GENERIC")) return SP1_KERNEL_PTR(recomputeBottomPathsKbFast);
+    if (!getenv("SP1_GPU_MERKLE_GENERIC")) {
+#ifdef __HIPCC__
+        if (kbRdnaEnabled()) return SP1_KERNEL_PTR(recomputeBottomPathsKbFast<true>);
+#endif
+        return SP1_KERNEL_PTR(recomputeBottomPathsKbFast<false>);
+    }
 #endif
     return SP1_KERNEL_PTR(recomputeBottomPaths<
         poseidon2::KoalaBearHasher,

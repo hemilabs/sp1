@@ -673,6 +673,43 @@ mod tests {
         .await;
     }
 
+    /// The KoalaBear commit and opening paths are the same with the RDNA permutation (HIP;
+    /// poseidon2_kb31_16_rdna.cuh) and without it (`SP1_GPU_POSEIDON2_RDNA=0`), for widths a
+    /// multiple of the rate and not, and full and truncated trees (whose bottom paths are rehashed
+    /// per query).
+    #[tokio::test]
+    async fn test_poseidon2_koala_bear_rdna_matches_fast() {
+        run_in_place(|scope| async move {
+            for (width, log_height) in [(8usize, 10usize), (45, 12), (16, 16), (200, 15)] {
+                let n = width << log_height;
+                let host: Vec<SP1Field> = (0..n)
+                    .map(|i| SP1Field::from_canonical_u32((i as u32).wrapping_mul(2654435761) >> 2))
+                    .collect();
+                let host = Tensor::from(host).reshape([width, 1 << log_height]);
+                let tensor =
+                    sp1_gpu_cudart::DeviceTensor::from_host(&host, &scope).unwrap().into_inner();
+                let prover = Poseidon2SP1Field16CudaProver::new(&scope);
+                let indices = vec![0, 42, 7, (1 << log_height) - 1];
+
+                std::env::remove_var("SP1_GPU_POSEIDON2_RDNA");
+                let (rdna_commit, rdna_data) = prover.commit_tensors(&tensor).unwrap();
+                let rdna_proof =
+                    prover.prove_openings_at_indices(&rdna_data, &tensor, &indices).unwrap();
+
+                std::env::set_var("SP1_GPU_POSEIDON2_RDNA", "0");
+                let (fast_commit, fast_data) = prover.commit_tensors(&tensor).unwrap();
+                let fast_proof =
+                    prover.prove_openings_at_indices(&fast_data, &tensor, &indices).unwrap();
+                std::env::remove_var("SP1_GPU_POSEIDON2_RDNA");
+
+                assert_eq!(rdna_commit, fast_commit, "width {width}, log height {log_height}");
+                assert_eq!(rdna_proof.merkle_root, fast_proof.merkle_root);
+                assert_eq!(rdna_proof.paths, fast_proof.paths);
+            }
+        })
+        .await;
+    }
+
     /// The wrap's BN254 Merkle tree against the CPU prover's: commitments, paths and openings, for
     /// widths that pack into full and partial BN254 elements (8 values each) and fill the sponge's
     /// rate (2) fully or partly.
