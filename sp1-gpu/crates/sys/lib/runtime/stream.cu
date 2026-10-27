@@ -818,6 +818,18 @@ static hipError_t cachedHipMalloc(void** p, size_t s, hipStream_t stream) {
         g_cached_bytes -= s;
         return takeCachedBlock(block, s, stream, p);
     }
+    // With the arena, a block of the exact size from its free ranges before a larger cached one:
+    // that one's surplus would stay out of use as long as the block lives. Taking cached blocks
+    // up to twice the size first left 16 GB cards ~3 GB short (Groth16 proofs of Fibonacci 20M at
+    // 2^28-element shards ran out of memory with 8.9 GB live in a 14 GB arena).
+    arenaInit();
+    if (g_arena_on) {
+        if (void* q = arenaTake(s)) {
+            *p = q;
+            g_alloc_sizes[q] = s;
+            return hipSuccess;
+        }
+    }
     // Fallback: try a buffer up to 2x the requested size. This handles the
     // sumcheck halving pattern where each round needs exactly half the previous
     // size — the freed buffer from round N-1 (size 2S) satisfies round N (size S).
