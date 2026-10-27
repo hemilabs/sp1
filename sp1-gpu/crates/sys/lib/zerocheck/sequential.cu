@@ -433,8 +433,12 @@ __device__ __forceinline__ ext_t run_chunk_bytecode_uniform(
     return acc;
 }
 
+// RDNA: with the 16-register VGPR file (the RDNA default, see `rdna_defaults` in prover.rs) the ext kernel
+// fits in 96 VGPRs, i.e. 16 waves/SIMD instead of 12 (2-3% faster on an RX 9070 XT, bit-identical). Larger
+// register files would spill at that occupancy, so they keep the compiler's choice.
 template <typename K, int MAX_REGS, int V>
-__global__ void __launch_bounds__(256) zerocheck_fused_sequential_uniform(
+__global__ void __launch_bounds__(256) SP1_RDNA_WAVES_PER_EU((V > 0 && V <= 16) ? 16 : 1)
+    zerocheck_fused_sequential_uniform(
     const BlockDispatch* __restrict__ dispatch,
     const ChunkStatic* __restrict__ chunk_static,
     const ChipLayout* __restrict__ chip_layouts,
@@ -963,6 +967,19 @@ __global__ void zerocheck_fused_sequential_coop(
 
     SP1_EXTERN_SHARED(unsigned char, smem);
     ext_t* red = reinterpret_cast<ext_t*>(smem);
+#if defined(__HIPCC__)
+    // HIP: the instruction stream is read through the vector caches instead of being copied into
+    // LDS (the host sizes the dynamic LDS without it, see `coop_code_in_lds` in prover.rs). The
+    // copy was the largest part of a block's LDS and capped residency: on an RX 9070 XT (128 KB of
+    // LDS per WGP) 28.7 -> 15.6 KB per wide block, 4 -> 8 blocks per WGP, 31-38% faster.
+    (void)max_instrs;
+    const uint2* __restrict__ code = stc.coop_code;
+    uint16_t* lvl = reinterpret_cast<uint16_t*>(smem + 32 * sizeof(ext_t));
+    K* slots = reinterpret_cast<K*>(
+                   smem + 32 * sizeof(ext_t)
+                   + (((size_t)(max_levels + 1) * sizeof(uint16_t) + 15) & ~(size_t)15))
+               + (size_t)grp * max_phys;
+#else
     uint2* code = reinterpret_cast<uint2*>(smem + 32 * sizeof(ext_t));
     uint16_t* lvl = reinterpret_cast<uint16_t*>(code + max_instrs);
     K* slots = reinterpret_cast<K*>(
@@ -970,6 +987,7 @@ __global__ void zerocheck_fused_sequential_coop(
                    + (((size_t)(max_levels + 1) * sizeof(uint16_t) + 15) & ~(size_t)15))
                + (size_t)grp * max_phys;
     for (uint32_t i = threadIdx.x; i < stc.n_instrs; i += blockDim.x) code[i] = stc.coop_code[i];
+#endif
     for (uint32_t i = threadIdx.x; i <= stc.coop_n_levels; i += blockDim.x) {
         lvl[i] = stc.coop_level_starts[i];
     }

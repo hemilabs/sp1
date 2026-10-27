@@ -1258,7 +1258,10 @@ fn coop_max_phys() -> u32 {
 /// tables when a cooperative block holds `rows` rows.
 fn coop_max_phys_for(rows: u32) -> u32 {
     let cap = unsafe { zerocheck_coop_smem_cap() } as usize;
-    let fixed = coop_smem_bytes_for(rows, COOP_MAX_INSTRS, COOP_MAX_LEVELS, 0);
+    // The eligibility caps stay as when the instruction stream was in shared memory everywhere
+    // (same chunk routing on every backend; HIP just launches with less LDS).
+    let code_off_lds = if coop_code_in_lds() { 0 } else { COOP_MAX_INSTRS as usize * 8 };
+    let fixed = coop_smem_bytes_for(rows, COOP_MAX_INSTRS, COOP_MAX_LEVELS, 0) + code_off_lds;
     (cap.saturating_sub(fixed) / (rows as usize * std::mem::size_of::<Ext>())) as u32
 }
 
@@ -1266,9 +1269,16 @@ fn coop_smem_bytes(max_instrs: u32, max_levels: u32, max_phys: u32) -> usize {
     coop_smem_bytes_for(COOP_ROWS, max_instrs, max_levels, max_phys)
 }
 
+/// Whether the cooperative kernels copy the instruction stream into shared memory. On HIP they read
+/// it from global memory instead (`zerocheck_fused_sequential_coop`), so it takes no LDS.
+fn coop_code_in_lds() -> bool {
+    sp1_gpu_cudart::sys::BACKEND != "hip"
+}
+
 fn coop_smem_bytes_for(rows: u32, max_instrs: u32, max_levels: u32, max_phys: u32) -> usize {
+    let code_bytes = if coop_code_in_lds() { max_instrs as usize * 8 } else { 0 };
     32 * std::mem::size_of::<Ext>()
-        + max_instrs as usize * 8
+        + code_bytes
         + ((2 * (max_levels as usize + 1) + 15) & !15)
         + rows as usize * max_phys as usize * std::mem::size_of::<Ext>()
 }
@@ -1340,12 +1350,24 @@ pub(crate) fn zerocheck_uniform_enabled() -> bool {
 /// (4-node registers).
 const ZEROCHECK_BIV_VRF_DEFAULT: u32 = 16;
 
+/// RDNA (HIP with 32-wide waves): the VGPR register files cost more occupancy than
+/// they save in scratch traffic. On an RX 9070 XT the v0 bivariate kernel (90 VGPRs,
+/// 16 waves/SIMD) beats v16 (154 VGPRs, 9 waves) by 18-26%, and the v16 univariate
+/// kernel (104 VGPRs, 12 waves) beats v32 (169 VGPRs, 8 waves) by 3-9%, on real chunk
+/// bytecode (bit-identical partials). The MI300X keeps the values it was tuned with.
+fn rdna_defaults() -> bool {
+    // SAFETY: takes nothing and only reads the current device's attributes.
+    sp1_gpu_cudart::sys::BACKEND == "hip"
+        && unsafe { sp1_gpu_cudart::sys::runtime::sp1_hip_wave64() } == 0
+}
+
 /// Registers the wave-uniform G = 4 bivariate kernel keeps in VGPRs
 /// (`SP1_GPU_ZEROCHECK_BIV_VRF` ∈ {0, 16, 32}).
 pub(crate) fn zerocheck_biv_vrf_size() -> u32 {
-    match env_u32("SP1_GPU_ZEROCHECK_BIV_VRF", ZEROCHECK_BIV_VRF_DEFAULT) {
+    let default = if rdna_defaults() { 0 } else { ZEROCHECK_BIV_VRF_DEFAULT };
+    match env_u32("SP1_GPU_ZEROCHECK_BIV_VRF", default) {
         v @ (0 | 16 | 32) => v,
-        _ => ZEROCHECK_BIV_VRF_DEFAULT,
+        _ => default,
     }
 }
 
@@ -1359,9 +1381,10 @@ pub(crate) fn zerocheck_vrf_size() -> u32 {
     if !zerocheck_uniform_enabled() {
         return 0;
     }
-    match env_u32("SP1_GPU_ZEROCHECK_VRF", ZEROCHECK_VRF_DEFAULT) {
+    let default = if rdna_defaults() { 16 } else { ZEROCHECK_VRF_DEFAULT };
+    match env_u32("SP1_GPU_ZEROCHECK_VRF", default) {
         v @ (0 | 16 | 32) => v,
-        _ => ZEROCHECK_VRF_DEFAULT,
+        _ => default,
     }
 }
 
