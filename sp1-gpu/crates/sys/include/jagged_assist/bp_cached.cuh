@@ -378,7 +378,7 @@ __global__ void bpCachedInterpolateAndObserve(
     int round_num,
     EF* sum_values,
     EF* claim) {
-#ifndef SP1_PORTABLE
+#ifndef SP1_SYCL
     if constexpr (std::is_same<Challenger, DuplexChallenger>::value &&
                   std::is_same<EF, kb31_extension_t>::value) {
         // Warp path (launched with 32 threads): lane-parallel partial sums, closed-form

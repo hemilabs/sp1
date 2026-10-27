@@ -1,5 +1,5 @@
-// Fast KoalaBear Poseidon2-16 permutations for the Merkle kernels (CUDA only; HIP keeps the generic
-// poseidon2::Hasher path). Both are bit-exact with poseidon2::Hasher<poseidon2_kb31_16::KoalaBear>::permute:
+// Fast KoalaBear Poseidon2-16 permutations for the Merkle kernels and the device challenger (CUDA and
+// HIP). Both are bit-exact with poseidon2::Hasher<poseidon2_kb31_16::KoalaBear>::permute:
 // every intermediate is the same field element, only its 32-bit representative differs.
 // Inputs are canonical Montgomery residues in [0, p); outputs are canonical.
 //
@@ -202,10 +202,32 @@ __device__ __forceinline__ void permute(uint32_t* s) {
 }
 
 
-// The 4-lane permutation uses warp shuffles: CUDA only.
-#ifndef SP1_PORTABLE
 namespace quad {
 
+// Exchanges within an aligned quad of lanes: warp shuffles on CUDA; on HIP, DPP quad permutes (a
+// modifier of a vector move, instead of a round trip through the LDS crossbar that HIP's shuffles
+// take). quad_perm control: lane i of each quad reads lane sel_i, two bits each, lane 0 lowest.
+template <int M>
+__device__ __forceinline__ uint32_t quad_xor(uint32_t v, unsigned mask) {
+    static_assert(M == 1 || M == 2, "within a quad");
+#ifdef __HIPCC__
+    (void)mask;
+    constexpr int ctrl = M == 1 ? 0xb1 : 0x4e;  // [1, 0, 3, 2] / [2, 3, 0, 1]
+    return (uint32_t)__builtin_amdgcn_mov_dpp((int)v, ctrl, 0xf, 0xf, false);
+#else
+    return __shfl_xor_sync(mask, v, M);
+#endif
+}
+
+// Quad lane 0's `v`, in every lane of the quad.
+__device__ __forceinline__ uint32_t quad_lane0(uint32_t v, unsigned mask) {
+#ifdef __HIPCC__
+    (void)mask;
+    return (uint32_t)__builtin_amdgcn_mov_dpp((int)v, 0x00, 0xf, 0xf, false);  // [0, 0, 0, 0]
+#else
+    return __shfl_sync(mask, v, 0, 4);
+#endif
+}
 
 // shared table of the 128 external round constants (Montgomery form), indexed r*16 + i
 struct QCtx {
@@ -218,9 +240,9 @@ __device__ __forceinline__ void ext_layer(uint32_t (&x)[4], const QCtx& C) {
     mds4(x);
     uint32_t c[4];
 #pragma unroll
-    for (int k = 0; k < 4; k++) c[k] = addm(x[k], __shfl_xor_sync(C.mask, x[k], 1));
+    for (int k = 0; k < 4; k++) c[k] = addm(x[k], quad_xor<1>(x[k], C.mask));
 #pragma unroll
-    for (int k = 0; k < 4; k++) c[k] = addm(c[k], __shfl_xor_sync(C.mask, c[k], 2));
+    for (int k = 0; k < 4; k++) c[k] = addm(c[k], quad_xor<2>(c[k], C.mask));
 #pragma unroll
     for (int k = 0; k < 4; k++) x[k] = addm(x[k], c[k]);
 }
@@ -240,13 +262,15 @@ __device__ __forceinline__ void int_round(uint32_t (&x)[4], int r, const QCtx& C
     uint32_t y = fsub(x[0] + int_rc(r));
     uint32_t c0 = cube_lazy(y);
     uint64_t part = (uint64_t)(C.j == 0 ? 0u : x[0]) + x[1] + x[2] + x[3];
-#pragma unroll
-    for (int m = 1; m <= 2; m <<= 1) {
-        uint32_t lo = __shfl_xor_sync(C.mask, (uint32_t)part, m);
-        uint32_t hi = __shfl_xor_sync(C.mask, (uint32_t)(part >> 32), m);
+    {
+        uint32_t lo = quad_xor<1>((uint32_t)part, C.mask);
+        uint32_t hi = quad_xor<1>((uint32_t)(part >> 32), C.mask);
+        part += ((uint64_t)hi << 32) | lo;
+        lo = quad_xor<2>((uint32_t)part, C.mask);
+        hi = quad_xor<2>((uint32_t)(part >> 32), C.mask);
         part += ((uint64_t)hi << 32) | lo;
     }
-    uint32_t s0 = __shfl_sync(C.mask, c0, 0, 4);   // quad lane 0's new element 0
+    uint32_t s0 = quad_lane0(c0, C.mask);   // quad lane 0's new element 0
     uint64_t S = part + s0;
     if (C.j == 0) x[0] = s0;
     // diag shifts for element i = 4j + k: i=0 -> special, i>=1 -> SH[i-1] = {0,1,...,13,15}
@@ -278,6 +302,5 @@ __device__ __forceinline__ void permute(uint32_t (&x)[4], const QCtx& C) {
 }
 
 }  // namespace quad
-#endif  // SP1_PORTABLE
 }  // namespace poseidon2_kb31_16_fast
 #endif  // SP1_SYCL

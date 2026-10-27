@@ -76,7 +76,7 @@ __global__ void leafHashPacked(
 #ifndef SP1_SYCL
 // ---- KoalaBear fast paths (bit-exact with the generic kernels; see poseidon2_kb31_16_fast.cuh) ----
 // The one-thread-per-state kernels run on CUDA and HIP (on a Radeon RX 9070 XT the Merkle commit
-// bench went from 38.3 to 34-36 ms); the quad kernels (warp shuffles) on CUDA only.
+// bench went from 38.3 to 34-36 ms), and so do the quad kernels (warp shuffles; DPP on HIP).
 // SP1_GPU_MERKLE_GENERIC selects the generic kernels.
 namespace kbfast = poseidon2_kb31_16_fast;
 
@@ -136,7 +136,6 @@ __global__ void compressKbFast(poseidon2::KoalaBearHasher, kb31_t (*digests)[8],
     }
 }
 
-#ifndef SP1_PORTABLE
 #define KBQUAD_SETUP                                                                       \
     SP1_SHARED_ARRAY(uint32_t, s_rc, [128]);                                                         \
     for (int i = threadIdx.x; i < 128; i += blockDim.x)                                    \
@@ -189,7 +188,6 @@ __global__ void compressBatchedKbQuad(
         __syncthreads();
     }
 }
-#endif  // SP1_PORTABLE
 
 // recomputeBottomPaths<KoalaBear> with the fast permutation (same semantics and launch shape).
 __global__ void recomputeBottomPathsKbFast(
@@ -540,17 +538,17 @@ __global__ __launch_bounds__(128, 2) void compressBatched(
     }
 }
 
-// Quad-per-node kernels for small layers; nullptr on HIP or with SP1_GPU_MERKLE_GENERIC (the Rust side
+// Quad-per-node kernels for small layers; nullptr on SYCL or with SP1_GPU_MERKLE_GENERIC (the Rust side
 // then keeps the generic launch shapes).
 extern "C" void* compress_small_layer_merkle_tree_koala_bear_16_kernel() {
-#ifndef SP1_PORTABLE
+#ifndef SP1_SYCL
     if (!getenv("SP1_GPU_MERKLE_GENERIC")) return SP1_KERNEL_PTR(compressKbQuad);
 #endif
     return nullptr;
 }
 
 extern "C" void* compress_batched_small_merkle_tree_koala_bear_16_kernel() {
-#ifndef SP1_PORTABLE
+#ifndef SP1_SYCL
     if (!getenv("SP1_GPU_MERKLE_GENERIC")) return SP1_KERNEL_PTR(compressBatchedKbQuad);
 #endif
     return nullptr;
