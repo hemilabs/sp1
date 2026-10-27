@@ -502,7 +502,8 @@ where
                     // Every core shard is proven: free the core proving key before shrink, wrap
                     // and the final SNARK need the device memory.
                     release_core_proving_keys(&elf);
-                    compress_complete_tx.send(()).unwrap();
+                    // The receiver is gone only once the proof has failed elsewhere.
+                    let _ = compress_complete_tx.send(());
                     Ok(())
                 }
                 .instrument(tracing::debug_span!("reduce")),
@@ -530,7 +531,11 @@ where
                     self.worker_client.subscriber(context.proof_id.clone()).await?.per_task();
                 let worker_client = self.worker_client.clone();
                 join_set.spawn(async move {
-                    compress_complete_rx.await.unwrap();
+                    // Without the compressed proof (its task failed, with its own error), there is
+                    // nothing to wrap.
+                    if compress_complete_rx.await.is_err() {
+                        return Ok(());
+                    }
 
                     let shrinkwrap_task_id =
                         worker_client.submit_task(TaskType::ShrinkWrap, shrinkwrap_task).await?;
@@ -561,7 +566,11 @@ where
                     self.worker_client.subscriber(context.proof_id.clone()).await?.per_task();
                 let worker_client = self.worker_client.clone();
                 join_set.spawn(async move {
-                    compress_complete_rx.await.unwrap();
+                    // Without the compressed proof (its task failed, with its own error), there is
+                    // nothing to wrap.
+                    if compress_complete_rx.await.is_err() {
+                        return Ok(());
+                    }
 
                     let shrinkwrap_task_id =
                         worker_client.submit_task(TaskType::ShrinkWrap, shrinkwrap_task).await?;

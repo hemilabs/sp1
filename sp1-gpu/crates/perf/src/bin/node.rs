@@ -37,20 +37,38 @@ fn proof_mode_from_string(s: &str) -> ProofMode {
 #[global_allocator]
 static GLOBAL: sp1_gpu_host_alloc::HostAlloc = sp1_gpu_host_alloc::HostAlloc;
 
+/// How long a failed run waits for the runtime's remaining tasks before it exits.
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(30);
+
+/// How much longer it waits for the exit itself before it aborts.
+const EXIT_GRACE: Duration = Duration::from_secs(30);
+
 fn main() {
     // First: when started as its own Groth16 CPU helper, prove and exit here. See
     // `sp1_recursion_gnark_ffi::run_groth16_cpu_helper_if_requested`.
     sp1_recursion_gnark_ffi::run_groth16_cpu_helper_if_requested();
+    let runtime =
+        tokio::runtime::Builder::new_multi_thread().enable_all().build().expect("tokio runtime");
     // A failed proof ends the run with its error and exit code 1, once the runtime is down:
-    // exiting while its tasks still use the GPU crashes in the runtime's teardown.
-    if let Err(e) = run() {
+    // exiting while its tasks still use the GPU crashes in the runtime's teardown. Dropping the
+    // runtime would wait for its blocking tasks however long they take, though, and a task the
+    // failure left stuck kept the process alive (and a core busy) until it was killed: wait for
+    // them at most SHUTDOWN_GRACE.
+    if let Err(e) = runtime.block_on(run()) {
         eprintln!("proof failed: {e}");
+        // The last resort, should even the exit below block (in the GPU runtime's teardown, with a
+        // task still waiting on the device).
+        std::thread::spawn(|| {
+            std::thread::sleep(SHUTDOWN_GRACE + EXIT_GRACE);
+            eprintln!("node: the failed run did not exit; aborting");
+            std::process::abort();
+        });
+        runtime.shutdown_timeout(SHUTDOWN_GRACE);
         sp1_core_executor::unlink_owned_shm();
         std::process::exit(1);
     }
 }
 
-#[tokio::main]
 #[allow(clippy::field_reassign_with_default)]
 #[allow(clippy::print_stdout)]
 async fn run() -> Result<(), String> {
