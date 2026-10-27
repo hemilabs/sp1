@@ -910,7 +910,7 @@ extern "C" int32_t sp1_groth16_selftest() {
     int32_t failures = 0;
     G1Affine g1{Fp::one(), Fp::one() + Fp::one()};
     // gnark-crypto's G2 generator.
-    const uint32_t g2x0[8] = {0xd992f6ed, 0x46debd5c, 0xf75edadd, 0x674322d4, 0x5e5c4479, 0x426a0066, 0x3c1b8a26, 0x1800deef};
+    const uint32_t g2x0[8] = {0xd992f6ed, 0x46debd5c, 0xf75edadd, 0x674322d4, 0x5e5c4479, 0x426a0066, 0x121f1e76, 0x1800deef};
     const uint32_t g2x1[8] = {0xaef312c2, 0x97e485b7, 0x35a9e712, 0xf1aa4933, 0x31fb5d25, 0x7260bfb7, 0x920d483a, 0x198e9393};
     const uint32_t g2y0[8] = {0x66fa7daa, 0x4ce6cc01, 0x0c43d37b, 0xe3d1e769, 0x8dcb408f, 0x4aab7180, 0xdb8c6deb, 0x12c85ea5};
     const uint32_t g2y1[8] = {0xd122975b, 0x55acdadc, 0x70b38ef3, 0xbc4b3133, 0x690c3395, 0xec9e99ad, 0x585ff075, 0x090689d0};
