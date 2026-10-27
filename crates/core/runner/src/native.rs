@@ -200,7 +200,9 @@ impl MinimalExecutorRunner {
                 monitor.stop.store(true, Ordering::SeqCst);
                 let _ = log_handle.join();
                 let error = if status.success() {
-                    ExecutionError::Other(format!("failed sending input to child: {send_err}"))
+                    ExecutionError::Other(format!(
+                        "the executor runner exited before reading its input ({send_err})"
+                    ))
                 } else {
                     child_exit_error(&status, &monitor)
                 };
@@ -518,6 +520,13 @@ fn child_exit_error(status: &std::process::ExitStatus, monitor: &MonitorState) -
         }
         (_, Some(libc::SIGKILL)) => ExecutionError::ChildKilled(),
         (_, Some(libc::SIGILL)) => ExecutionError::Unimplemented(),
+        (Some(sp1_core_executor_runner_binary::EXIT_WITHOUT_NATIVE_EXECUTOR), _) => {
+            ExecutionError::Other(
+                "the executor runner binary was built without the native executor (see \
+                 sp1-core-executor-runner's build.rs)"
+                    .to_string(),
+            )
+        }
         (code, signal) => ExecutionError::Other(format!(
             "Child native executor terminated abnormally, code: {code:?}, signal: {signal:?}"
         )),

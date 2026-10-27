@@ -2,6 +2,9 @@ use serde::{Deserialize, Serialize};
 use sp1_core_executor::Program;
 use std::{collections::VecDeque, sync::Arc};
 
+/// The exit code of this binary when it was built without the native executor (see `main.rs`).
+pub const EXIT_WITHOUT_NATIVE_EXECUTOR: i32 = 3;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Input {
     pub program: Arc<Program>,

@@ -6,6 +6,7 @@
 use cargo_metadata::MetadataCommand;
 use sha2::{Digest, Sha256};
 use std::env;
+use std::path::PathBuf;
 use std::process::Command;
 
 // --- CONFIGURATION ---
@@ -92,13 +93,24 @@ fn main() {
         cmd.arg("--release");
     }
 
-    #[cfg(feature = "profiling")]
-    cmd.arg("--features").arg("profiling");
+    let features: Vec<&str> = [
+        cfg!(feature = "profiling").then_some("profiling"),
+        cfg!(feature = "mprotect").then_some("mprotect"),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
 
-    #[cfg(feature = "mprotect")]
-    cmd.arg("--features").arg("mprotect");
+    for feature in &features {
+        cmd.arg("--features").arg(feature);
+    }
 
-    let inner_target_dir = metadata.target_directory.join("sp1-native-bins");
+    // One target directory per feature set. Builds of different feature sets in one target
+    // directory (a release build and a feature-unified `cargo clippy --all-targets`, say) would
+    // otherwise overwrite each other's binary: one built with `profiling` or `mprotect` has no
+    // native executor and cannot run programs.
+    let feature_set = if features.is_empty() { "default".to_string() } else { features.join("-") };
+    let inner_target_dir = metadata.target_directory.join("sp1-native-bins").join(feature_set);
     cmd.env("CARGO_TARGET_DIR", &inner_target_dir);
 
     // Clear inherited RUSTFLAGS to avoid cross-compilation issues. When the outer
@@ -123,12 +135,17 @@ fn main() {
         bin_path.set_extension("exe");
     }
 
-    // 5. Export path for embedding
-    println!("cargo:rustc-env=SP1_CORE_RUNNER_BINARY={}", bin_path);
+    // 5. Export path for embedding: a copy in OUT_DIR, which only this run of the build script
+    //    writes. Embedding from the inner target directory would pick up whatever a later build
+    //    leaves there, while cargo may reuse this run's output, and so the hash below, unchanged.
+    let embedded = PathBuf::from(env::var("OUT_DIR").unwrap())
+        .join(bin_path.file_name().expect("binary file name"));
+    std::fs::copy(&bin_path, &embedded).expect("copy the runner binary into OUT_DIR");
+    println!("cargo:rustc-env=SP1_CORE_RUNNER_BINARY={}", embedded.display());
 
     // 6. Calculates and passes binary hash
     let mut hasher = Sha256::new();
-    hasher.update(std::fs::read(&bin_path).expect("read binary"));
+    hasher.update(std::fs::read(&embedded).expect("read binary"));
     let result = hasher.finalize();
     let hash_string = hex::encode(result);
     println!("cargo:rustc-env=SP1_CORE_RUNNER_BINARY_HASH={}", hash_string);
