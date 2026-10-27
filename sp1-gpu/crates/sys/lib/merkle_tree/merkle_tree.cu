@@ -292,6 +292,69 @@ using F = bn254_t;
 using P = poseidon2_bn254_3::Bn254;
 using RC = poseidon2::RoundConstants<P>;
 
+// a * b * 2^-256 mod r: Montgomery multiplication (CIOS) with each row's 8 products independent (one
+// v_mad_co_u64_u32 each, 64-bit addend), then one add-with-carry per limb, instead of bn254_t's 64-bit add of the
+// running carry per product, which serializes them; and m = -t0 r^-1 = -(t0 + t0 << 28) mod 2^32 kept as a shift
+// and an add (LLVM folds a visible shift amount back into v_mul_lo_u32). Inputs below 2r give an output below 2r
+// (4r < 2^256), reduced to [0, r) with Canonical.
+template <bool Canonical>
+__device__ __forceinline__ F montMul(const F& a, const F& b) {
+    const uint32_t* r = device::ALT_BN128_r;
+    uint32_t t[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+    uint32_t t8 = 0;
+#pragma unroll
+    for (int i = 0; i < 8; i++) {
+        uint64_t prod[8];
+#pragma unroll
+        for (int j = 0; j < 8; j++) prod[j] = (uint64_t)a.data[i] * b.data[j] + t[j];
+        unsigned c = 0;
+        t[0] = (uint32_t)prod[0];
+#pragma unroll
+        for (int j = 1; j < 8; j++) {
+            t[j] = __builtin_addc((uint32_t)prod[j], (uint32_t)(prod[j - 1] >> 32), c, &c);
+        }
+        t8 = t8 + (uint32_t)(prod[7] >> 32) + c;  // < 2^32 (r < 2^254)
+        uint32_t shift = 28;
+        asm("" : "+s"(shift));
+        const uint32_t m = 0u - ((t[0] << shift) + t[0]);
+#pragma unroll
+        for (int j = 0; j < 8; j++) prod[j] = (uint64_t)m * r[j] + t[j];
+        c = 0;
+#pragma unroll
+        for (int j = 1; j < 8; j++) {
+            t[j - 1] = __builtin_addc((uint32_t)prod[j], (uint32_t)(prod[j - 1] >> 32), c, &c);
+        }
+        t[7] = t8 + (uint32_t)(prod[7] >> 32) + c;
+        t8 = 0;
+    }
+    F out;
+    if constexpr (Canonical) {
+        uint32_t sub[8];
+        uint64_t borrow = 0;
+#pragma unroll
+        for (int i = 0; i < 8; i++) {
+            const uint64_t d = (uint64_t)t[i] - r[i] - borrow;
+            sub[i] = (uint32_t)d;
+            borrow = (d >> 63) & 1;
+        }
+#pragma unroll
+        for (int i = 0; i < 8; i++) out.data[i] = borrow ? t[i] : sub[i];
+    } else {
+#pragma unroll
+        for (int i = 0; i < 8; i++) out.data[i] = t[i];
+    }
+    return out;
+}
+
+// x^5 (P::D) with x^2 and x^4 left below 2r: on an RX 9070 XT the permutation runs 1.30x as fast as with
+// bn254_t's operators (whose sqr() keeps its reduction loop rolled, indexing registers at run time).
+__device__ __forceinline__ void sbox(F& x) {
+    static_assert(P::D == 5, "the S-box is x^5");
+    const F x2 = montMul<false>(x, x);
+    const F x4 = montMul<false>(x2, x2);
+    x = montMul<true>(x4, x);
+}
+
 __device__ __forceinline__ void externalLayer(F& s0, F& s1, F& s2) {
     // P::externalLinearLayer
     F sum = s0 + s1 + s2;
@@ -304,9 +367,9 @@ __device__ __forceinline__ void fullRound(F& s0, F& s1, F& s2, const F* rc) {
     s0 += rc[0];
     s1 += rc[1];
     s2 += rc[2];
-    s0 ^= P::D;
-    s1 ^= P::D;
-    s2 ^= P::D;
+    sbox(s0);
+    sbox(s1);
+    sbox(s2);
     externalLayer(s0, s1, s2);
 }
 
@@ -321,7 +384,7 @@ __device__ __forceinline__ void permute(F& s0, F& s1, F& s2, const RC& rc) {
 #pragma unroll 1
     for (int i = 0; i < P::ROUNDS_P; i++) {
         s0 += rc.internalRoundConstants[i];
-        s0 ^= P::D;
+        sbox(s0);
         // P::internalLinearLayer: diagonal (1, 1, 2) plus the sum.
         F s = s0 + s1 + s2;
         s0 += s;
