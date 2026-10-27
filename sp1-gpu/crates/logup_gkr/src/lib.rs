@@ -41,7 +41,7 @@ pub use sumcheck::{
 
 pub use execution::{extract_outputs, gkr_transition};
 
-fn prove_materialized_round<C: FieldChallenger<Felt>>(
+fn prove_materialized_round<C: FieldChallenger<Felt> + DeviceGrindingChallenger>(
     layer: GkrLayer,
     eval_point: &Point<Ext>,
     numerator_eval: Ext,
@@ -77,7 +77,7 @@ fn prove_materialized_round<C: FieldChallenger<Felt>>(
     LogupGkrRoundProof { numerator_0, numerator_1, denominator_0, denominator_1, sumcheck_proof }
 }
 
-fn prove_first_round<C: FieldChallenger<Felt>>(
+fn prove_first_round<C: FieldChallenger<Felt> + DeviceGrindingChallenger>(
     layer: FirstGkrLayer,
     eval_point: &Point<Ext>,
     numerator_eval: Ext,
@@ -106,7 +106,7 @@ fn prove_first_round<C: FieldChallenger<Felt>>(
     LogupGkrRoundProof { numerator_0, numerator_1, denominator_0, denominator_1, sumcheck_proof }
 }
 
-pub fn prove_round<'a, C: FieldChallenger<Felt>>(
+pub fn prove_round<'a, C: FieldChallenger<Felt> + DeviceGrindingChallenger>(
     circuit: GkrCircuitLayer<'a>,
     eval_point: &Point<Ext>,
     numerator_eval: Ext,
@@ -130,7 +130,7 @@ pub fn prove_round<'a, C: FieldChallenger<Felt>>(
 
 /// Proves the GKR circuit, layer by layer.
 #[instrument(skip_all, level = "debug")]
-pub fn prove_gkr_circuit<'a, C: FieldChallenger<Felt>>(
+pub fn prove_gkr_circuit<'a, C: FieldChallenger<Felt> + DeviceGrindingChallenger>(
     numerator_value: Ext,
     denominator_value: Ext,
     eval_point: Point<Ext>,

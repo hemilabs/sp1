@@ -93,6 +93,34 @@ impl<F: DeviceCopy + Field> DeviceMle<F> {
     where
         TaskScope: MleFixLastVariableKernel<F, EF>,
     {
+        self.fix_last_variable_constant_padding_inner(alpha, std::ptr::null(), padding_value)
+    }
+
+    /// [`Self::fix_last_variable_constant_padding`] at a challenge the device sampled: `alpha`
+    /// points to it in device memory, written by work queued before this on the stream.
+    pub fn fix_last_variable_constant_padding_at_device_challenge<
+        EF: DeviceCopy + ExtensionField<F>,
+    >(
+        &self,
+        alpha: *const EF,
+        padding_value: F,
+    ) -> DeviceMle<EF>
+    where
+        TaskScope: MleFixLastVariableKernel<F, EF>,
+    {
+        assert!(!alpha.is_null());
+        self.fix_last_variable_constant_padding_inner(EF::zero(), alpha, padding_value)
+    }
+
+    fn fix_last_variable_constant_padding_inner<EF: DeviceCopy + ExtensionField<F>>(
+        &self,
+        alpha: EF,
+        alpha_device: *const EF,
+        padding_value: F,
+    ) -> DeviceMle<EF>
+    where
+        TaskScope: MleFixLastVariableKernel<F, EF>,
+    {
         let mle = self.guts();
         let num_polynomials = self.num_polynomials();
         // MLE guts shape is [num_polynomials, num_entries] for TaskScope convention
@@ -118,6 +146,7 @@ impl<F: DeviceCopy + Field> DeviceMle<F> {
             output.as_mut_ptr(),
             padding_value,
             alpha,
+            alpha_device,
             input_height,
             num_polynomials
         );

@@ -208,6 +208,9 @@ extern "C" {
     pub fn logup_gkr_fix_and_sum_circuit_layer() -> KernelPtr;
     pub fn logup_gkr_fix_and_sum_last_circuit_layer() -> KernelPtr;
     pub fn logup_gkr_fix_and_sum_interactions_layer() -> KernelPtr;
+    /// 1 where the LogUp-GKR fix-and-sum kernels can finalize their rounds on the device (with the
+    /// KoalaBear duplex challenger), else 0.
+    pub fn logup_gkr_device_rounds() -> u32;
 
     // Logup GKR kernels - Two-round lookahead kernels
     pub fn logup_gkr_two_round_sum_circuit_layer() -> KernelPtr;

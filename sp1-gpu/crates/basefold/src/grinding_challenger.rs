@@ -1,23 +1,38 @@
 use serde::{Deserialize, Serialize};
 use slop_algebra::{Field, PrimeField, PrimeField31, PrimeField32, PrimeField64};
+use slop_alloc::CpuBackend;
 use slop_challenger::GrindingChallenger;
 use slop_symmetric::CryptographicPermutation;
 use sp1_gpu_challenger::{
     grind_koala_bear_challenger_on_device, grind_multi_field32_challenger_on_device,
-    KoalaBearDuplexChallenger,
+    DuplexChallenger, KoalaBearDuplexChallenger,
 };
 use sp1_gpu_cudart::TaskScope;
+use sp1_primitives::SP1Field;
 
 /// A [`GrindingChallenger`] that can also grind on device.
 pub trait DeviceGrindingChallenger: GrindingChallenger {
     /// Grinds on device.
     fn grind_device(&mut self, bits: usize, scope: &TaskScope) -> Self::Witness;
+
+    /// This challenger's state as the device duplex challenger lays it out (buffers padded to
+    /// the width), from which the device continues the transcript as this challenger would: for
+    /// protocols that sample their challenges on the device, such as the LogUp-GKR sumcheck
+    /// rounds. `None` where the device has no such challenger, and those protocols sample on the
+    /// host.
+    fn device_duplex_state(&self) -> Option<DuplexChallenger<SP1Field, CpuBackend>> {
+        None
+    }
 }
 
 // Concrete implementation for KoalaBear DuplexChallenger - uses GPU grinding
 impl DeviceGrindingChallenger for KoalaBearDuplexChallenger {
     fn grind_device(&mut self, bits: usize, scope: &TaskScope) -> Self::Witness {
         grind_koala_bear_challenger_on_device(self, bits, scope)
+    }
+
+    fn device_duplex_state(&self) -> Option<DuplexChallenger<SP1Field, CpuBackend>> {
+        Some(self.clone().into())
     }
 }
 

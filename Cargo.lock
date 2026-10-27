@@ -7618,6 +7618,7 @@ dependencies = [
  "sp1-core-executor",
  "sp1-core-machine",
  "sp1-gpu-basefold",
+ "sp1-gpu-challenger",
  "sp1-gpu-cudart",
  "sp1-gpu-jagged-tracegen",
  "sp1-gpu-utils",
