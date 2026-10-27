@@ -554,6 +554,9 @@ extern "C" void cuda_release_cached_memory() {
 
 // SYCL has no device memory arena (lib/runtime/stream.cu has HIP's).
 extern "C" size_t sp1_hip_arena_bytes() { return 0; }
+
+// No arena on SYCL (see the HIP one in runtime/stream.cu).
+extern "C" uint32_t sp1_hip_arena_scatters() { return 0; }
 extern "C" size_t sp1_hip_arena_free_bytes() { return 0; }
 // No DXGI budget for SYCL (lib/runtime/stream.cu reads HIP's).
 extern "C" uint64_t sp1_video_memory_budget() { return 0; }

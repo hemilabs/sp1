@@ -976,6 +976,26 @@ extern "C" size_t sp1_hip_arena_bytes() {
 #endif
 }
 
+// 1 where this process's arena assembles blocks from scattered pages (see arenaTakeScattered): on
+// Linux, with the arena on (SP1_GPU_ARENA, and no GPU PLONK helper on this card; see arenaInit) and
+// mapping its own pages; else 0, as on CUDA. The prover's memory tiers ask before the arena exists:
+// fragmentation then no longer decides what fits.
+extern "C" uint32_t sp1_hip_arena_scatters() {
+#if defined(__HIPCC__) && !defined(_WIN32)
+    const int setting = envSwitch("SP1_GPU_ARENA");
+    if (setting < 0) return 0;
+    size_t free_b = 0, total_b = 0;
+    if (hipMemGetInfo(&free_b, &total_b) != hipSuccess) {
+        (void)hipGetLastError();
+        return 0;
+    }
+    if (setting == 0 && plonkHelperOnThisCard(total_b)) return 0;
+    return arenaVmm() ? 1 : 0;
+#else
+    return 0;
+#endif
+}
+
 // The video memory budget Windows grants this process on the current device (DXGI, which counts
 // what other processes and the desktop hold), in bytes; 0 where unknown (elsewhere than HIP on
 // Windows).

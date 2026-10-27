@@ -129,15 +129,25 @@ pub fn local_gpu_opts() -> SP1CoreOpts {
             // memory rather than failing them, which slowed every kernel touching them (it proved a
             // 144M-cycle program in 15-17 s at the tier below and 12.7-13.5 s at this one).
             1 << 26
-        } else if gpu_memory_gb <= 20 && sp1_gpu_cudart::sys::BACKEND == "cuda" {
+        } else if gpu_memory_gb <= 20
+            && (sp1_gpu_cudart::sys::BACKEND == "cuda"
+                // SAFETY: takes nothing and creates nothing; reads settings and device attributes.
+                || unsafe { sp1_gpu_cudart::sys::runtime::sp1_hip_arena_scatters() } != 0)
+        {
             // 16 GB CUDA cards: 2^28 elements a shard, below the 24 GB tier's. An RTX 5060 Ti
             // driving the desktop peaked at 12.3 GB (Windows), and proved in fewer shards than at
             // 2^27: an RSP block (21000000) compressed in 65.0 s instead of 91.0, keccak over 20 MB
             // in 74.3 s instead of 99.7, bench-fib compressed in 4.12 s instead of 5.05 (2^28 +
             // 2^26 was faster still, 60.1 s for the block, but peaked at 13.9 GB).
+            //
+            // And 16 GB HIP cards whose arena assembles blocks from scattered pages: at 2^28 a
+            // shard's largest blocks (~4 GiB) found no free range that long in the single-range
+            // arena with half the card free. An RX 9070 XT proved the block in 50.0 s instead of
+            // 72.8 s.
             1 << 28
         } else if gpu_memory_gb <= 20 {
-            // 16 GB cards (e.g. RX 9070 XT): ~134M elements per shard to fit in VRAM.
+            // 16 GB cards (e.g. RX 9070 XT) whose arena can't take scattered blocks: ~134M
+            // elements per shard to fit in VRAM.
             ELEMENT_THRESHOLD - (1 << 28)
         } else if !opts.full_size_shards && gpu_memory_gb <= 30 {
             ELEMENT_THRESHOLD - (1 << 26) - (1 << 25) - (1 << 24)

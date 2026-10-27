@@ -26,6 +26,11 @@ extern "C" {
     /// The device memory HIP's arena holds, free or not (0 without an arena, and on CUDA and SYCL).
     pub fn sp1_hip_arena_bytes() -> usize;
 
+    /// 1 where HIP's arena assembles blocks from scattered pages, so that fragmentation no longer
+    /// decides what fits (Linux, with the arena on and virtual memory management); else 0, and on
+    /// CUDA and SYCL.
+    pub fn sp1_hip_arena_scatters() -> u32;
+
     /// The video memory budget Windows grants this process on its device (DXGI), in bytes: 0
     /// where unknown, which is everywhere but HIP on Windows.
     pub fn sp1_video_memory_budget() -> u64;
