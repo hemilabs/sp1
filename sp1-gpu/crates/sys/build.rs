@@ -782,15 +782,19 @@ fn build_sycl(
     if env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
         args.push("-fPIC".into());
     }
-    // Ahead-of-time device code, e.g. SP1_SYCL_TARGETS=spir64_gen with SP1_SYCL_DEVICE=bmg-g31;
-    // without it the kernels are SPIR-V that the driver compiles on first use.
-    if let Ok(targets) = env::var("SP1_SYCL_TARGETS") {
-        args.push(format!("-fsycl-targets={targets}").into());
-        println!("cargo:rerun-if-env-changed=SP1_SYCL_DEVICE");
-        if let Ok(device) = env::var("SP1_SYCL_DEVICE") {
-            args.push("-Xs".into());
-            args.push(format!("-device {device}").into());
-        }
+    // Device code: compiled ahead of time for Intel's Battlemage GPUs (bmg-g31: Arc Pro B70 and
+    // B60; bmg-g21: Arc B580 and B570), plus SPIR-V, which the driver compiles on first use on any
+    // other device. Compiling every kernel on first use took about 50 s of a B70's first proof
+    // after each build or driver update (a cold fibonacci proof 72 s, against 5.8 s ahead of
+    // time). SP1_SYCL_TARGETS and SP1_SYCL_DEVICE override the targets and the devices compiled
+    // for; SP1_SYCL_TARGETS=spir64 builds SPIR-V only, which builds faster.
+    println!("cargo:rerun-if-env-changed=SP1_SYCL_DEVICE");
+    let targets = env::var("SP1_SYCL_TARGETS").unwrap_or_else(|_| "spir64_gen,spir64".into());
+    args.push(format!("-fsycl-targets={targets}").into());
+    if targets.split(',').any(|t| t.trim() == "spir64_gen") {
+        let device = env::var("SP1_SYCL_DEVICE").unwrap_or_else(|_| "bmg-g21,bmg-g31".into());
+        args.push("-Xsycl-target-backend=spir64_gen".into());
+        args.push(format!("-device {device}").into());
     }
 
     let obj_dir = out_dir.join("sycl-objs");

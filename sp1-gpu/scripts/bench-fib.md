@@ -161,12 +161,13 @@ binary in the directory.
 - Run one prover process per card. A proof can use nearly all of a B70's 32 GB (30.7 GB for a
   20M-cycle fibonacci Groth16 proof); with three processes sharing the card (kernel 7.0.0-38),
   `xe` moved device memory out from under a copy, the copy engine faulted and the processes hung.
-- The first proof JIT-compiles the kernels, about 50 s, and the compiled kernels are cached
-  (`~/.cache/libsycl_cache`, `~/.cache/neo_compiler_cache`). An ahead-of-time build has no such
-  first proof (5.8 s instead of 72 s for a cold first fibonacci proof; proofs as fast): build with
-  `SP1_SYCL_TARGETS=spir64_gen SP1_SYCL_DEVICE=bmg-g31` (an Arc Pro B70; `bmg-g21` for a B580,
-  comma-separated for several). The kernels then run only on the devices named, and the
-  library is about 35 MB instead of 12.
+- The kernels are compiled ahead of time for Battlemage GPUs (`bmg-g31`: Arc Pro B70 and B60;
+  `bmg-g21`: Arc B580 and B570), and also kept as SPIR-V, which the driver compiles on first use
+  on any other Intel GPU (about 50 s on a B70's first proof; then cached in
+  `~/.cache/libsycl_cache` and `~/.cache/neo_compiler_cache`). Ahead of time, a cold first
+  fibonacci proof takes 5.8 s instead of 72 s, and proofs are as fast. `SP1_SYCL_DEVICE` sets
+  the devices compiled for (comma-separated), and `SP1_SYCL_TARGETS=spir64` builds SPIR-V only,
+  which builds faster and gives a smaller library.
 - Build only `node`: the GPU Groth16 and PLONK helpers use the CUDA/HIP MSM kernels and do not link
   on SYCL. The Groth16 prover runs in process with its MSMs and computeH on the GPU.
 
