@@ -79,6 +79,22 @@ import (
 var gpuHooks struct {
 	computeH, msmG1, msmG2 uintptr
 	totalMemory            uint64
+	// g2OnGpu is the host's choice for the G2 MSM (SetG2MsmOnGpu): -1 for none, else 0 or 1.
+	g2OnGpu int32
+}
+
+func init() {
+	gpuHooks.g2OnGpu = -1
+}
+
+// SetG2MsmOnGpu records where the host's GPU is known to run the G2 MSM faster (onGpu) or slower
+// than the CPU does alongside the G1 MSMs, in place of g2MsmOnCpu's default.
+func SetG2MsmOnGpu(onGpu bool) {
+	if onGpu {
+		gpuHooks.g2OnGpu = 1
+	} else {
+		gpuHooks.g2OnGpu = 0
+	}
 }
 
 // SetGpuHooks registers the GPU's computeH and MSM entry points (C function pointers; 0 unsets),
@@ -93,12 +109,16 @@ func SetGpuHooks(computeH, msmG1, msmG2 uintptr, totalMemory uint64) {
 // g2MsmOnCpu: whether the G2 MSM runs on the CPU, alongside the G1 MSMs on the GPU, rather than
 // on the GPU after them. SP1_GROTH16_G2_ON_CPU=0 runs it on the GPU and any other value on the
 // CPU. By default it runs on the CPU, where that took about as long as the G1 MSMs (~3 s each on
-// a Radeon RX 9070 XT or an Arc Pro B70, whose G2 MSM takes ~2.7 s more), except on cards of
-// 64 GiB or more and on hosts with fewer than 16 CPUs: on an MI300X with 13 vCPUs the CPU G2 MSM
-// took 6.7-6.9 s and the GPU's 0.58 s (Groth16 proofs 16-18% faster on the GPU).
+// an Arc Pro B70, whose G2 MSM takes ~2.7 s more), except on cards of 64 GiB or more and on
+// hosts with fewer than 16 CPUs: on an MI300X with 13 vCPUs the CPU G2 MSM took 6.7-6.9 s and the
+// GPU's 0.58 s (Groth16 proofs 16-18% faster on the GPU). The host's choice (SetG2MsmOnGpu), if
+// any, replaces that default.
 func g2MsmOnCpu() bool {
 	if v, ok := os.LookupEnv("SP1_GROTH16_G2_ON_CPU"); ok {
 		return v != "0"
+	}
+	if gpuHooks.g2OnGpu >= 0 {
+		return gpuHooks.g2OnGpu == 0
 	}
 	return gpuHooks.totalMemory < 64<<30 && runtime.NumCPU() >= 16
 }

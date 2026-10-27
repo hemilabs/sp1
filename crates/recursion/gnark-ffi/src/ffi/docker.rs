@@ -113,6 +113,9 @@ pub fn set_groth16_gpu_hooks(
 ) {
 }
 
+/// The Docker prover runs on the CPU: the G2 MSM's placement does not apply.
+pub fn set_groth16_g2_msm_on_gpu(_on_gpu: bool) {}
+
 /// The Docker prover runs on the CPU: a GPU R1CS solver is not used.
 pub fn set_groth16_gpu_r1cs_solver(_create: usize, _solve: usize, _destroy: usize) {}
 

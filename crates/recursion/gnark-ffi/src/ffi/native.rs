@@ -31,6 +31,13 @@ pub fn set_groth16_gpu_hooks(
 
 static GROTH16_GPU_HOOKS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// Records whether the GPU registered above runs the Groth16 prover's G2 MSM faster than the CPU
+/// does alongside the G1 MSMs, in place of the default choice (by the GPU's memory and the host's
+/// CPU count). `SP1_GROTH16_G2_ON_CPU` still overrides it.
+pub fn set_groth16_g2_msm_on_gpu(on_gpu: bool) {
+    unsafe { SetGroth16G2MsmOnGpu(on_gpu as _) }
+}
+
 /// Whether this process registered GPU entry points for the Groth16 prover. They exist only in this
 /// process, so `prove_isolated` then proves here rather than in a CPU helper.
 pub fn groth16_gpu_hooks_registered() -> bool {

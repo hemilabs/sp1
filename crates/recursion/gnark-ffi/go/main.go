@@ -202,6 +202,14 @@ func SetGroth16GpuHooks(computeH C.uintptr_t, msmG1 C.uintptr_t, msmG2 C.uintptr
 	sp1.SetGpuHooks(uintptr(computeH), uintptr(msmG1), uintptr(msmG2), uint64(totalMemory))
 }
 
+// SetGroth16G2MsmOnGpu records whether the host's GPU runs the Groth16 prover's G2 MSM faster
+// than the CPU (onGpu != 0), in place of the default (see sp1/groth16_gpu.go: g2MsmOnCpu).
+//
+//export SetGroth16G2MsmOnGpu
+func SetGroth16G2MsmOnGpu(onGpu C.int) {
+	sp1.SetG2MsmOnGpu(onGpu != 0)
+}
+
 // SetGroth16GpuR1csSolver registers the host's GPU R1CS solver for the Groth16 prover (C function
 // pointers for sp1_r1cs_solver_create, _solve and _destroy; zeros unregister it). It solves where
 // SetGroth16R1csPrepDir names its circuit data.

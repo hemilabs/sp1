@@ -143,7 +143,9 @@ pub fn local_gpu_opts() -> SP1CoreOpts {
             // And 16 GB HIP cards whose arena assembles blocks from scattered pages: at 2^28 a
             // shard's largest blocks (~4 GiB) found no free range that long in the single-range
             // arena with half the card free. An RX 9070 XT proved the block in 50.0 s instead of
-            // 72.8 s.
+            // 72.8 s. (2^28 + 2^25 and 2^28 + 2^26 proved the block in 41.4 and 39.7 s instead of
+            // 42.7, but fibonacci 20M's first shard ran out of memory at both: its codeword found
+            // too few whole free pages.)
             1 << 28
         } else if gpu_memory_gb <= 20 {
             // 16 GB cards (e.g. RX 9070 XT) whose arena can't take scattered blocks: ~134M
@@ -284,6 +286,11 @@ pub async fn cuda_worker_builder_with_machine(
     if let Some((compute_h, msm_g1, msm_g2)) = sp1_gpu_cudart::sys::groth16_entry_points() {
         let total = cuda_memory_info().map_or(0, |(_, total)| total as u64);
         sp1_recursion_gnark_ffi::ffi::set_groth16_gpu_hooks(compute_h, msm_g1, msm_g2, total);
+        // On an RX 9070 XT the GPU's G2 MSM, after the G1 MSMs, beats the CPU's alongside them: a
+        // Groth16 wrap of an RSP block took 7.2 s instead of 8.1.
+        if sp1_gpu_cudart::sys::BACKEND == "hip" {
+            sp1_recursion_gnark_ffi::ffi::set_groth16_g2_msm_on_gpu(true);
+        }
         // And solves the circuit on it where the build has the solver (HIP) and its circuit data
         // can be had (see `Groth16Bn254Prover::prove_isolated`; SP1_GPU_R1CS_SOLVER=cpu does not).
         if let Some((create, solve, destroy)) = sp1_gpu_cudart::sys::r1cs_solver_entry_points() {
@@ -395,7 +402,9 @@ pub async fn cuda_worker_builder_with_machine(
     // phases keep their LDE codewords and their materialized LogUp-GKR first layer. The tier only
     // shrinks the core threshold; the retained codewords in recursion (~2 GiB), shrink (~1 GiB) and
     // wrap (~2.5 GiB) are tier-blind, and the wrap's peak is what blocks a 16 GB card from finishing a
-    // Groth16 proof. On larger cards both flags default off, so nothing changes there.
+    // Groth16 proof. On larger cards both flags default off, so nothing changes there. (An RX 9070
+    // XT proved an RSP block compressed 0.3 s faster with recursion's kept, but a general-compute
+    // Groth16 run then ran out of memory in its second proof's core shard.)
     //
     // Correctness: `drop_ldes` only decides whether a codeword is kept or recomputed. The commitment
     // is taken before the drop (`FriCudaProver::encode_and_commit`), the recompute re-runs the same
