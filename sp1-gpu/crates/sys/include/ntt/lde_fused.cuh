@@ -1,4 +1,4 @@
-// Fused low-degree extension + forward NTT for KoalaBear (CUDA only).
+// Fused low-degree extension + forward NTT for KoalaBear (CUDA and HIP).
 //
 // Computes exactly what batch_coset_dft(perform_shift = false, bit_rev_output = true) computes for
 // lg_blowup = 2 and lg_domain_size in {20, 21}:
@@ -15,14 +15,21 @@
 //   twist by w_128^{s c}, DFT_32 over s, twiddle w_4096^{r(c + 4 k_a)}, DFT_32 over r,
 //   post-twiddle w_M^{i_lo (c + 4 k_a)} (w_M^{128 i_lo})^{k_b}.
 // Pass 2 (one warp per contiguous row of 2^C): DIF DFT_{2^C} with bit-reversed output, in place.
+//
+// On HIP it replaces the portable coset DFT (lib/ntt/kb_ntt.cu) for these shapes, which carry nearly
+// all of a proof's NTT work: 3-4 passes there. The column chunks per launch (64 MB of pass-1 output)
+// match an RX 9070 XT's 64 MB Infinity Cache as they do an RTX 5090's L2.
 #pragma once
 
-#if !defined(SP1_PORTABLE)
+#if !defined(SP1_SYCL)
 
 #include <cstdint>
 #include <map>
 #include <mutex>
 #include <vector>
+#ifdef __HIPCC__
+#include "runtime/stream.cuh"
+#endif
 
 namespace lde_fused {
 
@@ -227,15 +234,31 @@ inline std::vector<uint32_t> powers(uint64_t w, size_t n) {
     for (size_t e = 0; e < n; e++) { t[e] = to_mont(acc); acc = mulm(acc, w); }
     return t;
 }
-inline cudaError_t upload(kb31_t*& d, const std::vector<uint32_t>& h) {
+#ifdef __HIPCC__
+// Through the runtime's allocator (its arena) rather than hipMalloc, which while kernels run is a
+// mapping change, and those corrupt memory on gfx12 (lib/runtime/stream.cu).
+inline cudaError_t upload(kb31_t*& d, const std::vector<uint32_t>& h, cudaStream_t stream) {
+    const size_t bytes = h.size() * sizeof(uint32_t);
+    void* p = nullptr;
+    if (cuda_malloc_async(&p, bytes, stream).message != CUDA_SUCCESS_CSL.message) return hipErrorOutOfMemory;
+    d = static_cast<kb31_t*>(p);
+    if (cuda_mem_copy_host_to_device_async(p, h.data(), bytes, stream).message != CUDA_SUCCESS_CSL.message ||
+        cuda_stream_synchronize(stream).message != CUDA_SUCCESS_CSL.message) {
+        return hipErrorUnknown;
+    }
+    return hipSuccess;
+}
+#else
+inline cudaError_t upload(kb31_t*& d, const std::vector<uint32_t>& h, cudaStream_t) {
     cudaError_t err = cudaMalloc(&d, h.size() * sizeof(uint32_t));
     if (err != cudaSuccess) return err;
     return cudaMemcpy(d, h.data(), h.size() * sizeof(uint32_t), cudaMemcpyHostToDevice);
 }
+#endif
 }  // namespace detail
 
 // Per-device one-time initialisation (tables, constants, kernel attributes).
-inline cudaError_t get_tables(const Tables*& out) {
+inline cudaError_t get_tables(const Tables*& out, cudaStream_t stream) {
     using namespace detail;
     static std::mutex mutex;
     static std::map<int, Tables> cache;
@@ -246,22 +269,29 @@ inline cudaError_t get_tables(const Tables*& out) {
     auto it = cache.find(device);
     if (it != cache.end()) { out = &it->second; return cudaSuccess; }
     for (int k = 1; k <= 24; k++)
+#ifdef __HIPCC__
+        if (mulm(root(k), root(k)) != root(k - 1)) return hipErrorInvalidValue;
+#else
         if (mulm(root(k), root(k)) != root(k - 1)) return cudaErrorInvalidValue;
+#endif
     Tables t;
     std::vector<uint32_t> w64 = powers(root(6), 64), w128c(4 * 32);
     for (int c = 0; c < 4; c++)
         for (int s = 0; s < 32; s++) w128c[c * 32 + s] = to_mont(powm(root(7), (uint64_t)s * c));
     if ((err = cudaMemcpyToSymbol(c_w64, w64.data(), 64 * 4)) != cudaSuccess) return err;
     if ((err = cudaMemcpyToSymbol(c_w128c, w128c.data(), 128 * 4)) != cudaSuccess) return err;
-    if ((err = upload(t.tw4096, powers(root(12), 4096))) != cudaSuccess) return err;
+    if ((err = upload(t.tw4096, powers(root(12), 4096), stream)) != cudaSuccess) return err;
     for (int i = 0; i < 2; i++) {
         const int L = 22 + i, C = 10 + i;
-        if ((err = upload(t.tlo[i], powers(root(L), 4096))) != cudaSuccess) return err;
-        if ((err = upload(t.thi[i], powers(powm(root(L), 4096), (1u << L) / 4096))) != cudaSuccess) return err;
-        if ((err = upload(t.tw_row[i], powers(root(C), 1u << C))) != cudaSuccess) return err;
+        if ((err = upload(t.tlo[i], powers(root(L), 4096), stream)) != cudaSuccess) return err;
+        if ((err = upload(t.thi[i], powers(powm(root(L), 4096), (1u << L) / 4096), stream)) != cudaSuccess) return err;
+        if ((err = upload(t.tw_row[i], powers(root(C), 1u << C), stream)) != cudaSuccess) return err;
     }
+#ifndef __HIPCC__
+    // (HIP allows a block 64 KiB of shared memory without the attribute.)
     if ((err = cudaFuncSetAttribute(lde_pass1<10>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)PASS1_SMEM)) != cudaSuccess) return err;
     if ((err = cudaFuncSetAttribute(lde_pass1<11>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)PASS1_SMEM)) != cudaSuccess) return err;
+#endif
     out = &(cache[device] = t);
     return cudaSuccess;
 }
@@ -274,7 +304,7 @@ inline bool supported(uint32_t lg_domain_size, uint32_t lg_blowup) {
 inline cudaError_t batch_lde(kb31_t* d_out, const kb31_t* d_in, uint32_t lg_n, uint32_t poly_count,
                              cudaStream_t stream) {
     const Tables* t;
-    cudaError_t err = get_tables(t);
+    cudaError_t err = get_tables(t, stream);
     if (err != cudaSuccess) return err;
     const size_t n = (size_t)1 << lg_n, m = n << 2;
     const int L = (int)lg_n + 2;
@@ -300,4 +330,4 @@ inline cudaError_t batch_lde(kb31_t* d_out, const kb31_t* d_in, uint32_t lg_n, u
 
 }  // namespace lde_fused
 
-#endif  // !SP1_PORTABLE
+#endif  // !SP1_SYCL

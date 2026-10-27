@@ -189,6 +189,15 @@ static bool sp1_legacy_ntt() {
     }();
     return legacy;
 }
+
+// The fused LDE (ntt/lde_fused.cuh) for its shapes, unless SP1_GPU_LDE_FUSED=0.
+static bool sp1_lde_fused() {
+    static const bool on = [] {
+        const char* v = std::getenv("SP1_GPU_LDE_FUSED");
+        return !(v && v[0] == '0');
+    }();
+    return on;
+}
 #endif
 
 extern "C" rustCudaError_t batch_coset_dft(
@@ -206,6 +215,13 @@ extern "C" rustCudaError_t batch_coset_dft(
     }
 #ifdef __HIPCC__
     if (!sp1_legacy_ntt()) {
+        // The basefold encoder's shapes (2^20 and 2^21 columns, blowup 4, no shift): the fused
+        // LDE, bit-identical to the portable DFT below in two passes instead of three or four.
+        if (sp1_lde_fused() && !(shift != group_gen_inverse) && bit_rev_output &&
+            lde_fused::supported(lg_domain_size, lg_blowup)) {
+            CUDA_OK(lde_fused::batch_lde(d_out, d_in, lg_domain_size, poly_count, stream));
+            return CUDA_SUCCESS_CSL;
+        }
         uint32_t shift_monty;
         std::memcpy(&shift_monty, &shift, sizeof(shift_monty));
         return kb_ntt_coset_dft(
