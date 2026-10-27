@@ -33,7 +33,19 @@
 
 namespace lde_fused {
 
-constexpr size_t PASS1_SMEM = (4096 + 32 * 264) * sizeof(uint32_t);
+// HIP (RDNA: 128 KB of LDS per WGP): pass 1 reads the w_4096 table through the vector caches instead of
+// copying it to LDS, and XOR-swizzles its exchange buffer instead of padding it: 50 -> 32 KB of LDS per
+// 256-thread block, 2 -> 4 blocks per WGP (4 -> 8 waves per SIMD). RX 9070 XT, batch_lde over 16
+// columns: 2^21 3.92 -> 3.57 ms, 2^20 1.88 -> 1.68 ms, bit-identical. CUDA keeps the padded LDS layout.
+#if defined(__HIPCC__)
+constexpr bool P1_TW_IN_LDS = false;
+constexpr bool P1_SWIZZLE = true;
+#else
+constexpr bool P1_TW_IN_LDS = true;
+constexpr bool P1_SWIZZLE = false;
+#endif
+constexpr unsigned P1_XS = P1_SWIZZLE ? 256 : 264;  // exchange row stride (words)
+constexpr size_t PASS1_SMEM = ((P1_TW_IN_LDS ? 4096 : 0) + 32 * P1_XS) * sizeof(uint32_t);
 
 static __device__ __constant__ uint32_t c_w64[64];       // w_64^k, Montgomery
 static __device__ __constant__ uint32_t c_w128c[4][32];  // w_128^{s c}, Montgomery
@@ -80,8 +92,10 @@ __global__ void __launch_bounds__(256) lde_pass1(const kb31_t* __restrict__ in, 
                                                  const kb31_t* __restrict__ tlo,
                                                  const kb31_t* __restrict__ thi) {
     SP1_EXTERN_SHARED(kb31_t, p1_smem);
-    kb31_t* s_tw = p1_smem;         // w_4096^e
-    kb31_t* xchg = p1_smem + 4096;  // [k_a][r][z], k_a stride 264 (bank-conflict padding)
+    kb31_t* s_tw = p1_smem;                              // w_4096^e (if P1_TW_IN_LDS)
+    kb31_t* xchg = p1_smem + (P1_TW_IN_LDS ? 4096 : 0);  // [k_a][r][z], k_a stride P1_XS
+    // P1_SWIZZLE: column c of row k_a at c ^ ((k_a & 3) << 3), which keeps both access patterns
+    // conflict-free without the padding.
     const unsigned tid = threadIdx.x;
     const unsigned z = tid & 7, r = tid >> 3;
     const unsigned i_lo = blockIdx.x * 8 + z;
@@ -91,7 +105,8 @@ __global__ void __launch_bounds__(256) lde_pass1(const kb31_t* __restrict__ in, 
     kb31_t x[32];
 #pragma unroll
     for (int s = 0; s < 32; s++) x[s] = in[((size_t)(r + 32 * s) << C) + i_lo];
-    for (unsigned k = tid; k < 4096; k += 256) s_tw[k] = tw4096[k];
+    if (P1_TW_IN_LDS)
+        for (unsigned k = tid; k < 4096; k += 256) s_tw[k] = tw4096[k];
 
     const unsigned m_mask = (1u << lg_m) - 1;
     auto pow_m = [&](unsigned e) {  // w_M^e from a two-level table
@@ -99,7 +114,7 @@ __global__ void __launch_bounds__(256) lde_pass1(const kb31_t* __restrict__ in, 
         return tlo[e & 4095] * thi[e >> 12];
     };
     const kb31_t step = pow_m(128u * i_lo);
-    __syncthreads();
+    if (P1_TW_IN_LDS) __syncthreads();
 
 #pragma unroll 1
     for (int c = 0; c < 4; c++) {
@@ -110,15 +125,23 @@ __global__ void __launch_bounds__(256) lde_pass1(const kb31_t* __restrict__ in, 
 #pragma unroll
         for (int p = 0; p < 32; p++) {
             const unsigned ka = cbrev(p, 5);
-            v[p] = v[p] * s_tw[(r * (c + 4 * ka)) & 4095];
+            const unsigned e = (r * (c + 4 * ka)) & 4095;
+            v[p] = v[p] * (P1_TW_IN_LDS ? s_tw[e] : tw4096[e]);
         }
         __syncthreads();
 #pragma unroll
-        for (int p = 0; p < 32; p++) xchg[cbrev(p, 5) * 264 + r * 8 + z] = v[p];
+        for (int p = 0; p < 32; p++) {
+            const unsigned ka = cbrev(p, 5);
+            const unsigned col = P1_SWIZZLE ? ((r * 8 + z) ^ ((ka & 3) << 3)) : (r * 8 + z);
+            xchg[ka * P1_XS + col] = v[p];
+        }
         __syncthreads();
         // thread (z, r) now owns k_a = r
 #pragma unroll
-        for (int q = 0; q < 32; q++) v[q] = xchg[r * 264 + q * 8 + z];
+        for (int q = 0; q < 32; q++) {
+            const unsigned col = P1_SWIZZLE ? ((q * 8 + z) ^ ((r & 3) << 3)) : (q * 8 + z);
+            v[q] = xchg[r * P1_XS + col];
+        }
         dif<5>(v);
         kb31_t pw = pow_m(i_lo * (c + 4 * r));
         const unsigned row0 = (brev(c, 2) << 10) + (brev(r, 5) << 5);
