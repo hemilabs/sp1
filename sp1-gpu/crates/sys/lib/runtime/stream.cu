@@ -231,18 +231,47 @@ static bool deviceHeadroom(size_t* headroom) {
 //
 // The arena never moves a live block, and gives one of its allocations back to the driver only
 // when all of it is free, and a block that fits nowhere else needs it (arenaReleaseFreeChunksFor).
-// So a block larger than any free range, while live blocks split the free memory of the first
-// allocation (which holds nearly all of it), can only come from the memory outside the arena: the
-// headroom, and what wholly free later allocations give back.
+//
+// Scattered blocks. Where the device supports virtual memory management, an allocation of the arena
+// is a virtual range with physical pages of SP1_GPU_ARENA_PAGE_MB (32) mapped into it once, and a
+// block longer than every free range, while live blocks split the free memory, is assembled from
+// whole free pages wherever they are: mapped, in order, at a fresh virtual range (an alias;
+// arenaTakeScattered), which is unmapped when the block is freed and never mapped again. So
+// fragmentation costs at most a page per free range, instead of every block larger than the
+// longest range: with a single allocation, 16 GB cards ran out of memory with 6-8 GB free in
+// pieces of 1-3 GB (relaxed memory settings, or 2^28-element shards). Lending a page to an alias
+// changes no existing mapping, and no virtual address is ever mapped to other memory: on the RX
+// 9070 XT, 4000 rounds of lending random pages to fresh aliases while kernels rewrote and checked
+// the rest left every word right, while the same rounds with each alias's address freed and
+// reserved again (the driver hands the same one back) corrupted billions of words in the first
+// 200. SP1_GPU_ARENA_VMM=0 (or false, off, no) takes plain allocations instead.
 struct ArenaRange {
     size_t length;
     char* chunk;  // the allocation the range belongs to: ranges never merge across allocations
 };
-static std::vector<std::pair<char*, size_t>> g_arena_chunks;
+// An allocation of the arena: a hipMalloc, or a virtual range with `pages` mapped at it in order.
+struct ArenaChunk {
+    char* base;
+    size_t size;
+    std::vector<hipMemGenericAllocationHandle_t> pages;  // empty for a hipMalloc
+};
+// A scattered block: the arena pages (each with its allocation) mapped, in order, at the block's
+// own virtual range of `mapped` bytes.
+struct ArenaAlias {
+    size_t mapped;
+    std::vector<std::pair<char*, char*>> pages;
+};
+static std::vector<ArenaChunk> g_arena_chunks;
 static std::map<char*, ArenaRange> g_arena_free;     // free ranges by address
 static std::multimap<size_t, char*> g_arena_by_len;  // free ranges by length
+static std::unordered_map<void*, ArenaAlias> g_arena_aliases;
 static size_t g_arena_free_bytes = 0;
 static bool g_arena_on = false;
+// Virtual address space for aliases: reserved ARENA_ALIAS_VA at a time and never given back, so that
+// no address is mapped twice. Aliases are rare (each is a miss, reported), so 1 TiB lasts.
+static constexpr size_t ARENA_ALIAS_VA = size_t(1) << 40;
+static char* g_alias_va = nullptr;
+static size_t g_alias_va_left = 0;
 
 static void arenaEraseLength(size_t length, char* at) {
     auto range = g_arena_by_len.equal_range(length);
@@ -278,10 +307,197 @@ static void arenaRelease(char* at, size_t length, char* chunk) {
 
 // The chunk `p` lies in, or null.
 static char* arenaChunkOf(const void* p) {
-    for (auto& [base, size] : g_arena_chunks) {
-        if (p >= base && p < base + size) return base;
+    for (auto& chunk : g_arena_chunks) {
+        if (p >= chunk.base && p < chunk.base + chunk.size) return chunk.base;
     }
     return nullptr;
+}
+
+static ArenaChunk* arenaChunkAt(char* base) {
+    for (auto& chunk : g_arena_chunks) {
+        if (chunk.base == base) return &chunk;
+    }
+    return nullptr;
+}
+
+// The page size of the arena's mapped allocations (SP1_GPU_ARENA_PAGE_MB, 32 MiB by default).
+static size_t arenaPageBytes() {
+    static const size_t page = [] {
+        size_t mib = envMib("SP1_GPU_ARENA_PAGE_MB", size_t(32) << 20) >> 20;
+        if (mib < 2) mib = 2;
+        return mib << 20;
+    }();
+    return page;
+}
+
+// An on/off setting (defined below).
+static int envSwitch(const char* name);
+
+// Whether the arena maps its own pages (see above): the device supports virtual memory management,
+// and SP1_GPU_ARENA_VMM does not turn it off.
+static bool arenaVmm() {
+    static const bool on = [] {
+        if (envSwitch("SP1_GPU_ARENA_VMM") < 0) return false;
+        int device = 0, supported = 0;
+        if (hipGetDevice(&device) != hipSuccess ||
+            hipDeviceGetAttribute(&supported,
+                                  hipDeviceAttributeVirtualMemoryManagementSupported,
+                                  device) != hipSuccess) {
+            (void)hipGetLastError();
+            return false;
+        }
+        return supported != 0;
+    }();
+    return on;
+}
+
+static hipMemAccessDesc arenaAccess() {
+    int device = 0;
+    (void)hipGetDevice(&device);
+    hipMemAccessDesc access = {};
+    access.location.type = hipMemLocationTypeDevice;
+    access.location.id = device;
+    access.flags = hipMemAccessFlagsProtReadWrite;
+    return access;
+}
+
+// Maps `size` bytes (a multiple of the page size) of new pages at a new virtual range. False, with
+// everything it created given back, if the driver has not the memory (nothing has used the range,
+// so its addresses can go back too).
+static bool arenaMapPages(size_t size, ArenaChunk* chunk) {
+    int device = 0;
+    if (hipGetDevice(&device) != hipSuccess) return false;
+    hipMemAllocationProp prop = {};
+    prop.type = hipMemAllocationTypePinned;
+    prop.location.type = hipMemLocationTypeDevice;
+    prop.location.id = device;
+    void* va = nullptr;
+    if (hipMemAddressReserve(&va, size, 0, nullptr, 0) != hipSuccess) {
+        (void)hipGetLastError();
+        return false;
+    }
+    const size_t page = arenaPageBytes();
+    bool ok = true;
+    for (size_t offset = 0; offset < size; offset += page) {
+        hipMemGenericAllocationHandle_t handle;
+        if (hipMemCreate(&handle, page, &prop, 0) != hipSuccess) {
+            ok = false;
+            break;
+        }
+        if (hipMemMap(static_cast<char*>(va) + offset, page, 0, handle, 0) != hipSuccess) {
+            (void)hipMemRelease(handle);
+            ok = false;
+            break;
+        }
+        chunk->pages.push_back(handle);
+    }
+    const hipMemAccessDesc access = arenaAccess();
+    if (ok) ok = hipMemSetAccess(va, size, &access, 1) == hipSuccess;
+    if (!ok) {
+        if (!chunk->pages.empty()) (void)hipMemUnmap(va, chunk->pages.size() * page);
+        for (auto handle : chunk->pages) (void)hipMemRelease(handle);
+        chunk->pages.clear();
+        (void)hipMemAddressFree(va, size);
+        (void)hipGetLastError();
+        return false;
+    }
+    chunk->base = static_cast<char*>(va);
+    chunk->size = size;
+    return true;
+}
+
+// Takes [p, p + length) out of the free range holding it.
+static void arenaTakeAt(char* p, size_t length) {
+    auto range = std::prev(g_arena_free.upper_bound(p));
+    char* at = range->first;
+    const size_t range_length = range->second.length;
+    char* chunk = range->second.chunk;
+    arenaEraseLength(range_length, at);
+    g_arena_free.erase(range);
+    g_arena_free_bytes -= range_length;
+    if (p > at) arenaRelease(at, p - at, chunk);
+    if (p + length < at + range_length) arenaRelease(p + length, at + range_length - (p + length), chunk);
+}
+
+// Reports a scattered block (the first 10, then every 100th).
+static void arenaReportScattered(size_t s, size_t pages, size_t free_b, size_t largest) {
+    static size_t count = 0;
+    if (++count > 10 && count % 100 != 0) return;
+    fprintf(stderr,
+            "sp1-gpu: a %zu MiB block from %zu scattered pages of the device memory arena (%zu MiB "
+            "free, at most %zu MiB in one range; scattered block %zu)\n",
+            s >> 20, pages, free_b >> 20, largest >> 20, count);
+}
+
+// A block of `s` bytes from whole free pages wherever they lie, mapped in order at a fresh virtual
+// range (see above), for when no free range is long enough: the pages of the shortest free ranges
+// first, which keeps the long ones for contiguous blocks. Null if the free pages are too few, or
+// the mapping fails. The free ranges hold only memory whose last use has finished.
+static void* arenaTakeScattered(size_t s) {
+    if (!arenaVmm()) return nullptr;
+    const size_t page = arenaPageBytes();
+    const size_t count = (s + page - 1) / page;
+    std::vector<std::pair<char*, char*>> picked;
+    for (const auto& [length, at] : g_arena_by_len) {
+        if (picked.size() == count) break;
+        if (length < page) continue;
+        char* chunk = g_arena_free[at].chunk;
+        ArenaChunk* info = arenaChunkAt(chunk);
+        if (!info || info->pages.empty()) continue;
+        char* p = chunk + (static_cast<size_t>(at - chunk) + page - 1) / page * page;
+        for (; p + page <= at + length && picked.size() < count; p += page) {
+            picked.emplace_back(p, chunk);
+        }
+    }
+    if (picked.size() < count) return nullptr;
+    const size_t mapped = count * page;
+    if (g_alias_va_left < mapped) {
+        const size_t reserve = std::max(ARENA_ALIAS_VA, mapped);
+        void* va = nullptr;
+        if (hipMemAddressReserve(&va, reserve, 0, nullptr, 0) != hipSuccess) {
+            (void)hipGetLastError();
+            return nullptr;
+        }
+        g_alias_va = static_cast<char*>(va);
+        g_alias_va_left = reserve;
+    }
+    char* alias = g_alias_va;
+    // The addresses are used up either way: part of the range may have been mapped.
+    g_alias_va += mapped;
+    g_alias_va_left -= mapped;
+    size_t done = 0;
+    bool ok = true;
+    for (const auto& [p, chunk] : picked) {
+        ArenaChunk* info = arenaChunkAt(chunk);
+        const hipMemGenericAllocationHandle_t handle = info->pages[(p - chunk) / page];
+        if (hipMemMap(alias + done, page, 0, handle, 0) != hipSuccess) {
+            ok = false;
+            break;
+        }
+        done += page;
+    }
+    const hipMemAccessDesc access = arenaAccess();
+    if (ok) ok = hipMemSetAccess(alias, mapped, &access, 1) == hipSuccess;
+    if (!ok) {
+        if (done) (void)hipMemUnmap(alias, done);
+        (void)hipGetLastError();
+        return nullptr;
+    }
+    const size_t free_b = g_arena_free_bytes;
+    const size_t largest = g_arena_by_len.empty() ? 0 : g_arena_by_len.rbegin()->first;
+    for (const auto& [p, chunk] : picked) arenaTakeAt(p, page);
+    g_arena_aliases[alias] = ArenaAlias{mapped, std::move(picked)};
+    arenaReportScattered(s, count, free_b, largest);
+    return alias;
+}
+
+// Gives a scattered block's pages back to the free ranges and unmaps its alias, whose addresses are
+// never mapped again. The block's last use has finished.
+static void arenaFreeScattered(std::unordered_map<void*, ArenaAlias>::iterator alias) {
+    const size_t page = arenaPageBytes();
+    for (const auto& [p, chunk] : alias->second.pages) arenaRelease(p, page, chunk);
+    if (hipMemUnmap(alias->first, alias->second.mapped) != hipSuccess) (void)hipGetLastError();
+    g_arena_aliases.erase(alias);
 }
 
 // Blocks smaller than this come from the end of the free range they are taken from (arenaTake).
@@ -321,24 +537,39 @@ static void* arenaTake(size_t s) {
 // for the next call to report, rather than cleared).
 static bool arenaGrow(size_t size) {
     if (hipDeviceSynchronize() != hipSuccess) return false;
-    void* base = nullptr;
-    if (hipMalloc(&base, size) != hipSuccess) {
-        (void)hipGetLastError();  // only the failed allocation's error: the device was idle
+    ArenaChunk chunk{nullptr, 0, {}};
+    if (arenaVmm()) {
+        const size_t page = arenaPageBytes();
+        if (!arenaMapPages((size + page - 1) / page * page, &chunk)) return false;
+    } else {
+        void* base = nullptr;
+        if (hipMalloc(&base, size) != hipSuccess) {
+            (void)hipGetLastError();  // only the failed allocation's error: the device was idle
+            return false;
+        }
+        chunk.base = static_cast<char*>(base);
+        chunk.size = size;
+    }
+    if (hipMemset(chunk.base, 0, chunk.size) != hipSuccess || hipDeviceSynchronize() != hipSuccess) {
+        if (chunk.pages.empty()) {
+            hipFree(chunk.base);
+        } else {
+            // Unused: its addresses can go back with it.
+            (void)hipMemUnmap(chunk.base, chunk.size);
+            for (auto handle : chunk.pages) (void)hipMemRelease(handle);
+            (void)hipMemAddressFree(chunk.base, chunk.size);
+        }
         return false;
     }
-    if (hipMemset(base, 0, size) != hipSuccess || hipDeviceSynchronize() != hipSuccess) {
-        hipFree(base);
-        return false;
-    }
-    g_arena_chunks.emplace_back(static_cast<char*>(base), size);
-    arenaRelease(static_cast<char*>(base), size, static_cast<char*>(base));
+    g_arena_chunks.push_back(chunk);
+    arenaRelease(chunk.base, chunk.size, chunk.base);
     return true;
 }
 
 // The bytes of the arena's allocations.
 static size_t arenaBytes() {
     size_t total = 0;
-    for (auto& chunk : g_arena_chunks) total += chunk.second;
+    for (auto& chunk : g_arena_chunks) total += chunk.size;
     return total;
 }
 
@@ -356,10 +587,10 @@ static size_t arenaReleaseFreeChunksFor(size_t s) {
     std::vector<std::pair<size_t, char*>> unused;  // wholly free allocations, by size
     size_t unused_bytes = 0;
     for (auto& chunk : g_arena_chunks) {
-        auto range = g_arena_free.find(chunk.first);
-        if (range != g_arena_free.end() && range->second.length == chunk.second) {
-            unused.emplace_back(chunk.second, chunk.first);
-            unused_bytes += chunk.second;
+        auto range = g_arena_free.find(chunk.base);
+        if (range != g_arena_free.end() && range->second.length == chunk.size) {
+            unused.emplace_back(chunk.size, chunk.base);
+            unused_bytes += chunk.size;
         }
     }
     if (driver_free >= s || driver_free + unused_bytes < s) return 0;
@@ -372,21 +603,29 @@ static size_t arenaReleaseFreeChunksFor(size_t s) {
         std::reverse(unused.begin(), unused.end());
     }
     size_t freed = 0;
-    for (const auto& chunk : unused) {
-        const size_t size = chunk.first;
-        char* base = chunk.second;
+    for (const auto& [size, base] : unused) {
         if (driver_free + freed >= s) break;
         // A failed free leaves the allocation in the arena; the failure must not stay the thread's
-        // last error, which the next checked launch would report as its own.
-        if (hipFree(base) != hipSuccess) {
-            (void)hipGetLastError();
-            continue;
+        // last error, which the next checked launch would report as its own. A mapped allocation's
+        // addresses stay reserved: they are never mapped again (see above).
+        auto chunk = std::find_if(g_arena_chunks.begin(), g_arena_chunks.end(),
+                                  [&](const ArenaChunk& c) { return c.base == base; });
+        if (chunk->pages.empty()) {
+            if (hipFree(base) != hipSuccess) {
+                (void)hipGetLastError();
+                continue;
+            }
+        } else {
+            if (hipMemUnmap(base, size) != hipSuccess) {
+                (void)hipGetLastError();
+                continue;
+            }
+            for (auto handle : chunk->pages) (void)hipMemRelease(handle);
         }
         arenaEraseLength(size, base);
         g_arena_free.erase(base);
         g_arena_free_bytes -= size;
-        g_arena_chunks.erase(std::find(g_arena_chunks.begin(), g_arena_chunks.end(),
-                                       std::make_pair(base, size)));
+        g_arena_chunks.erase(chunk);
         freed += size;
     }
     return freed;
@@ -501,12 +740,19 @@ static void arenaInit() {
         if (free_b < headroom + (size_t(1) << 30)) return;
         want = (free_b - headroom) & ~((size_t(2) << 20) - 1);
     }
-    g_arena_on = arenaGrow(want);
+    // Whole pages, within what was asked for: arenaGrow rounds up.
+    if (arenaVmm()) want = want / arenaPageBytes() * arenaPageBytes();
+    g_arena_on = want > 0 && arenaGrow(want);
     if (!g_arena_on) fprintf(stderr, "sp1-gpu: no %zu MiB device memory arena\n", want >> 20);
 }
 
 // Frees a block of `size` bytes: back to the arena if it came from there, else to the driver.
 static void rawFree(void* p, size_t size) {
+    auto alias = g_arena_aliases.find(p);
+    if (alias != g_arena_aliases.end()) {
+        arenaFreeScattered(alias);
+        return;
+    }
     if (char* chunk = arenaChunkOf(p)) {
         arenaRelease(static_cast<char*>(p), size, chunk);
     } else {
@@ -588,9 +834,10 @@ static hipError_t cachedHipMalloc(void** p, size_t s, hipStream_t stream) {
         break; // lower_bound found nothing in range
     }
     // From the arena, if there is one: when it can't fit the block, the cached blocks go back to
-    // it (once the device is idle), and then it grows by an allocation of at least 1 GiB, or of
-    // the block where the driver has less. When the driver has not that either, on the retry of
-    // the block (see t_failed_miss), it gives back wholly free allocations to make room.
+    // it (once the device is idle), then the block is assembled from scattered free pages, and
+    // failing that the arena grows by an allocation of at least 1 GiB, or of the block where the
+    // driver has less. When the driver has not that either, on the retry of the block (see
+    // t_failed_miss), it gives back wholly free allocations to make room.
     arenaInit();
     if (g_arena_on) {
         void* q = arenaTake(s);
@@ -598,6 +845,7 @@ static hipError_t cachedHipMalloc(void** p, size_t s, hipStream_t stream) {
             releaseCachedBlocks();
             q = arenaTake(s);
         }
+        if (!q) q = arenaTakeScattered(s);
         if (!q) {
             const size_t free_b = g_arena_free_bytes;
             const size_t total = arenaBytes();
