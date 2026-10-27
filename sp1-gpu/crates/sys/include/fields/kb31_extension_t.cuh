@@ -112,8 +112,9 @@ class kb31_extension_t {
     }
 
     __device__ __forceinline__ kb31_extension_t& operator*=(const kb31_extension_t b) {
-#ifdef SP1_PORTABLE
-        // Karatsuba extension multiply for F[x]/(x^4 - W), W=3.
+#ifdef SP1_SYCL
+        // SYCL (Intel GPUs emulate 64-bit integer arithmetic, see kb31_t::mul): Karatsuba extension
+        // multiply for F[x]/(x^4 - W), W=3, on reduced 32-bit products.
         // Uses 2-level Karatsuba: 9 base-field multiplies instead of 16.
         // Split: P = (a0+a1*x) + (a2+a3*x)*x^2 = P_lo + P_hi*y, y=x^2
         //        Q = (b0+b1*x) + (b2+b3*x)*x^2 = Q_lo + Q_hi*y
@@ -202,7 +203,7 @@ class kb31_extension_t {
         #undef MULW
         #undef MUL
         return *this;
-#else // !SP1_PORTABLE (CUDA optimized path)
+#else  // CUDA and HIP: 64-bit lazy accumulation (on an RX 9070 XT, 1.8x the Karatsuba's rate)
         uint32_t x0 = value[0].val, x1 = value[1].val, x2 = value[2].val, x3 = value[3].val,
                  y0 = b.value[0].val, y1 = b.value[1].val, y2 = b.value[2].val, y3 = b.value[3].val;
 
@@ -290,12 +291,13 @@ class kb31_extension_t {
         unpack(l2, x2, a2);
         unpack(l3, x3, a3);
 
-        // Final_sub()
+        // Final_sub(). Through `.val`: hipcc resolves `value[k] = <uint32_t>` to
+        // kb31_t::operator=(const accel_t&), which would Montgomery-reduce the residue again.
 
-        value[0] = x0 >= MOD ? x0 - MOD : x0;
-        value[1] = x1 >= MOD ? x1 - MOD : x1;
-        value[2] = x2 >= MOD ? x2 - MOD : x2;
-        value[3] = x3 >= MOD ? x3 - MOD : x3;
+        value[0].val = x0 >= MOD ? x0 - MOD : x0;
+        value[1].val = x1 >= MOD ? x1 - MOD : x1;
+        value[2].val = x2 >= MOD ? x2 - MOD : x2;
+        value[3].val = x3 >= MOD ? x3 - MOD : x3;
 
         return *this;
 #endif
@@ -401,8 +403,8 @@ class kb31_extension_t {
 
     __device__ __forceinline__ kb31_extension_t
     interpolateLinear(const kb31_extension_t one, const kb31_extension_t zero) const {
-#ifdef SP1_PORTABLE
-        // HIP-safe: use schoolbook multiply via kb31_t operators
+#ifdef SP1_SYCL
+        // SYCL: through the 32-bit operators (see operator*=)
         kb31_extension_t diff = one - zero;
         kb31_extension_t result = *this * diff + zero;
         return result;
@@ -539,8 +541,8 @@ class kb31_extension_t {
 
     __device__ __forceinline__ kb31_extension_t
     interpolateLinear(const kb31_t one, const kb31_t zero) const {
-#ifdef SP1_PORTABLE
-        // HIP-safe: use schoolbook multiply via kb31_t operators
+#ifdef SP1_SYCL
+        // SYCL: through the 32-bit operators (see operator*=)
         kb31_t diff = one - zero;
         kb31_extension_t result = *this * diff;
         result.value[0] += zero;
