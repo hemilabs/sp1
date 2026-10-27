@@ -6,7 +6,7 @@ use slop_alloc::{Buffer, HasBackend};
 use slop_basefold::{BasefoldProof, FriConfig, BATCH_GRINDING_BITS};
 use slop_basefold_prover::{host_fold_even_odd, BasefoldProverError};
 use slop_challenger::{CanObserve, CanSampleBits, FieldChallenger, IopCtx};
-use slop_commit::{Message, Rounds};
+use slop_commit::Rounds;
 use slop_merkle_tree::MerkleTreeOpeningAndProof;
 use slop_multilinear::{partial_lagrange_blocking, Mle, MultilinearPcsChallenger, Point};
 use slop_tensor::Tensor;
@@ -28,9 +28,25 @@ use sp1_gpu_merkle_tree::{CudaTcsProver, MerkleTreeProverData, SingleLayerMerkle
 use sp1_gpu_utils::{Ext, Felt, JaggedTraceMle, TraceDenseData};
 
 use crate::{
-    encode_batch, CudaDftKoalaBear, CudaStackedPcsProverData, DeviceGrindingChallenger,
-    GrindingPowCudaProver,
+    encode_batch, host_codewords_enabled, CudaDftKoalaBear, CudaStackedPcsProverData,
+    DeviceGrindingChallenger, GrindingPowCudaProver, HostCodeword,
 };
+
+/// A round's codeword at the opening: on the device (kept, or encoded again), or in pinned host
+/// memory, whose queried leaves are uploaded when the queries are known.
+enum RoundCodeword {
+    Device(Arc<Tensor<Felt, TaskScope>>),
+    Host(Arc<HostCodeword>),
+}
+
+impl RoundCodeword {
+    fn sizes(&self) -> [usize; 2] {
+        match self {
+            RoundCodeword::Device(codeword) => [codeword.sizes()[0], codeword.sizes()[1]],
+            RoundCodeword::Host(codeword) => codeword.sizes(),
+        }
+    }
+}
 
 /// # Safety
 ///
@@ -103,12 +119,28 @@ where
 
         encode_batch(encoder, self.config.log_blowup as u32, virtual_tensor, &mut dst).unwrap();
 
+        // A dropped codeword goes to pinned host memory while the Merkle tree is hashed, if it
+        // fits there.
+        let host_codeword = if drop_traces && host_codewords_enabled() {
+            HostCodeword::copy_from(&dst)?
+        } else {
+            None
+        };
+
         // Commit to the tensors.
 
         let (commitment, tcs_data) = self.tcs_prover.commit_tensors(&dst)?;
 
+        if let Some(host_codeword) = &host_codeword {
+            // Before `dst` is freed.
+            host_codeword.order_after_copy(dst.backend())?;
+        }
         let codeword_mle = if drop_traces { None } else { Some(Arc::new(dst)) };
-        let prover_data = CudaStackedPcsProverData { merkle_tree_tcs_data: tcs_data, codeword_mle };
+        let prover_data = CudaStackedPcsProverData {
+            merkle_tree_tcs_data: tcs_data,
+            codeword_mle,
+            host_codeword: host_codeword.map(Arc::new),
+        };
 
         Ok((commitment, prover_data))
     }
@@ -118,16 +150,16 @@ where
         &self,
         batching_coefficients: &Tensor<GC::EF>,
         mles: &TraceDenseData<GC::F, TaskScope>,
-        codewords: Message<Tensor<Felt, TaskScope>>,
+        total_num_polynomials: usize,
+        codeword_size: usize,
         evaluation_claims: Vec<GC::EF>,
     ) -> (Mle<GC::EF, TaskScope>, Tensor<GC::F, TaskScope>, GC::EF) {
+        // The batched codeword is the encoding of the batched multilinear (the encoding is
+        // linear), so the rounds' codewords themselves are not read here.
         let log_stacking_height = self.log_height;
-        // Compute all the batch challenge powers.
-        let total_num_polynomials = codewords.iter().map(|c| c.sizes()[0]).sum::<usize>();
 
         // Compute the random linear combination of the MLEs of the columns of the matrices
         let num_variables = log_stacking_height;
-        let codeword_size = (codewords.first().unwrap()).sizes()[1];
         let scope: TaskScope = mles.backend().clone();
         // All three buffers below are fully overwritten by the kernels, so skip the zero-init.
         let mut batch_mle = Mle::new(Tensor::<GC::EF, TaskScope>::with_sizes_in(
@@ -333,11 +365,13 @@ where
         // 100K = +6.75 GiB delta) across {codeword_encode, batch,
         // commit_phase, query}. See sp1_gpu_cudart::vram_snapshot_mib doc.
         sp1_gpu_cudart::vram_reset_peak();
-        let mut codewords: Vec<Arc<Tensor<Felt, TaskScope>>> = Vec::new();
+        let mut codewords: Vec<RoundCodeword> = Vec::new();
         let num_rounds = prover_data.len();
         for (round, data) in prover_data.iter().enumerate() {
             if let Some(ref codeword) = data.codeword_mle {
-                codewords.push(codeword.clone());
+                codewords.push(RoundCodeword::Device(codeword.clone()));
+            } else if let Some(ref codeword) = data.host_codeword {
+                codewords.push(RoundCodeword::Host(codeword.clone()));
             } else {
                 // Codeword was dropped: a main trace's (`drop_ldes`), or, in the first of two
                 // rounds, the preprocessed traces' (kept without it by the shard prover's cache).
@@ -361,7 +395,7 @@ where
                 encode_batch(encoder, self.config.log_blowup as u32, virtual_tensor, &mut dst)
                     .unwrap();
 
-                codewords.push(Arc::new(dst));
+                codewords.push(RoundCodeword::Device(Arc::new(dst)));
             }
         }
 
@@ -376,8 +410,7 @@ where
 
         let total_num_polynomials = codewords.iter().map(|c| c.sizes()[0]).sum::<usize>();
         let num_batching_variables = total_num_polynomials.next_power_of_two().ilog2();
-
-        let encoded_messages: Message<_> = codewords.iter().cloned().collect();
+        let codeword_size = codewords.first().expect("a committed round").sizes()[1];
 
         // Grind for batch randomness.
         let batch_grinding_witness =
@@ -388,8 +421,13 @@ where
 
         // Batch the mles and codewords.
         sp1_gpu_cudart::vram_reset_peak();
-        let (mle_batch, codeword_batch, batched_eval_claim) =
-            self.batch(&batching_coefficients, mles.dense(), encoded_messages, evaluation_claims);
+        let (mle_batch, codeword_batch, batched_eval_claim) = self.batch(
+            &batching_coefficients,
+            mles.dense(),
+            total_num_polynomials,
+            codeword_size,
+            evaluation_claims,
+        );
         let (cur_mib, peak_mib) = sp1_gpu_cudart::vram_snapshot_mib();
         tracing::debug!(
             target: "sp1_gpu_vram",
@@ -474,11 +512,33 @@ where
         // Open the original polynomials at the query indices.
         let mut component_polynomials_query_openings_and_proofs = vec![];
         for (data, codeword) in prover_data.iter().zip(codewords.iter()) {
-            let values = self.tcs_prover.compute_openings_at_indices(codeword, &query_indices);
-            let proof = self
-                .tcs_prover
-                .prove_openings_at_indices(&data.merkle_tree_tcs_data, codeword, &query_indices)
-                .map_err(BasefoldProverError::TcsCommitError)?;
+            let (values, proof) = match codeword {
+                RoundCodeword::Device(codeword) => (
+                    self.tcs_prover.compute_openings_at_indices(codeword, &query_indices),
+                    self.tcs_prover.prove_openings_at_indices(
+                        &data.merkle_tree_tcs_data,
+                        codeword,
+                        &query_indices,
+                    ),
+                ),
+                RoundCodeword::Host(codeword) => {
+                    let window_log = data.merkle_tree_tcs_data.0.truncated_levels();
+                    let queried = codeword
+                        .upload_windows(&query_indices, window_log, &scope)
+                        .map_err(|e| BasefoldProverError::TcsCommitError(e.into()))?;
+                    (
+                        self.tcs_prover
+                            .compute_openings_at_indices(&queried.leaves, &queried.leaf_rows),
+                        self.tcs_prover.prove_openings_at_windows(
+                            &data.merkle_tree_tcs_data,
+                            &queried.leaves,
+                            &queried.window_rows,
+                            &query_indices,
+                        ),
+                    )
+                }
+            };
+            let proof = proof.map_err(BasefoldProverError::TcsCommitError)?;
             let opening = MerkleTreeOpeningAndProof::<GC> { values, proof };
             component_polynomials_query_openings_and_proofs.push(opening);
         }

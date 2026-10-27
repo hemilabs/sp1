@@ -567,6 +567,54 @@ impl TaskScope {
         Ok(())
     }
 
+    /// Enqueues a large D2H copy on the task's auxiliary stream, after the work queued so far on
+    /// the primary stream, so that it overlaps the primary stream's next kernels. `queued` and
+    /// `done` are recorded on the way: the primary stream must wait for `done` (see
+    /// [Self::wait_event]) before `src` is freed or written, and the host before reading `dst`.
+    ///
+    /// # Safety
+    /// `src` must stay valid for `byte_count` bytes of device reads, and `dst` (pinned host
+    /// memory) for `byte_count` bytes of writes, until the copy completes. The events must stay
+    /// alive until then too.
+    pub unsafe fn copy_device_to_host_aux_async(
+        &self,
+        dst: *mut std::ffi::c_void,
+        src: *const std::ffi::c_void,
+        byte_count: usize,
+        queued: &CudaEvent,
+        done: &CudaEvent,
+    ) -> Result<(), CudaError> {
+        use sp1_gpu_sys::runtime::{
+            cuda_event_record, cuda_mem_copy_device_to_host_async, cuda_stream_wait_event,
+        };
+
+        CudaError::result_from_ffi(cuda_event_record(queued.0, self.stream.0))?;
+        CudaError::result_from_ffi(cuda_stream_wait_event(self.aux_stream.0, queued.0))?;
+        CudaError::result_from_ffi(cuda_mem_copy_device_to_host_async(
+            dst,
+            src,
+            byte_count,
+            self.aux_stream.0,
+        ))?;
+        CudaError::result_from_ffi(cuda_event_record(done.0, self.aux_stream.0))
+    }
+
+    /// Records `event` on the primary stream, after the work queued so far.
+    pub fn record_event(&self, event: &CudaEvent) -> Result<(), CudaError> {
+        // SAFETY: both the stream and the event are valid for the lifetime of the call.
+        CudaError::result_from_ffi(unsafe {
+            sp1_gpu_sys::runtime::cuda_event_record(event.0, self.stream.0)
+        })
+    }
+
+    /// Makes the work queued on the primary stream from now on wait for `event`.
+    pub fn wait_event(&self, event: &CudaEvent) -> Result<(), CudaError> {
+        // SAFETY: both the stream and the event are valid for the lifetime of the call.
+        CudaError::result_from_ffi(unsafe {
+            sp1_gpu_sys::runtime::cuda_stream_wait_event(self.stream.0, event.0)
+        })
+    }
+
     /// Waits for all work enqueued so far in this task to finish.
     ///
     /// This function can be useful in case there is work to be enqueued but for some reason this

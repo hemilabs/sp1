@@ -114,11 +114,117 @@ pub trait CudaTcsProver<GC: IopCtx>: Send + Sync + 'static {
         indices: &[usize],
     ) -> Result<MerkleTreeTcsProof<GC::Digest>, ProverError>;
 
+    /// As [`Self::prove_openings_at_indices`], with only the leaves a truncated tree rehashes:
+    /// `windows` has the committed tensor's columns, and holds query `q`'s aligned subtree of
+    /// `1 << truncated_levels` leaves from row `window_rows[q]` on.
+    fn prove_openings_at_windows(
+        &self,
+        data: &MerkleTreeProverData<GC::Digest>,
+        windows: &Tensor<GC::F, TaskScope>,
+        window_rows: &[usize],
+        indices: &[usize],
+    ) -> Result<MerkleTreeTcsProof<GC::Digest>, ProverError>;
+
     fn compute_openings_at_indices(
         &self,
         tensors: &Tensor<GC::F, TaskScope>,
         indices: &[usize],
     ) -> Tensor<GC::F>;
+}
+
+impl<GC: IopCtx, W, K, H, const WIDTH: usize> MerkleTreeSingleLayerProver<GC, W, K, H, WIDTH>
+where
+    W: Field,
+    K: MerkleTreeSingleLayerKernels<GC>,
+    H: Hasher<W, WIDTH>,
+{
+    /// The paths of the queried leaves. A truncated tree's bottom siblings are rehashed from
+    /// `leaves`: the committed tensor (`window_rows` `None`), or a tensor of its columns holding
+    /// query `q`'s subtree from row `window_rows[q]` on.
+    fn prove_openings(
+        &self,
+        data: &MerkleTreeProverData<GC::Digest>,
+        leaves: &Tensor<GC::F, TaskScope>,
+        window_rows: Option<&[usize]>,
+        indices: &[usize],
+    ) -> Result<MerkleTreeTcsProof<GC::Digest>, ProverError> {
+        let tree = &data.0;
+        let height = tree.height;
+        let bottom = tree.truncated_levels();
+        assert_eq!(leaves.sizes()[0], data.3, "leaf tensor does not match the tree");
+        let paths = {
+            let scope = tree.backend();
+            let mut paths =
+                Tensor::<GC::Digest, _>::with_sizes_in([indices.len(), height], scope.clone());
+            let mut indices_buffer =
+                Buffer::<usize, _>::with_capacity_in(indices.len(), scope.clone());
+            indices_buffer.extend_from_host_slice(indices)?;
+            let indices = indices_buffer;
+            let mut rows_buffer = Buffer::<usize, _>::with_capacity_in(
+                window_rows.map_or(0, |r| r.len()),
+                scope.clone(),
+            );
+            let (leaf_rows, leaf_height) = match window_rows {
+                Some(rows) => {
+                    rows_buffer.extend_from_host_slice(rows)?;
+                    (rows_buffer.as_ptr(), leaves.sizes()[1])
+                }
+                None => (std::ptr::null(), 0usize),
+            };
+            unsafe {
+                paths.assume_init();
+
+                if bottom > 0 {
+                    // Rehash each query's bottom subtree from the leaf data.
+                    let subtree = 1usize << bottom;
+                    let shared_mem = (2 * subtree - 2) * std::mem::size_of::<GC::Digest>();
+                    let width = leaves.sizes()[0];
+                    let args = args!(
+                        self.hasher_device.as_raw(),
+                        leaves.as_ptr(),
+                        paths.as_mut_ptr(),
+                        indices.as_ptr(),
+                        indices.len(),
+                        width,
+                        height,
+                        bottom,
+                        leaf_rows,
+                        leaf_height
+                    );
+                    scope.launch_kernel(
+                        K::recompute_bottom_paths_kernel(),
+                        indices.len(),
+                        subtree.min(256),
+                        &args,
+                        shared_mem,
+                    )?;
+                }
+
+                let block_dim = 256;
+                let grid_dim = indices.len().div_ceil(block_dim);
+                let args = args!(
+                    paths.as_mut_ptr(),
+                    height,
+                    bottom,
+                    indices.as_ptr(),
+                    bottom,
+                    indices.len(),
+                    tree.digests.as_ptr(),
+                    tree.stored_height
+                );
+                scope.launch_kernel(K::compute_paths_kernel(), grid_dim, block_dim, &args, 0)?;
+            }
+            paths
+        };
+        let paths = DeviceTensor::from_raw(paths).to_host().unwrap();
+
+        Ok(MerkleTreeTcsProof {
+            paths,
+            log_tensor_height: data.2,
+            width: data.3,
+            merkle_root: data.1,
+        })
+    }
 }
 
 impl<GC: IopCtx, W, K, H, const WIDTH: usize> CudaTcsProver<GC>
@@ -279,70 +385,28 @@ where
         leaf_tensor: &Tensor<GC::F, TaskScope>,
         indices: &[usize],
     ) -> Result<MerkleTreeTcsProof<GC::Digest>, ProverError> {
-        let tree = &data.0;
-        let height = tree.height;
-        let bottom = tree.truncated_levels();
-        assert_eq!(leaf_tensor.sizes()[1], 1 << height, "leaf tensor does not match the tree");
-        assert_eq!(leaf_tensor.sizes()[0], data.3, "leaf tensor does not match the tree");
-        let paths = {
-            let scope = tree.backend();
-            let mut paths =
-                Tensor::<GC::Digest, _>::with_sizes_in([indices.len(), height], scope.clone());
-            let mut indices_buffer =
-                Buffer::<usize, _>::with_capacity_in(indices.len(), scope.clone());
-            indices_buffer.extend_from_host_slice(indices)?;
-            let indices = indices_buffer;
-            unsafe {
-                paths.assume_init();
+        assert_eq!(
+            leaf_tensor.sizes()[1],
+            1 << data.0.height,
+            "leaf tensor does not match the tree"
+        );
+        self.prove_openings(data, leaf_tensor, None, indices)
+    }
 
-                if bottom > 0 {
-                    // Rehash each query's bottom subtree from the leaf data.
-                    let subtree = 1usize << bottom;
-                    let shared_mem = (2 * subtree - 2) * std::mem::size_of::<GC::Digest>();
-                    let width = leaf_tensor.sizes()[0];
-                    let args = args!(
-                        self.hasher_device.as_raw(),
-                        leaf_tensor.as_ptr(),
-                        paths.as_mut_ptr(),
-                        indices.as_ptr(),
-                        indices.len(),
-                        width,
-                        height,
-                        bottom
-                    );
-                    scope.launch_kernel(
-                        K::recompute_bottom_paths_kernel(),
-                        indices.len(),
-                        subtree.min(256),
-                        &args,
-                        shared_mem,
-                    )?;
-                }
-
-                let block_dim = 256;
-                let grid_dim = indices.len().div_ceil(block_dim);
-                let args = args!(
-                    paths.as_mut_ptr(),
-                    height,
-                    bottom,
-                    indices.as_ptr(),
-                    bottom,
-                    indices.len(),
-                    tree.digests.as_ptr(),
-                    tree.stored_height
-                );
-                scope.launch_kernel(K::compute_paths_kernel(), grid_dim, block_dim, &args, 0)?;
-            }
-            paths
-        };
-        let paths = DeviceTensor::from_raw(paths).to_host().unwrap();
-
-        Ok(MerkleTreeTcsProof {
-            paths,
-            log_tensor_height: data.2,
-            width: data.3,
-            merkle_root: data.1,
-        })
+    fn prove_openings_at_windows(
+        &self,
+        data: &MerkleTreeProverData<GC::Digest>,
+        windows: &Tensor<GC::F, TaskScope>,
+        window_rows: &[usize],
+        indices: &[usize],
+    ) -> Result<MerkleTreeTcsProof<GC::Digest>, ProverError> {
+        assert_eq!(window_rows.len(), indices.len(), "one window per query");
+        let window = 1usize << data.0.truncated_levels();
+        assert!(
+            window_rows.iter().all(|&row| row + window <= windows.sizes()[1]),
+            "windows do not hold the queries' subtrees"
+        );
+        self.prove_openings(data, windows, Some(window_rows), indices)
     }
 
     fn compute_openings_at_indices(
@@ -705,6 +769,78 @@ mod tests {
                 assert_eq!(rdna_commit, fast_commit, "width {width}, log height {log_height}");
                 assert_eq!(rdna_proof.merkle_root, fast_proof.merkle_root);
                 assert_eq!(rdna_proof.paths, fast_proof.paths);
+            }
+        })
+        .await;
+    }
+
+    /// Openings from the queried leaves' windows only (`prove_openings_at_windows`, as basefold's
+    /// host codewords upload them) equal openings from the whole tensor, for full and truncated
+    /// trees, with both hashes.
+    #[tokio::test]
+    async fn test_prove_openings_at_windows() {
+        async fn check<P: CudaTcsProver<GC>, GC: IopCtx<F = SP1Field>>(
+            prover: &P,
+            scope: &TaskScope,
+            width: usize,
+            log_height: usize,
+        ) {
+            let height = 1usize << log_height;
+            let host: Vec<SP1Field> = (0..width * height)
+                .map(|i| SP1Field::from_canonical_u32((i as u32).wrapping_mul(2654435761) >> 2))
+                .collect();
+            let tensor = sp1_gpu_cudart::DeviceTensor::from_host(
+                &Tensor::from(host.clone()).reshape([width, height]),
+                scope,
+            )
+            .unwrap()
+            .into_inner();
+            let (_, data) = prover.commit_tensors(&tensor).unwrap();
+            let window_log = data.0.truncated_levels();
+            let window = 1usize << window_log;
+            let indices = vec![0, 42, 7, height - 1, 43];
+            // One window per query, in query order.
+            let rows = indices.len() * window;
+            let mut leaves = vec![SP1Field::zero(); width * rows];
+            for (q, &index) in indices.iter().enumerate() {
+                let start = (index >> window_log) << window_log;
+                for c in 0..width {
+                    for t in 0..window {
+                        leaves[c * rows + q * window + t] = host[c * height + start + t];
+                    }
+                }
+            }
+            let window_rows = (0..indices.len()).map(|q| q * window).collect::<Vec<_>>();
+            let leaf_rows = indices
+                .iter()
+                .enumerate()
+                .map(|(q, &i)| q * window + (i & (window - 1)))
+                .collect::<Vec<_>>();
+            let leaves = sp1_gpu_cudart::DeviceTensor::from_host(
+                &Tensor::from(leaves).reshape([width, rows]),
+                scope,
+            )
+            .unwrap()
+            .into_inner();
+
+            let full = prover.prove_openings_at_indices(&data, &tensor, &indices).unwrap();
+            let windowed =
+                prover.prove_openings_at_windows(&data, &leaves, &window_rows, &indices).unwrap();
+            assert_eq!(full.paths, windowed.paths, "width {width}, log height {log_height}");
+            assert_eq!(full.merkle_root, windowed.merkle_root);
+            assert_eq!(
+                prover.compute_openings_at_indices(&tensor, &indices),
+                prover.compute_openings_at_indices(&leaves, &leaf_rows),
+                "width {width}, log height {log_height}"
+            );
+        }
+
+        run_in_place(|scope| async move {
+            let koala_bear = Poseidon2SP1Field16CudaProver::new(&scope);
+            let bn254 = Poseidon2Bn254CudaProver::new(&scope);
+            for (width, log_height) in [(8usize, 10usize), (45, 12), (16, 16), (200, 15)] {
+                check(&koala_bear, &scope, width, log_height).await;
+                check(&bn254, &scope, width, log_height).await;
             }
         })
         .await;

@@ -216,11 +216,13 @@ __global__ void recomputeBottomPathsKbFast(
     size_t numIndices,
     size_t widths,
     size_t tree_height,
-    size_t bottom_levels) {
+    size_t bottom_levels,
+    const size_t* leafRows,
+    size_t leafHeight) {
     SP1_EXTERN_SHARED(uint4, smemKb);
     uint32_t(*nodes)[8] = reinterpret_cast<uint32_t(*)[8]>(smemKb);
     const uint32_t* input = reinterpret_cast<const uint32_t*>(input_);
-    const size_t H = (size_t)1 << tree_height;
+    const size_t H = leafRows ? leafHeight : (size_t)1 << tree_height;
     const size_t subtreeLeaves = (size_t)1 << bottom_levels;
     for (size_t q = blockIdx.x; q < numIndices; q += gridDim.x) {
         const size_t leafIdx = indices[q];
@@ -230,7 +232,7 @@ __global__ void recomputeBottomPathsKbFast(
             uint32_t s[16];
 #pragma unroll
             for (int i = 0; i < 16; i++) s[i] = 0;
-            const uint32_t* col = input + base + t;
+            const uint32_t* col = input + (leafRows ? leafRows[q] : base) + t;
             size_t j = 0;
             for (; j + 8 <= widths; j += 8) {
 #pragma unroll
@@ -507,21 +509,24 @@ __global__ __launch_bounds__(256) void recomputeBottomPathsBn254Fast(
     size_t numIndices,
     size_t widths,
     size_t tree_height,
-    size_t bottom_levels) {
+    size_t bottom_levels,
+    const size_t* leafRows,
+    size_t leafHeight) {
     using FDW_t = poseidon2::FDW_t<poseidon2_bn254_3::Bn254>;
     static_assert(sizeof(FDW_t) == sizeof(bn254_t), "digest slots must be tightly packed");
     SP1_EXTERN_SHARED(unsigned char, smemRaw);
     FDW_t* nodes = reinterpret_cast<FDW_t*>(smemRaw);
     const bn254fast::RC rc = hasher.roundConstants;
 
-    const size_t H = (size_t)1 << tree_height;
+    const size_t H = leafRows ? leafHeight : (size_t)1 << tree_height;
     const size_t subtreeLeaves = (size_t)1 << bottom_levels;
     for (size_t q = blockIdx.x; q < numIndices; q += gridDim.x) {
         const size_t leafIdx = indices[q];
         const size_t base = (leafIdx >> bottom_levels) << bottom_levels;
         const size_t local = leafIdx - base;
+        const size_t row = leafRows ? leafRows[q] : base;
         for (size_t t = threadIdx.x; t < subtreeLeaves; t += blockDim.x) {
-            nodes[t].v[0] = bn254fast::leafDigest(input, base + t, widths, H, rc);
+            nodes[t].v[0] = bn254fast::leafDigest(input, row + t, widths, H, rc);
         }
         __syncthreads();
         size_t levelBase = 0, levelLen = subtreeLeaves;
@@ -702,7 +707,9 @@ __global__ void computePaths(
 
 // Recomputes the bottom `bottom_levels` path siblings of each query from the leaf data.
 // One block per query: the block re-hashes the query's 2^bottom_levels-leaf subtree into
-// shared memory and reduces it level by level.
+// shared memory and reduces it level by level. The leaves are the input's rows: the tree's own
+// (a 2^tree_height-row input), or, with leafRows, each query's subtree at row leafRows[q] of a
+// leafHeight-row input. (The fast kernels above take the same arguments.)
 template <typename Hasher_t, typename HashParams, typename HasherState_t>
 __global__ void recomputeBottomPaths(
     Hasher_t hasher,
@@ -712,7 +719,9 @@ __global__ void recomputeBottomPaths(
     size_t numIndices,
     size_t widths,
     size_t tree_height,
-    size_t bottom_levels) {
+    size_t bottom_levels,
+    const size_t* leafRows,
+    size_t leafHeight) {
     using FDW_t = poseidon2::FDW_t<HashParams>;
     static_assert(
         sizeof(FDW_t) == HashParams::DIGEST_WIDTH * sizeof(typename HashParams::F_t),
@@ -720,17 +729,18 @@ __global__ void recomputeBottomPaths(
     SP1_EXTERN_SHARED(unsigned char, smemRaw);
     FDW_t* nodes = reinterpret_cast<FDW_t*>(smemRaw);
 
-    size_t matrixHeight = (size_t)1 << tree_height;
+    size_t matrixHeight = leafRows ? leafHeight : (size_t)1 << tree_height;
     size_t subtreeLeaves = (size_t)1 << bottom_levels;
 
     for (size_t q = blockIdx.x; q < numIndices; q += gridDim.x) {
         size_t leafIdx = indices[q];
         size_t base = (leafIdx >> bottom_levels) << bottom_levels;
         size_t local = leafIdx - base;
+        size_t row = leafRows ? leafRows[q] : base;
 
         for (size_t t = threadIdx.x; t < subtreeLeaves; t += blockDim.x) {
             HasherState_t state;
-            state.absorbRow(hasher, input, base + t, widths, matrixHeight);
+            state.absorbRow(hasher, input, row + t, widths, matrixHeight);
             state.finalize(hasher, nodes[t].v);
         }
         __syncthreads();
