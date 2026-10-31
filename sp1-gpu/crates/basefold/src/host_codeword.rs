@@ -16,13 +16,16 @@ use sp1_gpu_cudart::{CudaError, CudaEvent, PinnedBuffer, TaskScope};
 use sp1_gpu_utils::Felt;
 
 /// Whether `drop_ldes` keeps codewords in pinned host memory (`SP1_GPU_HOST_CODEWORDS={0,1}`; on
-/// by default on HIP).
+/// by default on HIP and SYCL).
+///
+/// On a 12 GB Arc B580 (SYCL, Windows) it made proofs ~7% faster: fibonacci 2M core 4.98 -> 4.61 s,
+/// compressed 8.95 -> 8.32 s, Groth16 29.7 -> 27.5 s, for ~1.8 GB more host memory at the peak.
 pub fn host_codewords_enabled() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| match std::env::var("SP1_GPU_HOST_CODEWORDS").as_deref() {
         Ok("0") => false,
         Ok("1") => true,
-        _ => sp1_gpu_cudart::sys::BACKEND == "hip",
+        _ => matches!(sp1_gpu_cudart::sys::BACKEND, "hip" | "sycl"),
     })
 }
 
