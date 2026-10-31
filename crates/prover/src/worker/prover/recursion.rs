@@ -1297,6 +1297,13 @@ impl<A: ArtifactClient, C: SP1ProverComponents> SP1RecursionProver<A, C> {
         // retry proves the wrap again.
         let (groth16_proof, wrap_verified) =
             tokio::join!(prove, finish_wrap_verify(&wrap_proof_artifact, wrap_verify));
+        // Give back what the wrap and Groth16 stages left on the device (the allocator's cached
+        // blocks, the quotient's tables), where the GPU prover asked for it (SYCL; see
+        // `set_release_after_groth16` in sp1-gpu's builder), whether or not the proof succeeded.
+        if sp1_recursion_gnark_ffi::device_caches::release_after_groth16() {
+            let _ =
+                tokio::task::spawn_blocking(sp1_recursion_gnark_ffi::device_caches::release).await;
+        }
         wrap_verified?;
         let groth16_proof = groth16_proof
             .map_err(|e| TaskError::Fatal(anyhow::anyhow!("Groth16 proof task panicked: {}", e)))?

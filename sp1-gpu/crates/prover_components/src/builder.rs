@@ -307,9 +307,19 @@ pub async fn cuda_worker_builder_with_machine(
         sp1_gpu_cudart::release_device_caches(true);
         // The Groth16 prover's GPU R1CS solver, which it keeps between proofs.
         sp1_recursion_gnark_ffi::ffi::release_groth16_gpu_r1cs_solver();
+        // And the tables its quotient keeps on this GPU.
+        sp1_gpu_cudart::sys::release_groth16_tables();
         // SAFETY: takes nothing; waits for the device and frees blocks no one holds.
         unsafe { sp1_gpu_cudart::sys::runtime::cuda_release_cached_memory() };
     });
+    // With SYCL, also after each Groth16 proof gnark makes in this process with this GPU's hooks:
+    // what the wrap and Groth16 stages left cached otherwise pushed the next proof's buffers into
+    // shared system memory on Windows. On a 12 GB Arc B580, fib 2M Groth16 proofs back to back
+    // took 39, 92-146 s (the compressed STARK 9 s, then 70-146 s); with this, 39 then 30.5-30.7 s.
+    // (Not measured with HIP, where the arena keeps freed memory for this process anyway.)
+    sp1_recursion_gnark_ffi::device_caches::set_release_after_groth16(
+        sp1_gpu_cudart::sys::BACKEND == "sycl",
+    );
     // HIP's arena holds the card's memory, out of a helper's reach: it gives an allocation back
     // only when that is wholly free, and only to make room for one of this process's blocks.
     // SAFETY: takes nothing and reads the arena's size under its lock.

@@ -137,9 +137,19 @@ struct Runtime {
 //   event never completed, until the kill reset the copy engine. That was 11 of 14
 //   fibonacci-compressed proofs (main also hung); with the legacy adapter, 20 of 20 passed.
 //   SYCL_UR_USE_LEVEL_ZERO_V2=1 still picks V2.
+// - On Windows, Level Zero's USM pool off: the allocator below caches device blocks itself, and
+//   decides what to keep from the video memory budget. Blocks it frees stayed in the adapter's
+//   pool, still counted in this process's usage, so its evictions made no room and later
+//   allocations spilled into shared system memory. On a 12 GB Arc B580, fib 2M Groth16 proofs
+//   back to back: the wrap's STARK went from ~14.5 to 18.6 s by the fourth proof with the pool,
+//   and stayed at 14.5-14.9 s without it. UR_L0_DISABLE_USM_ALLOCATOR=0 (or its older name,
+//   SYCL_PI_LEVEL_ZERO_DISABLE_USM_ALLOCATOR) keeps it.
 const bool kLevelZeroEnv = [] {
 #ifdef _WIN32
     if (!std::getenv("ZES_ENABLE_SYSMAN")) _putenv_s("ZES_ENABLE_SYSMAN", "1");
+    if (!std::getenv("UR_L0_DISABLE_USM_ALLOCATOR") &&
+        !std::getenv("SYCL_PI_LEVEL_ZERO_DISABLE_USM_ALLOCATOR"))
+        _putenv_s("UR_L0_DISABLE_USM_ALLOCATOR", "1");
 #else
     setenv("ZES_ENABLE_SYSMAN", "1", 0);
     setenv("SYCL_UR_USE_LEVEL_ZERO_V2", "0", 0);

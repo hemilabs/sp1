@@ -19,6 +19,21 @@ pub fn release() {
     }
 }
 
+static RELEASE_AFTER_GROTH16: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Sets whether the caches are emptied after each Groth16 proof gnark makes in this process (see
+/// [`release_after_groth16`]).
+pub fn set_release_after_groth16(release: bool) {
+    RELEASE_AFTER_GROTH16.store(release, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether the GPU prover asked for the caches to be emptied after each Groth16 proof gnark makes
+/// in this process, for the next proof's buffers to find the device's memory free.
+pub fn release_after_groth16() -> bool {
+    RELEASE_AFTER_GROTH16.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 static ARENA_BYTES: OnceLock<fn() -> u64> = OnceLock::new();
 
 /// Registers what tells how much device memory this process holds in an arena (HIP's), which a

@@ -46,6 +46,17 @@ pub fn groth16_entry_points() -> Option<(usize, usize, usize)> {
     }
 }
 
+/// Frees the device tables gnark's Groth16 prover keeps between proofs through
+/// [`groth16_entry_points`] (the quotient's domain twiddles and coset powers); the next proof
+/// computes them again.
+pub fn release_groth16_tables() {
+    #[cfg(any(hip_backend, sycl_backend))]
+    // SAFETY: takes nothing; serialized with the Groth16 entry points by their own lock.
+    unsafe {
+        groth16::sp1_groth16_release()
+    };
+}
+
 /// The GPU R1CS solver's entry points (see [`r1cs`]) as function pointers for gnark's Groth16
 /// prover, which solves the circuit with them: create, solve and destroy. None where gnark's prover
 /// has no GPU entry points ([`groth16_entry_points`]) or this build has no solver (SYCL).
