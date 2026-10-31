@@ -2,6 +2,7 @@ mod koalabear;
 
 #[cfg(feature = "native")]
 mod cpu_helper;
+pub mod device_caches;
 pub mod ffi;
 #[cfg(feature = "native")]
 mod gpu_cache;
@@ -38,11 +39,27 @@ pub use witness::*;
 pub use cpu_helper::{cpu_helper_main, run_groth16_cpu_helper_if_requested, CPU_HELPER_ARG};
 #[cfg(feature = "native")]
 pub use gpu_device::{
-    free_memory as gpu_free_memory, reset_requested as gpu_reset_requested,
+    free_memory as gpu_free_memory, proof_started as gpu_proof_started,
+    reserve_reset as gpu_reserve_reset, reset_available as gpu_reset_available,
+    reset_possible as gpu_reset_possible, reset_requested as gpu_reset_requested,
     total_memory as gpu_total_memory, trim_memory_pool as gpu_trim_memory_pool,
+    was_reset as gpu_was_reset, ProofInFlight as GpuProofInFlight,
+    ResetReservation as GpuResetReservation,
 };
 #[cfg(feature = "native")]
 pub use groth16_queue::{final_wrap_slot, FinalWrapSlot};
+
+/// The exit codes of the GPU wrap helpers (`groth16_gpu_helper`, `plonk_gpu_helper`), which their
+/// parent reads to tell a failure a GPU reset may help from one it cannot
+/// (`subprocess::Finished::may_be_out_of_gpu_memory`).
+pub mod helper_exit {
+    /// The prove failed, on the GPU (out of memory, say).
+    pub const PROVE_FAILED: i32 = 1;
+    /// A file could not be read, parsed or written.
+    pub const FILE_ERROR: i32 = 2;
+    /// Bad arguments or a bad message from the parent.
+    pub const BAD_ARGUMENTS: i32 = 3;
+}
 
 /// Lets this binary act as its own Groth16 CPU helper; see `cpu_helper`. Without the `native`
 /// feature there is no CPU helper, and this does nothing.
@@ -68,5 +85,24 @@ pub(crate) mod test_env {
 
     pub(crate) fn lock() -> MutexGuard<'static, ()> {
         LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// An environment variable set until this is dropped (also when a test fails), which then
+    /// has its earlier value again. Taken under [`lock`].
+    pub(crate) struct Var(&'static str, Option<std::ffi::OsString>);
+
+    pub(crate) fn set_var(name: &'static str, value: &str) -> Var {
+        let earlier = std::env::var_os(name);
+        std::env::set_var(name, value);
+        Var(name, earlier)
+    }
+
+    impl Drop for Var {
+        fn drop(&mut self) {
+            match self.1.take() {
+                Some(earlier) => std::env::set_var(self.0, earlier),
+                None => std::env::remove_var(self.0),
+            }
+        }
     }
 }

@@ -178,6 +178,9 @@ async fn main() {
         let permits = sp1_hypercube::prover::ProverSemaphore::new(1);
 
         let machine = RiscvAir::machine();
+        // The chips that count their byte lookups while they write their trace: a dump must have
+        // been made by a build where the same chips do.
+        let counted_in_trace = machine.chips_counting_in_trace();
         let (core_prover, core_verifier) =
             core_prover_and_verifier(t.clone(), machine.clone()).await;
 
@@ -202,8 +205,17 @@ async fn main() {
         for (i, job) in jobs.iter().enumerate() {
             // Deserialize the record.
             let record_bytes = std::fs::read(&job.record_path).expect("failed to read record file");
-            let record: ExecutionRecord =
-                bincode::deserialize(&record_bytes).expect("failed to deserialize record");
+            let record = ExecutionRecord::from_dump_bytes(&record_bytes, &counted_in_trace)
+                .unwrap_or_else(|e| panic!("{}: {e}", job.record_path.display()));
+            // The GPU prover counts the global chip's byte lookups on the device, which a record
+            // that counted them already (a CPU prover's) would count twice.
+            assert!(
+                record.global_dependencies_opt,
+                "{}: the record counted the global chip's byte lookups already \
+                 (global_dependencies_opt off, as the CPU prover's do), which the GPU prover counts \
+                 again: dump it with the GPU prover",
+                job.record_path.display()
+            );
 
             // Deserialize the VK.
             let vk_bytes = std::fs::read(&job.vk_path).expect("failed to read vk file");
@@ -257,7 +269,6 @@ async fn main() {
                     recursive_core_verifier,
                     &proof_shape,
                     reduce_shape,
-                    None,
                 );
 
                 // Build the witness using the real core proof. The other fields are not checked

@@ -58,10 +58,14 @@ extern "C" const rustCudaError_t CUDA_ERROR_NOT_READY_SLOP;
     } while (0)
 #endif
 
+// Returns a failed call's error to the Rust caller. The failure must not also stay the thread's
+// last error, which the next checked kernel launch (sppark's, through `cudaGetLastError`) would
+// report as its own: callers carry on after some failures (pinning, a pre-allocation).
 #define CUDA_OK(expr)                                                                              \
     do {                                                                                           \
         cudaError_t code = expr;                                                                   \
         if (code != cudaSuccess) {                                                                 \
+            (void)cudaGetLastError();                                                              \
             return rustCudaError_t{.message = cudaGetErrorString(code)};                           \
         }                                                                                          \
     } while (0)

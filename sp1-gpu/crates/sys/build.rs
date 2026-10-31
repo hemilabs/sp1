@@ -427,10 +427,25 @@ fn main() {
                 // If clang++ not found, let CMake auto-detect
             }
 
-            // Pass HIP architectures if explicitly set
-            if let Ok(hip_archs) = env::var("HIP_ARCHS") {
-                cmake_config.define("HIP_ARCHS", &hip_archs);
-            }
+            // HIP architectures: HIP_ARCHS, where `native` means the GPUs this host has (opt-in,
+            // as such a binary runs only on those), else CMakeLists.txt's portable default list.
+            // Always passed, empty when unset, so that an earlier configure's value cached by
+            // CMake does not persist.
+            let hip_archs = match env::var("HIP_ARCHS").ok().filter(|archs| !archs.is_empty()) {
+                Some(archs) if archs == "native" => {
+                    let detected = detect_hip_archs(&rocm_path).unwrap_or_else(|| {
+                        panic!(
+                            "HIP_ARCHS=native, but neither rocm_agent_enumerator nor amdgpu-arch \
+                             found an AMD GPU on this host; set HIP_ARCHS to the gfx targets"
+                        )
+                    });
+                    println!("cargo:warning=HIP_ARCHS=native: building for {detected}");
+                    detected
+                }
+                Some(archs) => archs,
+                None => String::new(),
+            };
+            cmake_config.define("HIP_ARCHS", &hip_archs);
         }
         GpuBackend::Cuda => {
             // Pass CUDA architectures to CMake only if explicitly set
@@ -561,6 +576,31 @@ fn main() {
     println!("cargo:include={}", out_include_dir.display());
 }
 
+/// The `gfx` targets of the AMD GPUs on this host (for `HIP_ARCHS=native`), `;`-separated, from
+/// ROCm's `rocm_agent_enumerator` or LLVM's `amdgpu-arch`/`offload-arch`; `None` when no tool runs
+/// or none reports a GPU (a build host without one, or in a container without `/dev/kfd`).
+fn detect_hip_archs(rocm_path: &str) -> Option<String> {
+    let tools = [
+        format!("{rocm_path}/bin/rocm_agent_enumerator"),
+        format!("{rocm_path}/lib/llvm/bin/amdgpu-arch"),
+        format!("{rocm_path}/lib/llvm/bin/offload-arch"),
+    ];
+    tools.iter().find_map(|tool| {
+        let output = std::process::Command::new(tool).output().ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let mut archs: Vec<String> = Vec::new();
+        for arch in String::from_utf8_lossy(&output.stdout).split_whitespace() {
+            // gfx000 is the CPU agent `rocm_agent_enumerator` lists.
+            if arch.starts_with("gfx") && arch != "gfx000" && !archs.iter().any(|a| a == arch) {
+                archs.push(arch.to_string());
+            }
+        }
+        (!archs.is_empty()).then(|| archs.join(";"))
+    })
+}
+
 /// The ROCm installation: `ROCM_PATH`, then `HIP_PATH` (what the Windows HIP SDK sets), then the
 /// usual Linux locations.
 fn rocm_path() -> String {
@@ -677,6 +717,10 @@ const SYCL_KERNEL_SOURCES: &[&str] = &[
     "lib/tracegen/recursion/sbox.cu",
     "lib/tracegen/recursion/select.cu",
     "lib/tracegen/riscv/global.cu",
+    "lib/tracegen/riscv/mul.cu",
+    "lib/tracegen/riscv/shift_right.cu",
+    "lib/tracegen/riscv/simple_alu.cu",
+    "lib/tracegen/riscv/branch.cu",
     "lib/transpose/transpose.cu",
     "lib/zerocheck/aggregate.cu",
     "lib/zerocheck/column_tile.cu",
@@ -733,15 +777,24 @@ fn build_sycl(
         format!("-I{}", crate_dir.join("sppark").display()).into(),
         format!("-I{}", cbindgen_dir.display()).into(),
     ];
-    // Ahead-of-time device code, e.g. SP1_SYCL_TARGETS=spir64_gen with SP1_SYCL_DEVICE=bmg-g31;
-    // without it the kernels are SPIR-V that the driver compiles on first use.
-    if let Ok(targets) = env::var("SP1_SYCL_TARGETS") {
-        args.push(format!("-fsycl-targets={targets}").into());
-        println!("cargo:rerun-if-env-changed=SP1_SYCL_DEVICE");
-        if let Ok(device) = env::var("SP1_SYCL_DEVICE") {
-            args.push("-Xs".into());
-            args.push(format!("-device {device}").into());
-        }
+    // The objects go into a shared library, which outside Windows needs position-independent
+    // code (ld rejects absolute relocations in one).
+    if env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
+        args.push("-fPIC".into());
+    }
+    // Device code: compiled ahead of time for Intel's Battlemage GPUs (bmg-g31: Arc Pro B70 and
+    // B60; bmg-g21: Arc B580 and B570), plus SPIR-V, which the driver compiles on first use on any
+    // other device. Compiling every kernel on first use took about 50 s of a B70's first proof
+    // after each build or driver update (a cold fibonacci proof 72 s, against 5.8 s ahead of
+    // time). SP1_SYCL_TARGETS and SP1_SYCL_DEVICE override the targets and the devices compiled
+    // for; SP1_SYCL_TARGETS=spir64 builds SPIR-V only, which builds faster.
+    println!("cargo:rerun-if-env-changed=SP1_SYCL_DEVICE");
+    let targets = env::var("SP1_SYCL_TARGETS").unwrap_or_else(|_| "spir64_gen,spir64".into());
+    args.push(format!("-fsycl-targets={targets}").into());
+    if targets.split(',').any(|t| t.trim() == "spir64_gen") {
+        let device = env::var("SP1_SYCL_DEVICE").unwrap_or_else(|_| "bmg-g21,bmg-g31".into());
+        args.push("-Xsycl-target-backend=spir64_gen".into());
+        args.push(format!("-device {device}").into());
     }
 
     let obj_dir = out_dir.join("sycl-objs");
@@ -810,8 +863,6 @@ fn build_sycl(
         link.arg(format!("-Wl,/DEF:{}", def.display()));
         // DXGI's video memory budget (lib/sycl/runtime.cpp, device_headroom).
         link.arg("-ldxgi");
-    } else {
-        link.arg("-fPIC");
     }
     link.arg("-o").arg(&lib);
     let out = link.output().unwrap_or_else(|e| panic!("failed to run {}: {e}", icpx.display()));

@@ -68,6 +68,13 @@ pub trait WorkerClient: Send + Sync + Clone + 'static {
         payload: Vec<u8>,
     ) -> impl Future<Output = anyhow::Result<()>> + Send;
 
+    /// Whether the proof `proof_id` has ended ([`Self::complete_proof`]): work still running for
+    /// it (an executor whose proof failed) stops instead of waiting for inputs its end deleted.
+    /// `false` where the client does not know.
+    fn proof_ended(&self, _proof_id: &ProofId) -> bool {
+        false
+    }
+
     fn submit_tasks(
         &self,
         kind: TaskType,

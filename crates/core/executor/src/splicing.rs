@@ -54,6 +54,8 @@ impl SplicingVM<'_, SupervisorMode> {
             // If we're not already done, ensure that we don't have a shard boundary.
             if !result.is_done() && self.shape_checker.check_shard_limit() {
                 result = CycleResult::ShardBoundary;
+            } else if self.shape_checker.commit_outgrew_halt_room() {
+                return Err(commit_long_before_halt());
             }
 
             match result {
@@ -189,6 +191,8 @@ impl SplicingVM<'_, UserMode> {
             // If we're not already done, ensure that we don't have a shard boundary.
             if !result.is_done() && self.shape_checker.check_shard_limit() {
                 result = CycleResult::ShardBoundary;
+            } else if self.shape_checker.commit_outgrew_halt_room() {
+                return Err(commit_long_before_halt());
             }
 
             match result {
@@ -371,6 +375,18 @@ impl SplicingVM<'_, UserMode> {
 
         Ok(())
     }
+}
+
+/// The error for a shard that holds a commit syscall and outgrew the room the sharding threshold
+/// keeps for `syscall_halt` ([`ShapeChecker::commit_outgrew_halt_room`]): the program committed
+/// (with an `ecall`; the SDK does so only in its halt) long before halting, and a shard is not cut
+/// between a commit and the halt, so this one would grow until the halt, past what can be proven.
+fn commit_long_before_halt() -> ExecutionError {
+    ExecutionError::Other(
+        "the program made a commit syscall long before it halted: the shard holding the commit \
+         cannot end before the halt, and it outgrew what a shard can prove"
+            .to_string(),
+    )
 }
 
 impl<M: ExecutionMode> SplicingVM<'_, M> {
@@ -683,6 +699,26 @@ impl<T: MinimalTrace> MinimalTrace for SplicedMinimalTrace<T> {
     }
 }
 
+impl<T: MinimalTrace> SplicedMinimalTrace<T> {
+    /// The bincode encoding of this trace (as a [`TraceChunk`]): the same bytes as
+    /// `bincode::serialize(self)`, written with a single copy of the memory reads.
+    #[must_use]
+    pub fn to_bincode(&self) -> Vec<u8> {
+        let len = self.last_mem_reads_idx - self.memory_reads_idx;
+        let start_mem_reads = self.mem_reads();
+        assert!(len <= start_mem_reads.len(), "spliced memory reads out of bounds");
+        // SAFETY: the reads from `memory_reads_idx` to `last_mem_reads_idx` are in the buffer.
+        let mem_reads = unsafe { std::slice::from_raw_parts(start_mem_reads.head_raw(), len) };
+        TraceChunk::encode_bincode(
+            &self.start_registers,
+            self.start_pc,
+            self.start_clk,
+            self.last_clk,
+            mem_reads,
+        )
+    }
+}
+
 impl<T: MinimalTrace> Serialize for SplicedMinimalTrace<T> {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
@@ -690,10 +726,11 @@ impl<T: MinimalTrace> Serialize for SplicedMinimalTrace<T> {
     {
         let len = self.last_mem_reads_idx - self.memory_reads_idx;
         let mem_reads = unsafe {
-            let mem_reads_buf = Arc::new_uninit_slice(len);
+            let mut mem_reads_buf = Arc::new_uninit_slice(len);
+            let slots = Arc::get_mut(&mut mem_reads_buf).expect("the new slice is not shared");
             let start_mem_reads = self.mem_reads();
             let src_ptr = start_mem_reads.head_raw();
-            std::ptr::copy_nonoverlapping(src_ptr, mem_reads_buf.as_ptr() as *mut MemValue, len);
+            std::ptr::copy_nonoverlapping(src_ptr, slots.as_mut_ptr().cast::<MemValue>(), len);
             mem_reads_buf.assume_init()
         };
 

@@ -117,10 +117,29 @@ gnark's CPU Groth16 prover peaks at ~16 GiB on the v6.1.0 circuit. So:
   ~14 GiB at peak, once per host):
   `sp1-gpu-server --sp1-groth16-cpu-helper --prepare --build-dir ~/.sp1/circuits/groth16/<version>`.
   Exit codes: 0 ready, 64 bad arguments or no circuit there, 65 unreadable circuit, 69 not built.
-- The GPU Groth16 prover is used only where the card has 18 GiB free beside the prover's own state:
-  in practice cards of 48 GB or more. A process that exits after its proof can set
-  `SP1_GPU_RESET_BEFORE_WRAP=1` to free its card first; a long-lived server must not, as the reset
-  destroys the state it proves the next proof with.
+- The GPU Groth16 prover is used only where the card has 18 GiB free beside the prover's own state,
+  once its memory pool's idle reserve is given back: in practice cards of 32 GB or more. On 16 GB
+  CUDA cards its helper streams its G1 point sets (`SP1_GROTH16_STREAM_SRS`) and needs 8 GiB,
+  which they have that way. A Groth16 proof starts the helper as it begins, to load its key while
+  the card proves (`SP1_GROTH16_PRESTART`), where the host has 32 GiB of memory available (RTX 5060
+  Ti, bench-fib: 9.2 s a Groth16 proof with the prestart, 10.5 s with `r1cs_solve_plan` and none,
+  against 18.1 s with gnark's CPU prover); 16 GB HIP and SYCL cards keep gnark's prover. A 16 GB card with `SP1_GPU_RESET_BEFORE_WRAP` may also be reset for it. The GPU
+  PLONK prover (`SP1_PLONK_GPU=1`) is tried only where 23 GiB is free that way (a 32 GB card) or
+  after a reset, and where the host has 112 GiB of memory available for its helper (126 GiB before
+  its key is exported, 24 GiB while a `SP1_PLONK_GPU_SERVER` helper runs); elsewhere gnark's CPU
+  prover, which needs ~42 GB, makes the proof without the GPU attempt.
+- On Linux the wrap helpers are the kernel's first choice when memory runs out (`oom_score_adj`
+  1000), so that a prover is not killed in their place: a killed helper's proof is retried or made
+  by gnark's CPU prover. Under systemd, give the prover's unit `OOMPolicy=continue`: with the
+  default, `stop`, a helper's OOM kill stops the whole unit, the prover with it.
+- A process that exits after its proof can set `SP1_GPU_RESET_BEFORE_WRAP=1` (Linux, CUDA or HIP) to
+  free its card for a wrap helper that would not fit otherwise: not where the card is too small for
+  the helper anyway, and not while another proof uses the GPU. The reset destroys the state the
+  prover proves the next proof with, so afterwards the process refuses to prove again; where the
+  helper fits without it, as on a 32 GB card, there is no reset and the process keeps proving. A
+  wrap that counts on a reset turns new proofs away while it tries the GPU, so that none starts
+  under the reset. A helper that runs out of memory without a reset gets one, once, if the flag is
+  set.
 
 | Variable | Default | Effect |
 | --- | --- | --- |
@@ -132,8 +151,9 @@ gnark's CPU Groth16 prover peaks at ~16 GiB on the v6.1.0 circuit. So:
 | `SP1_GROTH16_R1CS_CACHE`, `_DISABLE` | beside the circuit directory | Where the stripped circuit (~1.5 GB) is kept; `_DISABLE` (set to anything) turns it off. |
 | `SP1_GROTH16_GPU` | decided per proof | `1`/`true` forces the GPU prover, `0`/`false` the CPU prover. |
 | `SP1_GROTH16_GPU_HELPER` | beside the binary, then `PATH` | `groth16_gpu_helper` (`--features native,cuda`). |
+| `SP1_GROTH16_STREAM_SRS` | on below 20 GiB of GPU memory | `1`/`true`: the GPU prover uploads each G1 point set for its MSM and frees it after, instead of keeping all four (~4 GB) on the card; its peak drops enough to run beside the shard prover on a 16 GB card. `0`/`false` keeps them. |
 | `SP1_GROTH16_PK_CACHE`, `_DISABLE` | `/dev/shm` | The GPU prover's proving key (~9 GB, exported once). |
-| `SP1_GPU_RESET_BEFORE_WRAP` | off | `1`/`true`: reset the GPU before a GPU wrap helper. Only for a process that exits after its proof. |
+| `SP1_GPU_RESET_BEFORE_WRAP` | off | `1`/`true`: reset the GPU before a GPU wrap helper that would not fit otherwise. Only for a process that exits after its proof: after a reset it refuses to prove again. |
 | `GOMEMLIMIT` | set per helper where memory is short | An operator's value is kept, and applies to this process's own Go runtime too. |
 
 ## Profiling

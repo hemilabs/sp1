@@ -167,13 +167,30 @@ __global__ __launch_bounds__(256) void g16MsmCount(const Fr* scalars, size_t n, 
     }
 }
 
-// Exclusive prefix sums of each window's counts (one thread per window); hist becomes the cursor.
+// Exclusive prefix sums of each window's counts; hist becomes the cursor. A block per window: each
+// of its MSM_PREFIX_THREADS threads sums a run of MSM_BUCKETS / MSM_PREFIX_THREADS buckets, the
+// block scans the run sums, and each thread writes its run.
+constexpr uint32_t MSM_PREFIX_THREADS = 256;
+constexpr uint32_t MSM_PREFIX_RUN = MSM_BUCKETS / MSM_PREFIX_THREADS;
+
 __global__ __launch_bounds__(256) void g16MsmPrefix(uint32_t* hist, uint32_t* offset) {
-    size_t w = g16Tid();
-    if (w >= MSM_WINDOWS) return;
-    size_t base = w * MSM_BUCKETS;
-    uint32_t acc = 0;
-    for (uint32_t b = 0; b < MSM_BUCKETS; b++) {
+    SP1_SHARED_ARRAY(uint32_t, run_sum, [MSM_PREFIX_THREADS]);
+    const size_t base = (size_t)blockIdx.x * MSM_BUCKETS + (size_t)threadIdx.x * MSM_PREFIX_RUN;
+    uint32_t sum = 0;
+    for (uint32_t b = 0; b < MSM_PREFIX_RUN; b++) sum += hist[base + b];
+    run_sum[threadIdx.x] = sum;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        uint32_t acc = 0;
+        for (uint32_t t = 0; t < MSM_PREFIX_THREADS; t++) {
+            uint32_t c = run_sum[t];
+            run_sum[t] = acc;
+            acc += c;
+        }
+    }
+    __syncthreads();
+    uint32_t acc = run_sum[threadIdx.x];
+    for (uint32_t b = 0; b < MSM_PREFIX_RUN; b++) {
         uint32_t c = hist[base + b];
         offset[base + b] = acc;
         hist[base + b] = acc;
@@ -181,52 +198,78 @@ __global__ __launch_bounds__(256) void g16MsmPrefix(uint32_t* hist, uint32_t* of
     }
 }
 
-__global__ __launch_bounds__(256) void g16MsmScatter(const Fr* scalars, size_t n, uint32_t w, uint32_t* hist, uint32_t* sorted) {
+// The scalar indices by bucket of the nw windows from w0 (a pass, see msm): window w0 + j's at
+// sorted[j * n ..], from the cursors.
+__global__ __launch_bounds__(256) void g16MsmScatter(
+    const Fr* scalars,
+    size_t n,
+    uint32_t w0,
+    uint32_t nw,
+    uint32_t* hist,
+    uint32_t* sorted) {
     for (size_t i = g16Tid(); i < n; i += g16Stride()) {
-        uint32_t d = g16Digit(scalars[i], w);
-        if (d) {
-            uint32_t pos = atomicAdd(&hist[(size_t)w * MSM_BUCKETS + d], 1u);
-            sorted[pos] = (uint32_t)i;
+        Fr s = scalars[i];
+        for (uint32_t j = 0; j < MSM_WINDOWS; j++) {
+            if (j >= nw) break;
+            const uint32_t w = w0 + j;
+            uint32_t d = g16Digit(s, w);
+            if (d) {
+                uint32_t pos = atomicAdd(&hist[(size_t)w * MSM_BUCKETS + d], 1u);
+                sorted[(size_t)j * n + pos] = (uint32_t)i;
+            }
         }
     }
 }
 
-// The bucket sums of window w, over chunks of MSM_CHUNK of its sorted entries (`sorted`, the
-// window's scalar indices by bucket, from g16MsmScatter), a thread each, so
+// The bucket sums of the pass's nw windows from w0, over chunks of MSM_CHUNK of its sorted entries
+// (`sorted`, the windows' scalar indices by bucket, from g16MsmScatter), a thread each, so
 // that the work is balanced however the scalars fall: a witness's are mostly 0, 1 and other small
-// values, which leaves a few buckets with millions of points. A chunk writes the buckets that lie
+// values, which leaves a few buckets with millions of points. The pass's windows run in one launch
+// (a window has `cpw` chunk slots, enough for n entries; window w0 + j's chunk c is slot
+// j * cpw + c), so that the launch fills the GPU. A chunk writes the buckets that lie
 // within it to `buckets`, and the sums of its first and last buckets' entries to head and tail,
 // which g16MsmBucketFixup adds up for the buckets that span chunks. hist holds each bucket's end,
-// so the window's entry count is the last bucket's end.
-constexpr uint32_t MSM_CHUNK = 256;
+// so a window's entry count is its last bucket's end.
+#ifndef SP1_G16_MSM_CHUNK
+#define SP1_G16_MSM_CHUNK 256
+#endif
+constexpr uint32_t MSM_CHUNK = SP1_G16_MSM_CHUNK;
+
+__device__ __forceinline__ uint32_t g16WindowEntries(const uint32_t* hist, size_t w) {
+    return hist[w * MSM_BUCKETS + MSM_BUCKETS - 1];
+}
 
 template <class F>
 __global__ __launch_bounds__(256) void g16MsmChunks(
     const Affine<F>* points,
     const Fr* scalars,
     size_t n,
-    uint32_t w,
+    size_t cpw,
+    uint32_t w0,
+    uint32_t nw,
     const uint32_t* hist,
     const uint32_t* sorted,
     Xyzz<F>* buckets,
     Xyzz<F>* head,
     Xyzz<F>* tail) {
-    const uint32_t m = hist[(size_t)w * MSM_BUCKETS + MSM_BUCKETS - 1];
-    const uint32_t* idx = sorted;
-    Xyzz<F>* wbuckets = buckets + (size_t)w * MSM_BUCKETS;
-    for (size_t c = g16Tid(); c * MSM_CHUNK < m; c += g16Stride()) {
+    for (size_t t = g16Tid(); t < nw * cpw; t += g16Stride()) {
+        const size_t j = t / cpw, c = t % cpw, w = w0 + j;
+        const uint32_t m = g16WindowEntries(hist, w);
+        if (c * MSM_CHUNK >= m) continue;
+        const uint32_t* idx = sorted + j * n;
+        Xyzz<F>* wbuckets = buckets + w * MSM_BUCKETS;
         uint32_t k0 = (uint32_t)(c * MSM_CHUNK);
         uint32_t k1 = k0 + MSM_CHUNK < m ? k0 + MSM_CHUNK : m;
         uint32_t i = idx[k0];
-        uint32_t cur = g16Digit(scalars[i], w);
+        uint32_t cur = g16Digit(scalars[i], (uint32_t)w);
         bool first = true;
         Xyzz<F> acc = Xyzz<F>::from_affine(points[i]);
         for (uint32_t k = k0 + 1; k < k1; k++) {
             i = idx[k];
-            uint32_t d = g16Digit(scalars[i], w);
+            uint32_t d = g16Digit(scalars[i], (uint32_t)w);
             if (d != cur) {
                 if (first)
-                    head[c] = acc;
+                    head[t] = acc;
                 else
                     wbuckets[cur] = acc;
                 first = false;
@@ -236,60 +279,77 @@ __global__ __launch_bounds__(256) void g16MsmChunks(
             acc = acc.add_affine(points[i]);
         }
         if (first) {
-            head[c] = acc;
-            tail[c] = Xyzz<F>::inf();
+            head[t] = acc;
+            tail[t] = Xyzz<F>::inf();
         } else {
-            tail[c] = acc;
+            tail[t] = acc;
         }
     }
 }
 
 // Sums of the chunk heads in groups, so that a bucket spanning many chunks (a witness has buckets
-// with millions of points) adds a few group sums instead of every chunk's head: sums[g] = the sum
-// of in[g * MSM_GROUP ..] over MSM_GROUP of the window's `count` inputs, where count is its chunks
-// (level 1, in = head) or level-1 groups (level 2), from its entry count.
+// with millions of points) adds a few group sums instead of every chunk's head: per window,
+// sums[g] = the sum of in[g * MSM_GROUP ..] over MSM_GROUP of the window's `count` inputs, where
+// count is its chunks (level 1, in = head) or level-1 groups (level 2), from its entry count.
+// For the pass's nw windows from w0: window w0 + j's inputs start at in + j * in_pw and its sums at
+// sums + j * out_pw.
 constexpr uint32_t MSM_GROUP = 64;
 
 template <class F>
 __global__ __launch_bounds__(256) void g16MsmGroupSums(
-    uint32_t w,
     const uint32_t* hist,
     uint32_t level,
+    size_t in_pw,
+    size_t out_pw,
+    uint32_t w0,
+    uint32_t nw,
     const Xyzz<F>* in,
     Xyzz<F>* sums) {
-    const uint32_t m = hist[(size_t)w * MSM_BUCKETS + MSM_BUCKETS - 1];
-    uint32_t count = (m + MSM_CHUNK - 1) / MSM_CHUNK;
-    if (level == 2) count = (count + MSM_GROUP - 1) / MSM_GROUP;
-    for (size_t g = g16Tid(); g * MSM_GROUP < count; g += g16Stride()) {
+    for (size_t t = g16Tid(); t < nw * out_pw; t += g16Stride()) {
+        const size_t j = t / out_pw, g = t % out_pw;
+        const uint32_t m = g16WindowEntries(hist, w0 + j);
+        uint32_t count = (m + MSM_CHUNK - 1) / MSM_CHUNK;
+        if (level == 2) count = (count + MSM_GROUP - 1) / MSM_GROUP;
+        if (g * MSM_GROUP >= count) continue;
+        const Xyzz<F>* win = in + j * in_pw;
         const uint32_t lo = (uint32_t)g * MSM_GROUP;
         const uint32_t hi = lo + MSM_GROUP < count ? lo + MSM_GROUP : count;
-        Xyzz<F> acc = in[lo];
-        for (uint32_t c = lo + 1; c < hi; c++) acc = acc.add(in[c]);
-        sums[g] = acc;
+        Xyzz<F> acc = win[lo];
+        for (uint32_t c = lo + 1; c < hi; c++) acc = acc.add(win[c]);
+        sums[t] = acc;
     }
 }
 
-// Each bucket of window w that starts or ends a chunk: its sum from the chunks' heads and tails
-// (the buckets inside a chunk are already in `buckets`). Empty buckets are set to infinity.
-// group1 and group2 are g16MsmGroupSums' levels 1 and 2 over the heads.
+// Each bucket of the pass's nw windows from w0 that starts or ends a chunk: its sum from the
+// chunks' heads and tails (the buckets inside a chunk are already in `buckets`). Empty buckets are
+// set to infinity. group1 and group2 are g16MsmGroupSums' levels 1 and 2 over the heads; cpw, g1pw
+// and g2pw are the per-window strides of head and tail, group1 and group2.
 template <class F>
 __global__ __launch_bounds__(256) void g16MsmBucketFixup(
-    uint32_t w,
     const uint32_t* offset,
     const uint32_t* hist,
+    size_t cpw,
+    size_t g1pw,
+    size_t g2pw,
+    uint32_t w0,
+    uint32_t nw,
     Xyzz<F>* buckets,
-    const Xyzz<F>* head,
-    const Xyzz<F>* tail,
-    const Xyzz<F>* group1,
-    const Xyzz<F>* group2) {
-    const uint32_t m = hist[(size_t)w * MSM_BUCKETS + MSM_BUCKETS - 1];
-    for (size_t b = g16Tid(); b < MSM_BUCKETS; b += g16Stride()) {
-        size_t wb = (size_t)w * MSM_BUCKETS + b;
+    const Xyzz<F>* head_all,
+    const Xyzz<F>* tail_all,
+    const Xyzz<F>* group1_all,
+    const Xyzz<F>* group2_all) {
+    for (size_t t = g16Tid(); t < (size_t)nw * MSM_BUCKETS; t += g16Stride()) {
+        const size_t j = t / MSM_BUCKETS, w = w0 + j, wb = (size_t)w0 * MSM_BUCKETS + t;
         uint32_t start = offset[wb], end = hist[wb];
         if (start == end) {
             buckets[wb] = Xyzz<F>::inf();
             continue;
         }
+        const uint32_t m = g16WindowEntries(hist, w);
+        const Xyzz<F>* head = head_all + j * cpw;
+        const Xyzz<F>* tail = tail_all + j * cpw;
+        const Xyzz<F>* group1 = group1_all + j * g1pw;
+        const Xyzz<F>* group2 = group2_all + j * g2pw;
         uint32_t cs = start / MSM_CHUNK, ce = (end - 1) / MSM_CHUNK;
         uint32_t chunk_start = cs * MSM_CHUNK;
         if (cs == ce) {
@@ -528,6 +588,25 @@ void scale_powers(State& st, Fr* x, const Dev<Fr>& lo, const Dev<Fr>& hi, Fr c, 
     launch(SP1_KERNEL_PTR(g16ScalePowers), n, args, st.stream);
 }
 
+// The self-test's windows per MSM pass (0: as msm_windows_per_pass chooses).
+uint32_t g_msm_test_windows_per_pass = 0;
+
+// Windows per MSM pass (see msm) for per_window bytes of pass buffers per window:
+// SP1_GROTH16_MSM_WINDOWS_PER_PASS (1..MSM_WINDOWS) if set, else as many as fit in nine tenths of
+// the free device memory, at least one (whose allocation msm then tries anyway).
+uint32_t msm_windows_per_pass(size_t per_window) {
+    if (g_msm_test_windows_per_pass) return g_msm_test_windows_per_pass;
+    if (const char* e = std::getenv("SP1_GROTH16_MSM_WINDOWS_PER_PASS")) {
+        long v = std::strtol(e, nullptr, 10);
+        if (v >= 1) return v < (long)MSM_WINDOWS ? (uint32_t)v : MSM_WINDOWS;
+    }
+    size_t free = 0, total = 0;
+    if (cuda_mem_get_info(&free, &total).message != success_message()) return MSM_WINDOWS;
+    size_t fit = free / 10 * 9 / (per_window ? per_window : 1);
+    if (fit >= MSM_WINDOWS) return MSM_WINDOWS;
+    return fit ? (uint32_t)fit : 1;
+}
+
 template <class F>
 Xyzz<F> msm(State& st, const Affine<F>* host_points, const Fr* host_scalars, size_t n) {
     cudaStream_t s = st.stream;
@@ -542,15 +621,14 @@ Xyzz<F> msm(State& st, const Affine<F>* host_points, const Fr* host_scalars, siz
     }
     Dev<uint32_t> hist((size_t)MSM_WINDOWS * MSM_BUCKETS, s);
     Dev<uint32_t> offset((size_t)MSM_WINDOWS * MSM_BUCKETS, s);
-    // One window's scalar indices by bucket at a time (n entries, not 16 n).
-    Dev<uint32_t> sorted(n, s);
     {
         Timer t("msm count", s);
         check(cuda_mem_set_async(hist.ptr, 0, hist.len * sizeof(uint32_t), s));
         void* count[] = {&scalars.ptr, &n, &hist.ptr};
         launch(SP1_KERNEL_PTR(g16MsmCount), n, count, s);
         void* prefix[] = {&hist.ptr, &offset.ptr};
-        check(cuda_launch_kernel(SP1_KERNEL_PTR(g16MsmPrefix), dim3(1), dim3(MSM_WINDOWS), prefix, 0, s));
+        check(cuda_launch_kernel(SP1_KERNEL_PTR(g16MsmPrefix), dim3(MSM_WINDOWS), dim3(MSM_PREFIX_THREADS), prefix, 0,
+                                 s));
     }
     Dev<Affine<F>> points(n, s);
     {
@@ -561,26 +639,58 @@ Xyzz<F> msm(State& st, const Affine<F>* host_points, const Fr* host_scalars, siz
     Dev<Xyzz<F>> partial((size_t)MSM_WINDOWS * MSM_SEGS, s);
     {
         Timer t("msm buckets", s);
-        size_t chunks = (n + MSM_CHUNK - 1) / MSM_CHUNK;
-        Dev<Xyzz<F>> head(chunks, s), tail(chunks, s);
-        const size_t groups1 = (chunks + MSM_GROUP - 1) / MSM_GROUP;
-        const size_t groups2 = (groups1 + MSM_GROUP - 1) / MSM_GROUP;
-        Dev<Xyzz<F>> group1(groups1, s), group2(groups2, s);
-        for (uint32_t w = 0; w < MSM_WINDOWS; w++) {
-            void* scatter[] = {&scalars.ptr, &n, &w, &hist.ptr, &sorted.ptr};
+        // The windows in passes of nw, each step one launch per pass: a window's chunk slots
+        // (cpw) and group sums (g1pw, g2pw) are sized for n entries, whatever its count of
+        // nonzero digits. All windows in one pass (nw = MSM_WINDOWS) fill the GPU best, but take a
+        // window's scalar indices by bucket (n entries; 16 n are 1.07 GB at n = 2^24) and chunk
+        // and group sums each; where that does not fit, fewer windows per pass, down to one.
+        // Every window's buckets come out the same whatever the passes.
+        size_t cpw = (n + MSM_CHUNK - 1) / MSM_CHUNK;
+        size_t g1pw = (cpw + MSM_GROUP - 1) / MSM_GROUP;
+        size_t g2pw = (g1pw + MSM_GROUP - 1) / MSM_GROUP;
+        const size_t per_window = n * sizeof(uint32_t) + (2 * cpw + g1pw + g2pw) * sizeof(Xyzz<F>);
+        uint32_t nw = msm_windows_per_pass(per_window);
+        Dev<uint32_t> sorted;
+        Dev<Xyzz<F>> head, tail, group1, group2;
+        for (;;) {
+            try {
+                sorted = Dev<uint32_t>((size_t)nw * n, s);
+                head = Dev<Xyzz<F>>(nw * cpw, s);
+                tail = Dev<Xyzz<F>>(nw * cpw, s);
+                group1 = Dev<Xyzz<F>>(nw * g1pw, s);
+                group2 = Dev<Xyzz<F>>(nw * g2pw, s);
+                break;
+            } catch (const Error& e) {
+                if (nw == 1) throw;
+                sorted.reset();
+                head.reset();
+                tail.reset();
+                group1.reset();
+                group2.reset();
+                nw = (nw + 1) / 2;
+                std::fprintf(stderr, "[groth16-gpu] MSM: out of device memory (%s), %u windows per pass\n",
+                             e.e.message ? e.e.message : "?", nw);
+            }
+        }
+        if (verbose() && nw < MSM_WINDOWS) {
+            std::fprintf(stderr, "[groth16-gpu] MSM: %u windows per pass\n", nw);
+        }
+        for (uint32_t w0 = 0; w0 < MSM_WINDOWS; w0 += nw) {
+            uint32_t pw = MSM_WINDOWS - w0 < nw ? MSM_WINDOWS - w0 : nw;
+            void* scatter[] = {&scalars.ptr, &n, &w0, &pw, &hist.ptr, &sorted.ptr};
             launch(SP1_KERNEL_PTR(g16MsmScatter), n, scatter, s);
-            void* sum[] = {&points.ptr, &scalars.ptr, &n, &w, &hist.ptr, &sorted.ptr, &buckets.ptr,
-                           &head.ptr, &tail.ptr};
-            launch(SP1_KERNEL_PTR(g16MsmChunks<F>), chunks, sum, s);
+            void* sum[] = {&points.ptr, &scalars.ptr, &n, &cpw, &w0, &pw, &hist.ptr, &sorted.ptr,
+                           &buckets.ptr, &head.ptr, &tail.ptr};
+            launch(SP1_KERNEL_PTR(g16MsmChunks<F>), pw * cpw, sum, s);
             uint32_t level = 1;
-            void* g1[] = {&w, &hist.ptr, &level, &head.ptr, &group1.ptr};
-            launch(SP1_KERNEL_PTR(g16MsmGroupSums<F>), groups1, g1, s);
+            void* g1[] = {&hist.ptr, &level, &cpw, &g1pw, &w0, &pw, &head.ptr, &group1.ptr};
+            launch(SP1_KERNEL_PTR(g16MsmGroupSums<F>), pw * g1pw, g1, s);
             uint32_t level2 = 2;
-            void* g2[] = {&w, &hist.ptr, &level2, &group1.ptr, &group2.ptr};
-            launch(SP1_KERNEL_PTR(g16MsmGroupSums<F>), groups2, g2, s);
-            void* fix[] = {&w, &offset.ptr, &hist.ptr, &buckets.ptr, &head.ptr, &tail.ptr,
-                           &group1.ptr, &group2.ptr};
-            launch(SP1_KERNEL_PTR(g16MsmBucketFixup<F>), MSM_BUCKETS, fix, s);
+            void* g2[] = {&hist.ptr, &level2, &g1pw, &g2pw, &w0, &pw, &group1.ptr, &group2.ptr};
+            launch(SP1_KERNEL_PTR(g16MsmGroupSums<F>), pw * g2pw, g2, s);
+            void* fix[] = {&offset.ptr, &hist.ptr, &cpw, &g1pw, &g2pw, &w0, &pw, &buckets.ptr,
+                           &head.ptr, &tail.ptr, &group1.ptr, &group2.ptr};
+            launch(SP1_KERNEL_PTR(g16MsmBucketFixup<F>), (size_t)pw * MSM_BUCKETS, fix, s);
         }
     }
     {
@@ -800,7 +910,7 @@ extern "C" int32_t sp1_groth16_selftest() {
     int32_t failures = 0;
     G1Affine g1{Fp::one(), Fp::one() + Fp::one()};
     // gnark-crypto's G2 generator.
-    const uint32_t g2x0[8] = {0xd992f6ed, 0x46debd5c, 0xf75edadd, 0x674322d4, 0x5e5c4479, 0x426a0066, 0x3c1b8a26, 0x1800deef};
+    const uint32_t g2x0[8] = {0xd992f6ed, 0x46debd5c, 0xf75edadd, 0x674322d4, 0x5e5c4479, 0x426a0066, 0x121f1e76, 0x1800deef};
     const uint32_t g2x1[8] = {0xaef312c2, 0x97e485b7, 0x35a9e712, 0xf1aa4933, 0x31fb5d25, 0x7260bfb7, 0x920d483a, 0x198e9393};
     const uint32_t g2y0[8] = {0x66fa7daa, 0x4ce6cc01, 0x0c43d37b, 0xe3d1e769, 0x8dcb408f, 0x4aab7180, 0xdb8c6deb, 0x12c85ea5};
     const uint32_t g2y1[8] = {0xd122975b, 0x55acdadc, 0x70b38ef3, 0xbc4b3133, 0x690c3395, 0xec9e99ad, 0x585ff075, 0x090689d0};
@@ -812,6 +922,16 @@ extern "C" int32_t sp1_groth16_selftest() {
         failures += !check_msm<Fp2>(g2, n, false, "G2");
         failures += !check_msm<Fp2>(g2, n, true, "G2");
     }
+    // The windows in several passes, as where all of them at once do not fit (the last pass
+    // shorter with 5), and one at a time.
+    for (uint32_t per_pass : {5u, 1u}) {
+        g_msm_test_windows_per_pass = per_pass;
+        failures += !check_msm<Fp>(g1, 3000, false, "G1");
+        failures += !check_msm<Fp>(g1, 3000, true, "G1");
+        failures += !check_msm<Fp2>(g2, 3000, false, "G2");
+        failures += !check_msm<Fp2>(g2, 3000, true, "G2");
+    }
+    g_msm_test_windows_per_pass = 0;
 
     // computeH over 2^lg against a naive transform on the host.
     const uint32_t lg = 11;

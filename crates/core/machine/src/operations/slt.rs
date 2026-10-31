@@ -11,7 +11,10 @@ use sp1_primitives::consts::{u64_to_u16_limbs, WORD_SIZE};
 
 use crate::air::{SP1Operation, SP1OperationBuilder};
 
-use super::{U16CompareOperation, U16CompareOperationInput, U16MSBOperation, U16MSBOperationInput};
+use super::{
+    u16_difference_inverse, U16CompareOperation, U16CompareOperationInput, U16MSBOperation,
+    U16MSBOperationInput,
+};
 
 #[derive(
     AlignedBorrow,
@@ -178,9 +181,10 @@ impl<F: Field> LtOperationUnsigned<F> {
                 *flag = F::one();
                 comparison_limbs[0] = *b_limb;
                 comparison_limbs[1] = *c_limb;
+                // `b_limb - c_limb` is in `(-2^16, 2^16)`, inside the inverse table.
+                self.not_eq_inv = u16_difference_inverse(*b_limb, *c_limb);
                 let b_limb = F::from_canonical_u16(*b_limb);
                 let c_limb = F::from_canonical_u16(*c_limb);
-                self.not_eq_inv = (b_limb - c_limb).inverse();
                 self.comparison_limbs = [b_limb, c_limb];
                 break;
             }

@@ -1,10 +1,6 @@
-use std::{
-    marker::PhantomData,
-    ops::{Deref, DerefMut},
-    sync::Arc,
-};
+use std::{marker::PhantomData, sync::Arc};
 
-use hashbrown::HashMap;
+use hashbrown::{hash_map::Entry, HashMap};
 use sp1_hypercube::air::{PublicValues, PROOF_NONCE_NUM_WORDS};
 use sp1_jit::MinimalTrace;
 use sp1_primitives::consts::PAGE_SIZE;
@@ -561,9 +557,7 @@ impl<M: ExecutionMode> TracingVM<'_, M> {
             self.record.public_values.initial_timestamp = self.record.initial_timestamp;
         }
 
-        for (_, event) in self.local_memory_access.inner.drain() {
-            self.record.cpu_local_memory_access.push(event);
-        }
+        self.record.cpu_local_memory_access.extend(self.local_memory_access.drain());
 
         if M::PAGE_PROTECTION_ENABLED {
             for (_, event) in self.local_page_prot_access.inner.drain() {
@@ -973,6 +967,8 @@ impl<M: ExecutionMode> TracingVM<'_, M> {
     }
 
     /// Emit events for this cycle.
+    #[allow(clippy::inline_always)]
+    #[inline(always)]
     #[allow(clippy::too_many_arguments)]
     fn emit_events(
         &mut self,
@@ -1091,8 +1087,9 @@ impl<M: ExecutionMode> TracingVM<'_, M> {
     }
 
     /// Emit a memory instruction event.
+    #[allow(clippy::inline_always)]
+    #[inline(always)]
     #[allow(clippy::too_many_arguments)]
-    #[inline]
     fn emit_mem_instr_event(
         &mut self,
         instruction: &Instruction,
@@ -1150,6 +1147,8 @@ impl<M: ExecutionMode> TracingVM<'_, M> {
     }
 
     /// Emit an ALU event.
+    #[allow(clippy::inline_always)]
+    #[inline(always)]
     fn emit_alu_event(
         &mut self,
         instruction: &Instruction,
@@ -1225,7 +1224,8 @@ impl<M: ExecutionMode> TracingVM<'_, M> {
     }
 
     /// Emit a jal event.
-    #[inline]
+    #[allow(clippy::inline_always)]
+    #[inline(always)]
     #[allow(clippy::too_many_arguments)]
     fn emit_jal_event(
         &mut self,
@@ -1252,7 +1252,8 @@ impl<M: ExecutionMode> TracingVM<'_, M> {
     }
 
     /// Emit a jalr event.
-    #[inline]
+    #[allow(clippy::inline_always)]
+    #[inline(always)]
     #[allow(clippy::too_many_arguments)]
     fn emit_jalr_event(
         &mut self,
@@ -1279,7 +1280,8 @@ impl<M: ExecutionMode> TracingVM<'_, M> {
     }
 
     /// Emit a branch event.
-    #[inline]
+    #[allow(clippy::inline_always)]
+    #[inline(always)]
     #[allow(clippy::too_many_arguments)]
     fn emit_branch_event(
         &mut self,
@@ -1306,7 +1308,8 @@ impl<M: ExecutionMode> TracingVM<'_, M> {
     }
 
     /// Emit a `UType` event.
-    #[inline]
+    #[allow(clippy::inline_always)]
+    #[inline(always)]
     fn emit_utype_event(
         &mut self,
         instruction: &Instruction,
@@ -1479,49 +1482,78 @@ impl<'a, M: ExecutionMode> SyscallRuntime<'a, M> for TracingVM<'a, M> {
     }
 }
 
+/// The first and last access of every memory address touched in a shard (or in a precompile).
 #[derive(Debug, Default)]
 pub struct LocalMemoryAccess {
-    pub inner: HashMap<u64, MemoryLocalEvent>,
+    /// The accesses of the addresses that are not registers.
+    inner: HashMap<u64, MemoryLocalEvent>,
+    /// The accesses of the registers (addresses `0..32`), kept out of the map: nearly every
+    /// instruction touches two or three registers.
+    registers: [Option<MemoryLocalEvent>; 32],
 }
 
 impl LocalMemoryAccess {
     #[inline]
     #[allow(clippy::needless_pass_by_value)]
     pub(crate) fn insert_record(&mut self, addr: u64, event: impl IntoMemoryRecord) {
-        self.inner
-            .entry(addr)
-            .and_modify(|e| {
-                let current_record = event.current_record();
-                let previous_record = event.previous_record();
-
-                // The latest record is the one with the highest timestamp.
-                if current_record.timestamp > e.final_mem_access.timestamp {
-                    e.final_mem_access = current_record;
+        let slot = if addr < 32 {
+            &mut self.registers[addr as usize]
+        } else {
+            match self.inner.entry(addr) {
+                Entry::Occupied(e) => {
+                    Self::update(e.into_mut(), &event);
+                    return;
                 }
-
-                // The initial record is the one with the lowest timestamp.
-                if previous_record.timestamp < e.initial_mem_access.timestamp {
-                    e.initial_mem_access = previous_record;
+                Entry::Vacant(e) => {
+                    e.insert(Self::first(addr, &event));
+                    return;
                 }
-            })
-            .or_insert_with(|| MemoryLocalEvent {
-                addr,
-                initial_mem_access: event.previous_record(),
-                final_mem_access: event.current_record(),
-            });
+            }
+        };
+        match slot {
+            Some(e) => Self::update(e, &event),
+            None => *slot = Some(Self::first(addr, &event)),
+        }
     }
-}
 
-impl Deref for LocalMemoryAccess {
-    type Target = HashMap<u64, MemoryLocalEvent>;
-    fn deref(&self) -> &Self::Target {
-        &self.inner
+    #[inline]
+    fn first(addr: u64, event: &impl IntoMemoryRecord) -> MemoryLocalEvent {
+        MemoryLocalEvent {
+            addr,
+            initial_mem_access: event.previous_record(),
+            final_mem_access: event.current_record(),
+        }
     }
-}
 
-impl DerefMut for LocalMemoryAccess {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.inner
+    #[inline]
+    fn update(e: &mut MemoryLocalEvent, event: &impl IntoMemoryRecord) {
+        let current_record = event.current_record();
+        let previous_record = event.previous_record();
+
+        // The latest record is the one with the highest timestamp.
+        if current_record.timestamp > e.final_mem_access.timestamp {
+            e.final_mem_access = current_record;
+        }
+
+        // The initial record is the one with the lowest timestamp.
+        if previous_record.timestamp < e.initial_mem_access.timestamp {
+            e.initial_mem_access = previous_record;
+        }
+    }
+
+    /// Removes and returns the access of `addr`, if it was touched.
+    #[inline]
+    pub(crate) fn remove(&mut self, addr: u64) -> Option<MemoryLocalEvent> {
+        if addr < 32 {
+            self.registers[addr as usize].take()
+        } else {
+            self.inner.remove(&addr)
+        }
+    }
+
+    /// Removes and returns all the accesses.
+    pub(crate) fn drain(&mut self) -> impl Iterator<Item = MemoryLocalEvent> + '_ {
+        self.registers.iter_mut().filter_map(Option::take).chain(self.inner.drain().map(|(_, e)| e))
     }
 }
 
@@ -1619,8 +1651,8 @@ impl<'a, M: ExecutionMode> SyscallRuntime<'a, M> for PrecompileMemory<'a, '_, M>
     fn postprocess_precompile(&mut self) -> (Vec<MemoryLocalEvent>, Vec<PageProtLocalEvent>) {
         let mut precompile_local_memory_access = Vec::new();
         if let Some(local_memory_access) = &mut self.inner.precompile_local_memory_access {
-            for (addr, event) in local_memory_access.drain() {
-                if let Some(cpu_mem_access) = self.inner.local_memory_access.remove(&addr) {
+            for event in local_memory_access.drain() {
+                if let Some(cpu_mem_access) = self.inner.local_memory_access.remove(event.addr) {
                     self.inner.record.cpu_local_memory_access.push(cpu_mem_access);
                 }
                 precompile_local_memory_access.push(event);

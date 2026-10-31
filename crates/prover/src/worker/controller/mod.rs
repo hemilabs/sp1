@@ -30,7 +30,8 @@ use sp1_hypercube::{
 };
 use sp1_primitives::{io::SP1PublicValues, SP1GlobalContext};
 use sp1_prover_types::{
-    network_base_types::ProofMode, Artifact, ArtifactClient, ArtifactType, TaskStatus, TaskType,
+    await_blocking, network_base_types::ProofMode, Artifact, ArtifactClient, ArtifactType,
+    TaskStatus, TaskType,
 };
 use sp1_verifier::{ProofFromNetwork, SP1Proof};
 use std::{borrow::Borrow, collections::HashSet, sync::Arc};
@@ -72,6 +73,9 @@ pub struct SP1ControllerConfig {
     pub send_splice_input_buffer_size_per_splice: usize,
     pub use_fixed_pk: bool,
     pub global_memory_buffer_size: usize,
+    /// Whether this worker's card may use the GPU Groth16 prover: the recursion prover's
+    /// `groth16_gpu`, which decides whether a Groth16 proof prestarts its helper on a 16 GB card.
+    pub groth16_gpu: bool,
 }
 
 pub struct SP1Controller<A, W> {
@@ -272,7 +276,9 @@ where
         // when this process also runs the Groth16 task, as a local node or GPU server does.
         #[cfg(feature = "native-gnark")]
         let _groth16_prestart = (mode == ProofMode::Groth16)
-            .then(crate::worker::prover::groth16_backend::prestart_gpu_helper)
+            .then(|| {
+                crate::worker::prover::groth16_backend::prestart_gpu_helper(self.config.groth16_gpu)
+            })
             .flatten();
 
         let stdin_download_handle = self
@@ -284,6 +290,7 @@ where
             None => [0u32; PROOF_NONCE_NUM_WORDS],
         };
 
+        let use_fixed_pk = self.config.use_fixed_pk;
         let vkey_download_handle = tokio::spawn({
             let artifact_client_clone = self.artifact_client.clone();
             let worker_client_clone = self.worker_client.clone();
@@ -301,6 +308,58 @@ where
                 drop(lock);
                 let vk = if let Some(vkey) = vkey {
                     tracing::debug!("setup cache hit");
+                    // The vk is known, but this proof's core shards still need the proving key:
+                    // have a setup task build it now, off the first shard's critical path, as on
+                    // a cache miss (a no-op unless the workers run in this process). The shards
+                    // do not use it with a fixed proving key. Best effort: on failure the first
+                    // shard runs the setup itself.
+                    if !use_fixed_pk && reserve_core_proving_keys(&elf_clone) {
+                        tracing::debug!("setup task pre-builds the core proving key");
+                        let artifact_client = artifact_client_clone.clone();
+                        let worker_client = worker_client_clone.clone();
+                        let elf = elf_clone.clone();
+                        let context = context.clone();
+                        tokio::spawn(
+                            async move {
+                                let result: Result<(), TaskError> = async {
+                                    let vk_artifact = artifact_client.create_artifact()?;
+                                    let setup_request = RawTaskRequest {
+                                        inputs: vec![elf],
+                                        outputs: vec![vk_artifact.clone()],
+                                        context: context.clone(),
+                                    };
+                                    let setup_id = worker_client
+                                        .submit_task(TaskType::SetupVkey, setup_request)
+                                        .await?;
+                                    let subscriber = worker_client
+                                        .subscriber(context.proof_id.clone())
+                                        .await?
+                                        .per_task();
+                                    let status = subscriber
+                                        .wait_task(setup_id)
+                                        .await
+                                        .map_err(|e| TaskError::Fatal(e.into()))?;
+                                    let _ = artifact_client
+                                        .try_delete(
+                                            &vk_artifact,
+                                            ArtifactType::UnspecifiedArtifactType,
+                                        )
+                                        .await;
+                                    if status != TaskStatus::Succeeded {
+                                        return Err(TaskError::Fatal(anyhow::anyhow!(
+                                            "setup task failed"
+                                        )));
+                                    }
+                                    Ok::<(), TaskError>(())
+                                }
+                                .await;
+                                if let Err(e) = result {
+                                    tracing::warn!("pre-building the core proving key: {e}");
+                                }
+                            }
+                            .instrument(tracing::debug_span!("prebuild core pk")),
+                        );
+                    }
                     vkey.clone()
                 } else {
                     // Have the setup task leave its proving key for this proof's core shards
@@ -402,7 +461,9 @@ where
 
         let mut join_set = JoinSet::<Result<(), TaskError>>::new();
 
-        let mut core_proof_artifact = None;
+        // Core mode: the sorted bincode encodings of the shard proofs, handed over in memory by
+        // `collect_core_proofs` (no intermediate artifact, see `encode_core_proof_from_network`).
+        let mut core_proofs_rx = None;
         let mut compress_proof_artifact = None;
         let mut shrinkwrap_proof_artifact = None;
         let mut groth16_proof_artifact = None;
@@ -411,11 +472,12 @@ where
         let (compress_complete_tx, compress_complete_rx) = oneshot::channel();
 
         if mode == ProofMode::Core {
-            core_proof_artifact = Some(self.artifact_client.create_artifact()?);
+            let (core_proofs_tx, rx) = oneshot::channel();
+            core_proofs_rx = Some(rx);
             join_set.spawn(collect_core_proofs(
                 self.worker_client.clone(),
                 self.artifact_client.clone(),
-                core_proof_artifact.clone().unwrap(),
+                core_proofs_tx,
                 context.clone(),
                 core_proof_rx,
             ));
@@ -440,7 +502,8 @@ where
                     // Every core shard is proven: free the core proving key before shrink, wrap
                     // and the final SNARK need the device memory.
                     release_core_proving_keys(&elf);
-                    compress_complete_tx.send(()).unwrap();
+                    // The receiver is gone only once the proof has failed elsewhere.
+                    let _ = compress_complete_tx.send(());
                     Ok(())
                 }
                 .instrument(tracing::debug_span!("reduce")),
@@ -468,7 +531,11 @@ where
                     self.worker_client.subscriber(context.proof_id.clone()).await?.per_task();
                 let worker_client = self.worker_client.clone();
                 join_set.spawn(async move {
-                    compress_complete_rx.await.unwrap();
+                    // Without the compressed proof (its task failed, with its own error), there is
+                    // nothing to wrap.
+                    if compress_complete_rx.await.is_err() {
+                        return Ok(());
+                    }
 
                     let shrinkwrap_task_id =
                         worker_client.submit_task(TaskType::ShrinkWrap, shrinkwrap_task).await?;
@@ -499,7 +566,11 @@ where
                     self.worker_client.subscriber(context.proof_id.clone()).await?.per_task();
                 let worker_client = self.worker_client.clone();
                 join_set.spawn(async move {
-                    compress_complete_rx.await.unwrap();
+                    // Without the compressed proof (its task failed, with its own error), there is
+                    // nothing to wrap.
+                    if compress_complete_rx.await.is_err() {
+                        return Ok(());
+                    }
 
                     let shrinkwrap_task_id =
                         worker_client.submit_task(TaskType::ShrinkWrap, shrinkwrap_task).await?;
@@ -523,8 +594,15 @@ where
                     .wait_task(executor_task_id)
                     .instrument(tracing::debug_span!("wait executor"))
                     .await?;
-                if status != TaskStatus::Succeeded {
-                    return Err(TaskError::Fatal(anyhow::anyhow!("CoreExecute task failed")));
+                match status {
+                    TaskStatus::Succeeded => {}
+                    // The executor child was killed (by the memory monitor or the host).
+                    TaskStatus::FailedRetryable => {
+                        return Err(TaskError::Retryable(anyhow::anyhow!(
+                            "CoreExecute task failed with a retryable error"
+                        )))
+                    }
+                    _ => return Err(TaskError::Fatal(anyhow::anyhow!("CoreExecute task failed"))),
                 }
                 Ok(())
             });
@@ -541,48 +619,68 @@ where
 
         // Get the proof and wrap it if the mode is either groth16 or plonk.
         let inner_proof = match mode {
-            ProofMode::Core => {
-                let shard_proofs =
-                    self.artifact_client.download(&core_proof_artifact.clone().unwrap()).await?;
-                SP1Proof::Core(shard_proofs)
-            }
+            // Spliced from the shard proofs' own encodings below, without decoding them again.
+            ProofMode::Core => None,
             ProofMode::Compressed => {
                 let proof = self
                     .artifact_client
                     .download(&compress_proof_artifact.clone().unwrap())
                     .await?;
-                SP1Proof::Compressed(Box::new(proof))
+                Some(SP1Proof::Compressed(Box::new(proof)))
             }
             ProofMode::Plonk => {
                 let proof =
                     self.artifact_client.download(&plonk_proof_artifact.clone().unwrap()).await?;
-                SP1Proof::Plonk(proof)
+                Some(SP1Proof::Plonk(proof))
             }
             ProofMode::Groth16 => {
                 let proof =
                     self.artifact_client.download(&groth16_proof_artifact.clone().unwrap()).await?;
-                SP1Proof::Groth16(proof)
+                Some(SP1Proof::Groth16(proof))
             }
             _ => unimplemented!("proof mode not supported: {:?}", mode),
         };
 
         // Pair with public values and version
         let public_values = SP1PublicValues::from(&result.public_value_stream);
-        let proof = ProofFromNetwork {
-            proof: inner_proof,
-            public_values,
-            sp1_version: SP1_CIRCUIT_VERSION.to_string(),
-        };
+        let sp1_version = SP1_CIRCUIT_VERSION.to_string();
+        match inner_proof {
+            Some(inner_proof) => {
+                let proof = ProofFromNetwork { proof: inner_proof, public_values, sp1_version };
 
-        // Upload the proof
-        self.artifact_client.upload_proof(&output, proof).await?;
+                // Upload the proof
+                self.artifact_client.upload_proof(&output, proof).await?;
+            }
+            None => {
+                // Core mode. The collector always sends before it returns `Ok`, and every
+                // task of the join set returned `Ok` above.
+                let shard_proofs = core_proofs_rx
+                    .take()
+                    .expect("core mode has a core proof receiver")
+                    .await
+                    .map_err(|e| TaskError::Fatal(e.into()))?;
+                async {
+                    // The same bytes `upload_proof` would write for
+                    // `ProofFromNetwork { proof: SP1Proof::Core(shard_proofs), .. }`.
+                    let data = await_blocking(move || {
+                        encode_core_proof_from_network(&shard_proofs, public_values, sp1_version)
+                    })
+                    .instrument(tracing::debug_span!("splice core proof"))
+                    .await
+                    .unwrap()
+                    .map_err(anyhow::Error::from)?;
+                    self.artifact_client.upload_raw(&output, ArtifactType::Proof, data).await
+                }
+                .instrument(tracing::debug_span!("upload core proof"))
+                .await?;
+            }
+        }
 
         // Clean up artifacts
         let artifacts_to_cleanup = vec![
             Some(common_input_artifact),
             Some(stdin_artifact),
             Some(execution_output_artifact),
-            core_proof_artifact,
             compress_proof_artifact,
             shrinkwrap_proof_artifact,
             groth16_proof_artifact,
@@ -680,10 +778,16 @@ impl DuplicateShardFilter {
     }
 }
 
+/// Collects the core shard proofs of a proof and hands them to the controller, sorted by range.
+///
+/// The proofs are kept as their bincode encodings (each one decoded once on arrival, to check it
+/// and read its range), so that the final [`ProofFromNetwork`] is spliced from them by
+/// [`encode_core_proof_from_network`] instead of re-encoding the whole core proof, uploading it,
+/// downloading and decoding it again and encoding it once more after the last shard.
 async fn collect_core_proofs(
     worker_client: impl WorkerClient,
     artifact_client: impl ArtifactClient,
-    result_artifact: Artifact,
+    result_tx: oneshot::Sender<Vec<Vec<u8>>>,
     context: TaskContext,
     mut core_proof_rx: MessageReceiver<ProofData>,
 ) -> Result<(), TaskError> {
@@ -701,20 +805,85 @@ async fn collect_core_proofs(
             tracing::error!("core proof task failed: {:?}", task_id);
             return Err(TaskError::Fatal(anyhow::anyhow!("core proof task failed: {:?}", task_id)));
         }
-        let proof = artifact_client
-            .download::<ShardProof<SP1GlobalContext, SP1PcsProofInner>>(&proof)
-            .await?;
-        shard_proofs.push(proof);
+        shard_proofs.push(download_shard_proof_bytes(&artifact_client, &proof).await?);
     }
-    shard_proofs.sort_by_key(|shard_proof| {
-        let public_values: &PublicValues<[_; 4], [_; 3], [_; 4], _> =
-            shard_proof.public_values.as_slice().borrow();
-        public_values.range()
-    });
-
-    artifact_client.upload(&result_artifact, shard_proofs).await?;
+    let _span =
+        tracing::debug_span!("hand over core proofs", shards = shard_proofs.len()).entered();
+    shard_proofs.sort_by_key(|(range, _)| *range);
+    // The receiver is gone only if the controller task itself is gone.
+    let _ = result_tx.send(shard_proofs.into_iter().map(|(_, bytes)| bytes).collect());
 
     Ok(())
+}
+
+/// Downloads a shard proof artifact as `ArtifactClient::download` would, but returns its range and
+/// its exact bincode encoding instead of the decoded proof.
+async fn download_shard_proof_bytes<A: ArtifactClient>(
+    artifact_client: &A,
+    proof: &Artifact,
+) -> anyhow::Result<(ShardRange, Vec<u8>)> {
+    let bytes = artifact_client.download_raw(proof, ArtifactType::UnspecifiedArtifactType).await?;
+    let decoded = tokio::task::spawn_blocking(move || shard_proof_bytes(bytes)).await??;
+    Ok(decoded)
+}
+
+/// Decodes a shard proof's bincode encoding (as `bincode::deserialize` does) and returns its range
+/// with bytes that are exactly the encoding of the proof, without trailing bytes.
+fn shard_proof_bytes(bytes: Vec<u8>) -> bincode::Result<(ShardRange, Vec<u8>)> {
+    use bincode::Options;
+
+    fn range(proof: &ShardProof<SP1GlobalContext, SP1PcsProofInner>) -> ShardRange {
+        let public_values: &PublicValues<[_; 4], [_; 3], [_; 4], _> =
+            proof.public_values.as_slice().borrow();
+        public_values.range()
+    }
+
+    // `bincode::serialize`'s options, but the whole input must be the proof.
+    let exact = bincode::DefaultOptions::new().with_fixint_encoding().reject_trailing_bytes();
+    match exact.deserialize::<ShardProof<SP1GlobalContext, SP1PcsProofInner>>(&bytes) {
+        Ok(proof) => Ok((range(&proof), bytes)),
+        // Trailing bytes (no writer produces them) or a bad encoding: decode as before, which
+        // returns the same error as before for a bad encoding, and re-encode a good one.
+        Err(_) => {
+            let proof: ShardProof<SP1GlobalContext, SP1PcsProofInner> =
+                bincode::deserialize(&bytes)?;
+            Ok((range(&proof), bincode::serialize(&proof)?))
+        }
+    }
+}
+
+/// The bincode encoding of
+/// `ProofFromNetwork { proof: SP1Proof::Core(shard_proofs), public_values, sp1_version }`, given the
+/// exact bincode encoding of each shard proof, so the proofs are not encoded again.
+///
+/// Bincode (fixint, as `bincode::serialize`) writes the enum variant index, then a `Vec` as its
+/// length (u64 LE) followed by its elements, then the remaining fields in order. The encoding of
+/// the same value with an empty `Vec` therefore only has to have the length patched and the
+/// elements inserted after it.
+fn encode_core_proof_from_network(
+    shard_proofs: &[Vec<u8>],
+    public_values: SP1PublicValues,
+    sp1_version: String,
+) -> bincode::Result<Vec<u8>> {
+    let empty = bincode::serialize(&ProofFromNetwork {
+        proof: SP1Proof::Core(Vec::new()),
+        public_values,
+        sp1_version,
+    })?;
+    // Variant index (u32), then the (zero) length of the empty `Vec`.
+    const LEN_OFFSET: usize = std::mem::size_of::<u32>();
+    const LEN_END: usize = LEN_OFFSET + std::mem::size_of::<u64>();
+    assert_eq!(empty[LEN_OFFSET..LEN_END], 0u64.to_le_bytes(), "unexpected core proof layout");
+
+    let len = empty.len() + shard_proofs.iter().map(Vec::len).sum::<usize>();
+    let mut data = Vec::with_capacity(len);
+    data.extend_from_slice(&empty[..LEN_OFFSET]);
+    data.extend_from_slice(&(shard_proofs.len() as u64).to_le_bytes());
+    for proof in shard_proofs {
+        data.extend_from_slice(proof);
+    }
+    data.extend_from_slice(&empty[LEN_END..]);
+    Ok(data)
 }
 
 #[derive(Clone)]
@@ -725,6 +894,26 @@ pub struct ControllerInputs {
     pub cycle_limit: Option<u64>,
     pub proof_nonce: Option<Artifact>,
     pub metadata: ControllerInputMetadata,
+}
+
+impl ControllerInputs {
+    /// The inputs of a controller task, in the order `TryFrom<&[Artifact]>` reads them: elf, stdin,
+    /// mode, cycle limit (empty for none) and proof nonce.
+    pub fn request_inputs(
+        elf: Artifact,
+        stdin: Artifact,
+        mode: ProofMode,
+        cycle_limit: Option<u64>,
+        proof_nonce: Artifact,
+    ) -> Vec<Artifact> {
+        vec![
+            elf,
+            stdin,
+            Artifact((mode as i32).to_string()),
+            Artifact(cycle_limit.map(|limit| limit.to_string()).unwrap_or_default()),
+            proof_nonce,
+        ]
+    }
 }
 
 impl TryFrom<&[String]> for ControllerInputs {
@@ -793,6 +982,29 @@ impl ControllerInputMetadata {
 mod tests {
     use super::*;
     use sp1_prover_types::InMemoryArtifactClient;
+
+    #[test]
+    fn request_inputs_parse_back_with_their_nonce_and_cycle_limit() {
+        let (elf, stdin, nonce) =
+            (Artifact("elf".into()), Artifact("stdin".into()), Artifact("nonce".into()));
+        for (cycle_limit, parsed_limit) in
+            [(None, None), (Some(0), Some(0)), (Some(1_000_000), Some(1_000_000))]
+        {
+            let inputs = ControllerInputs::request_inputs(
+                elf.clone(),
+                stdin.clone(),
+                ProofMode::Groth16,
+                cycle_limit,
+                nonce.clone(),
+            );
+            let parsed = ControllerInputs::try_from(inputs.as_slice()).unwrap();
+            assert_eq!(parsed.elf, elf);
+            assert_eq!(parsed.stdin_artifact, stdin);
+            assert_eq!(parsed.mode, ProofMode::Groth16);
+            assert_eq!(parsed.cycle_limit, parsed_limit);
+            assert_eq!(parsed.proof_nonce, Some(nonce.clone()));
+        }
+    }
 
     #[tokio::test]
     async fn a_first_delivery_executes() {
@@ -873,5 +1085,81 @@ mod tests {
         // duplicates get through, until they carry an identity of their own.
         assert!(!filter.seen(&proof_data("t1", ShardRange::precompile())));
         assert!(!filter.seen(&proof_data("t2", ShardRange::precompile())));
+    }
+
+    /// Distinct shard proofs, as in a real core proof, from the circuit's dummy proof.
+    fn shard_proofs(n: usize) -> Vec<ShardProof<SP1GlobalContext, SP1PcsProofInner>> {
+        use slop_algebra::AbstractField;
+        use sp1_core_machine::riscv::RiscvAir;
+        use sp1_primitives::{fri_params::core_fri_config, SP1Field};
+
+        let chips = RiscvAir::<SP1Field>::chips().into_iter().take(4).collect();
+        let proof = sp1_recursion_circuit::dummy::dummy_shard_proof(
+            chips,
+            10,
+            core_fri_config(),
+            8,
+            &[2, 2],
+            &[1, 1],
+        );
+        (0..n)
+            .map(|i| {
+                let mut proof = proof.clone();
+                for (j, value) in proof.public_values.iter_mut().enumerate() {
+                    *value = SP1Field::from_canonical_usize((i * 31 + j) % 1000);
+                }
+                proof.main_commitment[0] = SP1Field::from_canonical_usize(i + 1);
+                proof
+            })
+            .collect()
+    }
+
+    #[test]
+    fn spliced_core_proof_is_the_bincode_encoding_of_the_proof() {
+        for n in [0, 1, 3] {
+            let proofs = shard_proofs(n);
+            let encoded = proofs
+                .iter()
+                .map(|proof| shard_proof_bytes(bincode::serialize(proof).unwrap()).unwrap().1)
+                .collect::<Vec<_>>();
+            let public_values = SP1PublicValues::from(&[1u8, 2, 3, 4, 5][..]);
+            let spliced = encode_core_proof_from_network(
+                &encoded,
+                public_values.clone(),
+                SP1_CIRCUIT_VERSION.to_string(),
+            )
+            .unwrap();
+            let expected = bincode::serialize(&ProofFromNetwork {
+                proof: SP1Proof::Core(proofs),
+                public_values,
+                sp1_version: SP1_CIRCUIT_VERSION.to_string(),
+            })
+            .unwrap();
+            assert_eq!(spliced, expected, "{n} shard proofs");
+            let decoded: ProofFromNetwork = bincode::deserialize(&spliced).unwrap();
+            assert_eq!(decoded.sp1_version, SP1_CIRCUIT_VERSION);
+            assert!(matches!(decoded.proof, SP1Proof::Core(ref p) if p.len() == n));
+        }
+    }
+
+    #[test]
+    fn shard_proof_bytes_drop_trailing_bytes_and_keep_errors() {
+        let proof = shard_proofs(1).pop().unwrap();
+        let bytes = bincode::serialize(&proof).unwrap();
+        let (range, exact) = shard_proof_bytes(bytes.clone()).unwrap();
+        assert_eq!(exact, bytes);
+        let mut trailing = bytes.clone();
+        trailing.extend_from_slice(&[7, 7, 7]);
+        let (trailing_range, trimmed) = shard_proof_bytes(trailing).unwrap();
+        assert_eq!(trimmed, bytes);
+        assert_eq!(trailing_range, range);
+
+        let truncated = bytes[..bytes.len() - 1].to_vec();
+        let expected =
+            bincode::deserialize::<ShardProof<SP1GlobalContext, SP1PcsProofInner>>(&truncated)
+                .err()
+                .unwrap()
+                .to_string();
+        assert_eq!(shard_proof_bytes(truncated).err().unwrap().to_string(), expected);
     }
 }

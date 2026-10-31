@@ -14,6 +14,13 @@ use sp1_recursion_compiler::{
     ir::{Config, Witness},
 };
 
+/// Free GPU memory the GPU PLONK prover's helper needs at N = 2^25 (the v6.1.0 circuit). Measured
+/// on an RTX 5090 with the rest of the card taken: it proved with 23000 MiB free and ran out with
+/// 22000 MiB; the streamed quotient (cards under 20 GiB, and HIP) proved with 22000 MiB and ran out
+/// with 20000 MiB. So no card under 24 GB fits it, and a 32 GB card does only once the shard
+/// prover's memory pool gives its idle reserve back (~25 GiB free on an RTX 5090).
+pub const PLONK_GPU_HELPER_VRAM_BYTES: u64 = 23 << 30;
+
 /// Create a temp directory in /dev/shm (tmpfs) on Linux, falling back to the
 /// default temp dir on other platforms. Mirrors the helper in groth16_bn254.rs.
 #[cfg(feature = "native")]
@@ -30,39 +37,11 @@ fn shm_tempdir() -> tempfile::TempDir {
     tempfile::TempDir::new().expect("failed to create temp dir")
 }
 
-/// Create a named temp file in /dev/shm (tmpfs) on Linux.
-#[cfg(feature = "native")]
-fn shm_named_tempfile() -> tempfile::NamedTempFile {
-    #[cfg(target_os = "linux")]
-    {
-        let shm = std::path::Path::new("/dev/shm");
-        if shm.exists() {
-            return tempfile::Builder::new()
-                .tempfile_in(shm)
-                .expect("failed to create temp file in /dev/shm");
-        }
-    }
-    tempfile::NamedTempFile::new().expect("failed to create temp file")
-}
-
-/// Detect whether the parent process was built against the CUDA backend by
-/// probing `/proc/self/maps` for the loaded runtime library. Returns true
-/// iff `libcudart.so.*` is loaded. Falls back to `false` when the maps file
-/// cannot be read (non-Linux or sandboxed). Used to gate the Phase H GPU
-/// PLONK SCS solver dispatch (CUDA-only at present).
+/// Whether this process has the CUDA runtime loaded (`gpu_device::runtime_name`; false off
+/// Linux). Only logged, for the Phase H GPU PLONK SCS solver (CUDA-only at present).
 #[cfg(feature = "native")]
 fn detect_runtime_backend_is_cuda() -> bool {
-    match std::fs::read_to_string("/proc/self/maps") {
-        Ok(maps) => {
-            let cuda = maps.contains("libcudart.so");
-            // If CUDA runtime is present, treat as CUDA backend. Mixed
-            // (CUDA + HIP loaded) is unusual but CUDA-first is the safe
-            // default since the solver is CUDA-only at present and the
-            // helper falls back gracefully if it can't initialize.
-            cuda
-        }
-        Err(_) => false,
-    }
+    crate::gpu_device::runtime_name() == Some("CUDA")
 }
 
 /// Per-vk PLONK GPU data cache directory. Mirror of Groth16's `pk_cache_dir`.
@@ -85,95 +64,154 @@ fn plonk_gpu_cache_dir(vkey_hash_hex: &str) -> Option<std::path::PathBuf> {
     Some(std::path::PathBuf::from(root).join(format!("sp1_plonk_gpu_cache_{vkey_hash_hex}")))
 }
 
+/// [`plonk_gpu_cache_dir`] for the circuit in `build_dir`. `None` too where its vk is unreadable.
+#[cfg(feature = "native")]
+fn gpu_cache_dir_of(build_dir: &Path) -> Option<std::path::PathBuf> {
+    let vk_bin_bytes = std::fs::read(build_dir.join("plonk_vk.bin")).ok()?;
+    plonk_gpu_cache_dir(&hex::encode(Sha256::digest(vk_bin_bytes)))
+}
+
 #[cfg(feature = "native")]
 const PLONK_CACHE_SENTINEL: &str = ".sp1_plonk_gpu_cache_complete";
 
-/// Resolved gpu_dir for one prove, plus a flag indicating whether the
-/// caller needs to run the (expensive) PLONK PK export.
+/// The directory with the PLONK PK export (selectors, permutation polys, SRS Lagrange) the helper
+/// proves with, exporting it first where needed. Cached per vk (see [`plonk_gpu_cache_dir`]): built
+/// by one prover at a time and published complete, so a prover never reads, or deletes, one that
+/// another is still writing (`gpu_cache::ensure_built`). With the cache off, it goes in `scratch`.
 #[cfg(feature = "native")]
-struct ResolvedPlonkGpuDir {
-    /// The directory the caller should pass to the helper / load from.
-    path: std::path::PathBuf,
-    /// True iff a complete cache was found and PK export can be skipped.
-    cache_hit: bool,
-    /// The cache root, present when caching is enabled.
-    cache_dir: Option<std::path::PathBuf>,
-    /// RAII guard for the per-prove tempdir, only set when the cache is
-    /// disabled. Drop releases the tempdir.
-    _per_prove_tempdir: Option<tempfile::TempDir>,
+fn plonk_gpu_pk_dir(build_dir: &Path, vkey_hash_hex: &str, scratch: &Path) -> std::path::PathBuf {
+    let build_dir_str = build_dir.to_str().unwrap();
+    let export = |dir: &Path| {
+        tracing::info!("Exporting PLONK GPU data (cache miss)...");
+        let t0 = std::time::Instant::now();
+        crate::ffi::export_plonk_gpu_data(build_dir_str, dir.to_str().unwrap());
+        tracing::info!("PLONK PK export completed in {:?}", t0.elapsed());
+    };
+    let Some(cache_dir) = plonk_gpu_cache_dir(vkey_hash_hex) else {
+        let dir = scratch.join("pk");
+        std::fs::create_dir_all(&dir).expect("create the PLONK PK export directory");
+        export(&dir);
+        return dir;
+    };
+    let outcome = crate::gpu_cache::ensure_built(&cache_dir, PLONK_CACHE_SENTINEL, |staging| {
+        export(staging);
+        Ok(())
+    })
+    .unwrap_or_else(|e| panic!("PLONK GPU cache at {}: {e:#}", cache_dir.display()));
+    if outcome != crate::gpu_cache::CacheOutcome::Built {
+        tracing::info!("Using cached PLONK GPU export at {}", cache_dir.display());
+        remove_old_layout_witness(&cache_dir);
+    }
+    cache_dir
 }
 
+/// How recently written an old-layout cache's witness may be in use by a prover from before
+/// per-proof directories that still runs on this host.
 #[cfg(feature = "native")]
-fn resolve_plonk_gpu_dir(vkey_hash_hex: &str) -> ResolvedPlonkGpuDir {
-    let cache_dir = plonk_gpu_cache_dir(vkey_hash_hex);
-    if let Some(cdir) = cache_dir {
-        let sentinel = cdir.join(PLONK_CACHE_SENTINEL);
-        if sentinel.exists() {
-            tracing::info!(
-                "Using cached PLONK GPU export at {} (sentinel present)",
-                cdir.display()
-            );
-            ResolvedPlonkGpuDir {
-                path: cdir.clone(),
-                cache_hit: true,
-                cache_dir: Some(cdir),
-                _per_prove_tempdir: None,
-            }
-        } else {
-            if cdir.exists() {
-                tracing::warn!(
-                    "Removing partial PLONK GPU cache at {} (no sentinel)",
-                    cdir.display()
-                );
-                let _ = std::fs::remove_dir_all(&cdir);
-            }
-            std::fs::create_dir_all(&cdir).expect("create PLONK GPU cache dir");
-            ResolvedPlonkGpuDir {
-                path: cdir.clone(),
-                cache_hit: false,
-                cache_dir: Some(cdir),
-                _per_prove_tempdir: None,
-            }
+const OLD_LAYOUT_WITNESS_IN_USE: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// Removes the solved witness of the last proof from a cache in the layout before per-proof
+/// directories, which wrote each proof's witness (~4 GiB at the wrap circuit's size) into the
+/// cache, where nothing removes it now. Such a cache's marker lists no files (`ok`); the files are
+/// the ones `ExportSolvedWitness` writes. One written in the last [`OLD_LAYOUT_WITNESS_IN_USE`]
+/// may be a running older prover's, and is left.
+#[cfg(feature = "native")]
+fn remove_old_layout_witness(cache_dir: &Path) {
+    let marker = std::fs::read_to_string(cache_dir.join(PLONK_CACHE_SENTINEL)).unwrap_or_default();
+    if marker.trim() != "ok" {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(cache_dir) else { return };
+    let mut removed = 0;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        let witness = matches!(
+            &*name,
+            "witness_l.bin" | "witness_r.bin" | "witness_o.bin" | "witness_info.bin"
+        ) || name.starts_with("bsb22_poly_")
+            || name.starts_with("bsb22_commitment_");
+        let Ok(meta) = entry.metadata() else { continue };
+        let in_use = meta
+            .modified()
+            .ok()
+            .and_then(|modified| modified.elapsed().ok())
+            .is_none_or(|age| age < OLD_LAYOUT_WITNESS_IN_USE);
+        if witness && !in_use && std::fs::remove_file(entry.path()).is_ok() {
+            removed += meta.len();
         }
+    }
+    if removed > 0 {
+        tracing::info!(
+            "removed {} MiB of an earlier proof's witness from the PLONK GPU cache at {}",
+            removed >> 20,
+            cache_dir.display()
+        );
+    }
+}
+
+/// Locates the `plonk_gpu_helper` binary: at `SP1_PLONK_GPU_HELPER` when that is set (and only
+/// there), else next to this executable, else on `PATH` (see `cpu_helper::find_executable`).
+#[cfg(feature = "native")]
+fn find_plonk_helper() -> Option<std::path::PathBuf> {
+    crate::cpu_helper::find_executable("plonk_gpu_helper", Some("SP1_PLONK_GPU_HELPER"))
+}
+
+/// The devices `SP1_PLONK_GPU_HELPER_DEVICES` gives the GPU PLONK helper (a
+/// `CUDA_VISIBLE_DEVICES`/`HIP_VISIBLE_DEVICES` value for the helper only), if it names any.
+#[cfg(feature = "native")]
+pub fn plonk_helper_devices() -> Option<String> {
+    let devices = std::env::var("SP1_PLONK_GPU_HELPER_DEVICES").ok()?;
+    let devices = devices.trim();
+    (!devices.is_empty()).then(|| devices.to_string())
+}
+
+/// Whether `SP1_PLONK_GPU_HELPER_DEVICES` puts the GPU PLONK helper on another card than this
+/// process's; see [`helper_shares_card`].
+#[cfg(feature = "native")]
+pub fn plonk_helper_routed() -> bool {
+    let Some(devices) = plonk_helper_devices() else { return false };
+    !helper_shares_card(&devices, &own_device_lists())
+}
+
+/// The visible-devices lists that place this process on its card, as its runtime reads them: CUDA
+/// reads `CUDA_VISIBLE_DEVICES`; HIP reads `HIP_VISIBLE_DEVICES`, or `CUDA_VISIBLE_DEVICES` where
+/// that is unset or empty. Both where the runtime is not known (not loaded yet, or linked
+/// statically, as on Windows). (The helper is given its list as both.)
+#[cfg(feature = "native")]
+fn own_device_lists() -> Vec<String> {
+    let var = |name| std::env::var(name).ok().filter(|list: &String| !list.trim().is_empty());
+    let (cuda, hip) = (var("CUDA_VISIBLE_DEVICES"), var("HIP_VISIBLE_DEVICES"));
+    match crate::gpu_device::runtime_name() {
+        Some("CUDA") => cuda.into_iter().collect(),
+        Some(_) => hip.or(cuda).into_iter().collect(),
+        None => cuda.into_iter().chain(hip).collect(),
+    }
+}
+
+/// Whether a GPU PLONK helper given `devices` (`SP1_PLONK_GPU_HELPER_DEVICES`) proves on this
+/// process's card, which the visible-devices lists `own` place it on (see [`own_device_lists`]).
+/// Each proves on the first device its list names, this process on device 0 where it has no list;
+/// an empty `devices` leaves the helper this process's devices, and one whose first entry is empty
+/// names no device the runtime can use, so not this card. (A device named by index in one list and
+/// by UUID in the other cannot be matched, and counts as another card.) `stream.cu`'s
+/// `plonkHelperOnThisCard` follows the same rule.
+#[cfg(feature = "native")]
+fn helper_shares_card(devices: &str, own: &[String]) -> bool {
+    let first = |list: &str| list.split(',').next().unwrap_or_default().trim().to_string();
+    if devices.trim().is_empty() {
+        return true;
+    }
+    let helper = first(devices);
+    if helper.is_empty() {
+        return false;
+    }
+    let own: Vec<String> = own.iter().map(|list| first(list)).filter(|d| !d.is_empty()).collect();
+    if own.is_empty() {
+        helper == "0"
     } else {
-        let td = shm_tempdir();
-        let path = td.path().to_path_buf();
-        ResolvedPlonkGpuDir {
-            path,
-            cache_hit: false,
-            cache_dir: None,
-            _per_prove_tempdir: Some(td),
-        }
+        own.contains(&helper)
     }
-}
-
-#[cfg(feature = "native")]
-fn mark_plonk_cache_complete(resolved: &ResolvedPlonkGpuDir) {
-    if let Some(ref cdir) = resolved.cache_dir {
-        if let Err(e) = std::fs::write(cdir.join(PLONK_CACHE_SENTINEL), b"ok\n") {
-            tracing::warn!("failed to write PLONK GPU cache sentinel: {e}");
-        }
-    }
-}
-
-/// Locate the `plonk_gpu_helper` subprocess binary. Priority:
-///   1. `SP1_PLONK_GPU_HELPER` env var (absolute path)
-///   2. Alongside the current executable
-///   3. `$PATH` lookup
-#[cfg(feature = "native")]
-fn resolve_plonk_helper_path(name: &str) -> std::path::PathBuf {
-    if let Ok(p) = std::env::var("SP1_PLONK_GPU_HELPER") {
-        return std::path::PathBuf::from(p);
-    }
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            let candidate = dir.join(name);
-            if candidate.exists() {
-                return candidate;
-            }
-        }
-    }
-    std::path::PathBuf::from(name)
 }
 
 // =====================================================================
@@ -469,6 +507,53 @@ impl PlonkBn254Prover {
         proof
     }
 
+    /// Whether the `plonk_gpu_helper` binary that [`Self::prove_gpu_subprocess`] spawns can be
+    /// found (`SP1_PLONK_GPU_HELPER`, next to this executable, then `$PATH`).
+    #[cfg(feature = "native")]
+    pub fn gpu_helper_available() -> bool {
+        find_plonk_helper().is_some()
+    }
+
+    /// Whether this circuit's GPU-format proving key is already exported (14 GB, under `/dev/shm`
+    /// unless `SP1_PLONK_GPU_CACHE` says otherwise), so that [`Self::prove_gpu_subprocess`] skips
+    /// the one-time export. Read-only, unlike the resolution the prover does. Always false when the
+    /// cache is disabled, or the circuit's vk is unreadable.
+    #[cfg(feature = "native")]
+    pub fn gpu_pk_cache_ready(build_dir: &Path) -> bool {
+        gpu_cache_dir_of(build_dir).is_some_and(|dir| dir.join(PLONK_CACHE_SENTINEL).is_file())
+    }
+
+    /// Removes an earlier proof's solved witness that this circuit's GPU cache holds from before
+    /// per-proof witness directories (see `remove_old_layout_witness`): ~4 GiB of host memory that
+    /// the decision whether the GPU prover fits would otherwise count as taken.
+    #[cfg(feature = "native")]
+    pub fn remove_stale_gpu_witness(build_dir: &Path) {
+        if let Some(dir) = gpu_cache_dir_of(build_dir) {
+            remove_old_layout_witness(&dir);
+        }
+    }
+
+    /// Whether a `SP1_PLONK_GPU_SERVER` helper from an earlier proof still runs (or proves now)
+    /// that this circuit's next proof would use, so that it holds most of the host memory that
+    /// proof needs. A kept helper that proof cannot use is shut down, so that the memory the proof
+    /// measures next is not held for nothing: one for another key (server mode needs the GPU
+    /// cache: each proof's key would otherwise be in a directory of its own).
+    #[cfg(feature = "native")]
+    pub fn keep_usable_gpu_helper_server(build_dir: &Path) -> bool {
+        if !crate::plonk_helper_server::enabled() {
+            return false;
+        }
+        crate::plonk_helper_server::keep_only_for(gpu_cache_dir_of(build_dir).as_deref())
+    }
+
+    /// Shuts down a kept `SP1_PLONK_GPU_SERVER` helper: for a proof that goes to gnark's CPU
+    /// prover, which needs the ~71 GB of host memory the helper holds. A helper another proof is
+    /// proving with stays, as a proof deciding meanwhile may count on it.
+    #[cfg(feature = "native")]
+    pub fn shut_down_gpu_helper_server() {
+        crate::plonk_helper_server::keep_only_for(None);
+    }
+
     /// Subprocess-isolated GPU PLONK prove. Spawns the `plonk_gpu_helper`
     /// binary so the GPU PLONK prover runs in a clean process that does NOT
     /// inherit HIP/CUDA state from the caller (sp1-prover's recursion task
@@ -486,36 +571,27 @@ impl PlonkBn254Prover {
         witness: Witness<C>,
         build_dir: &Path,
     ) -> PlonkBn254Proof {
-        use crate::ffi::{export_plonk_gpu_data, export_plonk_gpu_witness};
-
-        // Step 1: write witness JSON (CPU-only, no HIP/CUDA).
-        let mut witness_file = shm_named_tempfile();
-        let gnark_witness = GnarkWitness::new(witness);
-        let serialized = serde_json::to_string(&gnark_witness).unwrap();
-        witness_file.write_all(serialized.as_bytes()).unwrap();
-
         let vkey_hash = Self::get_vkey_hash(build_dir);
         let vkey_hash_hex = hex::encode(vkey_hash);
+
+        // Step 1: this proof's files (the witness JSON, the solved witness, the helper's proof) go
+        // in a directory of its own, swept if this prover dies before removing it. (Into the
+        // shared PK cache, a concurrent proof of the same circuit would overwrite them while the
+        // helper reads them.) It goes beside the cache, as Groth16's does: where
+        // SP1_PLONK_GPU_CACHE puts it, out of a small /dev/shm.
+        let cache = plonk_gpu_cache_dir(&vkey_hash_hex);
+        let scratch = crate::gpu_cache::proof_tempdir_beside(cache.as_deref(), "sp1_plonk_gpu_")
+            .expect("failed to create a scratch directory for the PLONK witness");
+        let witness_json = scratch.path().join("witness.json");
+        std::fs::write(&witness_json, serde_json::to_string(&GnarkWitness::new(witness)).unwrap())
+            .expect("failed to write the witness");
 
         // Step 2: Go shell-out to export PLONK GPU data + solve witness in
         // GPU-friendly layout (CPU-only, no GPU state). The PLONK PK export
         // is cached per-vk under /dev/shm; the per-proof witness data is
-        // re-derived every prove (depends on the witness).
-        let resolved = resolve_plonk_gpu_dir(&vkey_hash_hex);
-        let gpu_dir_path = resolved.path.clone();
-        let gpu_dir_str = gpu_dir_path.to_str().unwrap();
+        // re-derived every prove (depends on the witness), into the scratch directory.
+        let gpu_dir_path = plonk_gpu_pk_dir(build_dir, &vkey_hash_hex, scratch.path());
         let build_dir_str = build_dir.to_str().unwrap();
-
-        if !resolved.cache_hit {
-            tracing::info!("Exporting PLONK GPU data (cache miss)...");
-            let t0 = std::time::Instant::now();
-            export_plonk_gpu_data(build_dir_str, gpu_dir_str);
-            tracing::info!(
-                "PLONK PK export completed in {:?}; writing cache sentinel",
-                t0.elapsed()
-            );
-            mark_plonk_cache_complete(&resolved);
-        }
 
         // Phase H: when SP1_GPU_PLONK_SOLVER=gpu is set on a CUDA backend,
         // skip the gnark.spr.Solve shell-out and prepare the GPU SCS solver
@@ -539,7 +615,7 @@ impl PlonkBn254Prover {
             );
         }
         let gpu_solver_inputs = if want_gpu_solver {
-            try_prepare_gpu_plonk_inputs(build_dir, &vkey_hash_hex, witness_file.path())
+            try_prepare_gpu_plonk_inputs(build_dir, &vkey_hash_hex, &witness_json)
         } else {
             None
         };
@@ -547,10 +623,10 @@ impl PlonkBn254Prover {
         if gpu_solver_inputs.is_none() {
             tracing::info!("Solving PLONK SCS and exporting witness (gnark.spr.Solve)...");
             let t0 = std::time::Instant::now();
-            export_plonk_gpu_witness(
+            crate::ffi::export_plonk_gpu_witness(
                 build_dir_str,
-                witness_file.path().to_str().unwrap(),
-                gpu_dir_str,
+                witness_json.to_str().unwrap(),
+                scratch.path().to_str().unwrap(),
             );
             tracing::info!("PLONK witness export completed in {:?}", t0.elapsed());
         } else {
@@ -558,30 +634,43 @@ impl PlonkBn254Prover {
         }
 
         // Step 3: invoke the helper subprocess.
-        let helper_path = resolve_plonk_helper_path("plonk_gpu_helper");
-        let out_file = shm_named_tempfile();
+        let helper_path = find_plonk_helper().unwrap_or_else(|| {
+            panic!(
+                "plonk_gpu_helper not found at SP1_PLONK_GPU_HELPER, next to this binary, or on \
+                 PATH. Build it (cargo build --release -p sp1-recursion-gnark-ffi --features \
+                 native,cuda) or set SP1_PLONK_GPU_HELPER to its path."
+            )
+        });
+        let out_path = scratch.path().join("proof.json");
 
-        // The helper needs ~24 GB of VRAM at N=2^25, which a prover keeping its shard-prover
-        // state on the card does not have free. Only a process that exits after this proof may
-        // reset its GPU to make room (`SP1_GPU_RESET_BEFORE_WRAP=1`; see `gpu_device`).
-        crate::gpu_device::reset_if_requested("PLONK (GPU)");
+        // Operators can route the helper to a different GPU via SP1_PLONK_GPU_HELPER_DEVICES
+        // (a CUDA_VISIBLE_DEVICES / HIP_VISIBLE_DEVICES value for the helper subprocess only). On a multi-GPU box this is the most reliable way to give it room; the
+        // standalone helper validated at 17-19 s on a clean GPU.
+        let helper_devices_override = plonk_helper_devices();
+        // A helper on other cards needs no room made on this one. A `SP1_PLONK_GPU_SERVER` helper
+        // kept from an earlier proof does: idle, it holds ~0.8 GiB, and it allocates its working
+        // memory again for each proof.
+        let on_this_card = !plonk_helper_routed();
 
-        // Even a reset is not always sufficient (the parent's CUDA driver context
-        // may retain pooled memory until the host process exits). Operators
-        // can route the helper to a different GPU via SP1_PLONK_GPU_HELPER_DEVICES
-        // (semicolon-separated CUDA_VISIBLE_DEVICES / HIP_VISIBLE_DEVICES
-        // override for the helper subprocess only). On a multi-GPU box this
-        // is the most reliable mitigation; the standalone helper validated
-        // at 17-19 s on a clean GPU.
-        let helper_devices_override = std::env::var("SP1_PLONK_GPU_HELPER_DEVICES").ok();
+        // The helper needs PLONK_GPU_HELPER_VRAM_BYTES of GPU memory, which a prover keeping its
+        // shard-prover state on the card has free only on a 32 GB card, once its memory pool's
+        // idle reserve is given back. Only a process that exits after this proof may reset its
+        // GPU to make room (`SP1_GPU_RESET_BEFORE_WRAP=1`; see `gpu_device`), and it does only
+        // where the helper runs on this card and would not fit otherwise. The reset frees what
+        // this process holds, its keys too, but not what other processes hold on the card.
+        let reset = on_this_card
+            && crate::gpu_device::reset_if_requested("PLONK (GPU)", PLONK_GPU_HELPER_VRAM_BYTES);
 
-        // Log free VRAM, so operators can see whether the helper has room (after a reset, give
-        // the driver a moment to return the memory first).
-        if crate::gpu_device::reset_requested() {
+        // After a reset, give the driver a moment to return the memory. Log the free VRAM a helper
+        // on this card has, so operators can see whether it has room; not after a reset (this
+        // attempt's, or an earlier one's in this process), where measuring would start a new
+        // context on the device, which keeps some of the memory the helper needs.
+        if reset {
             std::thread::sleep(std::time::Duration::from_millis(500));
-        }
-        if let Some(free) = crate::gpu_device::free_memory() {
-            tracing::info!("[plonk] {} MiB of GPU memory is free for the helper", free >> 20);
+        } else if on_this_card && !crate::gpu_device::was_reset() {
+            if let Some(free) = crate::gpu_device::free_memory() {
+                tracing::info!("[plonk] {} MiB of GPU memory is free for the helper", free >> 20);
+            }
         }
 
         // Phase 1 long-lived server mode (opt-in, default OFF). When
@@ -589,7 +678,9 @@ impl PlonkBn254Prover {
         // keeps the helper subprocess alive across multiple proves in the
         // same parent process, amortising PK + PlonkProver + Phase H SCS
         // state init. Falls back to one-shot subprocess on any error.
-        if crate::plonk_helper_server::enabled() {
+        // Not with the GPU cache off, where the key is in this proof's scratch directory: no later
+        // proof could use the server.
+        if crate::plonk_helper_server::enabled() && cache.is_some() {
             let mut extra_env: Vec<(String, String)> = Vec::new();
             if std::env::var_os("SP1_GPU_GLV").is_none() {
                 extra_env.push(("SP1_GPU_GLV".to_string(), "0".to_string()));
@@ -611,9 +702,10 @@ impl PlonkBn254Prover {
                 &gpu_dir_path,
                 prep_dir_for_server.as_deref(),
                 &extra_env,
-                witness_file.path(),
+                &witness_json,
+                scratch.path(),
                 &vkey_hash_hex,
-                out_file.path(),
+                &out_path,
                 witness_init_dir_for_server.as_deref(),
             ) {
                 Ok(outcome) => {
@@ -623,7 +715,7 @@ impl PlonkBn254Prover {
                         outcome.proof_size,
                         t0.elapsed(),
                     );
-                    let proof_bytes = std::fs::read(out_file.path()).unwrap();
+                    let proof_bytes = std::fs::read(&out_path).unwrap();
                     return serde_json::from_slice(&proof_bytes).unwrap_or_else(|e| {
                         panic!("failed to parse helper's PlonkBn254Proof JSON: {e}");
                     });
@@ -637,7 +729,6 @@ impl PlonkBn254Prover {
             }
         }
 
-        tracing::info!("Spawning GPU PLONK subprocess: {helper_path:?}");
         // Force GLV off for the PLONK helper.
         //
         // Unlike the GPU Groth16 path (which has a validated HIP GLV
@@ -656,52 +747,73 @@ impl PlonkBn254Prover {
         // Until PLONK GLV is independently validated, force it off in both
         // backends. Operators can opt back in by setting SP1_GPU_GLV=1 /
         // SP1_GPU_G2_GLV=1 in the parent's environment.
-        let mut cmd = std::process::Command::new(&helper_path);
-        cmd.arg("--gpu-dir")
-            .arg(&gpu_dir_path)
-            .arg("--witness-json")
-            .arg(witness_file.path())
-            .arg("--vkey-hash-hex")
-            .arg(&vkey_hash_hex)
-            .arg("--out")
-            .arg(out_file.path());
-        // Phase H: when the GPU SCS solver was prepared above, pipe its
-        // inputs through to the helper so it builds witness data in-process
-        // instead of disk-loading the (skipped) gnark.spr.Solve outputs.
-        if let Some((ref prep_dir, ref witness_init_td)) = gpu_solver_inputs {
-            cmd.arg("--prep-circuit-dir").arg(prep_dir);
-            cmd.arg("--witness-init-dir").arg(witness_init_td.path());
-        }
-        if std::env::var_os("SP1_GPU_GLV").is_none() {
-            cmd.env("SP1_GPU_GLV", "0");
-        }
-        if std::env::var_os("SP1_GPU_G2_GLV").is_none() {
-            cmd.env("SP1_GPU_G2_GLV", "0");
-        }
-        if let Some(devs) = helper_devices_override.as_deref() {
-            // Overrides apply ONLY to the helper subprocess. The parent's
-            // CUDA_VISIBLE_DEVICES is left intact.
-            cmd.env("CUDA_VISIBLE_DEVICES", devs);
-            cmd.env("HIP_VISIBLE_DEVICES", devs);
-            tracing::info!(
+        let helper_command = || {
+            let mut cmd = std::process::Command::new(&helper_path);
+            cmd.arg("--gpu-dir")
+                .arg(&gpu_dir_path)
+                .arg("--witness-json")
+                .arg(&witness_json)
+                .arg("--witness-dir")
+                .arg(scratch.path())
+                .arg("--vkey-hash-hex")
+                .arg(&vkey_hash_hex)
+                .arg("--out")
+                .arg(&out_path);
+            // Phase H: when the GPU SCS solver was prepared above, pipe its
+            // inputs through to the helper so it builds witness data in-process
+            // instead of disk-loading the (skipped) gnark.spr.Solve outputs.
+            if let Some((ref prep_dir, ref witness_init_td)) = gpu_solver_inputs {
+                cmd.arg("--prep-circuit-dir").arg(prep_dir);
+                cmd.arg("--witness-init-dir").arg(witness_init_td.path());
+            }
+            if std::env::var_os("SP1_GPU_GLV").is_none() {
+                cmd.env("SP1_GPU_GLV", "0");
+            }
+            if std::env::var_os("SP1_GPU_G2_GLV").is_none() {
+                cmd.env("SP1_GPU_G2_GLV", "0");
+            }
+            if let Some(devs) = helper_devices_override.as_deref() {
+                // Overrides apply ONLY to the helper subprocess. The parent's
+                // CUDA_VISIBLE_DEVICES is left intact.
+                cmd.env("CUDA_VISIBLE_DEVICES", devs);
+                cmd.env("HIP_VISIBLE_DEVICES", devs);
+                tracing::info!(
                 "[plonk] Routing GPU PLONK helper to devices: {devs} (via SP1_PLONK_GPU_HELPER_DEVICES)"
             );
-        }
+            }
+            cmd
+        };
         // Bound to this prover and its final-wrap slot, and timed out if it hangs; see
         // `subprocess`.
-        let finished = crate::subprocess::run(cmd, "plonk_gpu_helper").unwrap_or_else(|e| {
-            panic!(
-                "GPU PLONK helper {helper_path:?}: {e:#}. Either build the `plonk_gpu_helper` \
-                 binary (cargo build --release -p sp1-recursion-gnark-ffi --features native,cuda) \
-                 or set SP1_PLONK_GPU_HELPER to its path."
+        let run_helper = || {
+            tracing::info!("Spawning GPU PLONK subprocess: {helper_path:?}");
+            crate::subprocess::run(helper_command(), "plonk_gpu_helper")
+                .unwrap_or_else(|e| panic!("GPU PLONK helper {helper_path:?}: {e:#}"))
+        };
+        let mut finished = run_helper();
+        // A helper that failed beside this process's state, which the measurement said it had
+        // room for, gets the card to itself once (SP1_GPU_RESET_BEFORE_WRAP), if it may have run
+        // out of GPU memory.
+        if on_this_card
+            && crate::gpu_device::reset_after_failed_helper(
+                "PLONK (GPU)",
+                PLONK_GPU_HELPER_VRAM_BYTES,
+                &finished,
             )
-        });
+        {
+            tracing::warn!(
+                "GPU PLONK helper failed ({}); running it again on the reset GPU",
+                finished.describe()
+            );
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            finished = run_helper();
+        }
         if !finished.status.success() {
             panic!("GPU PLONK helper failed: {}", finished.describe());
         }
 
         // Step 4: read the helper's proof JSON and return.
-        let proof_bytes = std::fs::read(out_file.path()).unwrap();
+        let proof_bytes = std::fs::read(&out_path).unwrap();
         serde_json::from_slice(&proof_bytes).unwrap_or_else(|e| {
             panic!("failed to parse helper's PlonkBn254Proof JSON: {e}");
         })
@@ -743,5 +855,71 @@ impl PlonkBn254Prover {
 impl Default for PlonkBn254Prover {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(all(test, feature = "native"))]
+mod tests {
+    use super::*;
+
+    /// The helper shares this process's card where both prove on the same first device.
+    #[test]
+    fn a_helper_shares_the_card_of_its_first_device() {
+        let own = |lists: &[&str]| lists.iter().map(|list| list.to_string()).collect::<Vec<_>>();
+        assert!(helper_shares_card("", &own(&["1"])));
+        assert!(helper_shares_card("  ", &own(&["1"])));
+        assert!(helper_shares_card("0", &own(&[])));
+        assert!(helper_shares_card(" 0 ", &own(&[])));
+        assert!(!helper_shares_card("1", &own(&[])));
+        assert!(helper_shares_card("0", &own(&["0,1"])));
+        assert!(helper_shares_card("1 ", &own(&["1"])));
+        assert!(!helper_shares_card("1", &own(&["0,1"])));
+        assert!(!helper_shares_card("0,1", &own(&["1,0"])));
+        assert!(helper_shares_card("0", &own(&[""])));
+        // A list naming no device first gives the helper none: not this card.
+        assert!(!helper_shares_card(",1", &own(&["0"])));
+        assert!(!helper_shares_card(" ,0", &own(&[])));
+    }
+
+    /// This process's card is placed by the list its runtime reads.
+    #[test]
+    fn the_runtime_decides_which_list_places_this_process() {
+        let _env = crate::test_env::lock();
+        let _cuda = crate::test_env::set_var("CUDA_VISIBLE_DEVICES", "0");
+        let _hip = crate::test_env::set_var("HIP_VISIBLE_DEVICES", "1");
+        let lists = own_device_lists();
+        match crate::gpu_device::runtime_name() {
+            Some("CUDA") => assert_eq!(lists, ["0"]),
+            Some(_) => assert_eq!(lists, ["1"]),
+            None => assert_eq!(lists, ["0", "1"]),
+        }
+    }
+
+    /// A cache in the layout before per-proof directories loses an earlier proof's witness, and
+    /// keeps its key; a cache with a manifest is left alone.
+    #[test]
+    fn an_old_layout_cache_loses_its_last_witness() {
+        let dir = tempfile::tempdir().unwrap();
+        let files = ["trace_ql.bin", "witness_l.bin", "witness_info.bin", "bsb22_poly_0.bin"];
+        let age = |file: &str, age: std::time::Duration| {
+            let file = std::fs::File::options().write(true).open(dir.path().join(file)).unwrap();
+            file.set_modified(std::time::SystemTime::now() - age).unwrap();
+        };
+        for file in files {
+            std::fs::write(dir.path().join(file), b"x").unwrap();
+            age(file, OLD_LAYOUT_WITNESS_IN_USE * 2);
+        }
+        std::fs::write(dir.path().join(PLONK_CACHE_SENTINEL), "1 trace_ql.bin\n").unwrap();
+        remove_old_layout_witness(dir.path());
+        assert!(files.iter().all(|file| dir.path().join(file).exists()));
+        std::fs::write(dir.path().join(PLONK_CACHE_SENTINEL), "ok\n").unwrap();
+        // One an older prover wrote just now may still be in use.
+        std::fs::write(dir.path().join("witness_r.bin"), b"x").unwrap();
+        remove_old_layout_witness(dir.path());
+        assert!(dir.path().join("trace_ql.bin").exists());
+        for file in &files[1..] {
+            assert!(!dir.path().join(file).exists(), "{file} was kept");
+        }
+        assert!(dir.path().join("witness_r.bin").exists(), "a recent witness was removed");
     }
 }

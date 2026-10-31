@@ -19,6 +19,32 @@ extern "C" {
 
     pub fn cuda_mem_get_info(free: *mut usize, total: *mut usize) -> CudaRustError;
 
+    /// Frees the device allocator's cached blocks (HIP and SYCL; nothing on CUDA), after waiting
+    /// for the device: to the driver, or with HIP's arena back to the arena.
+    pub fn cuda_release_cached_memory();
+
+    /// The device memory HIP's arena holds, free or not (0 without an arena, and on CUDA and SYCL).
+    pub fn sp1_hip_arena_bytes() -> usize;
+
+    /// 1 where HIP's arena assembles blocks from scattered pages, so that fragmentation no longer
+    /// decides what fits (Linux, with the arena on and virtual memory management); else 0, and on
+    /// CUDA and SYCL.
+    pub fn sp1_hip_arena_scatters() -> u32;
+
+    /// The video memory budget Windows grants this process on its device (DXGI), in bytes: 0
+    /// where unknown, which is everywhere but HIP on Windows.
+    pub fn sp1_video_memory_budget() -> u64;
+
+    /// 1 on HIP when the device runs 64-wide wavefronts (CDNA, e.g. the MI300X), else 0: RDNA,
+    /// CUDA, SYCL, or no device.
+    pub fn sp1_hip_wave64() -> u32;
+
+    /// Frees every block `cuda_malloc_async` handed out that is still live, once the device is
+    /// idle, and makes `cuda_free_async` a no-op from then on; returns the bytes freed. Only for a
+    /// process about to reset its device and use it no more: `cudaDeviceReset` does not free
+    /// stream-ordered allocations. Nothing on HIP (whose blocks a reset frees) and SYCL.
+    pub fn cuda_free_live_blocks() -> usize;
+
     pub fn cuda_get_device_name(name: *mut c_char, len: usize) -> CudaRustError;
 
     pub fn cuda_sm_count(count: *mut i32) -> CudaRustError;
@@ -28,6 +54,8 @@ extern "C" {
     pub fn sp1_profile_flush();
 
     pub fn cuda_malloc_host(ptr: *mut *mut c_void, count: usize) -> CudaRustError;
+    pub fn cuda_malloc_host_huge(ptr: *mut *mut c_void, count: usize) -> CudaRustError;
+    pub fn cuda_free_host_huge(ptr: *const c_void, count: usize) -> CudaRustError;
     pub fn cuda_host_register(ptr: *const c_void, count: usize) -> CudaRustError;
     pub fn cuda_free_host(ptr: *const c_void) -> CudaRustError;
     pub fn cuda_host_unregister(ptr: *const c_void) -> CudaRustError;

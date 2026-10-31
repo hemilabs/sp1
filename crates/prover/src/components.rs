@@ -170,6 +170,21 @@ pub trait SP1ProverComponents: Send + Sync + 'static + Sized {
     fn wrap_verifier() -> MachineVerifier<SP1OuterGlobalContext, WrapSC> {
         <Self::WrapProver as WrapProver>::wrap_verifier()
     }
+
+    /// Whether the core prover's trace generation generates the dependencies of the chips whose
+    /// `dependencies_in_trace` holds (for records with `dependencies_in_trace` set), so that the
+    /// workers generate the dependencies without them.
+    fn dependencies_in_trace() -> bool {
+        false
+    }
+
+    /// How many core setups must agree on the verifying key before a proof uses it, unless
+    /// `SP1_CORE_SETUP_CHECKS` says otherwise: a check for setups that went wrong on a device
+    /// (see `checked_core_setup`), which costs a setup per proof. One by default: a CPU setup has
+    /// no device to go wrong on.
+    fn core_setup_checks() -> usize {
+        1
+    }
 }
 
 pub struct CpuSP1ProverComponents;

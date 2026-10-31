@@ -32,7 +32,7 @@ pub(crate) mod gpu_ntt {
     /// Cached GPU buffer to avoid per-call cuda_malloc/cuda_free.
     /// The buffer grows as needed but is never shrunk, amortizing allocation
     /// across the ~31 NTT calls in a PLONK proof (saves ~10-15s of overhead).
-    struct GpuBuffer {
+    pub(crate) struct GpuBuffer {
         ptr: *mut c_void,
         capacity_bytes: usize,
     }
@@ -43,13 +43,22 @@ pub(crate) mod gpu_ntt {
     static BUFFER_CACHE: LazyLock<Mutex<GpuBuffer>> =
         LazyLock::new(|| Mutex::new(GpuBuffer { ptr: std::ptr::null_mut(), capacity_bytes: 0 }));
 
-    /// Get or grow the cached GPU buffer to at least `needed_bytes`.
-    pub(crate) fn get_device_buffer(needed_bytes: usize) -> *mut c_void {
-        let mut buf = BUFFER_CACHE.lock().unwrap();
+    /// Locks the cached GPU buffer, grown to at least `needed_bytes`. Hold the guard for as long
+    /// as the buffer is in use: another thread's NTT would otherwise write the same buffer, or
+    /// grow it (freeing this one) mid-operation.
+    pub(crate) fn lock_device_buffer(
+        needed_bytes: usize,
+    ) -> std::sync::MutexGuard<'static, GpuBuffer> {
+        // A panic mid-operation (a failed GPU call) leaves the pointer and capacity consistent,
+        // so a poisoned lock is still usable.
+        let mut buf = BUFFER_CACHE.lock().unwrap_or_else(|e| e.into_inner());
         if needed_bytes > buf.capacity_bytes {
-            // Free old buffer if exists
+            // Free old buffer if exists, and forget it before the allocation that may fail: a
+            // panic there must not leave a freed pointer for the next locker to use or free again.
             if !buf.ptr.is_null() {
                 unsafe { sp1_gpu_sys::runtime::cuda_free(buf.ptr) };
+                buf.ptr = std::ptr::null_mut();
+                buf.capacity_bytes = 0;
             }
             // Round up to 256 MiB granularity (not power-of-two which wastes up to
             // 50% and can cause OOM on 24 GiB GPUs with multiple device buffers).
@@ -64,7 +73,7 @@ pub(crate) mod gpu_ntt {
             buf.ptr = d_ptr;
             buf.capacity_bytes = alloc_bytes;
         }
-        buf.ptr
+        buf
     }
 
     /// Run a GPU NTT operation using the cached device buffer.
@@ -84,7 +93,8 @@ pub(crate) mod gpu_ntt {
         let stream = unsafe { sp1_gpu_sys::runtime::DEFAULT_STREAM };
 
         // Get cached device buffer (avoids per-call malloc/free)
-        let d_ptr = get_device_buffer(byte_size);
+        let ntt_scratch = lock_device_buffer(byte_size);
+        let d_ptr = ntt_scratch.ptr;
 
         // Copy host → device
         let err = unsafe {
@@ -167,7 +177,8 @@ pub(crate) mod gpu_ntt {
         let byte_size = packed.len() * std::mem::size_of::<Fr>();
         let stream = unsafe { sp1_gpu_sys::runtime::DEFAULT_STREAM };
 
-        let d_ptr = get_device_buffer(byte_size);
+        let ntt_scratch = lock_device_buffer(byte_size);
+        let d_ptr = ntt_scratch.ptr;
 
         // Single H2D copy for all polynomials
         let err = unsafe {
@@ -233,7 +244,8 @@ pub(crate) mod gpu_ntt {
             packed[i * target_n..(i * target_n + poly.len())].copy_from_slice(poly);
         }
 
-        let d_ptr = get_device_buffer(total_bytes);
+        let ntt_scratch = lock_device_buffer(total_bytes);
+        let d_ptr = ntt_scratch.ptr;
 
         // Single H2D for all polynomials
         let err = unsafe {
@@ -296,7 +308,8 @@ pub(crate) mod gpu_ntt {
         let byte_size_coeffs = std::mem::size_of_val(coeffs);
         let stream = unsafe { sp1_gpu_sys::runtime::DEFAULT_STREAM };
 
-        let d_ptr = get_device_buffer(byte_size_target);
+        let ntt_scratch = lock_device_buffer(byte_size_target);
+        let d_ptr = ntt_scratch.ptr;
 
         // H2D: only the coefficient portion (e.g., 1 GiB instead of 4 GiB)
         let err = unsafe {
@@ -396,7 +409,8 @@ pub(crate) mod gpu_ntt {
         let stream = unsafe { sp1_gpu_sys::runtime::DEFAULT_STREAM };
 
         // Use the shared NTT buffer for the FFT computation
-        let d_scratch = get_device_buffer(byte_size_target);
+        let mut ntt_scratch = lock_device_buffer(byte_size_target);
+        let d_scratch = ntt_scratch.ptr;
 
         // H2D: coefficient portion only
         let err = unsafe {
@@ -436,12 +450,9 @@ pub(crate) mod gpu_ntt {
         // This avoids a separate 4 GiB allocation that could cause OOM on 24 GiB GPUs
         // when multiple DeviceBuffers are accumulated.
         let d_out = d_scratch;
-        {
-            let mut buf = BUFFER_CACHE.lock().unwrap();
-            // Reset the cache so it doesn't free the buffer we just stole
-            buf.ptr = std::ptr::null_mut();
-            buf.capacity_bytes = 0;
-        }
+        // Reset the cache so it doesn't free the buffer we just stole
+        ntt_scratch.ptr = std::ptr::null_mut();
+        ntt_scratch.capacity_bytes = 0;
 
         DeviceBuffer { ptr: d_out, _len: target_n, _bytes: byte_size_target }
     }
@@ -470,7 +481,8 @@ pub(crate) mod gpu_ntt {
         let byte_size_4n = big_n * elem_size;
         let stream = unsafe { sp1_gpu_sys::runtime::DEFAULT_STREAM };
 
-        let d_scratch = get_device_buffer(byte_size_4n);
+        let mut ntt_scratch = lock_device_buffer(byte_size_4n);
+        let d_scratch = ntt_scratch.ptr;
         let err = unsafe {
             sp1_gpu_sys::runtime::cuda_mem_copy_host_to_device(
                 d_scratch,
@@ -507,11 +519,8 @@ pub(crate) mod gpu_ntt {
         }
 
         let d_out = d_scratch;
-        {
-            let mut buf = BUFFER_CACHE.lock().unwrap();
-            buf.ptr = std::ptr::null_mut();
-            buf.capacity_bytes = 0;
-        }
+        ntt_scratch.ptr = std::ptr::null_mut();
+        ntt_scratch.capacity_bytes = 0;
 
         DeviceBuffer { ptr: d_out, _len: big_n, _bytes: byte_size_4n }
     }
@@ -536,7 +545,8 @@ pub(crate) mod gpu_ntt {
         let stream = unsafe { sp1_gpu_sys::runtime::DEFAULT_STREAM };
 
         // Step 1: D2D copy from pre-uploaded source into NTT scratch buffer
-        let d_scratch = get_device_buffer(byte_size_4n);
+        let mut ntt_scratch = lock_device_buffer(byte_size_4n);
+        let d_scratch = ntt_scratch.ptr;
         let err = unsafe {
             sp1_gpu_sys::runtime::cuda_mem_copy_device_to_device(d_scratch, d_src, byte_size_n)
         };
@@ -587,11 +597,8 @@ pub(crate) mod gpu_ntt {
         }
 
         let d_out = d_scratch;
-        {
-            let mut buf = BUFFER_CACHE.lock().unwrap();
-            buf.ptr = std::ptr::null_mut();
-            buf.capacity_bytes = 0;
-        }
+        ntt_scratch.ptr = std::ptr::null_mut();
+        ntt_scratch.capacity_bytes = 0;
 
         (coeffs, DeviceBuffer { ptr: d_out, _len: big_n, _bytes: byte_size_4n })
     }
@@ -616,7 +623,8 @@ pub(crate) mod gpu_ntt {
         let byte_size_4n = big_n * elem_size;
         let stream = unsafe { sp1_gpu_sys::runtime::DEFAULT_STREAM };
 
-        let d_scratch = get_device_buffer(byte_size_4n);
+        let mut ntt_scratch = lock_device_buffer(byte_size_4n);
+        let d_scratch = ntt_scratch.ptr;
         let err = unsafe {
             sp1_gpu_sys::runtime::cuda_mem_copy_device_to_device(d_scratch, d_src, byte_size_n)
         };
@@ -629,9 +637,8 @@ pub(crate) mod gpu_ntt {
         }
 
         let mut d_canonical: *mut c_void = std::ptr::null_mut();
-        let err = unsafe {
-            sp1_gpu_sys::runtime::cuda_malloc(&mut d_canonical as *mut _, byte_size_n)
-        };
+        let err =
+            unsafe { sp1_gpu_sys::runtime::cuda_malloc(&mut d_canonical as *mut _, byte_size_n) };
         if err != unsafe { sp1_gpu_sys::runtime::CUDA_SUCCESS_CSL } {
             panic!("cuda_malloc failed for d_canonical (from_device keep_canonical)");
         }
@@ -681,11 +688,8 @@ pub(crate) mod gpu_ntt {
         }
 
         let d_out = d_scratch;
-        {
-            let mut buf = BUFFER_CACHE.lock().unwrap();
-            buf.ptr = std::ptr::null_mut();
-            buf.capacity_bytes = 0;
-        }
+        ntt_scratch.ptr = std::ptr::null_mut();
+        ntt_scratch.capacity_bytes = 0;
 
         (
             coeffs,
@@ -713,7 +717,8 @@ pub(crate) mod gpu_ntt {
         let stream = unsafe { sp1_gpu_sys::runtime::DEFAULT_STREAM };
 
         // Step 1: Upload evals → iFFT → coefficients on device
-        let d_scratch = get_device_buffer(byte_size_4n);
+        let mut ntt_scratch = lock_device_buffer(byte_size_4n);
+        let d_scratch = ntt_scratch.ptr;
         let err = unsafe {
             sp1_gpu_sys::runtime::cuda_mem_copy_host_to_device(
                 d_scratch,
@@ -769,11 +774,8 @@ pub(crate) mod gpu_ntt {
 
         // Step 4: Steal the NTT buffer as the output DeviceBuffer.
         let d_out = d_scratch;
-        {
-            let mut buf = BUFFER_CACHE.lock().unwrap();
-            buf.ptr = std::ptr::null_mut();
-            buf.capacity_bytes = 0;
-        }
+        ntt_scratch.ptr = std::ptr::null_mut();
+        ntt_scratch.capacity_bytes = 0;
 
         (coeffs, DeviceBuffer { ptr: d_out, _len: big_n, _bytes: byte_size_4n })
     }
@@ -807,7 +809,8 @@ pub(crate) mod gpu_ntt {
         let byte_size_4n = big_n * elem_size;
         let stream = unsafe { sp1_gpu_sys::runtime::DEFAULT_STREAM };
 
-        let d_scratch = get_device_buffer(byte_size_4n);
+        let mut ntt_scratch = lock_device_buffer(byte_size_4n);
+        let d_scratch = ntt_scratch.ptr;
         let err = unsafe {
             sp1_gpu_sys::runtime::cuda_mem_copy_host_to_device(
                 d_scratch,
@@ -826,9 +829,8 @@ pub(crate) mod gpu_ntt {
         // Allocate a separate device buffer and D2D-copy the canonical N-element
         // coefficients before the coset NTT overwrites d_scratch.
         let mut d_canonical: *mut c_void = std::ptr::null_mut();
-        let err = unsafe {
-            sp1_gpu_sys::runtime::cuda_malloc(&mut d_canonical as *mut _, byte_size_n)
-        };
+        let err =
+            unsafe { sp1_gpu_sys::runtime::cuda_malloc(&mut d_canonical as *mut _, byte_size_n) };
         if err != unsafe { sp1_gpu_sys::runtime::CUDA_SUCCESS_CSL } {
             panic!("cuda_malloc failed for d_canonical (keep_canonical)");
         }
@@ -879,11 +881,8 @@ pub(crate) mod gpu_ntt {
         }
 
         let d_out = d_scratch;
-        {
-            let mut buf = BUFFER_CACHE.lock().unwrap();
-            buf.ptr = std::ptr::null_mut();
-            buf.capacity_bytes = 0;
-        }
+        ntt_scratch.ptr = std::ptr::null_mut();
+        ntt_scratch.capacity_bytes = 0;
 
         (
             coeffs,
@@ -913,7 +912,8 @@ pub(crate) mod gpu_ntt {
         let stream = unsafe { sp1_gpu_sys::runtime::DEFAULT_STREAM };
 
         // Step 1: Upload evals (N) to GPU via cached buffer (4N capacity)
-        let d_ptr = get_device_buffer(byte_size_4n);
+        let ntt_scratch = lock_device_buffer(byte_size_4n);
+        let d_ptr = ntt_scratch.ptr;
         let err = unsafe {
             sp1_gpu_sys::runtime::cuda_mem_copy_host_to_device(
                 d_ptr,
@@ -995,7 +995,7 @@ pub(crate) mod gpu_ntt {
     /// Returns the number of bytes that were freed (0 if the buffer was not allocated).
     /// The buffer will be lazily re-allocated on the next NTT call.
     pub fn free_ntt_buffer() -> usize {
-        let mut buf = BUFFER_CACHE.lock().unwrap();
+        let mut buf = BUFFER_CACHE.lock().unwrap_or_else(|e| e.into_inner());
         if buf.ptr.is_null() {
             return 0;
         }
@@ -1009,7 +1009,7 @@ pub(crate) mod gpu_ntt {
     /// Return the current capacity (in bytes) of the cached GPU NTT buffer,
     /// or 0 if it has not been allocated yet.
     pub fn ntt_buffer_size() -> usize {
-        BUFFER_CACHE.lock().unwrap().capacity_bytes
+        BUFFER_CACHE.lock().unwrap_or_else(|e| e.into_inner()).capacity_bytes
     }
 }
 

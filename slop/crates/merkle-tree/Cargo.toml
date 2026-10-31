@@ -29,6 +29,7 @@ slop-utils = { workspace = true }
 thiserror = { workspace = true }
 serde = { workspace = true }
 itertools = { workspace = true }
+rayon = { workspace = true }
 
 
 [dev-dependencies]

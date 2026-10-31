@@ -38,6 +38,8 @@
 
 #include "runtime/gpu_compat.cuh"
 
+#include <type_traits>
+
 namespace {
 
 // Run one chunk's DAG bytecode for a single row position, adding each
@@ -203,6 +205,311 @@ __global__ void zerocheck_fused_sequential(
     if (threadIdx.x == 0) {
         ext_t lambda = ext_t::load(powers_of_lambda, stc.chip_idx);
         // Output layout: eval point e of tile t lives at (t * 3 + e).
+        ext_t::store(partials, blockIdx.x, block_sum * lambda);
+    }
+}
+
+// ============================================================================
+// Wave-uniform interpreter (`SP1_GPU_ZEROCHECK_UNIFORM`, default on).
+//
+// Every thread of a block runs the same chunk, so the instruction index, the
+// decoded instruction and every register index are wave-uniform. The generic
+// interpreter above does not tell the compiler so: on gfx942 it fetches each
+// instruction with a per-lane FLAT load (VMEM latency, waited on with
+// vmcnt(0)), dispatches the switch with exec-mask branches, and addresses
+// `regs[]` per lane in scratch, about 1200 cycles per bytecode instruction.
+// Here the loop index is made explicitly uniform (`readfirstlane`) and the
+// bytecode-side loads (instructions, leaves, constants, publics, assert
+// tables, alpha powers) go through the constant address space, so they become
+// scalar loads into SGPRs and the dispatch is scalar branches.
+//
+// The register file is a template parameter: `ZcScratchRegs` (the generic
+// per-thread array, still in scratch) or `ZcVgprRegs<V>`, which keeps
+// registers [0, V) in VGPRs indexed by the uniform register number
+// (`s_set_gpr_idx_on` + v_mov) and the rest in a scratch overflow array.
+// `rank_registers_by_use` (sp1-gpu-air) renumbers each chunk's registers by
+// access count, so the overflow is the coldest registers.
+//
+// Identical loads and the identical arithmetic in the identical order as
+// `run_chunk_bytecode`: only where values are stored and how the uniform
+// operands are fetched change, so results are bit-identical.
+// ============================================================================
+
+#if defined(__HIP_DEVICE_COMPILE__) && defined(__AMDGCN__)
+#define ZC_AMDGCN 1
+#define ZC_U32(x) ((uint32_t)__builtin_amdgcn_readfirstlane((int)(x)))
+typedef const __attribute__((address_space(4))) uint32_t zc_const_u32;
+// Load `sizeof(T)` bytes at `p[i]` (wave-uniform `p`, `i`) as scalar loads.
+template <typename T>
+__device__ __forceinline__ T zc_uload(const T* p, uint32_t i) {
+    static_assert(sizeof(T) % 4 == 0, "zc_uload loads whole dwords");
+    constexpr int D = sizeof(T) / 4;
+    zc_const_u32* q = (zc_const_u32*)(p) + (size_t)i * D;
+    uint32_t w[D];
+#pragma unroll
+    for (int d = 0; d < D; d++) w[d] = q[d];
+    T r;
+    __builtin_memcpy(&r, w, sizeof(T));
+    return r;
+}
+// Uniform u16 load: scalar loads are dword-granular, so load the aligned
+// dword holding the element (allocations are at least 4-byte aligned, so it
+// never leaves the buffer's allocation) and shift.
+__device__ __forceinline__ uint32_t zc_uload_u16(const uint16_t* p, uint32_t i) {
+    const uintptr_t addr = (uintptr_t)(p + i);
+    const uint32_t w = *(zc_const_u32*)(addr & ~(uintptr_t)3);
+    return (w >> ((addr & 2) * 8)) & 0xffffu;
+}
+#else
+#define ZC_U32(x) ((uint32_t)(x))
+template <typename T>
+__device__ __forceinline__ T zc_uload(const T* p, uint32_t i) {
+    T r;
+    memcpy(&r, p + i, sizeof(T));
+    return r;
+}
+__device__ __forceinline__ uint32_t zc_uload_u16(const uint16_t* p, uint32_t i) { return p[i]; }
+#endif
+
+// Generic per-thread register array (scratch on AMD).
+template <typename K, int MAX_REGS>
+struct ZcScratchRegs {
+    K regs[MAX_REGS];
+    __device__ __forceinline__ explicit ZcScratchRegs(K*) {}
+    __device__ __forceinline__ void init() {}
+    __device__ __forceinline__ K get(uint32_t r) const { return regs[r]; }
+    __device__ __forceinline__ void set(uint32_t r, const K& x) { regs[r] = x; }
+};
+
+#ifdef ZC_AMDGCN
+// Registers [0, V) in VGPRs: one V-wide vector per dword of K, indexed by the
+// uniform register number; [V, MAX_REGS) in a scratch overflow array.
+template <typename K, int V, int MAX_REGS>
+struct ZcVgprRegs {
+    static_assert(sizeof(K) % 4 == 0, "register type must be whole dwords");
+    static constexpr int D = sizeof(K) / 4;
+    typedef uint32_t vec_t __attribute__((ext_vector_type(V)));
+    static constexpr int N_SPILL = MAX_REGS > V ? MAX_REGS - V : 1;
+    vec_t lane[D];
+    // The overflow lives in a separate (caller-owned) array: a dynamically
+    // indexed member would keep SROA from promoting `lane` to registers.
+    K* spill;
+    __device__ __forceinline__ explicit ZcVgprRegs(K* spill_mem) : spill(spill_mem) {}
+    __device__ __forceinline__ void init() {
+#pragma unroll
+        for (int d = 0; d < D; d++) lane[d] = (vec_t)(0u);
+    }
+    __device__ __forceinline__ K get(uint32_t r) const {
+        if (r < (uint32_t)V) {
+            uint32_t w[D];
+#pragma unroll
+            for (int d = 0; d < D; d++) w[d] = lane[d][r];
+            K x;
+            __builtin_memcpy(&x, w, sizeof(K));
+            return x;
+        }
+        return spill[r - V];
+    }
+    __device__ __forceinline__ void set(uint32_t r, const K& x) {
+        if (r < (uint32_t)V) {
+            uint32_t w[D];
+            __builtin_memcpy(w, &x, sizeof(K));
+#pragma unroll
+            for (int d = 0; d < D; d++) lane[d][r] = w[d];
+        } else {
+            spill[r - V] = x;
+        }
+    }
+};
+#else
+template <typename K, int V, int MAX_REGS>
+struct ZcVgprRegs : ZcScratchRegs<K, MAX_REGS> {
+    static constexpr int N_SPILL = 1;
+    __device__ __forceinline__ explicit ZcVgprRegs(K* p) : ZcScratchRegs<K, MAX_REGS>(p) {}
+};
+#endif
+
+template <typename K, int MAX_REGS, int V>
+using ZcRegFile =
+    typename std::conditional<(V > 0), ZcVgprRegs<K, (V > 0 ? V : 1), MAX_REGS>,
+                              ZcScratchRegs<K, MAX_REGS>>::type;
+
+struct ZcInstr {
+    uint32_t op, f, out, a, b;
+};
+__device__ __forceinline__ ZcInstr zc_fetch(const DagInstr* instrs, uint32_t i) {
+    static_assert(sizeof(DagInstr) == 8, "DagInstr layout");
+    const uint2 w = zc_uload(reinterpret_cast<const uint2*>(instrs), i);
+    return ZcInstr{w.x & 0xffu, (w.x >> 8) & 0xffu, w.x >> 16, w.y & 0xffffu, w.y >> 16};
+}
+
+// Uniform-operand version of `AssertCursor`.
+struct ZcAssertCursor {
+    const uint16_t* pos;
+    const uint32_t* alphas;
+    uint32_t n, k, next, alpha_offset;
+    __device__ __forceinline__ explicit ZcAssertCursor(const ChunkStatic& stc)
+        : pos(stc.assert_pos),
+          alphas(stc.assert_alphas),
+          n(ZC_U32(stc.n_asserts)),
+          k(0),
+          alpha_offset(ZC_U32(stc.chip_alpha_offset)) {
+        next = n != 0 ? zc_uload_u16(pos, 0) : 0xffffffffu;
+    }
+    template <typename F>
+    __device__ __forceinline__ void at(uint32_t i, F f) {
+        while (i == next) {
+            f(alpha_offset + zc_uload(alphas, k));
+            k++;
+            next = k < n ? zc_uload_u16(pos, k) : 0xffffffffu;
+        }
+    }
+};
+
+template <typename K, typename RF, typename LoadLeaf>
+__device__ __forceinline__ ext_t run_chunk_bytecode_uniform(
+    const ChunkStatic& stc,
+    const felt_t* consts,
+    const felt_t* public_values,
+    const ext_t* powers_of_alpha,
+    RF& regs,
+    LoadLeaf load_leaf)
+{
+    K prev = K::zero();
+    ext_t acc = ext_t::zero();
+    ZcAssertCursor asserts(stc);
+    const uint32_t n = ZC_U32(stc.n_instrs);
+    for (uint32_t i_ = 0; i_ < n; i_++) {
+        const uint32_t i = ZC_U32(i_);
+        const ZcInstr instr = zc_fetch(stc.instrs, i);
+        const uint32_t f = instr.f;
+        K x;
+        switch (instr.op) {
+        case BC_LOAD_LEAF: {
+            x = load_leaf(zc_uload(stc.leaves, instr.a));
+            break;
+        }
+        case BC_LOAD_CONST: {
+            x = K(zc_uload(consts, instr.a));
+            break;
+        }
+        case BC_LOAD_PUBLIC: {
+            uint32_t pv_idx = zc_uload(stc.publics, instr.a);
+            x = K(zc_uload(public_values, pv_idx));
+            break;
+        }
+        case BC_ADD_F:
+        case BC_SUB_F:
+        case BC_MUL_F: {
+            K va, vb;
+            if (f & DAG_FLAG_A_PREV) va = prev; else va = regs.get(instr.a);
+            if (f & DAG_FLAG_B_PREV) vb = prev; else vb = regs.get(instr.b);
+            if (instr.op == BC_ADD_F) x = va + vb;
+            else if (instr.op == BC_SUB_F) x = va - vb;
+            else x = va * vb;
+            break;
+        }
+        case BC_MUL_CONST: {
+            K va;
+            if (f & DAG_FLAG_A_PREV) va = prev; else va = regs.get(instr.a);
+            x = va * zc_uload(consts, instr.b);
+            break;
+        }
+        case BC_NEG_F: {
+            K va;
+            if (f & DAG_FLAG_A_PREV) va = prev; else va = regs.get(instr.a);
+            x = K::zero() - va;
+            break;
+        }
+        default:
+            __trap();
+        }
+        if (!(f & DAG_FLAG_NO_STORE)) regs.set(instr.out, x);
+        prev = x;
+        asserts.at(i, [&](uint32_t alpha_idx) {
+            acc += zc_uload(powers_of_alpha, alpha_idx) * x;
+        });
+    }
+    return acc;
+}
+
+// RDNA: with the 16-register VGPR file (the RDNA default, see `rdna_defaults` in prover.rs) the ext kernel
+// fits in 96 VGPRs, i.e. 16 waves/SIMD instead of 12 (2-3% faster on an RX 9070 XT, bit-identical). Larger
+// register files would spill at that occupancy, so they keep the compiler's choice.
+template <typename K, int MAX_REGS, int V>
+__global__ void __launch_bounds__(256) SP1_RDNA_WAVES_PER_EU((V > 0 && V <= 16) ? 16 : 1)
+    zerocheck_fused_sequential_uniform(
+    const BlockDispatch* __restrict__ dispatch,
+    const ChunkStatic* __restrict__ chunk_static,
+    const ChipLayout* __restrict__ chip_layouts,
+    const K* __restrict__ trace_data,
+    const felt_t* __restrict__ public_values,
+    const ext_t* __restrict__ powers_of_alpha,
+    const ext_t* __restrict__ partial_lagrange,
+    const ext_t* __restrict__ powers_of_lambda,
+    const ext_t* __restrict__ gkr_powers,
+    uint32_t rest_point_dim,
+    ext_t* __restrict__ partials
+) {
+    // Same structure as `zerocheck_fused_sequential`; see there.
+    const uint32_t tile = blockIdx.x / 3;
+    const int e = (int)(blockIdx.x - 3 * tile);
+    BlockDispatch disp = dispatch[tile];
+    ChunkStatic stc = chunk_static[disp.chunk_id];
+    ChipLayout lay = chip_layouts[stc.chip_idx];
+    const felt_t* consts = reinterpret_cast<const felt_t*>(stc.consts);
+
+    K spill_mem[V > 0 ? MAX_REGS - V : 1];
+    ZcRegFile<K, MAX_REGS, V> regs(spill_mem);
+    regs.init();
+    ext_t thread_acc = ext_t::zero();
+
+    const uint32_t row_limit = 1u << rest_point_dim;
+    const uint32_t row_end = disp.row_offset + disp.n_rows;
+    const uint32_t gkr_main_width = ZC_U32(stc.gkr_main_width);
+    const uint32_t gkr_prep_width = ZC_U32(stc.gkr_prep_width);
+
+    for (uint32_t row_idx = disp.row_offset + threadIdx.x;
+         row_idx < row_end;
+         row_idx += blockDim.x)
+    {
+        ext_t acc = run_chunk_bytecode_uniform<K>(
+            stc, consts, public_values, powers_of_alpha, regs, [&](LeafRef leaf) {
+                size_t base = (leaf.source == LEAF_SOURCE_MAIN_LOCAL)
+                                  ? lay.main_ptr
+                                  : lay.preprocessed_ptr;
+                return interp_load_pair(trace_data, base, leaf.col, lay.height, row_idx, e);
+            });
+
+        if (gkr_main_width != 0 || gkr_prep_width != 0) {
+            for (uint32_t i_ = 0; i_ < gkr_main_width; i_++) {
+                const uint32_t i = ZC_U32(i_);
+                K v = interp_load_pair(trace_data, lay.main_ptr, i, lay.height, row_idx, e);
+                acc += zc_uload(gkr_powers, i) * v;
+            }
+            for (uint32_t i_ = 0; i_ < gkr_prep_width; i_++) {
+                const uint32_t i = ZC_U32(i_);
+                K v = interp_load_pair(
+                    trace_data, lay.preprocessed_ptr, i, lay.height, row_idx, e);
+                acc += zc_uload(gkr_powers, gkr_main_width + i) * v;
+            }
+        }
+
+        if (row_idx < row_limit) {
+            ext_t eq = ext_t::load(partial_lagrange, row_idx);
+            thread_acc += acc * eq;
+        }
+    }
+
+    SP1_EXTERN_SHARED(unsigned char, smem);
+    ext_t* shared = reinterpret_cast<ext_t*>(smem);
+
+    auto block = cg::this_thread_block();
+    auto tile_warp = cg::tiled_partition<32>(block);
+
+    ext_t block_sum = partialBlockReduce(block, tile_warp, thread_acc, shared);
+    if (threadIdx.x == 0) {
+        ext_t lambda = ext_t::load(powers_of_lambda, stc.chip_idx);
         ext_t::store(partials, blockIdx.x, block_sum * lambda);
     }
 }
@@ -471,6 +778,151 @@ __global__ void __launch_bounds__(256, MIN_BLOCKS) zerocheck_fused_sequential_bi
     }
 }
 
+// Wave-uniform version of `zerocheck_fused_sequential_bivariate_vec` (see
+// `run_chunk_bytecode_uniform`): scalar instruction fetch and dispatch, and a
+// register file of V NodeVec<G> registers in VGPRs plus a scratch overflow.
+// Same loads and arithmetic in the same order, so bit-identical partials.
+template <int G, int MAX_REGS, int MIN_BLOCKS, int V>
+__global__ void __launch_bounds__(256, MIN_BLOCKS) zerocheck_fused_sequential_bivariate_vec_uniform(
+    const BlockDispatch* __restrict__ dispatch,
+    const ChunkStatic* __restrict__ chunk_static,
+    const ChipLayout* __restrict__ chip_layouts,
+    const felt_t* __restrict__ trace_data,
+    const felt_t* __restrict__ public_values,
+    const ext_t* __restrict__ powers_of_alpha,
+    const ext_t* __restrict__ partial_lagrange,
+    const ext_t* __restrict__ powers_of_lambda,
+    uint32_t rest_point_dim,
+    ext_t* __restrict__ partials
+) {
+    static_assert(BIVARIATE_NUM_NODES % G == 0, "G must divide the node count");
+    constexpr uint32_t NP = BIVARIATE_NUM_NODES / G;
+    const uint32_t tile = blockIdx.x / NP;
+    const int e0 = (int)(blockIdx.x - NP * tile) * G;
+    BlockDispatch disp = dispatch[tile];
+    ChunkStatic stc = chunk_static[disp.chunk_id];
+    ChipLayout lay = chip_layouts[stc.chip_idx];
+    const felt_t* consts = reinterpret_cast<const felt_t*>(stc.consts);
+    const ext_t lambda = ext_t::load(powers_of_lambda, stc.chip_idx);
+
+    ext_t thread_acc[G];
+#pragma unroll
+    for (int g = 0; g < G; g++) {
+        thread_acc[g] = ext_t::zero();
+    }
+    NodeVec<G> spill_mem[V > 0 ? MAX_REGS - V : 1];
+    ZcRegFile<NodeVec<G>, MAX_REGS, V> regs(spill_mem);
+    regs.init();
+    const uint32_t n_instrs = ZC_U32(stc.n_instrs);
+
+    const uint32_t quad_limit = 1u << rest_point_dim;
+    const uint32_t quad_end = disp.row_offset + disp.n_rows;
+    for (uint32_t quad_idx = disp.row_offset + threadIdx.x; quad_idx < quad_end;
+         quad_idx += blockDim.x)
+    {
+        if (quad_idx >= quad_limit) {
+            continue;
+        }
+        const ext_t w = ext_t::load(partial_lagrange, quad_idx) * lambda;
+        const bool full_quad = ((quad_idx << 2) | 3u) < lay.height;
+        ext_t acc[G];
+#pragma unroll
+        for (int g = 0; g < G; g++) acc[g] = ext_t::zero();
+        ZcAssertCursor asserts(stc);
+        NodeVec<G> prev = nv_splat<G>(felt_t::zero());
+        for (uint32_t i_ = 0; i_ < n_instrs; i_++) {
+            const uint32_t i = ZC_U32(i_);
+            const ZcInstr instr = zc_fetch(stc.instrs, i);
+            const uint32_t f = instr.f;
+            NodeVec<G> x;
+            switch (instr.op) {
+            case BC_LOAD_LEAF: {
+                LeafRef leaf = zc_uload(stc.leaves, instr.a);
+                size_t base = (leaf.source == LEAF_SOURCE_MAIN_LOCAL) ? lay.main_ptr
+                                                                     : lay.preprocessed_ptr;
+                const size_t qb = base + (size_t)leaf.col * (size_t)lay.height
+                                  + ((size_t)quad_idx << 2);
+                felt_t r00 = felt_t::load(trace_data, qb);
+                felt_t r01 = felt_t::load(trace_data, qb + 1);
+                felt_t r10 = felt_t::zero();
+                felt_t r11 = felt_t::zero();
+                if (full_quad) {
+                    r10 = felt_t::load(trace_data, qb + 2);
+                    r11 = felt_t::load(trace_data, qb + 3);
+                }
+#pragma unroll
+                for (int g = 0; g < G; g++) {
+                    x.v[g] = bivariate_interp(r00, r01, r10, r11, bivariate_node(e0 + g));
+                }
+                break;
+            }
+            case BC_LOAD_CONST: {
+                x = nv_splat<G>(zc_uload(consts, instr.a));
+                break;
+            }
+            case BC_LOAD_PUBLIC: {
+                x = nv_splat<G>(zc_uload(public_values, zc_uload(stc.publics, instr.a)));
+                break;
+            }
+            case BC_ADD_F:
+            case BC_SUB_F:
+            case BC_MUL_F: {
+                NodeVec<G> va, vb;
+                if (f & DAG_FLAG_A_PREV) va = prev; else va = regs.get(instr.a);
+                if (f & DAG_FLAG_B_PREV) vb = prev; else vb = regs.get(instr.b);
+#pragma unroll
+                for (int g = 0; g < G; g++) {
+                    x.v[g] = (instr.op == BC_ADD_F)   ? va.v[g] + vb.v[g]
+                             : (instr.op == BC_SUB_F) ? va.v[g] - vb.v[g]
+                                                      : va.v[g] * vb.v[g];
+                }
+                break;
+            }
+            case BC_MUL_CONST: {
+                NodeVec<G> va;
+                if (f & DAG_FLAG_A_PREV) va = prev; else va = regs.get(instr.a);
+                const felt_t c = zc_uload(consts, instr.b);
+#pragma unroll
+                for (int g = 0; g < G; g++) x.v[g] = va.v[g] * c;
+                break;
+            }
+            case BC_NEG_F: {
+                NodeVec<G> va;
+                if (f & DAG_FLAG_A_PREV) va = prev; else va = regs.get(instr.a);
+#pragma unroll
+                for (int g = 0; g < G; g++) x.v[g] = felt_t::zero() - va.v[g];
+                break;
+            }
+            default:
+                __trap();
+            }
+            if (!(f & DAG_FLAG_NO_STORE)) regs.set(instr.out, x);
+            prev = x;
+            asserts.at(i, [&](uint32_t alpha_idx) {
+                const ext_t alpha = zc_uload(powers_of_alpha, alpha_idx);
+#pragma unroll
+                for (int g = 0; g < G; g++) acc[g] += alpha * x.v[g];
+            });
+        }
+#pragma unroll
+        for (int g = 0; g < G; g++) {
+            thread_acc[g] += acc[g] * w;
+        }
+    }
+
+    SP1_EXTERN_SHARED(unsigned char, smem);
+    ext_t* shared = reinterpret_cast<ext_t*>(smem);
+    auto block = cg::this_thread_block();
+    auto tile_warp = cg::tiled_partition<32>(block);
+    for (int g = 0; g < G; g++) {
+        ext_t block_sum = partialBlockReduce(block, tile_warp, thread_acc[g], shared);
+        if (threadIdx.x == 0) {
+            ext_t::store(partials, tile * BIVARIATE_NUM_NODES + (uint32_t)(e0 + g), block_sum);
+        }
+        block.sync();
+    }
+}
+
 // ============================================================================
 // Cooperative small-round variant.
 //
@@ -487,7 +939,7 @@ __global__ void __launch_bounds__(256, MIN_BLOCKS) zerocheck_fused_sequential_bi
 // Launch: grid (n_dispatch, 1, 3), block ZC_COOP_THREADS; dispatch tiles of
 // ZC_COOP_ROWS rows. Dynamic smem: zerocheck_coop_smem_bytes().
 // ============================================================================
-template <typename K>
+template <typename K, uint32_t LANES>
 __global__ void zerocheck_fused_sequential_coop(
     const BlockDispatch* __restrict__ dispatch,
     const ChunkStatic* __restrict__ chunk_static,
@@ -504,7 +956,7 @@ __global__ void zerocheck_fused_sequential_coop(
     uint32_t max_levels,
     uint32_t max_phys
 ) {
-    constexpr uint32_t G = ZC_COOP_LANES;
+    constexpr uint32_t G = LANES;
     BlockDispatch disp = dispatch[blockIdx.x];
     ChunkStatic stc = chunk_static[disp.chunk_id];
     ChipLayout lay = chip_layouts[stc.chip_idx];
@@ -515,6 +967,19 @@ __global__ void zerocheck_fused_sequential_coop(
 
     SP1_EXTERN_SHARED(unsigned char, smem);
     ext_t* red = reinterpret_cast<ext_t*>(smem);
+#if defined(__HIPCC__)
+    // HIP: the instruction stream is read through the vector caches instead of being copied into
+    // LDS (the host sizes the dynamic LDS without it, see `coop_code_in_lds` in prover.rs). The
+    // copy was the largest part of a block's LDS and capped residency: on an RX 9070 XT (128 KB of
+    // LDS per WGP) 28.7 -> 15.6 KB per wide block, 4 -> 8 blocks per WGP, 31-38% faster.
+    (void)max_instrs;
+    const uint2* __restrict__ code = stc.coop_code;
+    uint16_t* lvl = reinterpret_cast<uint16_t*>(smem + 32 * sizeof(ext_t));
+    K* slots = reinterpret_cast<K*>(
+                   smem + 32 * sizeof(ext_t)
+                   + (((size_t)(max_levels + 1) * sizeof(uint16_t) + 15) & ~(size_t)15))
+               + (size_t)grp * max_phys;
+#else
     uint2* code = reinterpret_cast<uint2*>(smem + 32 * sizeof(ext_t));
     uint16_t* lvl = reinterpret_cast<uint16_t*>(code + max_instrs);
     K* slots = reinterpret_cast<K*>(
@@ -522,6 +987,7 @@ __global__ void zerocheck_fused_sequential_coop(
                    + (((size_t)(max_levels + 1) * sizeof(uint16_t) + 15) & ~(size_t)15))
                + (size_t)grp * max_phys;
     for (uint32_t i = threadIdx.x; i < stc.n_instrs; i += blockDim.x) code[i] = stc.coop_code[i];
+#endif
     for (uint32_t i = threadIdx.x; i <= stc.coop_n_levels; i += blockDim.x) {
         lvl[i] = stc.coop_level_starts[i];
     }
@@ -608,30 +1074,36 @@ extern "C" uint32_t zerocheck_coop_smem_cap() {
 #endif
 }
 
-template <typename K>
+template <typename K, uint32_t LANES>
 static void* coop_kernel_with_smem_limit() {
     static const bool once = [] {
 #if defined(SP1_SYCL)
         // Nothing to raise: a SYCL launch sizes its work-group scratch memory itself.
 #elif defined(__HIPCC__)
-        hipFuncSetAttribute((const void*)zerocheck_fused_sequential_coop<K>,
+        hipFuncSetAttribute((const void*)zerocheck_fused_sequential_coop<K, LANES>,
                             hipFuncAttributeMaxDynamicSharedMemorySize,
                             (int)zerocheck_coop_smem_cap());
 #else
-        cudaFuncSetAttribute(zerocheck_fused_sequential_coop<K>,
+        cudaFuncSetAttribute(zerocheck_fused_sequential_coop<K, LANES>,
                              cudaFuncAttributeMaxDynamicSharedMemorySize,
                              (int)zerocheck_coop_smem_cap());
 #endif
         return true;
     }();
     (void)once;
-    return SP1_KERNEL_PTR(zerocheck_fused_sequential_coop<K>);
+    return SP1_KERNEL_PTR(zerocheck_fused_sequential_coop<K, LANES>);
 }
 extern "C" void* zerocheck_fused_sequential_coop_kb_kernel() {
-    return coop_kernel_with_smem_limit<felt_t>();
+    return coop_kernel_with_smem_limit<felt_t, ZC_COOP_LANES>();
 }
 extern "C" void* zerocheck_fused_sequential_coop_ext_kernel() {
-    return coop_kernel_with_smem_limit<ext_t>();
+    return coop_kernel_with_smem_limit<ext_t, ZC_COOP_LANES>();
+}
+extern "C" void* zerocheck_fused_sequential_coop_wide_kb_kernel() {
+    return coop_kernel_with_smem_limit<felt_t, ZC_COOP_WIDE_LANES>();
+}
+extern "C" void* zerocheck_fused_sequential_coop_wide_ext_kernel() {
+    return coop_kernel_with_smem_limit<ext_t, ZC_COOP_WIDE_LANES>();
 }
 
 // Fused dispatch entry points, tiered by MAX_REGS so the per-thread local
@@ -675,6 +1147,24 @@ extern "C" void* zerocheck_fused_sequential_ext_1024_kernel() {
     return SP1_KERNEL_PTR(zerocheck_fused_sequential<ext_t, 1024>);
 }
 
+// Wave-uniform interpreter entry points (MAX_REGS = 128 tier); the suffix is
+// the VGPR register-file size V (0 = scratch register file).
+extern "C" void* zerocheck_fused_sequential_uniform_kb_128_v0_kernel() {
+    return SP1_KERNEL_PTR(zerocheck_fused_sequential_uniform<felt_t, 128, 0>);
+}
+extern "C" void* zerocheck_fused_sequential_uniform_kb_128_v32_kernel() {
+    return SP1_KERNEL_PTR(zerocheck_fused_sequential_uniform<felt_t, 128, 32>);
+}
+extern "C" void* zerocheck_fused_sequential_uniform_ext_128_v0_kernel() {
+    return SP1_KERNEL_PTR(zerocheck_fused_sequential_uniform<ext_t, 128, 0>);
+}
+extern "C" void* zerocheck_fused_sequential_uniform_ext_128_v16_kernel() {
+    return SP1_KERNEL_PTR(zerocheck_fused_sequential_uniform<ext_t, 128, 16>);
+}
+extern "C" void* zerocheck_fused_sequential_uniform_ext_128_v32_kernel() {
+    return SP1_KERNEL_PTR(zerocheck_fused_sequential_uniform<ext_t, 128, 32>);
+}
+
 // Bivariate (fused first-two-rounds) entry points. Round 0 only, so only the
 // base-field instantiations exist.
 extern "C" void* zerocheck_fused_sequential_bivariate_kb_32_kernel() {
@@ -706,4 +1196,15 @@ extern "C" void* zerocheck_fused_sequential_bivariate_vec4_kb_128_kernel() {
 }
 extern "C" void* zerocheck_fused_sequential_bivariate_vec12_kb_128_kernel() {
     return SP1_KERNEL_PTR(zerocheck_fused_sequential_bivariate_vec<12, 128, 1>);
+}
+// Wave-uniform node-vectorised bivariate entry points (G = 4, MAX_REGS = 128),
+// suffix = VGPR register-file size.
+extern "C" void* zerocheck_fused_sequential_bivariate_vec4_uniform_kb_128_v0_kernel() {
+    return SP1_KERNEL_PTR(zerocheck_fused_sequential_bivariate_vec_uniform<4, 128, 4, 0>);
+}
+extern "C" void* zerocheck_fused_sequential_bivariate_vec4_uniform_kb_128_v16_kernel() {
+    return SP1_KERNEL_PTR(zerocheck_fused_sequential_bivariate_vec_uniform<4, 128, 4, 16>);
+}
+extern "C" void* zerocheck_fused_sequential_bivariate_vec4_uniform_kb_128_v32_kernel() {
+    return SP1_KERNEL_PTR(zerocheck_fused_sequential_bivariate_vec_uniform<4, 128, 2, 32>);
 }

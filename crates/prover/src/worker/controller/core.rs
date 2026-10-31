@@ -1,6 +1,9 @@
 use std::{
     marker::PhantomData,
-    sync::{Arc, OnceLock},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, OnceLock,
+    },
 };
 
 use futures::{prelude::*, stream::FuturesUnordered};
@@ -8,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use slop_futures::pipeline::Pipeline;
 use sp1_core_executor::{
     events::{MemoryInitializeFinalizeEvent, MemoryRecord, PageProtInitializeFinalizeEvent},
-    CoreVM, ExecutionError, Program, SP1CoreOpts, SyscallCode, UnsafeMemory,
+    CoreVM, ExecutionError, SP1CoreOpts, SyscallCode, UnsafeMemory,
 };
 use sp1_core_executor_runner::MinimalExecutorRunner;
 use sp1_core_machine::{executor::ExecutionOutput, io::SP1Stdin, riscv::RiscvAir};
@@ -29,9 +32,9 @@ use tokio::{
 use tracing::Instrument;
 
 use crate::worker::{
-    global_memory, precompile_channel, DeferredMessage, MinimalExecutorCache,
-    PrecompileArtifactSlice, ProveShardTaskRequest, RawTaskRequest, SplicingEngine, SplicingTask,
-    TaskContext, TaskError, TaskId, WorkerClient,
+    global_memory, precompile_channel, shared_program, DeferredMessage, MinimalExecutorCache,
+    OpenShard, PrecompileArtifactSlice, ProofId, ProveShardTaskRequest, RawTaskRequest,
+    SplicingEngine, SplicingTask, TaskContext, TaskError, TaskId, WorkerClient,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -126,8 +129,8 @@ impl CoreExecuteTaskRequest {
 
 #[derive(Serialize, Deserialize)]
 pub enum TraceData {
-    /// A core record to be proven.
-    Core(Vec<u8>),
+    /// A core record to be proven: a bincode-encoded `TraceChunk`, sent as one byte buffer.
+    Core(#[serde(with = "sp1_primitives::serde_bytes::vec")] Vec<u8>),
     // Precompile data. Several `PrecompileArtifactSlice`s, and the type of precompile.
     Precompile(Vec<PrecompileArtifactSlice>, SyscallCode),
     /// Memory data.
@@ -234,13 +237,13 @@ where
         let stdin = self.stdin.clone();
         let opts = self.opts.clone();
 
-        // Get the program from the elf. TODO: handle errors.
-        let program = Arc::new(Program::from(&elf_bytes).map_err(|e| {
+        // Get the program from the elf; the core workers of this process reuse it.
+        let program = shared_program(&self.elf, &elf_bytes).await.map_err(|e| {
             TaskError::Execution(ExecutionError::Other(format!(
                 "failed to dissassemble program: {}",
                 e
             )))
-        })?);
+        })?;
 
         // Initialize the touched addresses map.
         let (all_touched_addresses, all_touched_pages, global_memory_handler) =
@@ -252,6 +255,9 @@ where
 
         // Create a join set in order to be able to cancel all tasks
         let mut join_set = JoinSet::<Result<(), TaskError>>::new();
+        // Set once the executor child was killed, before the executor stops: the tasks that wait
+        // on the executor then fail too (no final vm state, say), maybe first.
+        let child_killed = Arc::new(AtomicBool::new(false));
 
         // Start the minimal executor.
         let (memory_tx, memory_rx) = oneshot::channel::<UnsafeMemory>();
@@ -263,6 +269,19 @@ where
         let (splicing_submit_tx, mut splicing_submit_rx) = mpsc::unbounded_channel();
         let span = tracing::debug_span!("minimal executor");
 
+        let new_minimal_executor = || {
+            let mut minimal_executor = MinimalExecutorRunner::new(
+                program.clone(),
+                false,
+                Some(opts.minimal_trace_chunk_threshold),
+                opts.memory_limit,
+                opts.trace_chunk_slots,
+            );
+            // End chunks by cycles too, so splicing and the first shard start before the end of
+            // a compute-bound execution.
+            minimal_executor.set_max_chunk_cycles(Some(opts.minimal_trace_chunk_cycles));
+            minimal_executor
+        };
         // Making the minimal executor blocks the rest of execution anyway, so we initialize it before spawning the rest of the tokio tasks.
         let mut minimal_executor = if let Some(cache) = &self.minimal_executor_cache {
             let mut optional_minimal_executor = cache.lock().await;
@@ -270,22 +289,10 @@ where
                 tracing::info!("minimal executor cache hit");
                 minimal_executor
             } else {
-                MinimalExecutorRunner::new(
-                    program.clone(),
-                    false,
-                    Some(opts.minimal_trace_chunk_threshold),
-                    opts.memory_limit,
-                    opts.trace_chunk_slots,
-                )
+                new_minimal_executor()
             }
         } else {
-            MinimalExecutorRunner::new(
-                program.clone(),
-                false,
-                Some(opts.minimal_trace_chunk_threshold),
-                opts.memory_limit,
-                opts.trace_chunk_slots,
-            )
+            new_minimal_executor()
         };
         join_set.spawn_blocking({
             let program = program.clone();
@@ -296,6 +303,7 @@ where
             let final_vm_state = final_vm_state.clone();
             let opts = opts.clone();
             let splicing_engine = self.splicing_engine.clone();
+            let child_killed = child_killed.clone();
 
             move || {
                 let _guard = span.enter();
@@ -312,9 +320,15 @@ where
                 tracing::debug!("Starting minimal executor");
                 let now = std::time::Instant::now();
                 let mut chunk_count = 0;
-                while let Some(chunk) =
-                    minimal_executor.try_execute_chunk().map_err(classify_chunk_error)?
-                {
+                // Hands the shard left open at the end of the previous chunk to the next splicer.
+                let mut carry_rx: Option<oneshot::Receiver<Option<OpenShard>>> = None;
+                while let Some(chunk) = minimal_executor.try_execute_chunk().map_err(|e| {
+                    let e = classify_chunk_error(e);
+                    if matches!(e, TaskError::Retryable(_)) {
+                        child_killed.store(true, Ordering::SeqCst);
+                    }
+                    e
+                })? {
                     tracing::debug!(
                         trace_chunk = chunk_count,
                         "mem reads chunk size bytes {}, program is done?: {}",
@@ -333,6 +347,16 @@ where
                         }
                     }
 
+                    // The next chunk resumes the previous chunk's open shard, so wait for it.
+                    let carry = match carry_rx.take() {
+                        Some(rx) => rx.blocking_recv().map_err(|_| {
+                            anyhow::anyhow!("the previous chunk's splicer stopped before its end")
+                        })?,
+                        None => None,
+                    };
+                    let (carry_tx, next_carry_rx) = oneshot::channel();
+                    carry_rx = Some(next_carry_rx);
+
                     // Create a splicing task
                     let task = SplicingTask {
                         program: program.clone(),
@@ -347,6 +371,8 @@ where
                         context: context.clone(),
                         opts: opts.clone(),
                         deferred_marker_tx: deferred_marker_tx.clone(),
+                        carry,
+                        carry_tx,
                     };
 
                     let splicing_handle = tracing::debug_span!("splicing", idx = chunk_count)
@@ -376,6 +402,12 @@ where
                         minimal_executor.is_done(),
                     )));
                 }
+                // The last chunk ends the program, so it leaves no shard open.
+                if let Some(Ok(Some(_))) = carry_rx.map(|rx| rx.blocking_recv()) {
+                    return Err(TaskError::Fatal(anyhow::anyhow!(
+                        "the last trace chunk ended inside a shard"
+                    )));
+                }
                 // Get the output and send it to the output channel.
                 let cycles = minimal_executor.global_clk();
                 let public_value_stream = minimal_executor.public_values_stream().clone();
@@ -400,11 +432,14 @@ where
                     tokio::select! {
                         Some((chunk_count, splicing_handle)) = splicing_submit_rx.recv() => {
                             tracing::debug!(chunk_count = chunk_count, "Received splicing handle");
-                            let handle = splicing_handle.map_ok(move |_| chunk_count);
+                            let handle = splicing_handle.map_ok(move |spliced| (chunk_count, spliced));
                             splicing_handles.push(handle);
                         }
                         Some(result) = splicing_handles.next() => {
-                            let chunk_count = result.map_err(|e| anyhow::anyhow!("splicing task panicked: {}", e))?;
+                            let (chunk_count, spliced) = result.map_err(|e| anyhow::anyhow!("splicing task panicked: {}", e))?;
+                            // A splicer can fail after handing its carry to the next chunk (sending
+                            // a shard to be proven, say): that chunk's shards are then missing.
+                            spliced?;
                             tracing::debug!(chunk_count = chunk_count, "Splicing task finished");
                         }
                         else => {
@@ -487,7 +522,16 @@ where
 
         // Wait for tasks to finish
         while let Some(result) = join_set.join_next().await {
-            result.map_err(|e| TaskError::Fatal(e.into()))??;
+            match result.map_err(|e| TaskError::Fatal(e.into())).and_then(|result| result) {
+                Ok(()) => {}
+                // The kill is the cause, and retryable, whichever task failed first.
+                Err(e) if child_killed.load(Ordering::SeqCst) => {
+                    return Err(TaskError::Retryable(anyhow::anyhow!(
+                        "the executor child was killed (first failure: {e})"
+                    )))
+                }
+                Err(e) => return Err(e),
+            }
         }
 
         let output = output_rx.await.map_err(|_| anyhow::anyhow!("failed to receive output"))?;
@@ -608,6 +652,11 @@ pub(super) async fn create_core_proving_task<A: ArtifactClient, W: WorkerClient>
         TraceData::Memory(_) | TraceData::Precompile(_, _) => None,
     };
 
+    // Not for a proof that has ended, which refuses the task: the record, tracked under its proof
+    // only by the task, would stay stored for good.
+    if worker_client.proof_ended(&context.proof_id) {
+        return Err(ExecutionError::Other(format!("proof {} has ended", context.proof_id)));
+    }
     artifact_client
         .upload(&record_artifact, trace_data)
         .await
@@ -621,7 +670,7 @@ pub(super) async fn create_core_proving_task<A: ArtifactClient, W: WorkerClient>
     let request = ProveShardTaskRequest {
         elf: elf_artifact,
         common_input: common_input_artifact,
-        record: record_artifact,
+        record: record_artifact.clone(),
         output: proof_artifact.clone(),
         deferred_marker_task: deferred_message
             .as_ref()
@@ -633,11 +682,17 @@ pub(super) async fn create_core_proving_task<A: ArtifactClient, W: WorkerClient>
 
     let task = request.into_raw().map_err(|e| ExecutionError::Other(e.to_string()))?;
 
-    // Send the task to the worker.
-    let task_id = worker_client
-        .submit_task(TaskType::ProveShard, task)
-        .await
-        .map_err(|e| ExecutionError::Other(e.to_string()))?;
+    // Send the task to the worker. A refused one (its proof ended meanwhile) leaves its record to
+    // be deleted here.
+    let task_id = match worker_client.submit_task(TaskType::ProveShard, task).await {
+        Ok(task_id) => task_id,
+        Err(e) => {
+            let _ = artifact_client
+                .try_delete(&record_artifact, ArtifactType::UnspecifiedArtifactType)
+                .await;
+            return Err(ExecutionError::Other(e.to_string()));
+        }
+    };
 
     gate.schedule_release(task_id.clone(), shard_permit);
 
@@ -653,14 +708,20 @@ const COMMON_INPUT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs
 /// The controller can start the executor while the proof's setup task is still running (the
 /// common input holds the vk), so whatever reads the common input or hands it to a task waits
 /// for it here first. Once it is there this is a single lookup.
-pub(crate) async fn wait_for_common_input<A: ArtifactClient>(
+pub(crate) async fn wait_for_common_input<A: ArtifactClient, W: WorkerClient>(
     artifact_client: &A,
+    worker_client: &W,
+    proof_id: &ProofId,
     common_input: &Artifact,
 ) -> anyhow::Result<()> {
     let start = std::time::Instant::now();
     while !artifact_client.exists(common_input, ArtifactType::UnspecifiedArtifactType).await? {
         if start.elapsed() > COMMON_INPUT_TIMEOUT {
             anyhow::bail!("timed out waiting for the common prover input {}", common_input.0);
+        }
+        // A failed proof's end deletes its common input while its executor still runs.
+        if worker_client.proof_ended(proof_id) {
+            anyhow::bail!("proof {proof_id} ended before its common prover input appeared");
         }
         tokio::time::sleep(std::time::Duration::from_millis(2)).await;
     }
@@ -685,6 +746,30 @@ fn classify_chunk_error(e: ExecutionError) -> TaskError {
 }
 
 #[cfg(test)]
+mod common_input_tests {
+    use sp1_prover_types::{InMemoryArtifactClient, ProofRequestStatus};
+
+    use super::*;
+    use crate::worker::LocalWorkerClient;
+
+    /// A failed proof's end deletes its common input while its executor may still run: the
+    /// executor's wait for it stops at once instead of running out its 600 s.
+    #[tokio::test]
+    async fn the_wait_for_the_common_input_stops_once_the_proof_has_ended() {
+        let artifacts = InMemoryArtifactClient::new();
+        let common_input = artifacts.create_artifact().unwrap();
+        let (client, _channels) = LocalWorkerClient::init();
+        let proof_id = ProofId::new("proof");
+        let wait = || wait_for_common_input(&artifacts, &client, &proof_id, &common_input);
+        // Still waiting while the proof runs.
+        assert!(tokio::time::timeout(std::time::Duration::from_millis(50), wait()).await.is_err());
+        client.complete_proof(proof_id.clone(), None, ProofRequestStatus::Failed, "").await.ok();
+        let ended = tokio::time::timeout(std::time::Duration::from_secs(5), wait()).await;
+        assert!(ended.expect("the wait stopped").is_err());
+    }
+}
+
+#[cfg(test)]
 mod classify_chunk_error_tests {
     use super::*;
 
@@ -703,5 +788,35 @@ mod classify_chunk_error_tests {
         assert!(!is_retryable(ExecutionError::TooMuchMemory()));
         assert!(!is_retryable(ExecutionError::Other("boom".to_string())));
         assert!(!is_retryable(ExecutionError::Unimplemented()));
+    }
+}
+
+#[cfg(test)]
+mod trace_data_encoding_tests {
+    use super::TraceData;
+
+    /// `TraceData` as it was before `Core` was serialized as bytes.
+    #[derive(serde::Serialize, serde::Deserialize)]
+    enum PlainTraceData {
+        Core(Vec<u8>),
+    }
+
+    /// `TraceData::Core` keeps its bincode encoding (variant 0, `u64` length, raw bytes), so
+    /// records written before the change read back after it and the other way around.
+    #[test]
+    fn core_encoding_unchanged() {
+        let chunk: Vec<u8> = (0..100_000u32).map(|i| (i * 7 + 3) as u8).collect();
+        let new = bincode::serialize(&TraceData::Core(chunk.clone())).unwrap();
+        let old = bincode::serialize(&PlainTraceData::Core(chunk.clone())).unwrap();
+        assert_eq!(new, old);
+        assert_eq!(&new[..4], &0u32.to_le_bytes());
+        assert_eq!(&new[4..12], &(chunk.len() as u64).to_le_bytes());
+        assert_eq!(&new[12..], &chunk[..]);
+        match bincode::deserialize::<TraceData>(&old).unwrap() {
+            TraceData::Core(bytes) => assert_eq!(bytes, chunk),
+            _ => panic!("expected a core record"),
+        }
+        let PlainTraceData::Core(bytes) = bincode::deserialize(&new).unwrap();
+        assert_eq!(bytes, chunk);
     }
 }

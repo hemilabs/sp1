@@ -17,6 +17,7 @@ use slop_poseidon2::{Poseidon2, Poseidon2ExternalMatrixGeneral};
 pub mod consts;
 pub mod io;
 pub mod polynomial;
+pub mod serde_bytes;
 pub mod types;
 pub use types::Elf;
 pub mod fri_params;

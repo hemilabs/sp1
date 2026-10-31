@@ -10,12 +10,14 @@
 
 #include <sycl/sycl.hpp>
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <map>
 #include <mutex>
+#include <new>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -125,18 +127,38 @@ struct Runtime {
     }
 };
 
-Runtime& rt() {
-    // The free-memory query (sycl::ext::intel::info::device::free_memory) needs Sysman, which
-    // Level Zero enables only if ZES_ENABLE_SYSMAN is set before it initializes.
-    static bool sysman = [] {
+// The environment Level Zero reads when it initializes (in rt()), set while the library loads,
+// before any thread runs: setenv while another thread reads the environment is undefined
+// behaviour in glibc.
+// - The free-memory query (sycl::ext::intel::info::device::free_memory) needs Sysman, which Level
+//   Zero enables only if ZES_ENABLE_SYSMAN is set before it initializes.
+// - Level Zero's V2 adapter, the default on Linux, intermittently left proofs waiting forever on an
+//   Arc Pro B70 (oneAPI 2025.3 and 2026.0 adapters, kernel 7.0 xe, compute runtime 26.09): a copy's
+//   event never completed, until the kill reset the copy engine. That was 11 of 14
+//   fibonacci-compressed proofs (main also hung); with the legacy adapter, 20 of 20 passed.
+//   SYCL_UR_USE_LEVEL_ZERO_V2=1 still picks V2.
+// - On Windows, Level Zero's USM pool off: the allocator below caches device blocks itself, and
+//   decides what to keep from the video memory budget. Blocks it frees stayed in the adapter's
+//   pool, still counted in this process's usage, so its evictions made no room and later
+//   allocations spilled into shared system memory. On a 12 GB Arc B580, fib 2M Groth16 proofs
+//   back to back: the wrap's STARK went from ~14.5 to 18.6 s by the fourth proof with the pool,
+//   and stayed at 14.5-14.9 s without it. UR_L0_DISABLE_USM_ALLOCATOR=0 (or its older name,
+//   SYCL_PI_LEVEL_ZERO_DISABLE_USM_ALLOCATOR) keeps it.
+const bool kLevelZeroEnv = [] {
 #ifdef _WIN32
-        if (!std::getenv("ZES_ENABLE_SYSMAN")) _putenv_s("ZES_ENABLE_SYSMAN", "1");
+    if (!std::getenv("ZES_ENABLE_SYSMAN")) _putenv_s("ZES_ENABLE_SYSMAN", "1");
+    if (!std::getenv("UR_L0_DISABLE_USM_ALLOCATOR") &&
+        !std::getenv("SYCL_PI_LEVEL_ZERO_DISABLE_USM_ALLOCATOR"))
+        _putenv_s("UR_L0_DISABLE_USM_ALLOCATOR", "1");
 #else
-        setenv("ZES_ENABLE_SYSMAN", "1", 0);
+    setenv("ZES_ENABLE_SYSMAN", "1", 0);
+    setenv("SYCL_UR_USE_LEVEL_ZERO_V2", "0", 0);
 #endif
-        return true;
-    }();
-    (void)sysman;
+    return true;
+}();
+
+Runtime& rt() {
+    (void)kLevelZeroEnv;
     static Runtime* runtime = new Runtime();  // never destroyed: queues outlive static teardown
     return *runtime;
 }
@@ -205,6 +227,64 @@ bool is_usm(const void* ptr) {
     return sycl::get_pointer_type(ptr, rt().context) != sycl::usm::alloc::unknown;
 }
 
+// On Linux, copies between the device and pageable (non-USM) host memory go through a pinned
+// staging buffer instead of the driver's import of the pageable range for the copy engine. On an
+// Arc Pro B70 (xe driver, compute runtime 26.09) that import was slow and crash-prone: the copy
+// it crashed in (a segfault inside libze_intel_gpu enqueueing a device-to-host copy into a Rust
+// Vec) went away, and keccak-compressed proofs took 44 s instead of 50 s. The buffer is per thread
+// (no lock on the copy path) and grows to at most kStageChunk; larger copies go in chunks. These
+// copies wait for completion anyway, as CUDA's do for pageable memory. Windows' driver stages
+// pageable copies itself.
+#ifdef _WIN32
+constexpr bool kStagePageable = false;
+#else
+constexpr bool kStagePageable = true;
+#endif
+constexpr size_t kStageChunk = size_t(16) << 20;
+
+// A thread's staging buffer, freed when the thread exits: the copies run on tokio's blocking-pool
+// threads, which exit after 10 s idle, and each new one would otherwise pin another buffer.
+struct StageBuffer {
+    char* buf = nullptr;
+    size_t cap = 0;
+    ~StageBuffer() {
+        if (buf) sycl::free(buf, rt().context);
+    }
+};
+
+char* stage_buffer(size_t size) {
+    thread_local StageBuffer stage;
+    if (size > stage.cap) {
+        if (stage.buf) sycl::free(stage.buf, rt().context);
+        stage.buf = nullptr;
+        stage.cap = std::max(size, std::min(stage.cap * 2, kStageChunk));
+        stage.buf = static_cast<char*>(sycl::malloc_host(stage.cap, rt().context));
+        if (!stage.buf) {
+            stage.cap = 0;
+            throw std::bad_alloc();
+        }
+    }
+    return stage.buf;
+}
+
+void copy_from_pageable(sycl::queue& q, void* dst, const void* src, size_t count) {
+    for (size_t off = 0; off < count; off += kStageChunk) {
+        const size_t n = std::min(kStageChunk, count - off);
+        char* stage = stage_buffer(n);
+        std::memcpy(stage, static_cast<const char*>(src) + off, n);
+        q.memcpy(static_cast<char*>(dst) + off, stage, n).wait_and_throw();
+    }
+}
+
+void copy_to_pageable(sycl::queue& q, void* dst, const void* src, size_t count) {
+    for (size_t off = 0; off < count; off += kStageChunk) {
+        const size_t n = std::min(kStageChunk, count - off);
+        char* stage = stage_buffer(n);
+        q.memcpy(stage, static_cast<const char*>(src) + off, n).wait_and_throw();
+        std::memcpy(static_cast<char*>(dst) + off, stage, n);
+    }
+}
+
 // ---------------------------------------------------------------------------------------------
 // Events
 // ---------------------------------------------------------------------------------------------
@@ -237,8 +317,8 @@ size_t g_cached_bytes = 0;
 // shard to the next. So sizes above 1 MiB are rounded up to a sixteenth of their power of two,
 // for a cached block to fit the next shard's slightly different request, and the cache may hold
 // up to half the card. When an allocation would not fit, cached blocks are freed, largest first,
-// only until it does, each once its own last use has finished, instead of draining the device
-// and freeing them all.
+// only until it does, instead of freeing them all. (With SYCL the eviction first waits for every
+// queue: see evict_until_fits.)
 size_t round_alloc_size(size_t s) {
     if (s <= (size_t(1) << 20)) return (s + 4095) & ~size_t(4095);
     int lg = 63;
@@ -355,11 +435,23 @@ void release_cached_blocks() {
     g_cached_bytes = 0;
 }
 
-// Free cached blocks, largest first, until `need` bytes fit in `headroom`. The caller holds
-// g_alloc_mutex.
+// Free cached blocks, largest first, until `need` bytes fit in `headroom`, once every queue is
+// idle. The caller holds g_alloc_mutex.
+//
+// A block's `freed` barrier only covers the queue that freed it, and a block can also have been
+// used on another queue (the compress prover's and a core shard's): sycl::free then unmapped it
+// under a copy still running there. On an Arc Pro B70 under Linux, with two streams, that was a
+// copy-engine page fault ("Fault response: Unsuccessful -EINVAL") and a fatal device error in 3
+// of 20 keccak-compressed proofs; waiting for every queue first, 20 of 20 passed. Evicting is
+// rare (an allocation that would not fit), so the wait costs little.
 void evict_until_fits(size_t need, size_t headroom) {
     sp1prof::HostTimer timer("host: evict cached blocks");
+    bool drained = false;
     while (g_cached_bytes > 0 && need + FIT_MARGIN_BYTES > headroom) {
+        if (!drained) {
+            rt().wait_all();
+            drained = true;
+        }
         auto it = std::prev(g_free_pool.end());
         if (it->second.empty()) {
             g_free_pool.erase(it);
@@ -369,7 +461,6 @@ void evict_until_fits(size_t need, size_t headroom) {
         it->second.pop_back();
         const size_t size = it->first;
         if (it->second.empty()) g_free_pool.erase(it);
-        block.freed.wait();
         sycl::free(block.ptr, rt().context);
         g_alloc_sizes.erase(block.ptr);
         g_cached_bytes -= size;
@@ -453,9 +544,11 @@ rustCudaError_t cached_free(void* p, sycl::queue* q) {
         }
         g_alloc_sizes.erase(it);
     }
-    // Not cached: let the freeing stream's work, which may still use it, finish first.
+    // Not cached: let the work that may still use it finish first. All queues', as for an
+    // eviction (evict_until_fits): a block can also have been used on another queue than the one
+    // freeing it, and sycl::free unmaps it under whatever still runs there.
     sp1prof::HostTimer timer("host: uncached free (wait + free)");
-    q->wait_and_throw();
+    rt().wait_all();
     sycl::free(p, rt().context);
     return SP1_SUCCESS;
 }
@@ -468,6 +561,20 @@ extern "C" void cuda_release_cached_memory() {
     std::lock_guard<std::mutex> lock(g_alloc_mutex);
     release_cached_blocks();
 }
+
+// SYCL has no device memory arena (lib/runtime/stream.cu has HIP's).
+extern "C" size_t sp1_hip_arena_bytes() { return 0; }
+
+// No arena on SYCL (see the HIP one in runtime/stream.cu).
+extern "C" uint32_t sp1_hip_arena_scatters() { return 0; }
+extern "C" size_t sp1_hip_arena_free_bytes() { return 0; }
+// No DXGI budget for SYCL (lib/runtime/stream.cu reads HIP's).
+extern "C" uint64_t sp1_video_memory_budget() { return 0; }
+// Not HIP (lib/runtime/stream.cu answers for HIP).
+extern "C" uint32_t sp1_hip_wave64() { return 0; }
+
+// Nothing resets a SYCL device (gnark-ffi's reset is CUDA and HIP only).
+extern "C" size_t cuda_free_live_blocks() { return 0; }
 
 // For the other SYCL sources (lib/sycl/ntt.cpp): times a submission if the kernel timing is on.
 void sp1_sycl_profile_event(const char* name, const sycl::event& e) {
@@ -555,6 +662,11 @@ rustCudaError_t cuda_free_host(void* ptr) {
     })
 }
 
+// No transparent-huge-page variant on SYCL: plain host memory.
+rustCudaError_t cuda_malloc_host_huge(void** ptr, size_t size) { return cuda_malloc_host(ptr, size); }
+
+rustCudaError_t cuda_free_host_huge(void* ptr, size_t) { return cuda_free_host(ptr); }
+
 // Pinning existing host memory: SYCL copies from it without registration, staging through the
 // runtime's own buffers, so these only need to succeed.
 rustCudaError_t cuda_host_register(void*, size_t) { return SP1_SUCCESS; }
@@ -569,6 +681,10 @@ rustCudaError_t cuda_mem_set(void* dst, uint8_t value, size_t count) {
 
 rustCudaError_t cuda_mem_copy_host_to_device(void* dst, const void* src, size_t count) {
     SP1_TRY({
+        if (kStagePageable && !is_usm(src)) {
+            copy_from_pageable(*rt().default_queue, dst, src, count);
+            return SP1_SUCCESS;
+        }
         rt().default_queue->memcpy(dst, src, count).wait_and_throw();
         return SP1_SUCCESS;
     })
@@ -576,6 +692,10 @@ rustCudaError_t cuda_mem_copy_host_to_device(void* dst, const void* src, size_t 
 
 rustCudaError_t cuda_mem_copy_device_to_host(void* dst, const void* src, size_t count) {
     SP1_TRY({
+        if (kStagePageable && !is_usm(dst)) {
+            copy_to_pageable(*rt().default_queue, dst, src, count);
+            return SP1_SUCCESS;
+        }
         rt().default_queue->memcpy(dst, src, count).wait_and_throw();
         return SP1_SUCCESS;
     })
@@ -717,6 +837,10 @@ cuda_mem_copy_host_to_device_async(void* dst, const void* src, size_t count, voi
     SP1_TRY({
         auto& q = queue_of(stream);
         const bool pinned = is_usm(src);
+        if (kStagePageable && !pinned) {
+            copy_from_pageable(q, dst, src, count);
+            return SP1_SUCCESS;
+        }
         auto e = q.memcpy(dst, src, count);
         if (sp1prof::enabled()) {
             GpuProfiler::get().add(
@@ -732,8 +856,12 @@ rustCudaError_t
 cuda_mem_copy_device_to_host_async(void* dst, const void* src, size_t count, void* stream) {
     SP1_TRY({
         auto& q = queue_of(stream);
-        auto e = q.memcpy(dst, src, count);
         const bool pinned = is_usm(dst);
+        if (kStagePageable && !pinned) {
+            copy_to_pageable(q, dst, src, count);
+            return SP1_SUCCESS;
+        }
+        auto e = q.memcpy(dst, src, count);
         if (sp1prof::enabled()) {
             GpuProfiler::get().add(
                 pinned ? "copy: device to host" : "copy: device to host (pageable)",

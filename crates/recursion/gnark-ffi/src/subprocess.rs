@@ -9,6 +9,8 @@
 //! - On Linux it gets `SIGKILL` when the spawning thread goes away (`PR_SET_PDEATHSIG`), so it is
 //!   not left running as an orphan. That thread waits for it, so in practice this means when the
 //!   parent process dies.
+//! - On Linux the kernel kills it before its prover when memory runs out
+//!   ([`kill_first_when_out_of_memory`]).
 //! - It is killed if it runs longer than `SP1_GROTH16_HELPER_TIMEOUT_SECS` (default 1800; 0 for no
 //!   limit). A hung helper would otherwise hold the host-wide slot, and stall every prover on the
 //!   host, for ever.
@@ -34,9 +36,9 @@ use anyhow::{Context, Result};
 const STDERR_TAIL_BYTES: usize = 4096;
 /// Helper run time when `SP1_GROTH16_HELPER_TIMEOUT_SECS` is unset.
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(1800);
-/// How long to wait for a killed helper to be gone. One stuck in the kernel (a GPU driver hang, say)
-/// never goes, and must not take this thread with it.
-const REAP_WITHIN: Duration = Duration::from_secs(30);
+/// How long to wait for a killed helper to be gone, or a stopped one to exit. One stuck in the
+/// kernel (a GPU driver hang, say) never goes, and must not take this thread with it.
+pub(crate) const REAP_WITHIN: Duration = Duration::from_secs(30);
 
 /// How a helper ended.
 #[derive(Debug)]
@@ -57,6 +59,29 @@ impl Finished {
     #[cfg(not(unix))]
     pub(crate) fn signal(&self) -> Option<i32> {
         None
+    }
+
+    /// Whether the failure could be its GPU running out of memory, which a reset of this process's
+    /// GPU can help: it exited with an error (a panic's 101 included: a failed `cuda_malloc` panics)
+    /// or aborted (an uncaught C++ exception, as for a CUDA error). The helpers' messages for a
+    /// device allocation that failed do not all say so ("Failed to create persistent MSM context",
+    /// "cuda_malloc failed for ..."), so other failures count too: one that a reset cannot help (a
+    /// GPU R1CS solver set up from a stale prep cache, say) costs the process its GPU and a rerun
+    /// that fails the same way, which SP1_GPU_RESET_BEFORE_WRAP's processes (they exit after their
+    /// proof) can afford. Not the GPU helpers' exit codes for a file they could not read or write or
+    /// for bad arguments (`helper_exit`), not the shell's for a program it could not run (126, 127),
+    /// not a kill (the kernel kills a helper first when the host runs out of memory), and not a
+    /// host allocation that failed (under strict overcommit), which aborts with Rust's or C++'s own
+    /// message.
+    pub(crate) fn may_be_out_of_gpu_memory(&self) -> bool {
+        use crate::helper_exit::{BAD_ARGUMENTS, FILE_ERROR};
+        let host_allocation_failed = self.stderr_tail.contains("memory allocation of")
+            || self.stderr_tail.contains("std::bad_alloc");
+        !host_allocation_failed
+            && match self.status.code() {
+                Some(code) => !matches!(code, 0 | FILE_ERROR | BAD_ARGUMENTS | 126 | 127),
+                None => self.signal() == Some(libc::SIGABRT),
+            }
     }
 
     /// The status and the last of its stderr, for an error message.
@@ -176,19 +201,26 @@ impl KillOnDrop {
 
     /// Kills the helper and waits up to [`REAP_WITHIN`] for it to go. Whether it went.
     fn kill_and_reap(&mut self) -> bool {
-        let Some(mut child) = self.0.take() else {
-            return true;
-        };
-        let _ = child.kill();
-        let deadline = Instant::now() + REAP_WITHIN;
-        loop {
-            match child.try_wait() {
-                Ok(Some(_)) | Err(_) => return true,
-                Ok(None) if Instant::now() >= deadline => return false,
-                Ok(None) => std::thread::sleep(Duration::from_millis(50)),
-            }
+        self.0.take().is_none_or(|mut child| kill_and_reap(&mut child))
+    }
+}
+
+/// Waits up to `within` for `child` to exit. Whether it did (or can no longer be waited for).
+pub(crate) fn exited_within(child: &mut std::process::Child, within: Duration) -> bool {
+    let deadline = Instant::now() + within;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) | Err(_) => return true,
+            Ok(None) if Instant::now() >= deadline => return false,
+            Ok(None) => std::thread::sleep(Duration::from_millis(50)),
         }
     }
+}
+
+/// Kills `child` and waits up to [`REAP_WITHIN`] for it to go. Whether it went.
+pub(crate) fn kill_and_reap(child: &mut std::process::Child) -> bool {
+    let _ = child.kill();
+    exited_within(child, REAP_WITHIN)
 }
 
 impl Drop for KillOnDrop {
@@ -261,10 +293,54 @@ pub(crate) fn bind_to_parent(cmd: &mut Command) {
             Ok(())
         });
     }
+    kill_first_when_out_of_memory(cmd);
 }
 
 #[cfg(not(unix))]
 pub(crate) fn bind_to_parent(_cmd: &mut Command) {}
+
+/// Makes the child the kernel's first choice when the host, or this process's cgroup, runs out of
+/// memory (`oom_score_adj` 1000). A killed helper's proof falls back to gnark's CPU prover or is
+/// retried, while a killed prover loses everything it was proving; by size alone the kernel can
+/// pick the prover, which outgrows a Groth16 CPU helper (~16 GB). Any process may raise its own
+/// score. (Under systemd the prover's unit needs `OOMPolicy=continue`: by default an OOM kill
+/// stops the whole unit.) Runs between fork and exec, so it only makes async-signal-safe calls.
+#[cfg(target_os = "linux")]
+pub(crate) fn kill_first_when_out_of_memory(cmd: &mut Command) {
+    use std::os::unix::process::CommandExt;
+    // SAFETY: the closure only calls open, write and close, which are async-signal-safe, with a
+    // static path and buffer.
+    unsafe {
+        cmd.pre_exec(|| {
+            let fd =
+                libc::open(c"/proc/self/oom_score_adj".as_ptr(), libc::O_WRONLY | libc::O_CLOEXEC);
+            if fd >= 0 {
+                // Best effort: a helper that cannot raise its score still runs.
+                let _ = libc::write(fd, b"1000".as_ptr().cast(), 4);
+                libc::close(fd);
+            }
+            Ok(())
+        });
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn kill_first_when_out_of_memory(_cmd: &mut Command) {}
+
+/// [`kill_first_when_out_of_memory`] for a child already started, from its parent: for a spawn
+/// that must not `fork` this process, which a `pre_exec` closure makes `Command` do instead of
+/// `posix_spawn` (a fork copies the page tables of a prover holding tens of GB). A process may
+/// raise the score of another of its user's. Best effort, as there.
+#[cfg(target_os = "linux")]
+pub(crate) fn kill_child_first_when_out_of_memory(child: &std::process::Child) {
+    let path = format!("/proc/{}/oom_score_adj", child.id());
+    if let Err(e) = std::fs::write(&path, "1000") {
+        tracing::debug!("could not raise {path}: {e}");
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn kill_child_first_when_out_of_memory(_child: &std::process::Child) {}
 
 #[cfg(all(test, unix))]
 pub(crate) mod tests {
@@ -323,6 +399,50 @@ pub(crate) mod tests {
 
         let killed = run_with_timeout(sh("kill -9 $$"), "test", None).unwrap();
         assert_eq!(killed.signal(), Some(9));
+    }
+
+    /// A reset of this process's GPU is tried after a helper's failure only where the helper may
+    /// have run out of GPU memory: not after a file or argument error, a program the shell could
+    /// not run, or a kill.
+    #[cfg(unix)]
+    #[test]
+    fn only_a_failure_that_may_be_out_of_gpu_memory_asks_for_a_reset() {
+        let ended = |script: &str| run_with_timeout(sh(script), "test", None).unwrap();
+        assert!(!ended("exit 0").may_be_out_of_gpu_memory());
+        assert!(ended("exit 1").may_be_out_of_gpu_memory());
+        assert!(ended("exit 101").may_be_out_of_gpu_memory());
+        assert!(ended("kill -6 $$").may_be_out_of_gpu_memory());
+        assert!(!ended("exit 2").may_be_out_of_gpu_memory());
+        assert!(!ended("exit 3").may_be_out_of_gpu_memory());
+        assert!(!ended("exit 126").may_be_out_of_gpu_memory());
+        assert!(!ended("exit 127").may_be_out_of_gpu_memory());
+        assert!(!ended("kill -9 $$").may_be_out_of_gpu_memory());
+        // A host allocation that failed: the same abort, but with Rust's (or C++'s) message.
+        let host = "echo 'memory allocation of 4096 bytes failed' >&2; kill -6 $$";
+        assert!(!ended(host).may_be_out_of_gpu_memory());
+        let host = "echo 'terminate called after throwing std::bad_alloc' >&2; kill -6 $$";
+        assert!(!ended(host).may_be_out_of_gpu_memory());
+    }
+
+    /// A helper, whether run through `run` or spawned by the PLONK helper server, is the kernel's
+    /// first choice when memory runs out.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_helper_is_killed_first_when_memory_runs_out() {
+        let finished =
+            run_with_timeout(sh("cat /proc/self/oom_score_adj >&2"), "test", None).unwrap();
+        assert_eq!(finished.stderr_tail.trim(), "1000");
+        let mut cmd = sh("cat /proc/self/oom_score_adj");
+        kill_first_when_out_of_memory(&mut cmd);
+        let output = cmd.output().unwrap();
+        assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "1000");
+        // The server's way: raised by its parent once it runs.
+        let mut server = sh("exec sleep 60").spawn().unwrap();
+        kill_child_first_when_out_of_memory(&server);
+        let score = std::fs::read_to_string(format!("/proc/{}/oom_score_adj", server.id()));
+        let _ = server.kill();
+        let _ = server.wait();
+        assert_eq!(score.unwrap().trim(), "1000");
     }
 
     #[test]

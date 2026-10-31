@@ -338,6 +338,7 @@ impl<'a, M: ExecutionMode> CoreVM<'a, M> {
     }
 
     /// Execute a jump instruction.
+    #[inline]
     pub fn execute_jump(&mut self, instruction: &Instruction) -> JumpResult {
         match instruction.opcode {
             Opcode::JAL => {
@@ -380,6 +381,7 @@ impl<'a, M: ExecutionMode> CoreVM<'a, M> {
     }
 
     /// Execute a branch instruction.
+    #[inline]
     pub fn execute_branch(&mut self, instruction: &Instruction) -> BranchResult {
         let (rs1, rs2, imm) = instruction.b_type();
 

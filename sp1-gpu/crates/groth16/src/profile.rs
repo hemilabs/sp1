@@ -21,11 +21,14 @@ static PUSH_FN: AtomicPtr<()> = AtomicPtr::new(std::ptr::null_mut());
 static POP_FN: AtomicPtr<()> = AtomicPtr::new(std::ptr::null_mut());
 static MARK_FN: AtomicPtr<()> = AtomicPtr::new(std::ptr::null_mut());
 
+#[cfg(unix)]
 extern "C" {
     fn dlopen(filename: *const c_char, flag: c_int) -> *mut std::ffi::c_void;
     fn dlsym(handle: *mut std::ffi::c_void, symbol: *const c_char) -> *mut std::ffi::c_void;
 }
+#[cfg(unix)]
 const RTLD_LAZY: c_int = 1;
+#[cfg(unix)]
 const RTLD_GLOBAL: c_int = 0x100;
 
 fn init() {
@@ -33,6 +36,10 @@ fn init() {
         if std::env::var("SP1_GPU_PROFILE").ok().as_deref() != Some("1") {
             return;
         }
+        // rocTX is a shared library of Linux ROCm only.
+        #[cfg(not(unix))]
+        eprintln!("[profile] SP1_GPU_PROFILE=1 but rocTX needs Linux; markers disabled");
+        #[cfg(unix)]
         unsafe {
             let candidates = [
                 b"libroctx64.so.4\0".as_ptr() as *const c_char,
@@ -47,14 +54,18 @@ fn init() {
                 }
             }
             if handle.is_null() {
-                eprintln!("[profile] SP1_GPU_PROFILE=1 but libroctx64 not loadable; markers disabled");
+                eprintln!(
+                    "[profile] SP1_GPU_PROFILE=1 but libroctx64 not loadable; markers disabled"
+                );
                 return;
             }
             let push = dlsym(handle, b"roctxRangePushA\0".as_ptr() as *const c_char);
             let pop = dlsym(handle, b"roctxRangePop\0".as_ptr() as *const c_char);
             let mark = dlsym(handle, b"roctxMarkA\0".as_ptr() as *const c_char);
             if push.is_null() || pop.is_null() {
-                eprintln!("[profile] libroctx64 loaded but roctxRangePushA/Pop missing; markers disabled");
+                eprintln!(
+                    "[profile] libroctx64 loaded but roctxRangePushA/Pop missing; markers disabled"
+                );
                 return;
             }
             PUSH_FN.store(push as *mut (), Ordering::Release);

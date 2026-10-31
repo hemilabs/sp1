@@ -62,6 +62,11 @@ extern "C" void cuda_release_cached_memory();
 
 extern "C" rustCudaError_t cuda_free_async(void* devPtr, cudaStream_t stream);
 
+// Frees every block cuda_malloc_async handed out that is still live, for a process about to reset
+// its device (a reset leaves stream-ordered allocations allocated); later frees do nothing.
+// Returns the bytes freed.
+extern "C" size_t cuda_free_live_blocks();
+
 extern "C" rustCudaError_t
 cuda_mem_set_async(void* dst, uint8_t value, size_t count, cudaStream_t stream);
 

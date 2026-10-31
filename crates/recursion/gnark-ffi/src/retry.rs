@@ -334,20 +334,18 @@ mod tests {
 
     #[test]
     fn retry_budget_env_default() {
-        // Make sure the default kicks in cleanly when env unset.
+        let _env = crate::test_env::lock();
+        // Make sure the default kicks in cleanly when env unset. Each guard restores the
+        // variable's earlier value.
+        let unset = crate::test_env::set_var(RETRY_ENV, "");
         std::env::remove_var(RETRY_ENV);
         assert_eq!(retry_budget(), DEFAULT_RETRIES);
+        drop(unset);
 
-        std::env::set_var(RETRY_ENV, "0");
-        assert_eq!(retry_budget(), 0);
-
-        std::env::set_var(RETRY_ENV, "5");
-        assert_eq!(retry_budget(), 5);
-
-        std::env::set_var(RETRY_ENV, "garbage");
-        assert_eq!(retry_budget(), DEFAULT_RETRIES);
-
-        std::env::remove_var(RETRY_ENV);
+        for (value, budget) in [("0", 0), ("5", 5), ("garbage", DEFAULT_RETRIES)] {
+            let _var = crate::test_env::set_var(RETRY_ENV, value);
+            assert_eq!(retry_budget(), budget);
+        }
     }
 
     #[test]

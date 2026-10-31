@@ -5,11 +5,16 @@
 //!
 //! Required env (or CLI args, in this order):
 //!   HELPER=/path/to/plonk_gpu_helper     (absolute path)
-//!   GPU_DIR=/dev/shm/sp1_plonk_gpu_cache_<vk>   (cached prep + witness)
+//!   GPU_DIR=/dev/shm/sp1_plonk_gpu_cache_<vk>   (the cached PK export)
 //!   WITNESS_JSON=/.../plonk_witness.json
 //!   VKEY_HASH_HEX=<64-hex>              (sha256 of plonk_vk.bin)
 //!
 //! Optional env:
+//!   WITNESS_DIR=/.../witness  (the solved witness, as `ExportSolvedWitness` writes it)
+//!     Unset: with BUILD_DIR set (the PLONK circuit's build directory) the bench solves
+//!     WITNESS_JSON into a temporary directory beside GPU_DIR first; otherwise it uses GPU_DIR,
+//!     which holds a witness only in a cache from before per-proof witness directories.
+//!   BUILD_DIR=/.../plonk_circuit_build_dir
 //!   PREP_CIRCUIT_DIR=/dev/shm/sp1_plonk_prep_circuit_<vk>
 //!     If set, exercises the Phase H GPU SCS solver path. Requires
 //!     WITNESS_INIT_DIR (a per-prove `make-witness-init` output).
@@ -18,7 +23,7 @@
 //!     this env is set — that's appropriate for measuring solver +
 //!     PlonkProver amortisation, not for measuring `make-witness-init` reuse.
 //!   N=3   (number of warm server proves; default 3)
-//!   SP1_PLONK_GPU_HELPER_DEVICES=N (CUDA_VISIBLE_DEVICES override)
+//!   SP1_PLONK_GPU_HELPER_DEVICES=N (CUDA_VISIBLE_DEVICES override, as for the prover)
 //!
 //! Acceptance:
 //!   - Iter 2+ wall < iter 1 wall (server amortises PK + prover construction).
@@ -52,10 +57,40 @@ fn main() -> anyhow::Result<()> {
     if prep_circuit_dir.is_some() && witness_init_dir.is_none() {
         anyhow::bail!("PREP_CIRCUIT_DIR requires WITNESS_INIT_DIR");
     }
+    // Kept alive while the server proves from it.
+    let mut _solved = None;
+    let witness_dir = match (std::env::var_os("WITNESS_DIR"), std::env::var("BUILD_DIR")) {
+        (Some(dir), _) => PathBuf::from(dir),
+        (None, Ok(build_dir)) => {
+            // Beside the key, as the prover's own witness goes: out of a small /dev/shm.
+            let dir = match gpu_dir.parent() {
+                Some(parent) => tempfile::tempdir_in(parent),
+                None => tempfile::tempdir(),
+            }?;
+            eprintln!("solving the witness into {}", dir.path().display());
+            sp1_recursion_gnark_ffi::ffi::export_plonk_gpu_witness(
+                &build_dir,
+                witness_json.to_str().expect("a UTF-8 witness path"),
+                dir.path().to_str().expect("a UTF-8 temporary path"),
+            );
+            let path = dir.path().to_path_buf();
+            _solved = Some(dir);
+            path
+        }
+        (None, Err(_)) => gpu_dir.clone(),
+    };
+    if prep_circuit_dir.is_none() && !witness_dir.join("witness_info.bin").is_file() {
+        anyhow::bail!(
+            "{} holds no solved witness (witness_info.bin): set WITNESS_DIR, or BUILD_DIR to solve \
+             WITNESS_JSON",
+            witness_dir.display()
+        );
+    }
 
     println!("helper           = {}", helper.display());
     println!("gpu_dir          = {}", gpu_dir.display());
     println!("witness_json     = {}", witness_json.display());
+    eprintln!("witness_dir      = {}", witness_dir.display());
     println!("vkey_hash_hex    = {vkey_hash_hex}");
     println!("prep_circuit_dir = {:?}", prep_circuit_dir);
     println!("witness_init_dir = {:?}", witness_init_dir);
@@ -68,7 +103,7 @@ fn main() -> anyhow::Result<()> {
     if std::env::var_os("SP1_GPU_G2_GLV").is_none() {
         extra_env.push(("SP1_GPU_G2_GLV".to_string(), "0".to_string()));
     }
-    if let Ok(devs) = std::env::var("SP1_PLONK_GPU_HELPER_DEVICES") {
+    if let Some(devs) = sp1_recursion_gnark_ffi::plonk_helper_devices() {
         extra_env.push(("CUDA_VISIBLE_DEVICES".to_string(), devs.clone()));
         extra_env.push(("HIP_VISIBLE_DEVICES".to_string(), devs));
     }
@@ -89,8 +124,13 @@ fn main() -> anyhow::Result<()> {
         let out = tempfile::NamedTempFile::new_in("/dev/shm")
             .or_else(|_| tempfile::NamedTempFile::new())?;
         let t1 = Instant::now();
-        let outcome =
-            server.prove(&witness_json, &vkey_hash_hex, out.path(), witness_init_dir.as_deref())?;
+        let outcome = server.prove(
+            &witness_json,
+            &witness_dir,
+            &vkey_hash_hex,
+            out.path(),
+            witness_init_dir.as_deref(),
+        )?;
         let wall = t1.elapsed();
         walls.push(wall);
         prove_ms_vec.push(outcome.prove_ms);

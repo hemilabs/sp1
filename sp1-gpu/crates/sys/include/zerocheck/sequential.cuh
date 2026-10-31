@@ -185,6 +185,16 @@ extern "C" void* zerocheck_fused_sequential_ext_256_kernel();
 extern "C" void* zerocheck_fused_sequential_ext_512_kernel();
 extern "C" void* zerocheck_fused_sequential_ext_1024_kernel();
 
+// Wave-uniform interpreter variants of the MAX_REGS = 128 tier: scalar
+// instruction fetch/dispatch, and a register file of V registers in VGPRs
+// (indexed by the uniform register number) plus a scratch overflow. Same
+// launch shape and results as the generic kernels. Suffix = V (0 = scratch).
+extern "C" void* zerocheck_fused_sequential_uniform_kb_128_v0_kernel();
+extern "C" void* zerocheck_fused_sequential_uniform_kb_128_v32_kernel();
+extern "C" void* zerocheck_fused_sequential_uniform_ext_128_v0_kernel();
+extern "C" void* zerocheck_fused_sequential_uniform_ext_128_v16_kernel();
+extern "C" void* zerocheck_fused_sequential_uniform_ext_128_v32_kernel();
+
 // Cooperative small-round kernel: ZC_COOP_LANES lanes per row, ZC_COOP_ROWS
 // rows per block (ZC_COOP_THREADS threads), lanes split each level of the
 // chunk's level schedule, values in dynamic shared memory. Used for chunks
@@ -199,6 +209,17 @@ constexpr uint32_t ZC_COOP_ROWS = ZC_COOP_THREADS / ZC_COOP_LANES;
 extern "C" uint32_t zerocheck_coop_smem_cap();
 extern "C" void* zerocheck_fused_sequential_coop_kb_kernel();
 extern "C" void* zerocheck_fused_sequential_coop_ext_kernel();
+// Wide cooperative variant: ZC_COOP_WIDE_LANES lanes per row, so a block holds
+// only ZC_COOP_WIDE_ROWS rows' value slots. For chunks whose level schedule
+// needs too many slots for ZC_COOP_ROWS rows in shared memory (and which
+// otherwise fall back to the thread-per-row kernel's serial walk). Same
+// arguments, grid and results; dispatch tiles of ZC_COOP_WIDE_ROWS rows.
+// Dynamic smem bytes = 32 * 16 + max_instrs * 8
+//   + align16(2 * (max_levels + 1)) + ZC_COOP_WIDE_ROWS * max_phys * sizeof(K).
+constexpr uint32_t ZC_COOP_WIDE_LANES = 32;
+constexpr uint32_t ZC_COOP_WIDE_ROWS = ZC_COOP_THREADS / ZC_COOP_WIDE_LANES;
+extern "C" void* zerocheck_fused_sequential_coop_wide_kb_kernel();
+extern "C" void* zerocheck_fused_sequential_coop_wide_ext_kernel();
 
 // Bivariate (fused first-two-rounds) variants: eval nodes on blockIdx.z
 // (12 nodes), quadruple row consumption, output stride 12. Round 0 only —
@@ -209,3 +230,9 @@ extern "C" void* zerocheck_fused_sequential_bivariate_kb_128_kernel();
 extern "C" void* zerocheck_fused_sequential_bivariate_kb_256_kernel();
 extern "C" void* zerocheck_fused_sequential_bivariate_kb_512_kernel();
 extern "C" void* zerocheck_fused_sequential_bivariate_kb_1024_kernel();
+
+// Wave-uniform node-vectorised bivariate kernels (G = 4, MAX_REGS = 128):
+// same launch as `..._bivariate_vec4_kb_128`; suffix = VGPR register-file size.
+extern "C" void* zerocheck_fused_sequential_bivariate_vec4_uniform_kb_128_v0_kernel();
+extern "C" void* zerocheck_fused_sequential_bivariate_vec4_uniform_kb_128_v16_kernel();
+extern "C" void* zerocheck_fused_sequential_bivariate_vec4_uniform_kb_128_v32_kernel();

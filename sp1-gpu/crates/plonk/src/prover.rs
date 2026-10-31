@@ -45,6 +45,22 @@ pub struct PlonkProver {
     /// fold call when `SP1_PLONK_R5_GPU` is enabled. ~4-5 GiB depending on
     /// circuit. Lifetime tied to `PlonkProver` (per-PK).
     pub(crate) canonical_cache: crate::static_cache::PlonkCanonicalCache,
+    /// The host arrays of `cached` registered with the driver, unregistered on drop: their memory
+    /// goes back to the allocator, and registering it again (a later prover's arrays) would fail.
+    #[cfg(feature = "cuda")]
+    pinned_host: Vec<usize>,
+}
+
+#[cfg(feature = "cuda")]
+impl Drop for PlonkProver {
+    fn drop(&mut self) {
+        // Before `cached` (whose arrays these are) is dropped.
+        for &ptr in &self.pinned_host {
+            unsafe {
+                let _ = sp1_gpu_sys::runtime::cuda_host_unregister(ptr as *const std::ffi::c_void);
+            }
+        }
+    }
 }
 
 /// Cached verifying key commitments (static per circuit).
@@ -115,7 +131,7 @@ pub(crate) struct CachedFrData {
     zh_invs_4: [Fr; 4],
     /// Two-level omega lookup tables for on-the-fly coset point computation in GPU kernel.
     /// lo_table[k] = omega_4N^k for k = 0..2^14-1
-    /// hi_table[k] = omega_4N^(k*2^14) for k = 0..big_n/2^14-1
+    /// hi_table[k] = omega_4N^(k*2^14) for k = 0..max(big_n/2^14, 1)-1
     /// Total ~768 KB pinned memory, replaces 4.3 GiB coset_points PCIe transfer.
     omega_lo_table: Vec<Fr>,
     omega_hi_table: Vec<Fr>,
@@ -474,7 +490,8 @@ impl PlonkProver {
 
         // Two-level omega lookup tables for on-the-fly coset point computation.
         // lo_table[k] = omega_4N^k for k = 0..2^14-1
-        // hi_table[k] = omega_4N^(k*2^14) for k = 0..big_n/2^14-1
+        // hi_table[k] = omega_4N^(k*2^14) for k = 0..max(big_n/2^14, 1)-1 (a domain under 2^14
+        // still reads hi_table[0])
         let omega_lo_table: Vec<Fr> = {
             let mut t = vec![Fr::ONE; 1 << 14];
             for i in 1..t.len() {
@@ -484,7 +501,7 @@ impl PlonkProver {
         };
         let omega_hi_table: Vec<Fr> = {
             let omega_step = omega_4n.pow(&[1u64 << 14, 0, 0, 0]);
-            let hi_len = big_n >> 14;
+            let hi_len = (big_n >> 14).max(1);
             let mut t = vec![Fr::ONE; hi_len];
             for i in 1..t.len() {
                 t[i] = t[i - 1] * omega_step;
@@ -574,15 +591,24 @@ impl PlonkProver {
         // The quotient kernel uploads these in chunks via cudaMemcpyAsync.
         // Pinning enables direct DMA at full PCIe bandwidth (~25 GB/s vs ~1.7 GB/s unpinned).
         #[cfg(feature = "cuda")]
+        let mut pinned_host = Vec::new();
+        #[cfg(feature = "cuda")]
         {
             use std::ffi::c_void;
             let mut pin_failures = 0u32;
-            let pin = |name: &str, v: &[Fr], failures: &mut u32| unsafe {
+            let mut pin = |name: &str, v: &[Fr], failures: &mut u32| unsafe {
+                // Nothing to pin, and registering 0 bytes fails with an error the runtime keeps
+                // pending: the next kernel launch check (sppark's NTT) would then report it.
+                if v.is_empty() {
+                    return;
+                }
                 let err = sp1_gpu_sys::runtime::cuda_host_register(
                     v.as_ptr() as *const c_void,
                     std::mem::size_of_val(v),
                 );
-                if err != sp1_gpu_sys::runtime::CUDA_SUCCESS_CSL {
+                if err == sp1_gpu_sys::runtime::CUDA_SUCCESS_CSL {
+                    pinned_host.push(v.as_ptr() as usize);
+                } else {
                     *failures += 1;
                     eprintln!(
                         "[WARN] cuda_host_register failed for {} ({} bytes)",
@@ -619,6 +645,8 @@ impl PlonkProver {
             cached,
             static_cache: crate::static_cache::PlonkStaticCache::new(),
             canonical_cache: crate::static_cache::PlonkCanonicalCache::new(),
+            #[cfg(feature = "cuda")]
+            pinned_host,
         }
     }
 
@@ -994,9 +1022,7 @@ impl PlonkProver {
                 let msg = if err.message.is_null() {
                     "unknown error".to_string()
                 } else {
-                    unsafe { std::ffi::CStr::from_ptr(err.message) }
-                        .to_string_lossy()
-                        .into_owned()
+                    unsafe { std::ffi::CStr::from_ptr(err.message) }.to_string_lossy().into_owned()
                 };
                 panic!("GPU grand product kernel failed: {msg}");
             }
@@ -2640,8 +2666,7 @@ impl PlonkProver {
         // saving the 4 GiB host upload that re-uploads h_coeffs from CPU).
         // Otherwise drop immediately to free ~4 GiB before R4 finishes.
         #[cfg(feature = "cuda")]
-        let r5_gpu_keep_d_h =
-            std::env::var("SP1_PLONK_R5_GPU").ok().as_deref() == Some("1");
+        let r5_gpu_keep_d_h = std::env::var("SP1_PLONK_R5_GPU").ok().as_deref() == Some("1");
         #[cfg(feature = "cuda")]
         let d_h_for_r5: Option<crate::domain::gpu_ntt::DeviceBuffer> = if r5_gpu_keep_d_h {
             d_h_coeffs
@@ -3144,8 +3169,8 @@ impl PlonkProver {
                     };
                     gpu_polys.push(match d_h_base_ptr {
                         Some(base) => {
-                            let ptr = (base + offset_polys * stride_bytes)
-                                as *const std::ffi::c_void;
+                            let ptr =
+                                (base + offset_polys * stride_bytes) as *const std::ffi::c_void;
                             PolyInput::Device { ptr, len: n + 2 }
                         }
                         None => PolyInput::Host(host_fallback),
@@ -3157,8 +3182,7 @@ impl PlonkProver {
                 gpu_polys.push(PolyInput::Host(&l_coeffs));
                 gpu_polys.push(PolyInput::Host(&r_coeffs));
                 gpu_polys.push(PolyInput::Host(&o_coeffs));
-                let s12_slots: [(CS, &[Fr]); 2] =
-                    [(CS::S1, s1_coeffs), (CS::S2, s2_coeffs)];
+                let s12_slots: [(CS, &[Fr]); 2] = [(CS::S1, s1_coeffs), (CS::S2, s2_coeffs)];
                 for (slot, fallback) in s12_slots.iter() {
                     gpu_polys.push(match self.canonical_cache.get(*slot) {
                         Some((ptr, len)) => PolyInput::Device { ptr, len },
@@ -3172,10 +3196,8 @@ impl PlonkProver {
                     });
                 }
                 debug_assert_eq!(gpu_polys.len(), fused_polys.len());
-                let n_device = gpu_polys
-                    .iter()
-                    .filter(|p| matches!(p, PolyInput::Device { .. }))
-                    .count();
+                let n_device =
+                    gpu_polys.iter().filter(|p| matches!(p, PolyInput::Device { .. })).count();
                 gpu_linear_combination_mixed(&mut result, &gpu_polys, &fused_scalars);
                 eprintln!(
                     "[T] 10a. GPU R5 lincomb (mixed; {n_device}/{} device-resident): {:?}",
@@ -4876,9 +4898,8 @@ impl PlonkProver {
         // the multi-invoke leak that wedges PlonkProver server-mode.
         if pin_err == unsafe { sp1_gpu_sys::runtime::CUDA_SUCCESS_CSL } {
             unsafe {
-                let _ = sp1_gpu_sys::runtime::cuda_host_unregister(
-                    h_coeffs.as_ptr() as *const c_void,
-                );
+                let _ =
+                    sp1_gpu_sys::runtime::cuda_host_unregister(h_coeffs.as_ptr() as *const c_void);
             }
         }
         eprintln!("[T] 7c. D2H download: {:?}", _t_d2h.elapsed());
@@ -5164,9 +5185,8 @@ impl PlonkProver {
                         * (l_evals[i] + beta_val * s1_evals[i] + gamma_val)
                         * (r_evals[i] + beta_val * s2_evals[i] + gamma_val)
                         * (o_evals[i] + beta_val * s3_evals[i] + gamma_val);
-                    // PLONK permutation identity: α·(Z·num - Z(ωX)·den).
-                    // Restored to commit a32120e7c convention; flipping does not
-                    // fix gnark verify (see note in quotient.cu).
+                    // PLONK permutation identity with gnark's sign: α·(Z(ωX)·den - Z·num)
+                    // (`orderingConstraint` in gnark's PLONK prover), as in quotient.cu.
                     let perm = alpha_val * (perm_den - perm_num);
 
                     let l1_x = zh_values[i] * x_minus_one_n_inv[i];
@@ -5378,11 +5398,7 @@ pub(crate) enum PolyInput<'a> {
 }
 
 #[cfg(feature = "cuda")]
-fn gpu_linear_combination_mixed(
-    result: &mut [Fr],
-    polys: &[PolyInput<'_>],
-    scalars: &[Fr],
-) {
+fn gpu_linear_combination_mixed(result: &mut [Fr], polys: &[PolyInput<'_>], scalars: &[Fr]) {
     use std::ffi::c_void;
     assert_eq!(polys.len(), scalars.len());
     let n_polys = polys.len() as u32;
@@ -5403,8 +5419,7 @@ fn gpu_linear_combination_mixed(
             PolyInput::Host(slice) => {
                 let bytes = slice.len() * elem_sz;
                 let mut ptr: *mut c_void = std::ptr::null_mut();
-                let err =
-                    unsafe { sp1_gpu_sys::runtime::cuda_malloc(&mut ptr as *mut _, bytes) };
+                let err = unsafe { sp1_gpu_sys::runtime::cuda_malloc(&mut ptr as *mut _, bytes) };
                 if err != unsafe { sp1_gpu_sys::runtime::CUDA_SUCCESS_CSL } {
                     panic!("gpu_linear_combination_mixed: cuda_malloc failed");
                 }
@@ -7034,8 +7049,9 @@ mod tests {
     /// This test constructs a circuit with a non-identity permutation (swap two
     /// wire positions) so that Z is NOT all ones. The permutation contribution
     /// to the quotient becomes non-trivial, and we verify:
-    ///   h(x) * Z_H(x) == gate(x) + alpha*(perm_num - perm_den) + alpha^2*(Z-1)*L1(x)
-    /// at random evaluation points (matches the kernel's current sign).
+    ///   h(x) * Z_H(x) == gate(x) + alpha*(perm_den - perm_num) + alpha^2*(Z-1)*L1(x)
+    /// at random evaluation points: gnark's sign (`orderingConstraint` in its PLONK prover
+    /// computes Z(ωx)·den - Z(x)·num), which the quotient kernel and the CPU path use.
     #[test]
     fn test_constraint_satisfaction_nonidentity_permutation() {
         let n: usize = 8;
@@ -7246,8 +7262,8 @@ mod tests {
                 * (l_x + beta * s1_x + gamma)
                 * (r_x + beta * s2_x + gamma)
                 * (o_x + beta * s3_x + gamma);
-            // SP1 convention: α·(num - den). Matches the kernel.
-            let perm = alpha * (perm_num - perm_den);
+            // gnark's convention: α·(den - num), as the kernel computes it.
+            let perm = alpha * (perm_den - perm_num);
 
             // Boundary: alpha^2 * (Z - 1) * L_1(x)
             let l1_x = zh_x * ((*x - Fr::ONE) * n_fr).inv();
@@ -7283,8 +7299,8 @@ mod tests {
                 * (l_x + beta * s1_x + gamma)
                 * (r_x + beta * s2_x + gamma)
                 * (o_x + beta * s3_x + gamma);
-            // WRONG sign: (den - num) instead of (num - den)
-            let perm = alpha * (perm_den - perm_num);
+            // WRONG sign: (num - den) instead of (den - num)
+            let perm = alpha * (perm_num - perm_den);
 
             let l1_x = zh_x * ((*x - Fr::ONE) * n_fr).inv();
             let boundary = alpha.square() * (z_x - Fr::ONE) * l1_x;
@@ -7303,7 +7319,7 @@ mod tests {
             // Correct sign MUST match
             assert_eq!(
                 lhs, rhs_correct,
-                "CRITICAL: h(x)*Z_H(x) != numerator(x) with (perm_num - perm_den) sign.\n\
+                "CRITICAL: h(x)*Z_H(x) != numerator(x) with (perm_den - perm_num) sign.\n\
                  This means the quotient computation or the sign convention is wrong.\n\
                  h(x)*Z_H(x)  = {:?}\n\
                  numerator(x) = {:?}",
@@ -7313,7 +7329,7 @@ mod tests {
             // Wrong sign MUST NOT match (proving the test is discriminating)
             assert_ne!(
                 lhs, rhs_wrong,
-                "BUG: h(x)*Z_H(x) matches with WRONG sign (perm_den - perm_num)!\n\
+                "BUG: h(x)*Z_H(x) matches with WRONG sign (perm_num - perm_den)!\n\
                  This can only happen if the permutation contribution is zero,\n\
                  meaning the test is not exercising the sign. Z[1] = {:?}",
                 z_lagrange[1],

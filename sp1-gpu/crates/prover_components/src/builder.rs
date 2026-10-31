@@ -19,14 +19,38 @@ pub const GPU_NUM_CORE_WORKERS: usize = 8;
 /// holds a shard's records in host RAM (about +9 GB for the four extra on an RTX 5090 host).
 pub const GPU_NUM_CORE_WORKERS_MIN_AVAILABLE_RAM: u64 = 48 << 30;
 
+/// Normalize (lift) programs the GPU prover keeps compiled, on hosts with
+/// [`GPU_NORMALIZE_PROGRAM_CACHE_MIN_AVAILABLE_RAM`]. A program is compiled for each new core shard
+/// shape (0.4-1 s of CPU) and takes 50-70 MB; an rsp proof has 18 shapes, so the upstream default
+/// of 5 recompiles every one of them in every proof (~8-10 s of CPU per proof). 32 keeps a proof's
+/// programs for the next proof of a similar program, for up to ~2.3 GB.
+pub const GPU_NORMALIZE_PROGRAM_CACHE_SIZE: usize = 32;
+
+/// Host memory the process must have available for [`GPU_NORMALIZE_PROGRAM_CACHE_SIZE`].
+pub const GPU_NORMALIZE_PROGRAM_CACHE_MIN_AVAILABLE_RAM: u64 = 64 << 30;
+
 /// Whether the compress prover gets its own CUDA stream and permit (see
 /// `cuda_worker_builder_with_machine`). On by default above the 30 GB tier, where a core shard and
-/// a compress proof fit on the card together; `SP1_GPU_RECURSION_STREAM=0|1` overrides.
+/// a compress proof fit on the card together, except with SYCL; `SP1_GPU_RECURSION_STREAM=0|1`
+/// overrides.
+///
+/// On Windows two streams do not fit an Arc Pro B70 either: the video memory budget (31.8 GB) is
+/// below the card's 32 GB, and past it WDDM moves memory to shared system memory. Groth16 proofs
+/// of `local-fibonacci --param 20000000` (1.44B cycles) took 58-225 s, erratically, with two
+/// streams, and 44.4-44.8 s with one, without spilling (peak 30.7 GB).
+///
+/// On an Arc Pro B70 under Linux (xe driver, compute runtime 26.09, Level Zero's legacy adapter),
+/// two streams first crashed about one proof in nine inside the driver; with pageable copies
+/// staged and evictions draining every queue (lib/sycl/runtime.cpp) they no longer crash, but they
+/// do not fit: a 20M-cycle fibonacci Groth16 proof then reaches the card's 32 GB as compression
+/// starts (the kernels' scratch memory comes on top of the allocator's), and two of four such
+/// runs died out of device memory. One stream peaks at 30.7 GB and is under 1% slower (rsp
+/// compressed 77.0 s against 76.4 s, keccak 43.6 s against 43.3 s).
 fn separate_recursion_stream() -> bool {
     match std::env::var("SP1_GPU_RECURSION_STREAM").as_deref() {
         Ok("0") | Ok("false") => false,
         Ok("1") | Ok("true") => true,
-        _ => gpu_memory_gb() > 30,
+        _ => gpu_memory_gb() > 30 && sp1_gpu_cudart::sys::BACKEND != "sycl",
     }
 }
 
@@ -49,6 +73,15 @@ use crate::{
     new_cuda_prover, CudaProverCoreComponents, CudaProverRecursionComponents,
     SP1CudaProverComponents,
 };
+
+/// Least video memory budget (DXGI) at which a 16 GB AMD card on Windows takes the 16 GB tier
+/// rather than the one below it (see `local_gpu_opts`). An RX 9060 XT driving no display has 15.1
+/// GiB, and at the 16 GB tier proved in 8 shards instead of 15: bench-fib core 7.04 -> 5.83 s,
+/// compressed 14.67 -> 10.35 s, a 1.44B-cycle Groth16 proof 164 -> 115 s, an RSP block (21000000)
+/// compressed 317 -> 186 s, with shared memory no higher than at the tier below (its allocator
+/// fills the budget either way: 14.2 and 14.6 GiB at peak). An RX 9070 XT that Windows granted
+/// ~12.5 GB spilled at the 16 GB tier.
+const HIP_WINDOWS_16GB_TIER_MIN_BUDGET: u64 = 14 << 30;
 
 /// The card's memory as the tiers below see it: `ceil(total GiB) + 4`, so a 16 GB card reports 20
 /// and a 24 GB card 28.
@@ -85,14 +118,38 @@ pub fn local_gpu_opts() -> SP1CoreOpts {
     // Shard threshold tiers based on GPU memory. `gpu_memory_gb` = ceil(actual GiB) + 4, so a 16 GB
     // card reports 20 and a 24 GB card 28.
     let tier_threshold =
-        if gpu_memory_gb <= 20 && cfg!(windows) && sp1_gpu_cudart::sys::BACKEND == "hip" {
-            // 16GB AMD GPUs on Windows: the video memory budget Windows grants a process is ~12.5 GB of
-            // the 16, and past it WDDM moves allocations into shared system memory rather than failing
-            // them, which slowed every kernel touching them (an RX 9070 XT proved a 144M-cycle program in
-            // 15-17 s at the tier below and 12.7-13.5 s at this one).
+        if gpu_memory_gb <= 20 && cfg!(windows) && sp1_gpu_cudart::sys::BACKEND == "hip" && {
+            // SAFETY: takes nothing and queries DXGI for the current device.
+            let budget = unsafe { sp1_gpu_cudart::sys::runtime::sp1_video_memory_budget() };
+            tracing::debug!("video memory budget: {:.1} GiB", budget as f64 / (1u64 << 30) as f64);
+            budget < HIP_WINDOWS_16GB_TIER_MIN_BUDGET
+        } {
+            // 16GB AMD GPUs on Windows with a tight video memory budget: Windows granted a process
+            // ~12.5 GB of an RX 9070 XT's 16, and past it WDDM moves allocations into shared system
+            // memory rather than failing them, which slowed every kernel touching them (it proved a
+            // 144M-cycle program in 15-17 s at the tier below and 12.7-13.5 s at this one).
             1 << 26
+        } else if gpu_memory_gb <= 20
+            && (sp1_gpu_cudart::sys::BACKEND == "cuda"
+                // SAFETY: takes nothing and creates nothing; reads settings and device attributes.
+                || unsafe { sp1_gpu_cudart::sys::runtime::sp1_hip_arena_scatters() } != 0)
+        {
+            // 16 GB CUDA cards: 2^28 elements a shard, below the 24 GB tier's. An RTX 5060 Ti
+            // driving the desktop peaked at 12.3 GB (Windows), and proved in fewer shards than at
+            // 2^27: an RSP block (21000000) compressed in 65.0 s instead of 91.0, keccak over 20 MB
+            // in 74.3 s instead of 99.7, bench-fib compressed in 4.12 s instead of 5.05 (2^28 +
+            // 2^26 was faster still, 60.1 s for the block, but peaked at 13.9 GB).
+            //
+            // And 16 GB HIP cards whose arena assembles blocks from scattered pages: at 2^28 a
+            // shard's largest blocks (~4 GiB) found no free range that long in the single-range
+            // arena with half the card free. An RX 9070 XT proved the block in 50.0 s instead of
+            // 72.8 s. (2^28 + 2^25 and 2^28 + 2^26 proved the block in 41.4 and 39.7 s instead of
+            // 42.7, but fibonacci 20M's first shard ran out of memory at both: its codeword found
+            // too few whole free pages.)
+            1 << 28
         } else if gpu_memory_gb <= 20 {
-            // 16 GB cards (e.g. RTX 5080, RX 9070 XT): ~134M elements per shard to fit in VRAM.
+            // 16 GB cards (e.g. RX 9070 XT) whose arena can't take scattered blocks: ~134M
+            // elements per shard to fit in VRAM.
             ELEMENT_THRESHOLD - (1 << 28)
         } else if !opts.full_size_shards && gpu_memory_gb <= 30 {
             ELEMENT_THRESHOLD - (1 << 26) - (1 << 25) - (1 << 24)
@@ -227,7 +284,81 @@ pub async fn cuda_worker_builder_with_machine(
     // gnark's Groth16 prover runs its quotient polynomial and MSMs on this GPU where the build has
     // them (HIP and SYCL; SP1_GROTH16_GPU=0 keeps them on the CPU).
     if let Some((compute_h, msm_g1, msm_g2)) = sp1_gpu_cudart::sys::groth16_entry_points() {
-        sp1_recursion_gnark_ffi::ffi::set_groth16_gpu_hooks(compute_h, msm_g1, msm_g2);
+        let total = cuda_memory_info().map_or(0, |(_, total)| total as u64);
+        sp1_recursion_gnark_ffi::ffi::set_groth16_gpu_hooks(compute_h, msm_g1, msm_g2, total);
+        // On an RX 9070 XT the GPU's G2 MSM, after the G1 MSMs, beats the CPU's alongside them: a
+        // Groth16 wrap of an RSP block took 7.2 s instead of 8.1.
+        if sp1_gpu_cudart::sys::BACKEND == "hip" {
+            sp1_recursion_gnark_ffi::ffi::set_groth16_g2_msm_on_gpu(true);
+        }
+        // And solves the circuit on it where the build has the solver (HIP) and its circuit data
+        // can be had (see `Groth16Bn254Prover::prove_isolated`; SP1_GPU_R1CS_SOLVER=cpu does not).
+        if let Some((create, solve, destroy)) = sp1_gpu_cudart::sys::r1cs_solver_entry_points() {
+            sp1_recursion_gnark_ffi::ffi::set_groth16_gpu_r1cs_solver(create, solve, destroy);
+        }
+    }
+
+    // A final-wrap GPU helper needs the memory of the shard prover's device caches too, which a
+    // pool trim or a device reset does not return: rsp's PLONK helper otherwise ran out of memory.
+    // (Their release also gives back the small blocks the streams keep for reuse.) With HIP and
+    // SYCL, also the allocator's cached blocks, which the pool trim does not see (on HIP they go
+    // back to the arena when there is one, which a helper cannot have either).
+    sp1_recursion_gnark_ffi::device_caches::set_releaser(|| {
+        sp1_gpu_cudart::release_device_caches(true);
+        // The Groth16 prover's GPU R1CS solver, which it keeps between proofs.
+        sp1_recursion_gnark_ffi::ffi::release_groth16_gpu_r1cs_solver();
+        // And the tables its quotient keeps on this GPU.
+        sp1_gpu_cudart::sys::release_groth16_tables();
+        // SAFETY: takes nothing; waits for the device and frees blocks no one holds.
+        unsafe { sp1_gpu_cudart::sys::runtime::cuda_release_cached_memory() };
+    });
+    // With SYCL, also after each Groth16 proof gnark makes in this process with this GPU's hooks:
+    // what the wrap and Groth16 stages left cached otherwise pushed the next proof's buffers into
+    // shared system memory on Windows. On a 12 GB Arc B580, fib 2M Groth16 proofs back to back
+    // took 39, 92-146 s (the compressed STARK 9 s, then 70-146 s); with this, 39 then 30.5-30.7 s.
+    // (Not measured with HIP, where the arena keeps freed memory for this process anyway.)
+    sp1_recursion_gnark_ffi::device_caches::set_release_after_groth16(
+        sp1_gpu_cudart::sys::BACKEND == "sycl",
+    );
+    // HIP's arena holds the card's memory, out of a helper's reach: it gives an allocation back
+    // only when that is wholly free, and only to make room for one of this process's blocks.
+    // SAFETY: takes nothing and reads the arena's size under its lock.
+    sp1_recursion_gnark_ffi::device_caches::set_arena_bytes(|| unsafe {
+        sp1_gpu_cudart::sys::runtime::sp1_hip_arena_bytes() as u64
+    });
+    // A device reset before a wrap helper (SP1_GPU_RESET_BEFORE_WRAP) does not free the blocks the
+    // prover took from the stream-ordered allocator, its keys among them; this does, first.
+    // SAFETY: takes nothing; called only by a process about to reset its device, which uses the
+    // blocks no more (their later frees do nothing).
+    sp1_recursion_gnark_ffi::device_caches::set_live_blocks_freer(|| unsafe {
+        sp1_gpu_cudart::sys::runtime::cuda_free_live_blocks() as u64
+    });
+    // Measuring and trimming GPU memory for that helper. On Linux the wrap paths find the CUDA or
+    // HIP runtime library themselves; on Windows it is linked statically, and without these the
+    // GPU Groth16 prover was never chosen ("free GPU memory is unknown"), while the GPU PLONK
+    // prover's helper was started on any HIP or SYCL card, 16 GB ones too, where it ran the host
+    // out of memory. HIP and SYCL allocate through their own caching allocator rather than the
+    // memory pool, so their trim gives its cached blocks back instead, the pool's idle reserve on
+    // CUDA: on an RX 9060 XT the pool trim alone freed nothing, and only the device caches'
+    // release, which the next shards then upload again, made room.
+    #[cfg(not(target_os = "linux"))]
+    {
+        sp1_recursion_gnark_ffi::device_caches::set_runtime(
+            sp1_recursion_gnark_ffi::device_caches::Runtime {
+                mem_get_info: || {
+                    let (free, total) = sp1_gpu_cudart::cuda_memory_info().ok()?;
+                    Some((free as u64, total as u64))
+                },
+                trim_memory_pool: || {
+                    if sp1_gpu_cudart::sys::BACKEND != "cuda" {
+                        // SAFETY: takes nothing; waits for the device and frees blocks no one
+                        // holds.
+                        unsafe { sp1_gpu_cudart::sys::runtime::cuda_release_cached_memory() };
+                    }
+                    sp1_gpu_cudart::trim_default_mem_pool().is_ok()
+                },
+            },
+        );
     }
 
     // The wrap prover keeps its proving key between Groth16/PLONK proofs (sp1-prover's WrapProver)
@@ -281,7 +412,9 @@ pub async fn cuda_worker_builder_with_machine(
     // phases keep their LDE codewords and their materialized LogUp-GKR first layer. The tier only
     // shrinks the core threshold; the retained codewords in recursion (~2 GiB), shrink (~1 GiB) and
     // wrap (~2.5 GiB) are tier-blind, and the wrap's peak is what blocks a 16 GB card from finishing a
-    // Groth16 proof. On larger cards both flags default off, so nothing changes there.
+    // Groth16 proof. On larger cards both flags default off, so nothing changes there. (An RX 9070
+    // XT proved an RSP block compressed 0.3 s faster with recursion's kept, but a general-compute
+    // Groth16 run then ran out of memory in its second proof's core shard.)
     //
     // Correctness: `drop_ldes` only decides whether a codeword is kept or recomputed. The commitment
     // is taken before the drop (`FriCudaProver::encode_and_commit`), the recompute re-runs the same
@@ -337,17 +470,33 @@ pub async fn cuda_worker_builder_with_machine(
         .await,
     );
 
-    // The GPU Groth16 prover is for cards above the 16 GB tier; 16 GB cards use gnark's CPU
-    // prover, as the v6.0.0 fork always did. Before each proof the recursion prover also checks
-    // that the card has the GPU memory free for the GPU prover's helper (beside this prover's own
-    // state, that rules out cards below 48 GB unless SP1_GPU_RESET_BEFORE_WRAP is set) and the host
-    // has the memory, and uses the CPU prover if not.
-    let groth16_gpu = gpu_memory_gb() > 20;
+    // The GPU Groth16 prover is for cards above the 16 GB tier, and for 16 GB CUDA cards, where its
+    // helper streams its G1 point sets (`SP1_GROTH16_STREAM_SRS`) to fit beside this prover: on an
+    // RTX 5060 Ti a Groth16 proof took 13.8 s with it against 18.5 s with gnark's CPU prover.
+    // Other 16 GB cards use gnark's prover, as the v6.0.0 fork always did; on HIP it runs in
+    // process with GPU hooks, which is faster there than the helper (RX 9060 XT: 19.5 s against
+    // 36.9 s). Before each proof the recursion prover also checks that the card has the GPU
+    // memory free for the GPU prover's helper (beside this prover's own state, once its memory
+    // pool's idle reserve is given back) and the host has the memory, and uses the CPU prover if
+    // not.
+    // `gpu_memory_gb() > 20` is a total above 16 GiB on any backend (20 GB cards included, which
+    // stream too); this adds the CUDA cards of 15-16 GiB.
+    let cuda_16gb_card = sp1_gpu_cudart::sys::BACKEND == "cuda"
+        && cuda_memory_info().is_ok_and(|(_, total)| total >= 15 << 30);
+    let groth16_gpu = gpu_memory_gb() > 20 || cuda_16gb_card;
+    // The shrink prover keeps its proving key between proofs only where the card has the memory
+    // for it, like the wrap prover above: on a 16 GB Radeon RX 9070 XT the key, held from
+    // start-up, left HIP's arena without a 2 GiB range for the next proof's traces, and every
+    // second compressed proof of a process failed out of device memory.
+    let shrink_persistent_pk = !cuda_memory_info().is_ok_and(|(_, total)| total < 24 << 30);
 
     let base_builder = SP1WorkerBuilder::new_with_machine(machine)
         .with_core_opts(opts)
         .with_config(|config| {
             config.prover_config.recursion_prover_config.groth16_gpu = groth16_gpu;
+            config.prover_config.recursion_prover_config.shrink_persistent_pk =
+                shrink_persistent_pk;
+            config.controller_config.groth16_gpu = groth16_gpu;
             // A core worker runs tracing, host tracegen, the core proof, its CPU verification and
             // then the shard's normalize (lift) proof before it takes the next shard. With the
             // upstream default of 4 workers all four are often in those CPU phases together and
@@ -361,6 +510,14 @@ pub async fn cuda_worker_builder_with_machine(
                 && more_core_workers(separate_recursion_stream)
             {
                 config.prover_config.core_prover_config.num_core_workers = GPU_NUM_CORE_WORKERS;
+            }
+            // `SP1_WORKER_NORMALIZE_PROGRAM_CACHE_SIZE` still overrides.
+            if std::env::var("SP1_WORKER_NORMALIZE_PROGRAM_CACHE_SIZE").is_err()
+                && sp1_recursion_gnark_ffi::host_memory::available()
+                    .is_some_and(|bytes| bytes >= GPU_NORMALIZE_PROGRAM_CACHE_MIN_AVAILABLE_RAM)
+            {
+                config.prover_config.core_prover_config.normalize_program_cache_size =
+                    GPU_NORMALIZE_PROGRAM_CACHE_SIZE;
             }
         })
         .with_core_air_prover(core_prover, prover_permits.clone())

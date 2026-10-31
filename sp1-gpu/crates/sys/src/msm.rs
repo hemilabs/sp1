@@ -188,30 +188,6 @@ extern "C" {
     /// HIP-only stub on CUDA (sppark MSM doesn't show this pattern).
     pub fn sp1_bn254_gpu_warmup(spin_us: i32) -> CudaRustError;
 
-    /// Pre-upload MSM scalars via GPU gather from a persistent device-side
-    /// wire-values buffer plus a persistent device-side u32 index array.
-    /// Eliminates the ~22ms CPU par_iter_mut scatter + the ~100ms pinned
-    /// host-to-device SDMA copy of pinned_a scalars that otherwise sit before
-    /// the first MSM.
-    ///
-    /// - d_wire_values: device pointer to wire-value Fr array (8×u32 each).
-    ///   Caller is responsible for having uploaded the wire-values once per
-    ///   prove (e.g. via cuda_mem_copy_host_to_device_async).
-    /// - d_indices: device pointer to u32 indices, one per output element.
-    ///   Caller uploads this once at prover setup.
-    /// - npoints: number of output scalars (== d_indices length).
-    ///
-    /// Lands scalars in g_glv_pool->d_scalars[cur_buf], records upload_done
-    /// event, sets next_upload_pending=true — identical contract to
-    /// sp1_bn254_msm_preupload_scalars.
-    pub fn sp1_bn254_msm_preupload_gather(
-        d_wire_values_dst: *mut c_void,
-        h_wire_values: *const c_void,
-        wire_values_bytes: usize,
-        d_indices: *const c_void,
-        npoints: usize,
-    ) -> CudaRustError;
-
     // ========================================================================
     // G2 MSM (sppark-templated, CUDA-only)
     // ========================================================================

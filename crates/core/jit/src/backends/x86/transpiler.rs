@@ -101,7 +101,7 @@ impl RiscvTranspiler for TranspilerBackend {
 
             // We dont have a control flow insruction so we need to bump the pc first.
             if self.may_early_exit {
-                self.exit_if_trace_exceeds(self.max_trace_size);
+                self.exit_if_trace_exceeds(self.max_trace_size, Some(self.pc_current + 4));
             }
         }
 

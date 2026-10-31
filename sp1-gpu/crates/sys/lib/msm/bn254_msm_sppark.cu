@@ -295,14 +295,6 @@ sp1_bn254_msm_preupload_scalars(const void* /*scalars*/, size_t /*npoints*/) {
     return CUDA_SUCCESS_CSL;
 }
 
-extern "C" rustCudaError_t
-sp1_bn254_msm_preupload_gather(
-    void* /*d_wire_values_dst*/, const void* /*h_wire_values*/,
-    size_t /*wire_values_bytes*/, const void* /*d_indices*/, size_t /*npoints*/)
-{
-    return CUDA_SUCCESS_CSL;
-}
-
 // GLV-accelerated MSM invokes — on CUDA these should never be called (GLV
 // is HIP-only), so return an error rather than silently running a wrong
 // path. The Rust caller must gate via SP1_GPU_GLV. If something slips
