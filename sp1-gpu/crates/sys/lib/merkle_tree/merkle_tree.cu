@@ -280,8 +280,8 @@ __global__ void recomputeBottomPathsKbFast(
 }
 #endif  // SP1_SYCL
 
-#ifdef __HIPCC__
-// ---- BN254 register-resident paths (HIP; bit-exact with the generic kernels) ----
+#if defined(__HIPCC__) || defined(SP1_SYCL)
+// ---- BN254 register-resident paths (HIP and SYCL; bit-exact with the generic kernels) ----
 // On gfx942 the generic BN254 kernels keep the width-3 Poseidon2 state in scratch: the per-element
 // loops of Hasher::permute (addExtRc, sbox) are not unrolled, so `state[i]` is indexed at run time
 // (compress: 176 B of scratch per lane), and leafHash calls HasherState::absorbRow / finalize out
@@ -289,6 +289,9 @@ __global__ void recomputeBottomPathsKbFast(
 // values and run the same permutation, with the same operations in the same order, on the same
 // round constants (`hasher.roundConstants`), so the digests are identical. Launch shapes and
 // arguments match the generic kernels. SP1_GPU_MERKLE_GENERIC selects the generic kernels.
+// On an Arc B580 (SYCL, with the field's own multiplication: see montMul) bench_commit_bn254 went
+// from 519 to 479 ms, and a Groth16 proof's shrink and wrap from 12.3 to 11.7-11.8 s. The rest of
+// its time is the 254-bit multiplications themselves.
 namespace bn254fast {
 using F = bn254_t;
 using P = poseidon2_bn254_3::Bn254;
@@ -301,6 +304,12 @@ using RC = poseidon2::RoundConstants<P>;
 // (4r < 2^256), reduced to [0, r) with Canonical.
 template <bool Canonical>
 __device__ __forceinline__ F montMul(const F& a, const F& b) {
+#ifdef SP1_SYCL
+    // SYCL: the field's own multiplication (its output is canonical, so below 2r too). Intel's GPU
+    // compiler did not finish compiling the unrolled 64-bit CIOS below in 45 minutes, and with its
+    // rows in a loop the commit ran slower than with this (657 against 479 ms in bench_commit_bn254).
+    return a * b;
+#else
     const uint32_t* r = device::ALT_BN128_r;
     uint32_t t[8] = {0, 0, 0, 0, 0, 0, 0, 0};
     uint32_t t8 = 0;
@@ -346,6 +355,7 @@ __device__ __forceinline__ F montMul(const F& a, const F& b) {
         for (int i = 0; i < 8; i++) out.data[i] = t[i];
     }
     return out;
+#endif
 }
 
 // x^5 (P::D) with x^2 and x^4 left below 2r: on an RX 9070 XT the permutation runs 1.30x as fast as with
@@ -548,7 +558,7 @@ __global__ __launch_bounds__(256) void recomputeBottomPathsBn254Fast(
         __syncthreads();
     }
 }
-#endif  // __HIPCC__
+#endif  // __HIPCC__ || SP1_SYCL
 
 #ifdef __HIPCC__
 // Whether the one-thread-per-state KoalaBear kernels use poseidon2_kb31_16_rdna's permutation, unless
@@ -572,7 +582,7 @@ extern "C" void* leaf_hash_merkle_tree_koala_bear_16_kernel() {
 }
 
 extern "C" void* leaf_hash_merkle_tree_bn254_kernel() {
-#ifdef __HIPCC__
+#if defined(__HIPCC__) || defined(SP1_SYCL)
     if (!getenv("SP1_GPU_MERKLE_GENERIC")) return SP1_KERNEL_PTR(leafHashBn254Fast);
 #endif
     return SP1_KERNEL_PTR(leafHash<poseidon2::Bn254Hasher, poseidon2_bn254_3::Bn254, poseidon2::Bn254HasherState>);
@@ -616,7 +626,7 @@ extern "C" void* compress_merkle_tree_koala_bear_16_kernel() {
 }
 
 extern "C" void* compress_merkle_tree_bn254_kernel() {
-#ifdef __HIPCC__
+#if defined(__HIPCC__) || defined(SP1_SYCL)
     if (!getenv("SP1_GPU_MERKLE_GENERIC")) return SP1_KERNEL_PTR(compressBn254Fast);
 #endif
     return SP1_KERNEL_PTR(compress<poseidon2::Bn254Hasher, poseidon2_bn254_3::Bn254, poseidon2::Bn254HasherState>);
@@ -667,7 +677,7 @@ extern "C" void* compress_batched_merkle_tree_koala_bear_16_kernel() {
 }
 
 extern "C" void* compress_batched_merkle_tree_bn254_kernel() {
-#ifdef __HIPCC__
+#if defined(__HIPCC__) || defined(SP1_SYCL)
     if (!getenv("SP1_GPU_MERKLE_GENERIC")) return SP1_KERNEL_PTR(compressBatchedBn254Fast);
 #endif
     return SP1_KERNEL_PTR(compressBatched<
@@ -803,7 +813,7 @@ extern "C" void* recompute_bottom_paths_merkle_tree_koala_bear_16_kernel() {
 }
 
 extern "C" void* recompute_bottom_paths_merkle_tree_bn254_kernel() {
-#ifdef __HIPCC__
+#if defined(__HIPCC__) || defined(SP1_SYCL)
     if (!getenv("SP1_GPU_MERKLE_GENERIC")) return SP1_KERNEL_PTR(recomputeBottomPathsBn254Fast);
 #endif
     return SP1_KERNEL_PTR(recomputeBottomPaths<
