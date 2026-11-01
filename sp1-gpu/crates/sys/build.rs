@@ -783,18 +783,29 @@ fn build_sycl(
         args.push("-fPIC".into());
     }
     // Device code: compiled ahead of time for Intel's Battlemage GPUs (bmg-g31: Arc Pro B70 and
-    // B60; bmg-g21: Arc B580 and B570), plus SPIR-V, which the driver compiles on first use on any
-    // other device. Compiling every kernel on first use took about 50 s of a B70's first proof
+    // B60; bmg-g21: Arc B580 and B570) and Alchemist (acm-g10, below), plus SPIR-V, which the
+    // driver compiles on first use on any other device. Compiling every kernel on first use took about 50 s of a B70's first proof
     // after each build or driver update (a cold fibonacci proof 72 s, against 5.8 s ahead of
     // time). SP1_SYCL_TARGETS and SP1_SYCL_DEVICE override the targets and the devices compiled
     // for; SP1_SYCL_TARGETS=spir64 builds SPIR-V only, which builds faster.
     println!("cargo:rerun-if-env-changed=SP1_SYCL_DEVICE");
-    let targets = env::var("SP1_SYCL_TARGETS").unwrap_or_else(|_| "spir64_gen,spir64".into());
+    let targets = env::var("SP1_SYCL_TARGETS")
+        .unwrap_or_else(|_| "spir64_gen,intel_gpu_acm_g10,spir64".into());
     args.push(format!("-fsycl-targets={targets}").into());
     if targets.split(',').any(|t| t.trim() == "spir64_gen") {
         let device = env::var("SP1_SYCL_DEVICE").unwrap_or_else(|_| "bmg-g21,bmg-g31".into());
         args.push("-Xsycl-target-backend=spir64_gen".into());
         args.push(format!("-device {device}").into());
+    }
+    // Alchemist (acm-g10: Arc A770, A750) ahead of time as well, in 256-GRF mode. Its registers
+    // are 32 bytes, half of Xe2's, so at SIMD16 the extension-field kernels spilled heavily in
+    // the default 128-GRF mode (logup-GKR's sum layer 9.7 KB per thread). On an Arc A770,
+    // fibonacci 2M core proofs: 8.8 s (SPIR-V or ahead of time in 128-GRF mode), 7.3 s here.
+    // IGC's automatic GRF mode moved only 8 of 277 kernels to 256 (8.8 s), and the driver
+    // compiling the SPIR-V with -cl-intel-256-GRF-per-thread gave no gain (8.7 s).
+    if targets.split(',').any(|t| t.trim() == "intel_gpu_acm_g10") {
+        args.push("-Xsycl-target-backend=intel_gpu_acm_g10".into());
+        args.push("-options -cl-intel-256-GRF-per-thread".into());
     }
 
     let obj_dir = out_dir.join("sycl-objs");

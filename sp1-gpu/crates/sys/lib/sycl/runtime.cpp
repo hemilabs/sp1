@@ -144,26 +144,27 @@ struct Runtime {
 //   back to back: the wrap's STARK went from ~14.5 to 18.6 s by the fourth proof with the pool,
 //   and stayed at 14.5-14.9 s without it. UR_L0_DISABLE_USM_ALLOCATOR=0 (or its older name,
 //   SYCL_PI_LEVEL_ZERO_DISABLE_USM_ALLOCATOR) keeps it.
-// - On Windows, immediate command lists and no copy engine, for Alchemist (Arc A770), which runs
-//   on the legacy adapter there. With its default batched command lists, a host wait on one
-//   queue's event never returned while the other queue's batch was never submitted (the GPU sat
-//   idle), and with the copy engine, copies read device data before the kernels that wrote it
-//   finished (logup-GKR, dot and reduction tests failed, proofs failed GKR verification). Either
-//   variable set keeps its value. Battlemage runs on the V2 adapter, which always uses immediate
-//   command lists.
+// - On Windows, the V2 adapter always. The loader picks V2 only when a visible device supports
+//   it, so an Alchemist card (Arc A770) alone (ZE_AFFINITY_MASK, as the dispatcher sets it) got
+//   the legacy adapter, whose batched command lists left a host wait hanging (GPU idle; only a
+//   reboot cleared the card), whose copy engine read data before the kernels writing it
+//   finished (logup-GKR, dot and reduction tests failed; core proofs failed GKR verification),
+//   and which, with immediate command lists, aborted on waits for barrier events ("ur_die:
+//   urEventWait must not be called for an internal event"). On V2 the A770 passes the GPU tests
+//   and proves without failed shards. SYCL_UR_USE_LEVEL_ZERO_V2=0 still picks the legacy one.
+// - SYCL's persistent kernel cache on (unless SYCL_CACHE_PERSISTENT is set): GPUs without
+//   ahead-of-time code (e.g. Alchemist) get the kernels compiled from SPIR-V by the driver on
+//   first use, ~2 minutes for this library on an A770; cached, only once per machine.
 const bool kLevelZeroEnv = [] {
 #ifdef _WIN32
     if (!std::getenv("ZES_ENABLE_SYSMAN")) _putenv_s("ZES_ENABLE_SYSMAN", "1");
     if (!std::getenv("UR_L0_DISABLE_USM_ALLOCATOR") &&
         !std::getenv("SYCL_PI_LEVEL_ZERO_DISABLE_USM_ALLOCATOR"))
         _putenv_s("UR_L0_DISABLE_USM_ALLOCATOR", "1");
-    if (!std::getenv("UR_L0_USE_IMMEDIATE_COMMANDLISTS") &&
-        !std::getenv("SYCL_PI_LEVEL_ZERO_USE_IMMEDIATE_COMMANDLISTS"))
-        _putenv_s("UR_L0_USE_IMMEDIATE_COMMANDLISTS", "1");
-    if (!std::getenv("UR_L0_USE_COPY_ENGINE") &&
-        !std::getenv("SYCL_PI_LEVEL_ZERO_USE_COPY_ENGINE"))
-        _putenv_s("UR_L0_USE_COPY_ENGINE", "0");
+    if (!std::getenv("SYCL_UR_USE_LEVEL_ZERO_V2")) _putenv_s("SYCL_UR_USE_LEVEL_ZERO_V2", "1");
+    if (!std::getenv("SYCL_CACHE_PERSISTENT")) _putenv_s("SYCL_CACHE_PERSISTENT", "1");
 #else
+    setenv("SYCL_CACHE_PERSISTENT", "1", 0);
     setenv("ZES_ENABLE_SYSMAN", "1", 0);
     setenv("SYCL_UR_USE_LEVEL_ZERO_V2", "0", 0);
 #endif
@@ -240,19 +241,17 @@ bool is_usm(const void* ptr) {
     return sycl::get_pointer_type(ptr, rt().context) != sycl::usm::alloc::unknown;
 }
 
-// On Linux, copies between the device and pageable (non-USM) host memory go through a pinned
-// staging buffer instead of the driver's import of the pageable range for the copy engine. On an
+// Copies between the device and pageable (non-USM) host memory go through a pinned staging
+// buffer instead of the driver's import of the pageable range for the copy engine. On an
 // Arc Pro B70 (xe driver, compute runtime 26.09) that import was slow and crash-prone: the copy
 // it crashed in (a segfault inside libze_intel_gpu enqueueing a device-to-host copy into a Rust
 // Vec) went away, and keccak-compressed proofs took 44 s instead of 50 s. The buffer is per thread
 // (no lock on the copy path) and grows to at most kStageChunk; larger copies go in chunks. These
-// copies wait for completion anyway, as CUDA's do for pageable memory. Windows' driver stages
-// pageable copies itself.
-#ifdef _WIN32
-constexpr bool kStagePageable = false;
-#else
+// copies wait for completion anyway, as CUDA's do for pageable memory. On Windows too: there the
+// driver stages pageable copies itself, and on an Arc A770 some of those copies never completed
+// (a 48-byte copy's urEventWait blocked forever in the kernel driver, the GPU idle), hanging the
+// jagged-assist tests in most runs.
 constexpr bool kStagePageable = true;
-#endif
 constexpr size_t kStageChunk = size_t(16) << 20;
 
 // A thread's staging buffer, freed when the thread exits: the copies run on tokio's blocking-pool

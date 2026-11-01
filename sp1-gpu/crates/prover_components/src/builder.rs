@@ -196,8 +196,15 @@ pub fn local_gpu_opts() -> SP1CoreOpts {
     opts.global_dependencies_opt = true;
     // Dropping the LDEs after the trace commit and re-encoding them in basefold trades time for
     // ~6 GiB at a 100K shard. Upstream drops them only for full-size shards on 24 GB-class cards;
-    // the 16 GB tier always drops them, as the v6.0.0 fork did. Override with
-    // `SP1_GPU_DROP_LDES={0,1}`.
+    // the 16 GB tier always drops them, as the v6.0.0 fork did, except on SYCL, where they fit:
+    // on a 16 GB Arc A770, fibonacci 2M core 8.5 -> 7.3 s and compressed 16.2 -> 14.0 s keeping
+    // them, with the same ~14 GB peak (the caching allocator holds the card either way); 12 GB
+    // cards (Arc B580) still drop them. Override with `SP1_GPU_DROP_LDES={0,1}`.
+    let small_card = if sp1_gpu_cudart::sys::BACKEND == "sycl" {
+        gpu_memory_gb <= 16
+    } else {
+        gpu_memory_gb <= 20
+    };
     opts.drop_ldes = std::env::var("SP1_GPU_DROP_LDES")
         .ok()
         .and_then(|s| match s.as_str() {
@@ -205,7 +212,7 @@ pub fn local_gpu_opts() -> SP1CoreOpts {
             "1" | "true" => Some(true),
             _ => None,
         })
-        .unwrap_or(gpu_memory_gb <= 20 || (opts.full_size_shards && gpu_memory_gb <= 30));
+        .unwrap_or(small_card || (opts.full_size_shards && gpu_memory_gb <= 30));
 
     // Recomputing the first GKR layer instead of keeping it resident saves ~2.8 GiB at a 100K
     // shard. Upstream turned it off once look-ahead sumchecks and truncated Merkle trees (#2917,
