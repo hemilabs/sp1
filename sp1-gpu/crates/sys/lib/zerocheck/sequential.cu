@@ -1066,9 +1066,23 @@ __global__ void zerocheck_fused_sequential_coop(
 
 // The cooperative kernel may need more than the default 48 KB of dynamic
 // shared memory; raise its limit once when the launcher first asks for it.
+#if defined(SP1_SYCL)
+extern "C" void* sp1_sycl_queue_of(void* stream);
+#endif
+
 extern "C" uint32_t zerocheck_coop_smem_cap() {
-#if defined(__HIPCC__) || defined(SP1_SYCL)
-    return 64 * 1024;  // LDS per workgroup on AMD; shared local memory per work-group on Intel
+#if defined(SP1_SYCL)
+    // 64 KB, or less where a work-group has less shared local memory: 64 KB on Alchemist (Arc
+    // A770), where the kernel's own group scratch memory comes out of the same 64 KB (a 64 KB
+    // request failed with UR_RESULT_ERROR_OUT_OF_RESOURCES). Battlemage has 128 KB.
+    static const uint32_t cap = [] {
+        auto* q = static_cast<sycl::queue*>(sp1_sycl_queue_of(nullptr));
+        size_t local = q->get_device().get_info<sycl::info::device::local_mem_size>();
+        return (uint32_t)std::min<size_t>(64 * 1024, local - 1024);
+    }();
+    return cap;
+#elif defined(__HIPCC__)
+    return 64 * 1024;  // LDS per workgroup on AMD
 #else
     return 96 * 1024;
 #endif

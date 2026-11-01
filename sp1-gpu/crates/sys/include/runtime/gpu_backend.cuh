@@ -346,8 +346,14 @@ sycl::event launch_impl(
         (size_t)grid.x * block.x);
     namespace syclex = sycl::ext::oneapi::experimental;
     // The callers size shared memory for 32-wide warps (one partial per warp), and with narrower
-    // sub-groups a block has more of them.
-    const size_t scratch = shared_mem * (32 / SP1_SYCL_SUB_GROUP);
+    // sub-groups a block has more of them. Doubled, a large request can pass the work-group's
+    // shared local memory (64 KB on Alchemist, 128 KB on Battlemage) and fail the launch with
+    // UR_RESULT_ERROR_OUT_OF_RESOURCES, so the extra is capped there (less 1 KB for the kernel's
+    // own); the request itself is always kept.
+    static const size_t local_limit =
+        q.get_device().get_info<sycl::info::device::local_mem_size>() - 1024;
+    const size_t scratch =
+        std::max(shared_mem, std::min(shared_mem * (32 / SP1_SYCL_SUB_GROUP), local_limit));
     syclex::launch_config config{
         sycl::nd_range<3>(global, local),
         syclex::properties{syclex::work_group_scratch_size(scratch)}};

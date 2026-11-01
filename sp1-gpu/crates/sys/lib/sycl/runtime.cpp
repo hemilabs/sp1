@@ -144,12 +144,25 @@ struct Runtime {
 //   back to back: the wrap's STARK went from ~14.5 to 18.6 s by the fourth proof with the pool,
 //   and stayed at 14.5-14.9 s without it. UR_L0_DISABLE_USM_ALLOCATOR=0 (or its older name,
 //   SYCL_PI_LEVEL_ZERO_DISABLE_USM_ALLOCATOR) keeps it.
+// - On Windows, immediate command lists and no copy engine, for Alchemist (Arc A770), which runs
+//   on the legacy adapter there. With its default batched command lists, a host wait on one
+//   queue's event never returned while the other queue's batch was never submitted (the GPU sat
+//   idle), and with the copy engine, copies read device data before the kernels that wrote it
+//   finished (logup-GKR, dot and reduction tests failed, proofs failed GKR verification). Either
+//   variable set keeps its value. Battlemage runs on the V2 adapter, which always uses immediate
+//   command lists.
 const bool kLevelZeroEnv = [] {
 #ifdef _WIN32
     if (!std::getenv("ZES_ENABLE_SYSMAN")) _putenv_s("ZES_ENABLE_SYSMAN", "1");
     if (!std::getenv("UR_L0_DISABLE_USM_ALLOCATOR") &&
         !std::getenv("SYCL_PI_LEVEL_ZERO_DISABLE_USM_ALLOCATOR"))
         _putenv_s("UR_L0_DISABLE_USM_ALLOCATOR", "1");
+    if (!std::getenv("UR_L0_USE_IMMEDIATE_COMMANDLISTS") &&
+        !std::getenv("SYCL_PI_LEVEL_ZERO_USE_IMMEDIATE_COMMANDLISTS"))
+        _putenv_s("UR_L0_USE_IMMEDIATE_COMMANDLISTS", "1");
+    if (!std::getenv("UR_L0_USE_COPY_ENGINE") &&
+        !std::getenv("SYCL_PI_LEVEL_ZERO_USE_COPY_ENGINE"))
+        _putenv_s("UR_L0_USE_COPY_ENGINE", "0");
 #else
     setenv("ZES_ENABLE_SYSMAN", "1", 0);
     setenv("SYCL_UR_USE_LEVEL_ZERO_V2", "0", 0);
