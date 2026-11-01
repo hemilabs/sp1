@@ -316,9 +316,16 @@ pub async fn cuda_worker_builder_with_machine(
     // what the wrap and Groth16 stages left cached otherwise pushed the next proof's buffers into
     // shared system memory on Windows. On a 12 GB Arc B580, fib 2M Groth16 proofs back to back
     // took 39, 92-146 s (the compressed STARK 9 s, then 70-146 s); with this, 39 then 30.5-30.7 s.
-    // (Not measured with HIP, where the arena keeps freed memory for this process anyway.)
+    // And with HIP where gnark makes the Groth16 proofs in this process (16 GB cards; see
+    // `groth16_gpu` below): the quotient's tables (2 x 272 MiB) were then the only memory the
+    // next proof found held that the first did not, and in the arena of an RX 9060 XT (13.25 GiB,
+    // 448 MiB less than an RX 9070 XT's) the next fib 20M proof's first 2^28-element shard often
+    // found no 2304 MiB block without them: 4 of 9 processes of three Groth16 proofs each failed
+    // (one of them crashed). With this, 8 of 8 passed, and the later proofs of general-compute and
+    // rsp took as long as without it.
     sp1_recursion_gnark_ffi::device_caches::set_release_after_groth16(
-        sp1_gpu_cudart::sys::BACKEND == "sycl",
+        sp1_gpu_cudart::sys::BACKEND == "sycl"
+            || (sp1_gpu_cudart::sys::BACKEND == "hip" && gpu_memory_gb() <= 20),
     );
     // HIP's arena holds the card's memory, out of a helper's reach: it gives an allocation back
     // only when that is wholly free, and only to make room for one of this process's blocks.
