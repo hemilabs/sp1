@@ -604,6 +604,18 @@ void sp1_sycl_profile_event(const char* name, const sycl::event& e) {
 
 extern "C" {
 
+// Whether the device has 32-byte registers (Alchemist: Arc A770, A750), half of Xe2's, where
+// kernels that hold many wide values do better at a SIMD width IGC picks (see SP1_SYCL_ANY_SIMD).
+bool sp1_sycl_small_grf_device() {
+    static const bool result = [] {
+        namespace sx = sycl::ext::oneapi::experimental;
+        const auto a = rt().device.get_info<sx::info::device::architecture>();
+        return a == sx::architecture::intel_gpu_acm_g10 || a == sx::architecture::intel_gpu_acm_g11 ||
+               a == sx::architecture::intel_gpu_acm_g12;
+    }();
+    return result;
+}
+
 // The DEFAULT_STREAM the kernel headers declare: the runtime's default queue.
 extern const void* const DEFAULT_STREAM = nullptr;
 

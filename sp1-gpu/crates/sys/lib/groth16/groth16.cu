@@ -239,7 +239,7 @@ __device__ __forceinline__ uint32_t g16WindowEntries(const uint32_t* hist, size_
     return hist[w * MSM_BUCKETS + MSM_BUCKETS - 1];
 }
 
-template <class F>
+template <class F, bool AnySimd = false>
 __global__ __launch_bounds__(256) void g16MsmChunks(
     const Affine<F>* points,
     const Fr* scalars,
@@ -295,7 +295,7 @@ __global__ __launch_bounds__(256) void g16MsmChunks(
 // sums + j * out_pw.
 constexpr uint32_t MSM_GROUP = 64;
 
-template <class F>
+template <class F, bool AnySimd = false>
 __global__ __launch_bounds__(256) void g16MsmGroupSums(
     const uint32_t* hist,
     uint32_t level,
@@ -324,7 +324,7 @@ __global__ __launch_bounds__(256) void g16MsmGroupSums(
 // chunks' heads and tails (the buckets inside a chunk are already in `buckets`). Empty buckets are
 // set to infinity. group1 and group2 are g16MsmGroupSums' levels 1 and 2 over the heads; cpw, g1pw
 // and g2pw are the per-window strides of head and tail, group1 and group2.
-template <class F>
+template <class F, bool AnySimd = false>
 __global__ __launch_bounds__(256) void g16MsmBucketFixup(
     const uint32_t* offset,
     const uint32_t* hist,
@@ -383,7 +383,7 @@ __global__ __launch_bounds__(256) void g16MsmBucketFixup(
 }
 
 // Per segment of buckets [lo, lo + SEG): sum_b b * B_b, by running sums.
-template <class F>
+template <class F, bool AnySimd = false>
 __global__ __launch_bounds__(256) void g16MsmReduce(const Xyzz<F>* buckets, Xyzz<F>* partial) {
     using P = Xyzz<F>;
     for (size_t ws = g16Tid(); ws < (size_t)MSM_WINDOWS * MSM_SEGS; ws += g16Stride()) {
@@ -404,7 +404,11 @@ __global__ __launch_bounds__(256) void g16MsmReduce(const Xyzz<F>* buckets, Xyzz
 
 }  // namespace
 
-// The MSM's point kernels hold several 256-bit (512-bit for G2) values per work item.
+// The MSM's point kernels hold several 256-bit (512-bit for G2) values per work item. Their
+// AnySimd = true copies leave the SIMD width to IGC (SP1_SYCL_ANY_SIMD) and are launched on GPUs
+// with 32-byte registers (msm_any_simd): on an Arc A770, IGC picks SIMD8 for them, and
+// g16MsmChunks went from ~8.7 s to ~0.37 s per call (the Groth16 step 40 -> 5.9 s). Xe2 GPUs launch
+// the SIMD16 ones as before (IGC would pick SIMD32 for some there).
 SP1_SYCL_LARGE_GRF(g16MsmChunks<Fp>)
 SP1_SYCL_LARGE_GRF(g16MsmChunks<Fp2>)
 SP1_SYCL_LARGE_GRF(g16MsmBucketFixup<Fp>)
@@ -413,6 +417,22 @@ SP1_SYCL_LARGE_GRF(g16MsmGroupSums<Fp>)
 SP1_SYCL_LARGE_GRF(g16MsmGroupSums<Fp2>)
 SP1_SYCL_LARGE_GRF(g16MsmReduce<Fp>)
 SP1_SYCL_LARGE_GRF(g16MsmReduce<Fp2>)
+SP1_SYCL_LARGE_GRF(g16MsmChunks<Fp, true>)
+SP1_SYCL_LARGE_GRF(g16MsmChunks<Fp2, true>)
+SP1_SYCL_LARGE_GRF(g16MsmBucketFixup<Fp, true>)
+SP1_SYCL_LARGE_GRF(g16MsmBucketFixup<Fp2, true>)
+SP1_SYCL_LARGE_GRF(g16MsmGroupSums<Fp, true>)
+SP1_SYCL_LARGE_GRF(g16MsmGroupSums<Fp2, true>)
+SP1_SYCL_LARGE_GRF(g16MsmReduce<Fp, true>)
+SP1_SYCL_LARGE_GRF(g16MsmReduce<Fp2, true>)
+SP1_SYCL_ANY_SIMD(g16MsmChunks<Fp, true>)
+SP1_SYCL_ANY_SIMD(g16MsmChunks<Fp2, true>)
+SP1_SYCL_ANY_SIMD(g16MsmBucketFixup<Fp, true>)
+SP1_SYCL_ANY_SIMD(g16MsmBucketFixup<Fp2, true>)
+SP1_SYCL_ANY_SIMD(g16MsmGroupSums<Fp, true>)
+SP1_SYCL_ANY_SIMD(g16MsmGroupSums<Fp2, true>)
+SP1_SYCL_ANY_SIMD(g16MsmReduce<Fp, true>)
+SP1_SYCL_ANY_SIMD(g16MsmReduce<Fp2, true>)
 
 namespace {
 
@@ -607,8 +627,21 @@ uint32_t msm_windows_per_pass(size_t per_window) {
     return fit ? (uint32_t)fit : 1;
 }
 
+#ifdef SP1_SYCL
+extern "C" bool sp1_sycl_small_grf_device();
+#endif
+// Whether to launch the MSM kernels' AnySimd copies: on SYCL GPUs with 32-byte registers.
+static bool msm_any_simd() {
+#ifdef SP1_SYCL
+    return sp1_sycl_small_grf_device();
+#else
+    return false;
+#endif
+}
+
 template <class F>
 Xyzz<F> msm(State& st, const Affine<F>* host_points, const Fr* host_scalars, size_t n) {
+    const bool any_simd = msm_any_simd();
     cudaStream_t s = st.stream;
     Xyzz<F> result = Xyzz<F>::inf();
     if (n == 0) return result;
@@ -681,22 +714,22 @@ Xyzz<F> msm(State& st, const Affine<F>* host_points, const Fr* host_scalars, siz
             launch(SP1_KERNEL_PTR(g16MsmScatter), n, scatter, s);
             void* sum[] = {&points.ptr, &scalars.ptr, &n, &cpw, &w0, &pw, &hist.ptr, &sorted.ptr,
                            &buckets.ptr, &head.ptr, &tail.ptr};
-            launch(SP1_KERNEL_PTR(g16MsmChunks<F>), pw * cpw, sum, s);
+            launch((any_simd ? SP1_KERNEL_PTR(g16MsmChunks<F, true>) : SP1_KERNEL_PTR(g16MsmChunks<F, false>)), pw * cpw, sum, s);
             uint32_t level = 1;
             void* g1[] = {&hist.ptr, &level, &cpw, &g1pw, &w0, &pw, &head.ptr, &group1.ptr};
-            launch(SP1_KERNEL_PTR(g16MsmGroupSums<F>), pw * g1pw, g1, s);
+            launch((any_simd ? SP1_KERNEL_PTR(g16MsmGroupSums<F, true>) : SP1_KERNEL_PTR(g16MsmGroupSums<F, false>)), pw * g1pw, g1, s);
             uint32_t level2 = 2;
             void* g2[] = {&hist.ptr, &level2, &g1pw, &g2pw, &w0, &pw, &group1.ptr, &group2.ptr};
-            launch(SP1_KERNEL_PTR(g16MsmGroupSums<F>), pw * g2pw, g2, s);
+            launch((any_simd ? SP1_KERNEL_PTR(g16MsmGroupSums<F, true>) : SP1_KERNEL_PTR(g16MsmGroupSums<F, false>)), pw * g2pw, g2, s);
             void* fix[] = {&offset.ptr, &hist.ptr, &cpw, &g1pw, &g2pw, &w0, &pw, &buckets.ptr,
                            &head.ptr, &tail.ptr, &group1.ptr, &group2.ptr};
-            launch(SP1_KERNEL_PTR(g16MsmBucketFixup<F>), (size_t)pw * MSM_BUCKETS, fix, s);
+            launch((any_simd ? SP1_KERNEL_PTR(g16MsmBucketFixup<F, true>) : SP1_KERNEL_PTR(g16MsmBucketFixup<F, false>)), (size_t)pw * MSM_BUCKETS, fix, s);
         }
     }
     {
         Timer t("msm reduce", s);
         void* args[] = {&buckets.ptr, &partial.ptr};
-        launch(SP1_KERNEL_PTR(g16MsmReduce<F>), (size_t)MSM_WINDOWS * MSM_SEGS, args, s);
+        launch((any_simd ? SP1_KERNEL_PTR(g16MsmReduce<F, true>) : SP1_KERNEL_PTR(g16MsmReduce<F, false>)), (size_t)MSM_WINDOWS * MSM_SEGS, args, s);
     }
     std::vector<Xyzz<F>> host((size_t)MSM_WINDOWS * MSM_SEGS);
     check(cuda_mem_copy_device_to_host_async(host.data(), partial.ptr, host.size() * sizeof(Xyzz<F>), s));

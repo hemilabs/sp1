@@ -307,6 +307,14 @@ using launch_fn = sycl::event (*)(
 // scope after the kernel.
 template <auto& F>
 inline constexpr bool large_grf = false;
+// Kernels without sub-group operations whose register needs set the SIMD width better than the
+// fixed SP1_SYCL_SUB_GROUP: SP1_SYCL_ANY_SIMD(kernel) leaves the width to IGC per device. With 32-
+// byte registers (Alchemist), the Groth16 MSM's Fp2 bucket sums spilled ~22 KB per thread at SIMD16
+// even in 256-GRF mode, and g16MsmChunks took ~26x as long as on an Arc B580; IGC picks SIMD8 there.
+// On Xe2 it may pick SIMD32, so such kernels are separate copies launched only where wanted (see
+// the Groth16 MSM).
+template <auto& F>
+inline constexpr bool any_simd = false;
 
 template <auto& F, typename Tuple>
 struct KernelFunctor {
@@ -317,7 +325,12 @@ struct KernelFunctor {
     }
 
     auto get(sycl::ext::oneapi::experimental::properties_tag) const {
-        if constexpr (large_grf<F>) {
+        if constexpr (large_grf<F> && any_simd<F>) {
+            return sycl::ext::oneapi::experimental::properties{
+                sycl::ext::intel::experimental::grf_size<256>};
+        } else if constexpr (any_simd<F>) {
+            return sycl::ext::oneapi::experimental::properties{};
+        } else if constexpr (large_grf<F>) {
             return sycl::ext::oneapi::experimental::properties{
                 sycl::ext::oneapi::experimental::sub_group_size<SP1_SYCL_SUB_GROUP>,
                 sycl::ext::intel::experimental::grf_size<256>};
@@ -409,8 +422,10 @@ extern "C" void* sp1_kernel_named(void* kernel, const char* name);
 #ifdef SP1_SYCL
 #define SP1_KERNEL_PTR(...) sp1_kernel_named((void*)&::sp1sycl::launch_thunk<__VA_ARGS__>, #__VA_ARGS__)
 #define SP1_SYCL_LARGE_GRF(...)                                                                        template <>                                                                                        inline constexpr bool ::sp1sycl::large_grf<__VA_ARGS__> = true;
+#define SP1_SYCL_ANY_SIMD(...)                                                                        template <>                                                                                        inline constexpr bool ::sp1sycl::any_simd<__VA_ARGS__> = true;
 #else
 #define SP1_SYCL_LARGE_GRF(...)
+#define SP1_SYCL_ANY_SIMD(...)
 #define SP1_KERNEL_PTR(...) sp1_kernel_named((void*)(__VA_ARGS__), #__VA_ARGS__)
 #endif
 
