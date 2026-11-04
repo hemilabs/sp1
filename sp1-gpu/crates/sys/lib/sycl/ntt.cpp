@@ -104,8 +104,9 @@ Twiddles& twiddles(sycl::queue& q) {
 
 }  // namespace
 
-// Times a submission for the optional kernel timing (lib/sycl/runtime.cpp).
-void sp1_sycl_profile_event(const char* name, const sycl::event& e);
+// Keeps a submission as the queue's latest command (record_event) and times it
+// (lib/sycl/runtime.cpp).
+void sp1_sycl_submitted(sycl::queue& q, const char* name, const sycl::event& e);
 
 namespace {
 
@@ -135,7 +136,7 @@ void dif_stage(sycl::queue& q, kb31_t* data, int lg_n, int lg_h, uint32_t cols, 
         x[i0] = a + b;
         x[i0 + h] = (a - b) * tw[(size_t)j << tw_shift];
     });
-    sp1_sycl_profile_event("ntt: dif_stage", e);
+    sp1_sycl_submitted(q, "ntt: dif_stage", e);
 }
 
 // The DIF stages with half-size below 2^lg_top (lg_top <= LG_TILE), within tiles of 2^lg_top
@@ -167,7 +168,7 @@ void dif_tile(sycl::queue& q, kb31_t* data, int lg_n, int lg_top, uint32_t cols,
                 for (uint32_t i = lid; i < tile; i += threads) x[i] = s[i];
             });
     });
-    sp1_sycl_profile_event("ntt: dif_tile", e);
+    sp1_sycl_submitted(q, "ntt: dif_tile", e);
 }
 
 // A full DIF transform of each column: natural order in, bit-reversed out.
@@ -194,14 +195,14 @@ void bit_reverse_in_place(sycl::queue& q, kb31_t* data, int lg_n, uint32_t cols)
             x[j] = tmp;
         }
     });
-    sp1_sycl_profile_event("ntt: bit_reverse", e);
+    sp1_sycl_submitted(q, "ntt: bit_reverse", e);
 }
 
 void scale(sycl::queue& q, kb31_t* data, size_t len, kb31_t factor) {
     auto e = q.parallel_for(
         sycl::range<1>(len),
         [=](sycl::id<1> id) { data[id[0]] = data[id[0]] * factor; });
-    sp1_sycl_profile_event("ntt: scale", e);
+    sp1_sycl_submitted(q, "ntt: scale", e);
 }
 
 // Column c's coefficient i (read from `in`, of stride `in_stride` per column, at position i, or
@@ -228,7 +229,7 @@ void spread(
         kb31_t power = base ^ i;
         out[col * ext + i] = in[col * in_stride + src] * power * factor;
     });
-    sp1_sycl_profile_event("ntt: spread", e);
+    sp1_sycl_submitted(q, "ntt: spread", e);
 }
 
 void zero_tail(sycl::queue& q, kb31_t* out, int lg_n, int lg_blowup, uint32_t cols) {
@@ -242,7 +243,7 @@ void zero_tail(sycl::queue& q, kb31_t* out, int lg_n, int lg_blowup, uint32_t co
         size_t k = n + t % tail;
         out[col * ext + k] = kb31_t(0u);
     });
-    sp1_sycl_profile_event("ntt: zero_tail", e);
+    sp1_sycl_submitted(q, "ntt: zero_tail", e);
 }
 
 kb31_t coset_base(kb31_t shift) { return kb31_t(to_monty(GROUP_GEN)) * shift; }
@@ -421,7 +422,10 @@ rustCudaError_t reverse_bits_batch(
     NTT_TRY({
         auto& q = queue_of(stream);
         const size_t n = (size_t)1 << lg_domain_size;
-        if (d_out != d_in) q.memcpy(d_out, d_in, n * poly_count * sizeof(kb31_t));
+        if (d_out != d_in) {
+            auto e = q.memcpy(d_out, d_in, n * poly_count * sizeof(kb31_t));
+            sp1_sycl_submitted(q, "ntt: copy", e);
+        }
         bit_reverse_in_place(q, d_out, lg_domain_size, poly_count);
         return SP1_SUCCESS;
     })
