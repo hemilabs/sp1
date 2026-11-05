@@ -11,7 +11,6 @@ use crate::{
     utils::{limbs_to_words, next_multiple_of_32},
     SupervisorMode, TrustMode, UserMode,
 };
-use hashbrown::HashMap;
 use itertools::Itertools;
 use num::{BigUint, Zero};
 use slop_air::{Air, BaseAir};
@@ -22,8 +21,7 @@ use slop_maybe_rayon::prelude::{
 };
 use sp1_core_executor::{
     events::{
-        ByteLookupEvent, ByteRecord, EllipticCurveAddEvent, FieldOperation, MemoryRecordEnum,
-        PrecompileEvent,
+        ByteRecord, EllipticCurveAddEvent, FieldOperation, MemoryRecordEnum, PrecompileEvent,
     },
     ExecutionRecord, Program, SyscallCode,
 };
@@ -204,7 +202,7 @@ impl<F: PrimeField32, E: EllipticCurve + EdwardsParameters, M: TrustMode> Machin
         }
     }
 
-    fn generate_dependencies(&self, input: &Self::Record, output: &mut Self::Record) {
+    fn generate_dependencies(&self, input: &Self::Record, _output: &mut Self::Record) {
         if input.program.enable_untrusted_programs == M::IS_TRUSTED {
             return;
         }
@@ -213,10 +211,8 @@ impl<F: PrimeField32, E: EllipticCurve + EdwardsParameters, M: TrustMode> Machin
         let events = input.get_precompile_events(SyscallCode::ED_ADD);
         let chunk_size = std::cmp::max(events.len() / num_cpus::get(), 1);
 
-        let blu_batches = events
-            .par_chunks(chunk_size)
-            .map(|events| {
-                let mut blu: HashMap<ByteLookupEvent, usize> = HashMap::new();
+        events.par_chunks(chunk_size).for_each(|events| {
+            input.byte_lookup_counts.count(|blu| {
                 events.iter().for_each(|(_, event)| {
                     let event = if let PrecompileEvent::EdAdd(event) = event {
                         event
@@ -226,13 +222,10 @@ impl<F: PrimeField32, E: EllipticCurve + EdwardsParameters, M: TrustMode> Machin
 
                     let mut row = vec![F::zero(); width];
                     let cols: &mut EdAddAssignCols<F, M> = row.as_mut_slice().borrow_mut();
-                    self.event_to_row(event, cols, &mut blu);
+                    self.event_to_row(event, cols, blu);
                 });
-                blu
-            })
-            .collect::<Vec<_>>();
-
-        output.add_byte_lookup_events_from_maps(blu_batches.iter().collect_vec());
+            });
+        });
     }
 
     fn included(&self, shard: &Self::Record) -> bool {

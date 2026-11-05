@@ -10,12 +10,16 @@
 
 #include <sycl/sycl.hpp>
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <map>
+#include <memory>
 #include <mutex>
+#include <shared_mutex>
+#include <new>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -66,12 +70,21 @@ rustCudaError_t error_from(const sycl::exception& e) {
 // Device, context and queues
 // ---------------------------------------------------------------------------------------------
 
+// A queue's latest command, whose event cudaEventRecord hands out (record_event).
+struct LastCommand {
+    std::mutex mutex;
+    sycl::event event;
+    bool valid = false;
+    // False after a host task, whose event is not handed out (record_event).
+    bool usable = true;
+};
+
 struct Runtime {
     sycl::device device;
     sycl::context context;
     sycl::queue* default_queue;
-    std::mutex queues_mutex;
-    std::unordered_set<sycl::queue*> queues;
+    std::shared_mutex queues_mutex;
+    std::unordered_map<sycl::queue*, std::unique_ptr<LastCommand>> queues;
 
     static sycl::device pick_device() {
         // The first GPU (Level Zero first). The dispatcher narrows the visible devices to one
@@ -101,48 +114,103 @@ struct Runtime {
                             context,
                             device,
                             sycl::property_list{sycl::property::queue::in_order{}});
-        std::lock_guard<std::mutex> lock(queues_mutex);
-        queues.insert(q);
+        std::unique_lock<std::shared_mutex> lock(queues_mutex);
+        queues.emplace(q, std::make_unique<LastCommand>());
         return q;
     }
 
     void delete_queue(sycl::queue* q) {
         {
-            std::lock_guard<std::mutex> lock(queues_mutex);
+            std::unique_lock<std::shared_mutex> lock(queues_mutex);
             queues.erase(q);
         }
         q->wait();
         delete q;
     }
 
+    // The queue's LastCommand. Valid until delete_queue, which the caller does not race.
+    LastCommand& last_of(sycl::queue* q) {
+        std::shared_lock<std::shared_mutex> lock(queues_mutex);
+        return *queues.at(q);
+    }
+
     void wait_all() {
         std::vector<sycl::queue*> all;
         {
-            std::lock_guard<std::mutex> lock(queues_mutex);
-            all.assign(queues.begin(), queues.end());
+            std::shared_lock<std::shared_mutex> lock(queues_mutex);
+            for (auto& [q, last] : queues) all.push_back(q);
         }
         for (auto* q : all) q->wait_and_throw();
     }
 };
 
-Runtime& rt() {
-    // The free-memory query (sycl::ext::intel::info::device::free_memory) needs Sysman, which
-    // Level Zero enables only if ZES_ENABLE_SYSMAN is set before it initializes.
-    static bool sysman = [] {
+// The environment Level Zero reads when it initializes (in rt()), set while the library loads,
+// before any thread runs: setenv while another thread reads the environment is undefined
+// behaviour in glibc.
+// - The free-memory query (sycl::ext::intel::info::device::free_memory) needs Sysman, which Level
+//   Zero enables only if ZES_ENABLE_SYSMAN is set before it initializes.
+// - Level Zero's V2 adapter, the default on Linux, intermittently left proofs waiting forever on an
+//   Arc Pro B70 (oneAPI 2025.3 and 2026.0 adapters, kernel 7.0 xe, compute runtime 26.09): a copy's
+//   event never completed, until the kill reset the copy engine. That was 11 of 14
+//   fibonacci-compressed proofs (main also hung); with the legacy adapter, 20 of 20 passed.
+//   SYCL_UR_USE_LEVEL_ZERO_V2=1 still picks V2.
+// - On Windows, Level Zero's USM pool off: the allocator below caches device blocks itself, and
+//   decides what to keep from the video memory budget. Blocks it frees stayed in the adapter's
+//   pool, still counted in this process's usage, so its evictions made no room and later
+//   allocations spilled into shared system memory. On a 12 GB Arc B580, fib 2M Groth16 proofs
+//   back to back: the wrap's STARK went from ~14.5 to 18.6 s by the fourth proof with the pool,
+//   and stayed at 14.5-14.9 s without it. UR_L0_DISABLE_USM_ALLOCATOR=0 (or its older name,
+//   SYCL_PI_LEVEL_ZERO_DISABLE_USM_ALLOCATOR) keeps it.
+// - On Windows, the V2 adapter always. The loader picks V2 only when a visible device supports
+//   it, so an Alchemist card (Arc A770) alone (ZE_AFFINITY_MASK, as the dispatcher sets it) got
+//   the legacy adapter, whose batched command lists left a host wait hanging (GPU idle; only a
+//   reboot cleared the card), whose copy engine read data before the kernels writing it
+//   finished (logup-GKR, dot and reduction tests failed; core proofs failed GKR verification),
+//   and which, with immediate command lists, aborted on waits for barrier events ("ur_die:
+//   urEventWait must not be called for an internal event"). On V2 the A770 passes the GPU tests
+//   and proves without failed shards. SYCL_UR_USE_LEVEL_ZERO_V2=0 still picks the legacy one.
+// - SYCL's persistent kernel cache on (unless SYCL_CACHE_PERSISTENT is set): GPUs without
+//   ahead-of-time code (e.g. Alchemist) get the kernels compiled from SPIR-V by the driver on
+//   first use, ~2 minutes for this library on an A770; cached, only once per machine.
+const bool kLevelZeroEnv = [] {
 #ifdef _WIN32
-        if (!std::getenv("ZES_ENABLE_SYSMAN")) _putenv_s("ZES_ENABLE_SYSMAN", "1");
+    if (!std::getenv("ZES_ENABLE_SYSMAN")) _putenv_s("ZES_ENABLE_SYSMAN", "1");
+    if (!std::getenv("UR_L0_DISABLE_USM_ALLOCATOR") &&
+        !std::getenv("SYCL_PI_LEVEL_ZERO_DISABLE_USM_ALLOCATOR"))
+        _putenv_s("UR_L0_DISABLE_USM_ALLOCATOR", "1");
+    if (!std::getenv("SYCL_UR_USE_LEVEL_ZERO_V2")) _putenv_s("SYCL_UR_USE_LEVEL_ZERO_V2", "1");
+    if (!std::getenv("SYCL_CACHE_PERSISTENT")) _putenv_s("SYCL_CACHE_PERSISTENT", "1");
 #else
-        setenv("ZES_ENABLE_SYSMAN", "1", 0);
+    setenv("SYCL_CACHE_PERSISTENT", "1", 0);
+    setenv("ZES_ENABLE_SYSMAN", "1", 0);
+    setenv("SYCL_UR_USE_LEVEL_ZERO_V2", "0", 0);
 #endif
-        return true;
-    }();
-    (void)sysman;
+    return true;
+}();
+
+Runtime& rt() {
+    (void)kLevelZeroEnv;
     static Runtime* runtime = new Runtime();  // never destroyed: queues outlive static teardown
     return *runtime;
 }
 
 sycl::queue& queue_of(void* stream) {
     return stream ? *static_cast<sycl::queue*>(stream) : *rt().default_queue;
+}
+
+// Submits one command to `q` (`submit` returns its event) and keeps its event as the queue's latest
+// command, whose event cudaEventRecord hands out (record_event, below). `usable`: whether
+// record_event may hand the event out (not a host task's).
+template <class Submit>
+sycl::event submit_noted(sycl::queue& q, Submit&& submit, bool usable = true) {
+    LastCommand& last = rt().last_of(&q);
+    // Under the queue's lock, so that the kept event is the queue's latest one also when several
+    // threads submit to it.
+    std::lock_guard<std::mutex> lock(last.mutex);
+    last.event = submit();
+    last.valid = true;
+    last.usable = usable;
+    return last.event;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -205,6 +273,64 @@ bool is_usm(const void* ptr) {
     return sycl::get_pointer_type(ptr, rt().context) != sycl::usm::alloc::unknown;
 }
 
+// Copies between the device and pageable (non-USM) host memory go through a pinned staging
+// buffer instead of the driver's import of the pageable range for the copy engine. On an
+// Arc Pro B70 (xe driver, compute runtime 26.09) that import was slow and crash-prone: the copy
+// it crashed in (a segfault inside libze_intel_gpu enqueueing a device-to-host copy into a Rust
+// Vec) went away, and keccak-compressed proofs took 44 s instead of 50 s. The buffer is per thread
+// (no lock on the copy path) and grows to at most kStageChunk; larger copies go in chunks. These
+// copies wait for completion anyway, as CUDA's do for pageable memory. On Windows too: there the
+// driver stages pageable copies itself, and on an Arc A770 some of those copies never completed
+// (a 48-byte copy's urEventWait blocked forever in the kernel driver, the GPU idle), hanging the
+// jagged-assist tests in most runs.
+constexpr bool kStagePageable = true;
+constexpr size_t kStageChunk = size_t(16) << 20;
+
+// A thread's staging buffer, freed when the thread exits: the copies run on tokio's blocking-pool
+// threads, which exit after 10 s idle, and each new one would otherwise pin another buffer.
+struct StageBuffer {
+    char* buf = nullptr;
+    size_t cap = 0;
+    ~StageBuffer() {
+        if (buf) sycl::free(buf, rt().context);
+    }
+};
+
+char* stage_buffer(size_t size) {
+    thread_local StageBuffer stage;
+    if (size > stage.cap) {
+        if (stage.buf) sycl::free(stage.buf, rt().context);
+        stage.buf = nullptr;
+        stage.cap = std::max(size, std::min(stage.cap * 2, kStageChunk));
+        stage.buf = static_cast<char*>(sycl::malloc_host(stage.cap, rt().context));
+        if (!stage.buf) {
+            stage.cap = 0;
+            throw std::bad_alloc();
+        }
+    }
+    return stage.buf;
+}
+
+void copy_from_pageable(sycl::queue& q, void* dst, const void* src, size_t count) {
+    for (size_t off = 0; off < count; off += kStageChunk) {
+        const size_t n = std::min(kStageChunk, count - off);
+        char* stage = stage_buffer(n);
+        std::memcpy(stage, static_cast<const char*>(src) + off, n);
+        char* to = static_cast<char*>(dst) + off;
+        submit_noted(q, [&] { return q.memcpy(to, stage, n); }).wait_and_throw();
+    }
+}
+
+void copy_to_pageable(sycl::queue& q, void* dst, const void* src, size_t count) {
+    for (size_t off = 0; off < count; off += kStageChunk) {
+        const size_t n = std::min(kStageChunk, count - off);
+        char* stage = stage_buffer(n);
+        const char* from = static_cast<const char*>(src) + off;
+        submit_noted(q, [&] { return q.memcpy(stage, from, n); }).wait_and_throw();
+        std::memcpy(static_cast<char*>(dst) + off, stage, n);
+    }
+}
+
 // ---------------------------------------------------------------------------------------------
 // Events
 // ---------------------------------------------------------------------------------------------
@@ -212,18 +338,74 @@ bool is_usm(const void* ptr) {
 struct Event {
     sycl::event event;
     bool recorded = false;
+    const sycl::queue* queue = nullptr;  // the queue it was recorded on
 };
+
+// Recording an event (cudaEventRecord) hands out the event of the queue's latest command: on these
+// in-order queues it completes once everything submitted before it has. Every submission therefore
+// goes through submit_noted (or, in ntt.cpp, sp1_sycl_submitted), which keeps its event.
+//
+// Not q.ext_oneapi_submit_barrier(), as this used to be. On Linux this library runs Level Zero's
+// legacy adapter (kLevelZeroEnv), which over-releases barrier events when several threads use their
+// own in-order queues in one context: for a barrier it hands out the queue's last command event,
+// retained, and a barrier event gets an extra internal release when it is released. Under that
+// contention an event SP1 still held went back to the adapter's event cache, which zeroes its count
+// of external references, and the next wait on it aborted the server ("ur_die: urEventWait must not
+// be called for an internal event"): 3 of 6 benchmark runs on an Arc B580. A stress test of these
+// calls (4 threads; barrier records, waits, host tasks) aborts every run with barrier records, and
+// none when the records are other commands' events. The V2 adapter has no such bug but left proofs
+// waiting forever (kLevelZeroEnv), on the B580 too: 3 of 3 benchmark runs.
+//
+// Nor an empty kernel of its own: a stream that only copies (the copy engine) then had to wait for
+// a turn on the compute engine, behind the other streams' kernels, for each record. That made
+// proofs 18% slower on the B580 (sha256-chain 113 -> 133 s), about 5 ms per record in a two-stream
+// test. A barrier had cost nothing, being the last command's event: so is this. With it (and
+// wait_for_event), sha256-chain takes 111.5 s on the B580, and no run aborted (0 of 4; before, 1
+// in 3 with the same build).
+sycl::event record_event(sycl::queue& q) {
+    LastCommand& last = rt().last_of(&q);
+    std::lock_guard<std::mutex> lock(last.mutex);
+    // Nothing submitted yet: a completed event.
+    if (!last.valid) return sycl::event();
+    // After a host task (cuda_launch_host_function, which SP1 does not call), an empty kernel's
+    // event: in the same stress test, another queue's barrier on a host task's event crashed the
+    // SYCL runtime (SIGSEGV).
+    if (!last.usable) {
+        last.event = q.single_task<class sp1_record_event>([] {});
+        last.usable = true;
+    }
+    return last.event;
+}
+
+// Makes `q`'s later work wait for `e` (cudaStreamWaitEvent), recorded on `origin`: nothing to do on
+// the same in-order queue, else an empty kernel that depends on `e`, kept as the queue's latest
+// command. Not a barrier on `e`: the runtime leaves an event that has already completed out of a
+// barrier's wait list, and a barrier on nothing is again the adapter's shared last-command event
+// (in the stress test, barrier waits on copies' events aborted 1 run in 5; kernel waits none in
+// 12). This one costs a kernel, but streams wait on each other far less often than they record,
+// and mostly on the compute engine: about 1 s of a 113 s proof against barrier waits, with kernel
+// records.
+void wait_for_event(sycl::queue& q, const sycl::event& e, const sycl::queue* origin) {
+    if (origin == &q) return;
+    submit_noted(q, [&] {
+        return q.submit([&](sycl::handler& h) {
+            h.depends_on(e);
+            h.single_task<class sp1_wait_event>([] {});
+        });
+    });
+}
 
 // ---------------------------------------------------------------------------------------------
 // Stream-ordered caching device allocator (as the HIP build's): a freed block may still be in use
-// by work queued on the freeing stream, so the free records a barrier there, and an allocation on
-// another stream waits for it before its work can touch the block.
+// by work queued on the freeing stream, so an allocation on another stream makes its work wait for
+// that stream's work first: for its latest command when the block is taken, which comes after all
+// the work it had when it freed the block.
 // ---------------------------------------------------------------------------------------------
 
 struct CachedBlock {
     void* ptr;
+    // The stream that freed it, or null once that stream's work has finished (forget_stream).
     sycl::queue* queue;
-    sycl::event freed;
 };
 
 std::mutex g_alloc_mutex;
@@ -237,8 +419,8 @@ size_t g_cached_bytes = 0;
 // shard to the next. So sizes above 1 MiB are rounded up to a sixteenth of their power of two,
 // for a cached block to fit the next shard's slightly different request, and the cache may hold
 // up to half the card. When an allocation would not fit, cached blocks are freed, largest first,
-// only until it does, each once its own last use has finished, instead of draining the device
-// and freeing them all.
+// only until it does, instead of freeing them all. (With SYCL the eviction first waits for every
+// queue: see evict_until_fits.)
 size_t round_alloc_size(size_t s) {
     if (s <= (size_t(1) << 20)) return (s + 4095) & ~size_t(4095);
     int lg = 63;
@@ -337,8 +519,21 @@ size_t device_headroom() {
     return SIZE_MAX;
 }
 
+// The caller holds g_alloc_mutex.
 void take_cached_block(const CachedBlock& block, sycl::queue* q) {
-    if (block.queue != q) q->ext_oneapi_submit_barrier({block.freed});
+    if (block.queue && block.queue != q) {
+        wait_for_event(*q, record_event(*block.queue), block.queue);
+    }
+}
+
+// A stream about to be destroyed, its work finished: its cached blocks no longer wait for it.
+void forget_stream(sycl::queue* q) {
+    std::lock_guard<std::mutex> lock(g_alloc_mutex);
+    for (auto& [size, blocks] : g_free_pool) {
+        for (auto& block : blocks) {
+            if (block.queue == q) block.queue = nullptr;
+        }
+    }
 }
 
 // Free every cached block once the device is idle. The caller holds g_alloc_mutex.
@@ -355,11 +550,23 @@ void release_cached_blocks() {
     g_cached_bytes = 0;
 }
 
-// Free cached blocks, largest first, until `need` bytes fit in `headroom`. The caller holds
-// g_alloc_mutex.
+// Free cached blocks, largest first, until `need` bytes fit in `headroom`, once every queue is
+// idle. The caller holds g_alloc_mutex.
+//
+// Waiting for the queue that freed a block is not enough: a block can also have been
+// used on another queue (the compress prover's and a core shard's): sycl::free then unmapped it
+// under a copy still running there. On an Arc Pro B70 under Linux, with two streams, that was a
+// copy-engine page fault ("Fault response: Unsuccessful -EINVAL") and a fatal device error in 3
+// of 20 keccak-compressed proofs; waiting for every queue first, 20 of 20 passed. Evicting is
+// rare (an allocation that would not fit), so the wait costs little.
 void evict_until_fits(size_t need, size_t headroom) {
     sp1prof::HostTimer timer("host: evict cached blocks");
+    bool drained = false;
     while (g_cached_bytes > 0 && need + FIT_MARGIN_BYTES > headroom) {
+        if (!drained) {
+            rt().wait_all();
+            drained = true;
+        }
         auto it = std::prev(g_free_pool.end());
         if (it->second.empty()) {
             g_free_pool.erase(it);
@@ -369,7 +576,6 @@ void evict_until_fits(size_t need, size_t headroom) {
         it->second.pop_back();
         const size_t size = it->first;
         if (it->second.empty()) g_free_pool.erase(it);
-        block.freed.wait();
         sycl::free(block.ptr, rt().context);
         g_alloc_sizes.erase(block.ptr);
         g_cached_bytes -= size;
@@ -447,15 +653,17 @@ rustCudaError_t cached_free(void* p, sycl::queue* q) {
     if (it != g_alloc_sizes.end()) {
         size_t s = it->second;
         if (g_cached_bytes + s <= max_cached_bytes()) {
-            g_free_pool[s].push_back(CachedBlock{p, q, q->ext_oneapi_submit_barrier()});
+            g_free_pool[s].push_back(CachedBlock{p, q});
             g_cached_bytes += s;
             return SP1_SUCCESS;
         }
         g_alloc_sizes.erase(it);
     }
-    // Not cached: let the freeing stream's work, which may still use it, finish first.
+    // Not cached: let the work that may still use it finish first. All queues', as for an
+    // eviction (evict_until_fits): a block can also have been used on another queue than the one
+    // freeing it, and sycl::free unmaps it under whatever still runs there.
     sp1prof::HostTimer timer("host: uncached free (wait + free)");
-    q->wait_and_throw();
+    rt().wait_all();
     sycl::free(p, rt().context);
     return SP1_SUCCESS;
 }
@@ -469,9 +677,37 @@ extern "C" void cuda_release_cached_memory() {
     release_cached_blocks();
 }
 
+// SYCL has no device memory arena (lib/runtime/stream.cu has HIP's).
+extern "C" size_t sp1_hip_arena_bytes() { return 0; }
+
+// No arena on SYCL (see the HIP one in runtime/stream.cu).
+extern "C" uint32_t sp1_hip_arena_scatters() { return 0; }
+extern "C" size_t sp1_hip_arena_free_bytes() { return 0; }
+// No DXGI budget for SYCL (lib/runtime/stream.cu reads HIP's).
+extern "C" uint64_t sp1_video_memory_budget() { return 0; }
+// Not HIP (lib/runtime/stream.cu answers for HIP).
+extern "C" uint32_t sp1_hip_wave64() { return 0; }
+
+// Nothing resets a SYCL device (gnark-ffi's reset is CUDA and HIP only).
+extern "C" size_t cuda_free_live_blocks() { return 0; }
+
 // For the other SYCL sources (lib/sycl/ntt.cpp): times a submission if the kernel timing is on.
 void sp1_sycl_profile_event(const char* name, const sycl::event& e) {
     if (sp1prof::enabled()) GpuProfiler::get().add(name, e);
+}
+
+// ntt.cpp's submissions: kept as the queue's latest command (record_event) and timed. After the
+// submission rather than around it, which is enough there: a transform runs on its caller's stream,
+// from that stream's thread.
+void sp1_sycl_submitted(sycl::queue& q, const char* name, const sycl::event& e) {
+    LastCommand& last = rt().last_of(&q);
+    {
+        std::lock_guard<std::mutex> lock(last.mutex);
+        last.event = e;
+        last.valid = true;
+        last.usable = true;
+    }
+    sp1_sycl_profile_event(name, e);
 }
 
 #define SP1_TRY(body)                                                                              \
@@ -484,6 +720,18 @@ void sp1_sycl_profile_event(const char* name, const sycl::event& e) {
     }
 
 extern "C" {
+
+// Whether the device has 32-byte registers (Alchemist: Arc A770, A750), half of Xe2's, where
+// kernels that hold many wide values do better at a SIMD width IGC picks (see SP1_SYCL_ANY_SIMD).
+bool sp1_sycl_small_grf_device() {
+    static const bool result = [] {
+        namespace sx = sycl::ext::oneapi::experimental;
+        const auto a = rt().device.get_info<sx::info::device::architecture>();
+        return a == sx::architecture::intel_gpu_acm_g10 || a == sx::architecture::intel_gpu_acm_g11 ||
+               a == sx::architecture::intel_gpu_acm_g12;
+    }();
+    return result;
+}
 
 // The DEFAULT_STREAM the kernel headers declare: the runtime's default queue.
 extern const void* const DEFAULT_STREAM = nullptr;
@@ -555,6 +803,11 @@ rustCudaError_t cuda_free_host(void* ptr) {
     })
 }
 
+// No transparent-huge-page variant on SYCL: plain host memory.
+rustCudaError_t cuda_malloc_host_huge(void** ptr, size_t size) { return cuda_malloc_host(ptr, size); }
+
+rustCudaError_t cuda_free_host_huge(void* ptr, size_t) { return cuda_free_host(ptr); }
+
 // Pinning existing host memory: SYCL copies from it without registration, staging through the
 // runtime's own buffers, so these only need to succeed.
 rustCudaError_t cuda_host_register(void*, size_t) { return SP1_SUCCESS; }
@@ -562,28 +815,40 @@ rustCudaError_t cuda_host_unregister(void*) { return SP1_SUCCESS; }
 
 rustCudaError_t cuda_mem_set(void* dst, uint8_t value, size_t count) {
     SP1_TRY({
-        rt().default_queue->memset(dst, value, count).wait_and_throw();
+        auto& q = *rt().default_queue;
+        submit_noted(q, [&] { return q.memset(dst, value, count); }).wait_and_throw();
         return SP1_SUCCESS;
     })
 }
 
 rustCudaError_t cuda_mem_copy_host_to_device(void* dst, const void* src, size_t count) {
     SP1_TRY({
-        rt().default_queue->memcpy(dst, src, count).wait_and_throw();
+        if (kStagePageable && !is_usm(src)) {
+            copy_from_pageable(*rt().default_queue, dst, src, count);
+            return SP1_SUCCESS;
+        }
+        auto& q = *rt().default_queue;
+        submit_noted(q, [&] { return q.memcpy(dst, src, count); }).wait_and_throw();
         return SP1_SUCCESS;
     })
 }
 
 rustCudaError_t cuda_mem_copy_device_to_host(void* dst, const void* src, size_t count) {
     SP1_TRY({
-        rt().default_queue->memcpy(dst, src, count).wait_and_throw();
+        if (kStagePageable && !is_usm(dst)) {
+            copy_to_pageable(*rt().default_queue, dst, src, count);
+            return SP1_SUCCESS;
+        }
+        auto& q = *rt().default_queue;
+        submit_noted(q, [&] { return q.memcpy(dst, src, count); }).wait_and_throw();
         return SP1_SUCCESS;
     })
 }
 
 rustCudaError_t cuda_mem_copy_device_to_device(void* dst, const void* src, size_t count) {
     SP1_TRY({
-        rt().default_queue->memcpy(dst, src, count).wait_and_throw();
+        auto& q = *rt().default_queue;
+        submit_noted(q, [&] { return q.memcpy(dst, src, count); }).wait_and_throw();
         return SP1_SUCCESS;
     })
 }
@@ -620,7 +885,8 @@ rustCudaError_t cuda_event_destroy(void* event) {
 rustCudaError_t cuda_event_record(void* event, void* stream) {
     SP1_TRY({
         auto* e = static_cast<Event*>(event);
-        e->event = queue_of(stream).ext_oneapi_submit_barrier();
+        e->event = record_event(queue_of(stream));
+        e->queue = &queue_of(stream);
         e->recorded = true;
         return SP1_SUCCESS;
     })
@@ -658,7 +924,12 @@ rustCudaError_t cuda_stream_create(void** stream) {
 
 rustCudaError_t cuda_stream_destroy(void* stream) {
     SP1_TRY({
-        if (stream) rt().delete_queue(static_cast<sycl::queue*>(stream));
+        if (stream) {
+            auto* q = static_cast<sycl::queue*>(stream);
+            q->wait();
+            forget_stream(q);
+            rt().delete_queue(q);
+        }
         return SP1_SUCCESS;
     })
 }
@@ -677,7 +948,7 @@ rustCudaError_t cuda_stream_query(void* stream) {
 rustCudaError_t cuda_stream_wait_event(void* stream, void* event) {
     SP1_TRY({
         auto* e = static_cast<Event*>(event);
-        if (e->recorded) queue_of(stream).ext_oneapi_submit_barrier({e->event});
+        if (e->recorded) wait_for_event(queue_of(stream), e->event, e->queue);
         return SP1_SUCCESS;
     })
 }
@@ -696,7 +967,8 @@ rustCudaError_t cuda_free_async(void* ptr, void* stream) {
 
 rustCudaError_t cuda_mem_set_async(void* dst, uint8_t value, size_t count, void* stream) {
     SP1_TRY({
-        queue_of(stream).memset(dst, value, count);
+        auto& q = queue_of(stream);
+        submit_noted(q, [&] { return q.memset(dst, value, count); });
         return SP1_SUCCESS;
     })
 }
@@ -704,7 +976,8 @@ rustCudaError_t cuda_mem_set_async(void* dst, uint8_t value, size_t count, void*
 rustCudaError_t
 cuda_mem_copy_device_to_device_async(void* dst, const void* src, size_t count, void* stream) {
     SP1_TRY({
-        auto e = queue_of(stream).memcpy(dst, src, count);
+        auto& q = queue_of(stream);
+        auto e = submit_noted(q, [&] { return q.memcpy(dst, src, count); });
         if (sp1prof::enabled()) GpuProfiler::get().add("copy: device to device", e);
         return SP1_SUCCESS;
     })
@@ -717,7 +990,11 @@ cuda_mem_copy_host_to_device_async(void* dst, const void* src, size_t count, voi
     SP1_TRY({
         auto& q = queue_of(stream);
         const bool pinned = is_usm(src);
-        auto e = q.memcpy(dst, src, count);
+        if (kStagePageable && !pinned) {
+            copy_from_pageable(q, dst, src, count);
+            return SP1_SUCCESS;
+        }
+        auto e = submit_noted(q, [&] { return q.memcpy(dst, src, count); });
         if (sp1prof::enabled()) {
             GpuProfiler::get().add(
                 pinned ? "copy: host to device" : "copy: host to device (pageable)",
@@ -732,8 +1009,12 @@ rustCudaError_t
 cuda_mem_copy_device_to_host_async(void* dst, const void* src, size_t count, void* stream) {
     SP1_TRY({
         auto& q = queue_of(stream);
-        auto e = q.memcpy(dst, src, count);
         const bool pinned = is_usm(dst);
+        if (kStagePageable && !pinned) {
+            copy_to_pageable(q, dst, src, count);
+            return SP1_SUCCESS;
+        }
+        auto e = submit_noted(q, [&] { return q.memcpy(dst, src, count); });
         if (sp1prof::enabled()) {
             GpuProfiler::get().add(
                 pinned ? "copy: device to host" : "copy: device to host (pageable)",
@@ -748,7 +1029,7 @@ rustCudaError_t
 cuda_mem_copy_host_to_host_async(void* dst, const void* src, size_t count, void* stream) {
     SP1_TRY({
         auto& q = queue_of(stream);
-        auto e = q.memcpy(dst, src, count);
+        auto e = submit_noted(q, [&] { return q.memcpy(dst, src, count); });
         if (!is_usm(src) || !is_usm(dst)) e.wait_and_throw();
         return SP1_SUCCESS;
     })
@@ -756,7 +1037,11 @@ cuda_mem_copy_host_to_host_async(void* dst, const void* src, size_t count, void*
 
 rustCudaError_t cuda_launch_host_function(void* stream, void (*fn)(void*), void* data) {
     SP1_TRY({
-        queue_of(stream).submit([&](sycl::handler& h) { h.host_task([=] { fn(data); }); });
+        auto& q = queue_of(stream);
+        submit_noted(
+            q,
+            [&] { return q.submit([&](sycl::handler& h) { h.host_task([=] { fn(data); }); }); },
+            false);
         return SP1_SUCCESS;
     })
 }
@@ -766,12 +1051,12 @@ cuda_launch_kernel(void* kernel, dim3 grid, dim3 block, void** args, size_t shar
     SP1_TRY({
         if (grid.x == 0 || grid.y == 0 || grid.z == 0) return SP1_SUCCESS;
         auto launch = reinterpret_cast<::sp1sycl::launch_fn>(kernel);
+        // With its event, which record_event hands out.
+        auto& q = queue_of(stream);
+        auto e = submit_noted(q, [&] { return launch(&q, grid, block, args, shared_mem, true); });
         if (sp1prof::enabled()) {
-            auto e = launch(&queue_of(stream), grid, block, args, shared_mem, true);
             GpuProfiler::get().add(sp1prof::totals().name_of(kernel), std::move(e));
-            return SP1_SUCCESS;
         }
-        launch(&queue_of(stream), grid, block, args, shared_mem, false);
         return SP1_SUCCESS;
     })
 }

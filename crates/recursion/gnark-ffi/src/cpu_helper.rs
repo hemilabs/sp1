@@ -324,11 +324,11 @@ fn self_exe() -> (PathBuf, Option<OsString>) {
 }
 
 /// Finds an executable: at `env_var` when that is set (and only there), else next to this
-/// executable, else on `PATH`.
+/// executable, else on `PATH`. `name` is without the platform's suffix (`.exe` on Windows).
 pub(crate) fn find_executable(name: &str, env_var: Option<&str>) -> Option<PathBuf> {
     let exe_dir = std::env::current_exe().ok().and_then(|exe| exe.parent().map(Path::to_path_buf));
     search(
-        name,
+        &format!("{name}{}", std::env::consts::EXE_SUFFIX),
         env_var.and_then(std::env::var_os).as_deref(),
         exe_dir.as_deref(),
         std::env::var_os("PATH").as_deref(),

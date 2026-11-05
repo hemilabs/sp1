@@ -6,6 +6,12 @@ use std::{
 use sp1_build::{build_program_with_args, BuildArgs};
 
 fn main() -> Result<()> {
+    // `build_program_with_args` skips the programs under SP1_SKIP_PROGRAM_BUILD=true, yet still
+    // points their ELF paths at where the build would put them. Without this, cargo would not rerun
+    // this script once the variable is unset, and the crates that include those ELFs would keep
+    // failing to compile until the cached build state was cleared.
+    println!("cargo:rerun-if-env-changed=SP1_SKIP_PROGRAM_BUILD");
+
     let tests_path =
         [env!("CARGO_MANIFEST_DIR"), "programs"].iter().collect::<PathBuf>().canonicalize()?;
 

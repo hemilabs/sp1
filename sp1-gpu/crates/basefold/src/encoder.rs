@@ -6,6 +6,8 @@ use sp1_gpu_cudart::TaskScope;
 use sp1_gpu_merkle_tree::MerkleTree;
 use sp1_gpu_utils::Felt;
 
+use crate::HostCodeword;
+
 use slop_algebra::{AbstractField, Field};
 use slop_tensor::{Tensor, TensorView};
 use sp1_gpu_cudart::{
@@ -59,6 +61,9 @@ pub struct CudaStackedPcsProverData<GC: IopCtx> {
     pub merkle_tree_tcs_data: (MerkleTree<GC::Digest, TaskScope>, GC::Digest, usize, usize),
     /// The codeword (encoded polynomial). This is `None` when `drop_traces` is true.
     pub codeword_mle: Option<Arc<Tensor<GC::F, TaskScope>>>,
+    /// With `drop_traces`, the codeword in pinned host memory, if kept there (see
+    /// [`crate::host_codewords_enabled`]); else it is encoded again at the opening.
+    pub host_codeword: Option<Arc<HostCodeword>>,
 }
 
 impl<T: Field, F: CudaDftSys<T>> CudaDft<F, T> {

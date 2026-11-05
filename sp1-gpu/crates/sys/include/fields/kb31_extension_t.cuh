@@ -112,8 +112,9 @@ class kb31_extension_t {
     }
 
     __device__ __forceinline__ kb31_extension_t& operator*=(const kb31_extension_t b) {
-#ifdef SP1_PORTABLE
-        // Karatsuba extension multiply for F[x]/(x^4 - W), W=3.
+#ifdef SP1_SYCL
+        // SYCL (Intel GPUs emulate 64-bit integer arithmetic, see kb31_t::mul): Karatsuba extension
+        // multiply for F[x]/(x^4 - W), W=3, on reduced 32-bit products.
         // Uses 2-level Karatsuba: 9 base-field multiplies instead of 16.
         // Split: P = (a0+a1*x) + (a2+a3*x)*x^2 = P_lo + P_hi*y, y=x^2
         //        Q = (b0+b1*x) + (b2+b3*x)*x^2 = Q_lo + Q_hi*y
@@ -202,7 +203,30 @@ class kb31_extension_t {
         #undef MULW
         #undef MUL
         return *this;
-#else // !SP1_PORTABLE (CUDA optimized path)
+#elif defined(__HIP_DEVICE_COMPILE__)
+        // HIP: W folded into y1..y3 first (3y mod MOD, adds only), so the 16 products accumulate
+        // straight into the 4 result columns (each below 4 MOD^2 < 2^64) without the fold mads of the
+        // path below; then one 2^32 -> MUL2_32 pass (below 2^57) and kb31_t::redc_signed. On an
+        // RX 9070 XT, 1.24x the rate of the path below.
+        // v < 2 MOD -> v mod MOD, as a subtract and an unsigned min (see kb31_t::final_sub).
+        auto reduce = [](uint32_t v) { return __builtin_elementwise_min(v - MOD, v); };
+        auto times_w = [&](uint32_t v) { return reduce(reduce(v + v) + v); };  // 3v mod MOD, v < MOD
+        const uint32_t x0 = value[0].val, x1 = value[1].val, x2 = value[2].val, x3 = value[3].val;
+        const uint32_t y0 = b.value[0].val, y1 = b.value[1].val, y2 = b.value[2].val,
+                       y3 = b.value[3].val;
+        const uint32_t y1w = times_w(y1), y2w = times_w(y2), y3w = times_w(y3);
+        uint64_t a[4];
+        a[0] = (uint64_t)x0 * y0 + (uint64_t)x1 * y3w + (uint64_t)x2 * y2w + (uint64_t)x3 * y1w;
+        a[1] = (uint64_t)x0 * y1 + (uint64_t)x1 * y0 + (uint64_t)x2 * y3w + (uint64_t)x3 * y2w;
+        a[2] = (uint64_t)x0 * y2 + (uint64_t)x1 * y1 + (uint64_t)x2 * y0 + (uint64_t)x3 * y3w;
+        a[3] = (uint64_t)x0 * y3 + (uint64_t)x1 * y2 + (uint64_t)x2 * y1 + (uint64_t)x3 * y0;
+#pragma unroll
+        for (int k = 0; k < 4; k++) {
+            const uint64_t r = (uint64_t)(uint32_t)(a[k] >> 32) * MUL2_32 + (uint32_t)a[k];
+            value[k].val = reduce(kb31_t::redc_signed(r));  // through .val, see below
+        }
+        return *this;
+#else  // CUDA: 64-bit lazy accumulation (on an RX 9070 XT, 1.8x the Karatsuba's rate)
         uint32_t x0 = value[0].val, x1 = value[1].val, x2 = value[2].val, x3 = value[3].val,
                  y0 = b.value[0].val, y1 = b.value[1].val, y2 = b.value[2].val, y3 = b.value[3].val;
 
@@ -290,12 +314,13 @@ class kb31_extension_t {
         unpack(l2, x2, a2);
         unpack(l3, x3, a3);
 
-        // Final_sub()
+        // Final_sub(). Through `.val`: hipcc resolves `value[k] = <uint32_t>` to
+        // kb31_t::operator=(const accel_t&), which would Montgomery-reduce the residue again.
 
-        value[0] = x0 >= MOD ? x0 - MOD : x0;
-        value[1] = x1 >= MOD ? x1 - MOD : x1;
-        value[2] = x2 >= MOD ? x2 - MOD : x2;
-        value[3] = x3 >= MOD ? x3 - MOD : x3;
+        value[0].val = x0 >= MOD ? x0 - MOD : x0;
+        value[1].val = x1 >= MOD ? x1 - MOD : x1;
+        value[2].val = x2 >= MOD ? x2 - MOD : x2;
+        value[3].val = x3 >= MOD ? x3 - MOD : x3;
 
         return *this;
 #endif
@@ -401,8 +426,8 @@ class kb31_extension_t {
 
     __device__ __forceinline__ kb31_extension_t
     interpolateLinear(const kb31_extension_t one, const kb31_extension_t zero) const {
-#ifdef SP1_PORTABLE
-        // HIP-safe: use schoolbook multiply via kb31_t operators
+#ifdef SP1_SYCL
+        // SYCL: through the 32-bit operators (see operator*=)
         kb31_extension_t diff = one - zero;
         kb31_extension_t result = *this * diff + zero;
         return result;
@@ -539,8 +564,8 @@ class kb31_extension_t {
 
     __device__ __forceinline__ kb31_extension_t
     interpolateLinear(const kb31_t one, const kb31_t zero) const {
-#ifdef SP1_PORTABLE
-        // HIP-safe: use schoolbook multiply via kb31_t operators
+#ifdef SP1_SYCL
+        // SYCL: through the 32-bit operators (see operator*=)
         kb31_t diff = one - zero;
         kb31_extension_t result = *this * diff;
         result.value[0] += zero;

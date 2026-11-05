@@ -7,7 +7,7 @@ use std::{
     pin::Pin,
     ptr::{self, NonNull},
     sync::{
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicU64, AtomicUsize, Ordering},
         Arc, OnceLock, Weak,
     },
     task::{Context, Poll},
@@ -22,8 +22,8 @@ use slop_alloc::{
 };
 use slop_futures::queue::{AcquireWorkerError, TryAcquireWorkerError, Worker, WorkerQueue};
 use sp1_gpu_sys::runtime::{
-    cuda_device_get_default_mem_pool, cuda_mem_pool_set_release_threshold, CudaDevice, CudaMemPool,
-    CudaStreamHandle, Dim3, KernelPtr,
+    cuda_device_get_default_mem_pool, cuda_device_synchronize, cuda_mem_pool_set_release_threshold,
+    CudaDevice, CudaMemPool, CudaStreamHandle, Dim3, KernelPtr,
 };
 use thiserror::Error;
 use tokio::{sync::oneshot, task::JoinHandle};
@@ -56,6 +56,30 @@ pub struct TaskPoolBuilder {
 /// `cudaMalloc` syscall latency over per-shard / per-round allocations.
 const MEM_RELEASE_24GIB_CUTOFF: u64 = 24 * 1024 * 1024 * 1024;
 const MEM_RELEASE_HIGH_VRAM_DEFAULT: u64 = 8 * 1024 * 1024 * 1024;
+
+/// The release threshold the last task pool gave the default memory pool, which
+/// [`trim_default_mem_pool`] restores.
+static MEM_RELEASE_THRESHOLD: AtomicU64 = AtomicU64::new(0);
+
+/// Gives the unused reserve of device 0's default memory pool back to the driver: waits for the
+/// device with the pool's release threshold at zero, then restores the threshold. Live allocations
+/// are untouched. For a process handing the GPU to another one (the final wrap's GPU helpers).
+pub fn trim_default_mem_pool() -> Result<(), CudaError> {
+    unsafe {
+        let mut mem_pool = CudaMemPool(ptr::null_mut());
+        CudaError::result_from_ffi(cuda_device_get_default_mem_pool(&mut mem_pool, CudaDevice(0)))?;
+        CudaError::result_from_ffi(cuda_mem_pool_set_release_threshold(
+            CudaMemPool(mem_pool.0),
+            0,
+        ))?;
+        let synchronized = CudaError::result_from_ffi(cuda_device_synchronize());
+        CudaError::result_from_ffi(cuda_mem_pool_set_release_threshold(
+            mem_pool,
+            MEM_RELEASE_THRESHOLD.load(Ordering::Relaxed),
+        ))?;
+        synchronized
+    }
+}
 
 pub(crate) fn global_task_pool() -> &'static Arc<TaskPool> {
     GLOBAL_TASK_POOL.get_or_init(|| Arc::new(TaskPoolBuilder::new().build().unwrap()))
@@ -243,6 +267,7 @@ impl TaskPoolBuilder {
             ))
             .unwrap();
         };
+        MEM_RELEASE_THRESHOLD.store(mem_release_threshold, Ordering::Relaxed);
 
         let mut tasks = Vec::with_capacity(num_tasks);
         for (i, _) in (0..num_tasks).enumerate() {
@@ -540,6 +565,54 @@ impl TaskScope {
         CudaError::result_from_ffi(cuda_event_record(copy_done.0, self.aux_stream.0))?;
         CudaError::result_from_ffi(cuda_stream_wait_event(self.stream.0, copy_done.0))?;
         Ok(())
+    }
+
+    /// Enqueues a large D2H copy on the task's auxiliary stream, after the work queued so far on
+    /// the primary stream, so that it overlaps the primary stream's next kernels. `queued` and
+    /// `done` are recorded on the way: the primary stream must wait for `done` (see
+    /// [Self::wait_event]) before `src` is freed or written, and the host before reading `dst`.
+    ///
+    /// # Safety
+    /// `src` must stay valid for `byte_count` bytes of device reads, and `dst` (pinned host
+    /// memory) for `byte_count` bytes of writes, until the copy completes. The events must stay
+    /// alive until then too.
+    pub unsafe fn copy_device_to_host_aux_async(
+        &self,
+        dst: *mut std::ffi::c_void,
+        src: *const std::ffi::c_void,
+        byte_count: usize,
+        queued: &CudaEvent,
+        done: &CudaEvent,
+    ) -> Result<(), CudaError> {
+        use sp1_gpu_sys::runtime::{
+            cuda_event_record, cuda_mem_copy_device_to_host_async, cuda_stream_wait_event,
+        };
+
+        CudaError::result_from_ffi(cuda_event_record(queued.0, self.stream.0))?;
+        CudaError::result_from_ffi(cuda_stream_wait_event(self.aux_stream.0, queued.0))?;
+        CudaError::result_from_ffi(cuda_mem_copy_device_to_host_async(
+            dst,
+            src,
+            byte_count,
+            self.aux_stream.0,
+        ))?;
+        CudaError::result_from_ffi(cuda_event_record(done.0, self.aux_stream.0))
+    }
+
+    /// Records `event` on the primary stream, after the work queued so far.
+    pub fn record_event(&self, event: &CudaEvent) -> Result<(), CudaError> {
+        // SAFETY: both the stream and the event are valid for the lifetime of the call.
+        CudaError::result_from_ffi(unsafe {
+            sp1_gpu_sys::runtime::cuda_event_record(event.0, self.stream.0)
+        })
+    }
+
+    /// Makes the work queued on the primary stream from now on wait for `event`.
+    pub fn wait_event(&self, event: &CudaEvent) -> Result<(), CudaError> {
+        // SAFETY: both the stream and the event are valid for the lifetime of the call.
+        CudaError::result_from_ffi(unsafe {
+            sp1_gpu_sys::runtime::cuda_stream_wait_event(self.stream.0, event.0)
+        })
     }
 
     /// Waits for all work enqueued so far in this task to finish.

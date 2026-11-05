@@ -79,3 +79,26 @@ pub fn reverse_slice_index_bits<T>(slice: &mut [T]) {
         }
     }
 }
+
+/// Populates the rows of `values` (`width` columns each, row `i` from event `i`) in parallel
+/// chunks with `populate(i, row, blu)`. With `count`, the byte lookups go to
+/// `input.byte_lookup_counts` (the trace also generates the chip's dependencies, see
+/// `generate_trace_into_with_dependencies`); otherwise they are dropped.
+pub fn populate_event_rows<F: Send>(
+    input: &sp1_core_executor::ExecutionRecord,
+    values: &mut [F],
+    width: usize,
+    count: bool,
+    populate: impl Fn(usize, &mut [F], &mut sp1_core_executor::events::MaybeByteLookupCounter) + Sync,
+) {
+    use rayon::prelude::*;
+    let num_rows = values.len() / width;
+    let chunk_size = std::cmp::max(num_rows / num_cpus::get(), 1);
+    values.par_chunks_mut(chunk_size * width).enumerate().for_each(|(i, rows)| {
+        input.byte_lookup_counts.count_if(count, |blu| {
+            for (j, row) in rows.chunks_mut(width).enumerate() {
+                populate(i * chunk_size + j, row, blu);
+            }
+        });
+    });
+}

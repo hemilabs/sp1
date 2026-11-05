@@ -1,7 +1,5 @@
 use core::mem;
-use std::sync::Arc;
-
-use futures::future::join_all;
+use core::mem::MaybeUninit;
 use slop_algebra::PrimeField32;
 use slop_alloc::mem::CopyError;
 use slop_alloc::Buffer;
@@ -13,11 +11,11 @@ use sp1_gpu_cudart::{args, DeviceMle, TaskScope};
 use sp1_hypercube::air::MachineAir;
 use sp1_hypercube::septic_curve::SepticCurve;
 use sp1_hypercube::septic_digest::SepticDigest;
-use sp1_hypercube::septic_extension::{SepticBlock, SepticExtension};
+use sp1_hypercube::septic_extension::SepticBlock;
 
 use sp1_gpu_cudart::TracegenRiscvGlobalKernel;
 
-use crate::{CudaTracegenAir, F};
+use crate::{input_bytes, upload_input, CudaTracegenAir, StagedInput, F};
 
 // Keep in sync with the CUDA constants in sys/lib/scan/scan.cu.
 const CURVE_SCAN_BLOCK_SIZE: usize = 256;
@@ -62,20 +60,21 @@ impl CudaTracegenAir<F> for GlobalChip {
         true
     }
 
-    async fn generate_trace_device(
+    fn main_device_input<'a>(&self, record: &'a Self::Record) -> Option<&'a [MaybeUninit<u8>]> {
+        Some(input_bytes(&record.global_interaction_events))
+    }
+
+    async fn generate_trace_device_staged(
         &self,
         input: &Self::Record,
         output: &mut Self::Record,
+        staged: Option<StagedInput>,
         scope: &TaskScope,
     ) -> Result<DeviceMle<F>, CopyError> {
         let events = &input.global_interaction_events;
         let events_len = events.len();
 
-        let events_device = {
-            let mut buf = Buffer::try_with_capacity_in(events.len(), scope.clone()).unwrap();
-            buf.extend_from_host_slice(events)?;
-            buf
-        };
+        let events_device = upload_input(events, staged, scope)?;
 
         const NUM_GLOBAL_COLS: usize = size_of::<GlobalCols<u8>>();
 
@@ -231,41 +230,39 @@ impl CudaTracegenAir<F> for GlobalChip {
         // Modify the records passed as arguments.
         output.global_interaction_event_count =
             events.len().try_into().expect("number of Global events should fit in a u32");
-        // Wrap the trace so we can use it in concurrent tasks.
-        let trace = Arc::new(trace);
 
-        let global_sum = if height == 0 {
+        // No events (the padded height is never zero): nothing accumulated, and no last event row
+        // to read the sum from.
+        let global_sum = if height == 0 || events_len == 0 {
             SepticDigest(SepticCurve::convert(SepticDigest::<F>::zero().0, |x| {
                 F::as_canonical_u32(&x)
             }))
         } else {
-            // // Copy the last digest of the last `CURVE_POINT_WIDTH` columns, which are the global digest columns.
+            // The cumulative_sum columns of the last event row (the last `CURVE_POINT_WIDTH`
+            // columns) are copied verbatim by the finalize kernel from
+            // `cumulative_sums[events_len - 1]` (rows < nb_events take `cumulative_sums[i]` before
+            // adding their point), so read that one contiguous 56-byte point in a single copy
+            // instead of 14 strided 4-byte cells of the trace.
             const CUMULATIVE_SUM_COL_START: usize =
                 mem::offset_of!(GlobalCols<u8>, accumulation.cumulative_sum);
             assert_eq!(CUMULATIVE_SUM_COL_START + CURVE_POINT_WIDTH, NUM_GLOBAL_COLS);
-            let copied_sum = join_all((CUMULATIVE_SUM_COL_START..NUM_GLOBAL_COLS).map(|i| {
-                let trace = Arc::clone(&trace);
-                let scope = scope.clone();
-                tokio::task::spawn_blocking(move || {
-                    // No need to synchronize, since the host memory is not pinned.
-                    trace[[i, events_len - 1]].copy_into_host(&scope)
-                })
-            }))
-            .await;
-            SepticDigest(SepticCurve {
-                x: SepticExtension(core::array::from_fn(|i| {
-                    copied_sum[i].as_ref().unwrap().as_canonical_u32()
-                })),
-                y: SepticExtension(core::array::from_fn(|i| {
-                    copied_sum[CURVE_FIELD_EXT_DEGREE + i].as_ref().unwrap().as_canonical_u32()
-                })),
+            // SAFETY: the scan above wrote all `height` points (stream-ordered before the copy).
+            unsafe { cumulative_sums.set_len(height) };
+            let scope = scope.clone();
+            // One synchronous, stream-ordered D2H copy (it waits for the scan and finalize
+            // kernels queued before it); off the async worker since it blocks. The buffer is
+            // handed back so it is freed here, as before.
+            let (sum, cumulative_sums) = tokio::task::spawn_blocking(move || {
+                let sum = cumulative_sums[events_len - 1].copy_into_host(&scope);
+                (sum, cumulative_sums)
             })
+            .await
+            .expect("Global cumulative sum readback task panicked");
+            drop(cumulative_sums);
+            SepticDigest(SepticCurve::convert(sum, |x| F::as_canonical_u32(&x)))
         };
 
         *input.global_cumulative_sum.lock().unwrap() = global_sum;
-
-        let trace =
-            Arc::into_inner(trace).expect("trace Arc should have exactly one strong reference");
 
         Ok(DeviceMle::from(trace))
     }
@@ -278,11 +275,11 @@ mod tests {
     use slop_tensor::Tensor;
     use sp1_core_executor::{events::GlobalInteractionEvent, ExecutionRecord};
     use sp1_core_machine::global::GlobalChip;
-    use sp1_gpu_cudart::TaskScope;
+    use sp1_gpu_cudart::{PinnedBuffer, TaskScope};
     use sp1_hypercube::air::MachineAir;
     use sp1_hypercube::MachineRecord;
 
-    use crate::{CudaTracegenAir, F};
+    use crate::{CudaTracegenAir, StagedInput, F};
 
     #[test]
     fn test_hierarchical_curve_scan_boundaries() {
@@ -319,6 +316,46 @@ mod tests {
         .unwrap();
     }
 
+    /// The global cumulative sum is read back from the device as a single point
+    /// (`cumulative_sums[events_len - 1]`); check it against the CPU at small and boundary counts.
+    #[tokio::test]
+    async fn test_global_cumulative_sum_readback() {
+        sp1_gpu_cudart::spawn(|scope: TaskScope| async move {
+            let mut rng = StdRng::seed_from_u64(0x5EED);
+            for n in [1usize, 2, super::CURVE_SCAN_POINTS_PER_BLOCK + 1] {
+                let events = core::iter::repeat_with(|| GlobalInteractionEvent {
+                    message: core::array::from_fn(|_| rng.gen::<F>().as_canonical_u32()),
+                    is_receive: rng.gen(),
+                    kind: rng.gen_range(0..(1 << 6)),
+                })
+                .take(n)
+                .collect::<Vec<_>>();
+                let [shard, gpu_shard] = core::array::from_fn(|_| ExecutionRecord {
+                    global_interaction_events: events.clone(),
+                    ..Default::default()
+                });
+                let trace = Tensor::<F>::from(
+                    GlobalChip.generate_trace(&shard, &mut ExecutionRecord::default()),
+                );
+                let gpu_trace = GlobalChip
+                    .generate_trace_device(&gpu_shard, &mut ExecutionRecord::default(), &scope)
+                    .await
+                    .expect("should copy events to device successfully")
+                    .to_host()
+                    .expect("should copy trace to host successfully")
+                    .into_guts();
+                crate::tests::test_traces_eq(&trace, &gpu_trace, &events);
+                assert_eq!(
+                    *gpu_shard.global_cumulative_sum.lock().unwrap(),
+                    *shard.global_cumulative_sum.lock().unwrap(),
+                    "n={n}"
+                );
+            }
+        })
+        .await
+        .unwrap();
+    }
+
     #[tokio::test]
     async fn test_global_generate_trace() {
         sp1_gpu_cudart::spawn(inner_test_global_generate_trace).await.unwrap();
@@ -351,6 +388,30 @@ mod tests {
             .to_host()
             .expect("should copy trace to host successfully")
             .into_guts();
+
+        // The staged path (events first copied into pinned memory) must give the identical trace.
+        let staged_shard =
+            ExecutionRecord { global_interaction_events: events.clone(), ..Default::default() };
+        let input = chip.main_device_input(&staged_shard).unwrap();
+        let mut pinned = PinnedBuffer::<u8>::with_capacity(input.len());
+        unsafe {
+            std::ptr::copy_nonoverlapping(input.as_ptr().cast(), pinned.as_mut_ptr(), input.len())
+        };
+        let staged = unsafe { StagedInput::new(pinned.as_ptr(), input.len()) };
+        let gpu_trace_staged = chip
+            .generate_trace_device_staged(
+                &staged_shard,
+                &mut ExecutionRecord::default(),
+                Some(staged),
+                &scope,
+            )
+            .await
+            .expect("should copy events to device successfully")
+            .to_host()
+            .expect("should copy trace to host successfully")
+            .into_guts();
+        assert!(gpu_trace.as_slice() == gpu_trace_staged.as_slice(), "staged trace differs");
+        assert_eq!(staged_shard.public_values::<F>(), shard.public_values::<F>());
 
         crate::tests::test_traces_eq(&trace, &gpu_trace, &events);
 

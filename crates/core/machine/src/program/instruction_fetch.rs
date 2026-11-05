@@ -4,8 +4,8 @@ use core::{
 };
 
 use crate::{
-    air::SP1CoreAirBuilder, memory::MemoryAccessCols, program::InstructionCols,
-    utils::next_multiple_of_32,
+    air::SP1CoreAirBuilder, memory::MemoryAccessCols, operations::small_int_inverse,
+    program::InstructionCols, utils::next_multiple_of_32,
 };
 use hashbrown::HashMap;
 use itertools::Itertools;
@@ -72,8 +72,9 @@ impl InstructionFetchChip {
             F::from_canonical_u16(((pc >> 32) & 0xFFFF) as u16),
         ];
 
-        let sum_top_two_limb = cols.pc[1] + cols.pc[2];
-        cols.top_two_limb_inv = sum_top_two_limb.inverse();
+        // The sum of two u16 limbs is in `[0, 2^17 - 2]`, inside the inverse table.
+        cols.top_two_limb_inv =
+            small_int_inverse(((pc >> 16) & 0xFFFF) as u32 + ((pc >> 32) & 0xFFFF) as u32);
 
         let clk_high = (event.clk >> 24) as u32;
         let clk_low = (event.clk & 0xFFFFFF) as u32;

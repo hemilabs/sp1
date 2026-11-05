@@ -86,6 +86,12 @@ impl<M: ExecutionMode> MinimalExecutor<M> {
         Self::new(program, true, None)
     }
 
+    /// Also end a trace chunk once it has run `cycles` cycles. See
+    /// [`JitFunction::set_max_chunk_cycles`].
+    pub fn set_max_chunk_cycles(&mut self, cycles: Option<u64>) {
+        self.compiled.set_max_chunk_cycles(cycles);
+    }
+
     /// Add input to the executor.
     pub fn with_input(&mut self, input: &[u8]) {
         self.input.push_back(input.to_vec());

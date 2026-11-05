@@ -81,7 +81,7 @@ where
             opts.clone(),
             &mut touched_addresses,
             &mut touched_pages,
-        );
+        )?;
 
         // Trace each spliced chunk to generate execution records
         for (is_last, spliced) in spliced_traces {
@@ -257,7 +257,7 @@ fn splice_chunk_sequential<T: MinimalTrace>(
     opts: SP1CoreOpts,
     touched_addresses: &mut HashSet<u64>,
     touched_pages: &mut HashSet<u64>,
-) -> Vec<(bool, SplicedMinimalTrace<T>)> {
+) -> Result<Vec<(bool, SplicedMinimalTrace<T>)>, ExecutionError> {
     let mut result = Vec::new();
     let mut compressed_touched = CompressedMemory::new();
     let mut compressed_touched_pages = CompressedPages::new();
@@ -274,7 +274,7 @@ fn splice_chunk_sequential<T: MinimalTrace>(
     let start_num_mem_reads = chunk.num_mem_reads();
 
     loop {
-        match vm.execute().expect("splicing execution failed") {
+        match vm.execute()? {
             CycleResult::ShardBoundary => {
                 if let Some(spliced) = vm.splice(chunk.clone()) {
                     last_splice.set_last_clk(vm.clk());
@@ -304,7 +304,7 @@ fn splice_chunk_sequential<T: MinimalTrace>(
 
     touched_addresses.extend(compressed_touched.is_set());
     touched_pages.extend(compressed_touched_pages.is_set());
-    result
+    Ok(result)
 }
 
 #[derive(Error, Debug)]

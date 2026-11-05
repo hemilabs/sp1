@@ -1,32 +1,34 @@
+use std::mem::MaybeUninit;
+
 use slop_air::BaseAir;
 use slop_alloc::mem::CopyError;
-use slop_alloc::Buffer;
 use slop_tensor::Tensor;
 use sp1_gpu_cudart::TracegenRecursionPrefixSumChecksKernel;
 use sp1_gpu_cudart::{args, DeviceMle, TaskScope};
 use sp1_hypercube::air::MachineAir;
 use sp1_recursion_machine::chips::prefix_sum_checks::PrefixSumChecksChip;
 
-use crate::{CudaTracegenAir, F};
+use crate::{input_bytes, upload_input, CudaTracegenAir, StagedInput, F};
 
 impl CudaTracegenAir<F> for PrefixSumChecksChip {
     fn supports_device_main_tracegen(&self) -> bool {
         true
     }
 
-    async fn generate_trace_device(
+    fn main_device_input<'a>(&self, record: &'a Self::Record) -> Option<&'a [MaybeUninit<u8>]> {
+        Some(input_bytes(&record.prefix_sum_checks_events))
+    }
+
+    async fn generate_trace_device_staged(
         &self,
         input: &Self::Record,
         _: &mut Self::Record,
+        staged: Option<StagedInput>,
         scope: &TaskScope,
     ) -> Result<DeviceMle<F>, CopyError> {
         let events = &input.prefix_sum_checks_events;
 
-        let events_device = {
-            let mut buf = Buffer::try_with_capacity_in(events.len(), scope.clone()).unwrap();
-            buf.extend_from_host_slice(events)?;
-            buf
-        };
+        let events_device = upload_input(events, staged, scope)?;
 
         let width = <Self as BaseAir<F>>::width(self);
 

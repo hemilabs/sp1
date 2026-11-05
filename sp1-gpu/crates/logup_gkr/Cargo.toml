@@ -18,6 +18,7 @@ sp1-gpu-utils = { workspace = true }
 sp1-gpu-jagged-tracegen = { workspace = true }
 sp1-gpu-zerocheck = { workspace = true }
 sp1-gpu-basefold = { workspace = true }
+sp1-gpu-challenger = { workspace = true }
 
 # slop
 slop-air = { workspace = true }

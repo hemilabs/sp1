@@ -1,14 +1,18 @@
+use std::mem::MaybeUninit;
+
 use slop_air::BaseAir;
 use slop_alloc::mem::CopyError;
-use slop_alloc::Buffer;
 use slop_tensor::Tensor;
 use sp1_gpu_cudart::{args, DeviceMle, TaskScope};
 use sp1_gpu_cudart::{TracegenPreprocessedRecursionSelectKernel, TracegenRecursionSelectKernel};
 use sp1_hypercube::air::MachineAir;
-use sp1_recursion_executor::Instruction;
+use sp1_recursion_executor::{Instruction, SelectInstr};
 use sp1_recursion_machine::chips::select::SelectChip;
 
-use crate::{take_prep_or, CudaTracegenAir, PreprocessedPrep, F};
+use crate::{
+    input_bytes, prep_bytes, take_prep_or, upload_input, CudaTracegenAir, PreprocessedPrep,
+    StagedInput, F,
+};
 
 impl CudaTracegenAir<F> for SelectChip {
     fn supports_device_preprocessed_tracegen(&self) -> bool {
@@ -28,18 +32,26 @@ impl CudaTracegenAir<F> for SelectChip {
         ))
     }
 
+    fn preprocessed_device_input<'a>(
+        &self,
+        prep: &'a PreprocessedPrep,
+    ) -> Option<&'a [MaybeUninit<u8>]> {
+        prep_bytes::<SelectInstr<F>>(prep)
+    }
+
     fn generate_preprocessed_trace_device(
         &self,
         program: &Self::Program,
         scope: &TaskScope,
     ) -> impl core::future::Future<Output = Result<Option<DeviceMle<F>>, CopyError>> + Send {
-        self.generate_preprocessed_trace_device_prepared(program, None, scope)
+        self.generate_preprocessed_trace_device_prepared(program, None, None, scope)
     }
 
     async fn generate_preprocessed_trace_device_prepared(
         &self,
         program: &Self::Program,
         prep: Option<PreprocessedPrep>,
+        staged: Option<StagedInput>,
         scope: &TaskScope,
     ) -> Result<Option<DeviceMle<F>>, CopyError> {
         let instrs = take_prep_or(prep, || {
@@ -53,11 +65,7 @@ impl CudaTracegenAir<F> for SelectChip {
                 .collect::<Vec<_>>()
         });
 
-        let instrs_device = {
-            let mut buf = Buffer::try_with_capacity_in(instrs.len(), scope.clone()).unwrap();
-            buf.extend_from_host_slice(&instrs)?;
-            buf
-        };
+        let instrs_device = upload_input(&instrs, staged, scope)?;
 
         let width = MachineAir::<F>::preprocessed_width(self);
 
@@ -94,19 +102,20 @@ impl CudaTracegenAir<F> for SelectChip {
         true
     }
 
-    async fn generate_trace_device(
+    fn main_device_input<'a>(&self, record: &'a Self::Record) -> Option<&'a [MaybeUninit<u8>]> {
+        Some(input_bytes(&record.select_events))
+    }
+
+    async fn generate_trace_device_staged(
         &self,
         input: &Self::Record,
         _: &mut Self::Record,
+        staged: Option<StagedInput>,
         scope: &TaskScope,
     ) -> Result<DeviceMle<F>, CopyError> {
         let events = &input.select_events;
 
-        let events_device = {
-            let mut buf = Buffer::try_with_capacity_in(events.len(), scope.clone()).unwrap();
-            buf.extend_from_host_slice(events)?;
-            buf
-        };
+        let events_device = upload_input(events, staged, scope)?;
 
         let width = <Self as BaseAir<F>>::width(self);
 

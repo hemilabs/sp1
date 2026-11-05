@@ -2,11 +2,18 @@ use serde::{Deserialize, Serialize};
 use sp1_core_executor::Program;
 use std::{collections::VecDeque, sync::Arc};
 
+/// The exit code of this binary when it was built without the native executor (see `main.rs`).
+pub const EXIT_WITHOUT_NATIVE_EXECUTOR: i32 = 3;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Input {
     pub program: Arc<Program>,
     pub is_debug: bool,
     pub max_trace_size: Option<u64>,
+    /// The most cycles in a trace chunk, see `JitFunction::set_max_chunk_cycles`.
+    pub max_chunk_cycles: Option<u64>,
+    /// The stdin buffers, each serialized as one byte buffer.
+    #[serde(with = "sp1_primitives::serde_bytes::vec_deque")]
     pub input: VecDeque<Vec<u8>>,
     pub shm_slot_size: usize,
     pub id: String,

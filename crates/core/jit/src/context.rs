@@ -373,6 +373,9 @@ pub struct JitContext {
     /// This context is in unconstrainted mode.
     /// 1 if unconstrained, 0 otherwise.
     pub is_unconstrained: u64,
+    /// The `global_clk` at which a tracing run ends its trace chunk, at the next backward or
+    /// indirect jump outside unconstrained mode. `u64::MAX` when chunks are not capped by cycles.
+    pub(crate) chunk_global_clk_limit: u64,
     /// Mapping from (pc - pc_base) / 4 => absolute address of the instruction.
     pub(crate) jump_table: NonNull<*const u8>,
     /// The pointer to the program memory.

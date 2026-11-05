@@ -12,6 +12,7 @@ pub mod sync;
 pub mod task;
 mod tensor;
 mod tracegen;
+mod upload;
 
 pub use error::CudaError;
 pub use event::CudaEvent;
@@ -28,6 +29,7 @@ pub use scan::*;
 pub use task::*;
 pub use tensor::*;
 pub use tracegen::*;
+pub use upload::*;
 
 pub mod sys {
     pub use sp1_gpu_sys::*;

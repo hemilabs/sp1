@@ -54,6 +54,10 @@ pub struct Groth16ProvingData {
 }
 
 /// Solved Groth16 witness data (exported from gnark R1CS solver).
+///
+/// Its vectors are not pinned: the prover reads them only on the host, copying them into its
+/// own pinned buffers (the wire-value scatters, `compute_h`'s copies), and pinning their 2 GB
+/// made each wrap ~35 ms slower.
 pub struct Groth16WitnessData {
     /// All wire values (public + private), pre-converted to Montgomery Fr at
     /// load time to avoid ~350ms per-proof conversion in the hot prove path.
@@ -71,12 +75,6 @@ pub struct Groth16WitnessData {
     pub commitments: Vec<BN254G1Affine>,
     /// Pedersen commitment proof-of-knowledge
     pub commitment_pok: BN254G1Affine,
-    /// Whether the big vecs (wire_values, solution_a/b/c) are cuda_host_register'd
-    /// so async H2D actually uses SDMA. Set by load() on CUDA/HIP builds; cleared
-    /// by Drop which unregisters them. Hardware-agnostic callers can still use
-    /// the data unchanged; pinning is opaque at the Rust-type level.
-    #[cfg(feature = "cuda")]
-    pub(crate) pinned_on_device: bool,
 }
 
 /// Groth16 proof (BN254).
@@ -275,6 +273,19 @@ impl Groth16ProvingData {
     }
 }
 
+impl Groth16ProvingData {
+    /// [`Self::load`] on at most `threads` threads (all of the global pool's when `None`), for a
+    /// helper that loads the key while the prover it serves still needs the CPU.
+    pub fn load_with_threads(dir: &str, threads: Option<usize>) -> anyhow::Result<Self> {
+        match threads {
+            Some(n) => {
+                rayon::ThreadPoolBuilder::new().num_threads(n).build()?.install(|| Self::load(dir))
+            }
+            None => Self::load(dir),
+        }
+    }
+}
+
 impl Groth16WitnessData {
     /// Load solved witness data from the exported binary directory.
     pub fn load(dir: &str) -> anyhow::Result<Self> {
@@ -330,52 +341,6 @@ impl Groth16WitnessData {
             }
         };
 
-        // Pin the four big vecs so async H2D on copy_stream actually uses SDMA
-        // (and the GPU wire-gather path sees sub-20ms H2D instead of 140ms
-        // paged-memory staging). Failure to pin is non-fatal — we just fall
-        // back to the CPU-scatter / sync-H2D path.
-        #[cfg(feature = "cuda")]
-        let pinned_on_device = {
-            let mut ok = true;
-            let pin = |v: &[u8], label: &str| -> bool {
-                let err = unsafe {
-                    sp1_gpu_sys::runtime::cuda_host_register(
-                        v.as_ptr() as *const std::ffi::c_void,
-                        v.len(),
-                    )
-                };
-                if err != unsafe { sp1_gpu_sys::runtime::CUDA_SUCCESS_CSL } {
-                    eprintln!("[groth16-load] WARN: cuda_host_register({label}) failed");
-                    false
-                } else {
-                    true
-                }
-            };
-            unsafe {
-                let wv_bytes = std::slice::from_raw_parts(
-                    wire_values.as_ptr() as *const u8,
-                    wire_values.len() * std::mem::size_of::<Fr>(),
-                );
-                let sa_bytes = std::slice::from_raw_parts(
-                    solution_a.as_ptr() as *const u8,
-                    solution_a.len() * std::mem::size_of::<BN254Fr>(),
-                );
-                let sb_bytes = std::slice::from_raw_parts(
-                    solution_b.as_ptr() as *const u8,
-                    solution_b.len() * std::mem::size_of::<BN254Fr>(),
-                );
-                let sc_bytes = std::slice::from_raw_parts(
-                    solution_c.as_ptr() as *const u8,
-                    solution_c.len() * std::mem::size_of::<BN254Fr>(),
-                );
-                ok &= pin(wv_bytes, "wire_values");
-                ok &= pin(sa_bytes, "solution_a");
-                ok &= pin(sb_bytes, "solution_b");
-                ok &= pin(sc_bytes, "solution_c");
-            }
-            ok
-        };
-
         Ok(Self {
             wire_values,
             solution_a,
@@ -384,32 +349,7 @@ impl Groth16WitnessData {
             h_coefficients,
             commitments,
             commitment_pok,
-            #[cfg(feature = "cuda")]
-            pinned_on_device,
         })
-    }
-}
-
-#[cfg(feature = "cuda")]
-impl Drop for Groth16WitnessData {
-    fn drop(&mut self) {
-        if !self.pinned_on_device {
-            return;
-        }
-        unsafe {
-            let _ = sp1_gpu_sys::runtime::cuda_host_unregister(
-                self.wire_values.as_ptr() as *const std::ffi::c_void
-            );
-            let _ = sp1_gpu_sys::runtime::cuda_host_unregister(
-                self.solution_a.as_ptr() as *const std::ffi::c_void
-            );
-            let _ = sp1_gpu_sys::runtime::cuda_host_unregister(
-                self.solution_b.as_ptr() as *const std::ffi::c_void
-            );
-            let _ = sp1_gpu_sys::runtime::cuda_host_unregister(
-                self.solution_c.as_ptr() as *const std::ffi::c_void
-            );
-        }
     }
 }
 
@@ -496,28 +436,7 @@ fn load_g2_points(path: &std::path::Path) -> anyhow::Result<Vec<G2Affine>> {
 }
 
 fn load_fr_elements(path: &std::path::Path) -> anyhow::Result<Vec<BN254Fr>> {
-    let data = std::fs::read(path)?;
-    anyhow::ensure!(
-        data.len() % 32 == 0,
-        "{}: size {} not multiple of 32",
-        path.display(),
-        data.len()
-    );
-    let n = data.len() / 32;
-    let mut elements = Vec::with_capacity(n);
-    for i in 0..n {
-        let offset = i * 32;
-        let mut elem = BN254Fr { limbs: [0; 8] };
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                data[offset..].as_ptr(),
-                elem.limbs.as_mut_ptr() as *mut u8,
-                32,
-            );
-        }
-        elements.push(elem);
-    }
-    Ok(elements)
+    read_elements(path, 0)
 }
 
 /// Magic header for Montgomery-form Fr files written by `writeFrFileMontgomery`.
@@ -535,68 +454,163 @@ const FR_MONTGOMERY_MAGIC: &[u8; 4] = b"MFr1";
 ///
 /// This auto-detection makes the loader backward-compatible with old exports.
 fn load_fr_elements_auto(path: &std::path::Path) -> anyhow::Result<Vec<Fr>> {
-    let data = std::fs::read(path)?;
+    use std::io::Read;
+    let mut magic = [0u8; 4];
+    let has_magic =
+        std::fs::File::open(path)?.read_exact(&mut magic).is_ok() && &magic == FR_MONTGOMERY_MAGIC;
 
-    // Check for Montgomery magic header
-    if data.len() >= 4 && &data[..4] == FR_MONTGOMERY_MAGIC.as_slice() {
-        let payload = &data[4..];
-        anyhow::ensure!(
-            payload.len() % 32 == 0,
-            "{}: Montgomery payload size {} not multiple of 32",
-            path.display(),
-            payload.len()
-        );
-        let n = payload.len() / 32;
-        let mut elements = Vec::with_capacity(n);
-        // SAFETY: Fr is #[repr(transparent)] over [u64; 4] (32 bytes).
-        // The file contains raw LE u64 limbs in Montgomery form, which is
-        // exactly the in-memory layout of Fr on little-endian platforms.
-        for i in 0..n {
-            let offset = i * 32;
-            let mut fr = Fr::ZERO;
-            unsafe {
-                std::ptr::copy_nonoverlapping(
-                    payload[offset..].as_ptr(),
-                    fr.0.as_mut_ptr() as *mut u8,
-                    32,
-                );
-            }
-            elements.push(fr);
-        }
+    if has_magic {
+        let elements: Vec<Fr> = read_elements(path, FR_MONTGOMERY_MAGIC.len() as u64)?;
         eprintln!(
             "[groth16-load] {}: loaded {} Fr elements (Montgomery, no conversion)",
             path.display(),
-            n
+            elements.len()
         );
         Ok(elements)
     } else {
         // Legacy canonical LE format: load as BN254Fr, convert to Montgomery Fr.
-        anyhow::ensure!(
-            data.len() % 32 == 0,
-            "{}: size {} not multiple of 32",
-            path.display(),
-            data.len()
-        );
-        let n = data.len() / 32;
-        let mut raw = Vec::with_capacity(n);
-        for i in 0..n {
-            let offset = i * 32;
-            let mut elem = BN254Fr { limbs: [0; 8] };
-            unsafe {
-                std::ptr::copy_nonoverlapping(
-                    data[offset..].as_ptr(),
-                    elem.limbs.as_mut_ptr() as *mut u8,
-                    32,
-                );
-            }
-            raw.push(elem);
-        }
+        let raw: Vec<BN254Fr> = read_elements(path, 0)?;
         let elements: Vec<Fr> = raw.par_iter().map(Fr::from_bn254fr).collect();
         eprintln!(
             "[groth16-load] {}: loaded {} Fr elements (canonical, converted to Montgomery)",
             path.display(),
-            n
+            elements.len()
         );
         Ok(elements)
+    }
+}
+
+/// Field elements that are 32 bytes of plain data, little-endian limbs, and valid when all-zero:
+/// what [`read_elements`] may read straight from a file.
+///
+/// # Safety
+///
+/// Implementors must be exactly 32 bytes, with no padding, and every bit pattern must be a value
+/// of the type.
+unsafe trait RawElement: Copy + Send + Sync {}
+
+// SAFETY: `#[repr(C)]` over `[u32; 8]`.
+unsafe impl RawElement for BN254Fr {}
+// SAFETY: `#[repr(transparent)]` over `[u64; 4]`.
+unsafe impl RawElement for Fr {}
+
+/// Reads the elements in `path`, from byte `skip` on, straight into the vector that is returned,
+/// in parallel chunks. The witness files are ~0.5 GB each in RAM-backed `/dev/shm`, so their cost
+/// is the copy and the page faults, which reading into an intermediate buffer doubled.
+fn read_elements<T: RawElement>(path: &std::path::Path, skip: u64) -> anyhow::Result<Vec<T>> {
+    const CHUNK_BYTES: usize = 16 << 20;
+    assert_eq!(std::mem::size_of::<T>(), 32);
+    let file = std::fs::File::open(path)?;
+    let len = file.metadata()?.len();
+    anyhow::ensure!(
+        len >= skip && (len - skip).is_multiple_of(32),
+        "{}: size {} (after a {skip}-byte header) not multiple of 32",
+        path.display(),
+        len
+    );
+    let n = ((len - skip) / 32) as usize;
+    if n == 0 {
+        return Ok(Vec::new());
+    }
+    let layout = std::alloc::Layout::array::<T>(n)?;
+    // SAFETY: `layout` has a non-zero size, and an all-zero `T` is a valid value (`RawElement`),
+    // so the zeroed allocation holds `n` initialized elements; it was made by the global
+    // allocator with `T`'s layout, as `Vec::from_raw_parts` requires.
+    let mut elements = unsafe {
+        let ptr = std::alloc::alloc_zeroed(layout) as *mut T;
+        if ptr.is_null() {
+            std::alloc::handle_alloc_error(layout);
+        }
+        Vec::from_raw_parts(ptr, n, n)
+    };
+    // SAFETY: `T` is 32 bytes without padding and any bytes are a valid `T` (`RawElement`).
+    let bytes = unsafe { std::slice::from_raw_parts_mut(elements.as_mut_ptr() as *mut u8, n * 32) };
+    bytes.par_chunks_mut(CHUNK_BYTES).enumerate().try_for_each(|(i, chunk)| {
+        // Windows serializes I/O on one synchronous handle: each chunk reads through its own.
+        #[cfg(windows)]
+        let file =
+            std::fs::File::open(path).map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))?;
+        read_exact_at(&file, chunk, skip + (i * CHUNK_BYTES) as u64)
+            .map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))
+    })?;
+    Ok(elements)
+}
+
+/// Fills `buf` from `file` at `offset`, without the file's cursor: chunks read in parallel.
+#[cfg(unix)]
+fn read_exact_at(file: &std::fs::File, buf: &mut [u8], offset: u64) -> std::io::Result<()> {
+    std::os::unix::fs::FileExt::read_exact_at(file, buf, offset)
+}
+
+/// Fills `buf` from `file` at `offset`. Each read names its offset, so chunks read in parallel
+/// don't depend on the file's cursor.
+#[cfg(windows)]
+fn read_exact_at(file: &std::fs::File, mut buf: &mut [u8], mut offset: u64) -> std::io::Result<()> {
+    use std::os::windows::fs::FileExt;
+    while !buf.is_empty() {
+        match file.seek_read(buf, offset) {
+            Ok(0) => return Err(std::io::ErrorKind::UnexpectedEof.into()),
+            Ok(n) => {
+                buf = &mut buf[n..];
+                offset += n as u64;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn write(dir: &std::path::Path, name: &str, bytes: &[u8]) -> std::path::PathBuf {
+        let path = dir.join(name);
+        std::fs::write(&path, bytes).unwrap();
+        path
+    }
+
+    #[test]
+    fn elements_are_read_exactly_as_the_old_loader_copied_them() {
+        let dir = tempfile::tempdir().unwrap();
+        // Several read chunks, the last one partial.
+        let n = (3 << 20) / 2 + 7;
+        let bytes: Vec<u8> = (0..n * 32).map(|i| (i * 7 + i / 251) as u8).collect();
+        let canonical = write(dir.path(), "canonical.bin", &bytes);
+        let read = load_fr_elements(&canonical).unwrap();
+        assert_eq!(read.len(), n);
+        for (i, e) in read.iter().enumerate() {
+            let mut expected = BN254Fr { limbs: [0; 8] };
+            for (j, limb) in expected.limbs.iter_mut().enumerate() {
+                let o = i * 32 + j * 4;
+                *limb = u32::from_le_bytes(bytes[o..o + 4].try_into().unwrap());
+            }
+            assert_eq!(*e, expected, "element {i}");
+        }
+
+        let mut with_magic = FR_MONTGOMERY_MAGIC.to_vec();
+        with_magic.extend_from_slice(&bytes);
+        let montgomery = write(dir.path(), "montgomery.bin", &with_magic);
+        let read = load_fr_elements_auto(&montgomery).unwrap();
+        assert_eq!(read.len(), n);
+        for (i, e) in read.iter().enumerate() {
+            let mut expected = [0u64; 4];
+            for (j, limb) in expected.iter_mut().enumerate() {
+                let o = i * 32 + j * 8;
+                *limb = u64::from_le_bytes(bytes[o..o + 8].try_into().unwrap());
+            }
+            assert_eq!(e.0, expected, "element {i}");
+        }
+    }
+
+    #[test]
+    fn empty_and_ragged_files() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(load_fr_elements(&write(dir.path(), "empty.bin", &[])).unwrap().is_empty());
+        assert!(load_fr_elements_auto(&write(dir.path(), "magic.bin", FR_MONTGOMERY_MAGIC))
+            .unwrap()
+            .is_empty());
+        assert!(load_fr_elements(&write(dir.path(), "ragged.bin", &[0; 33])).is_err());
     }
 }

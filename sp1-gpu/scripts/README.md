@@ -12,6 +12,7 @@ be enough on its own — every command below can be copy-pasted.
 | --- | --- |
 | [`bench-compare.sh`](bench-compare.sh) | The driver you actually run. |
 | [`_bench_compare_format.py`](_bench_compare_format.py) | Internal helper that formats the comparison table. You don't call this directly. |
+| [`bench-fib.sh`](bench-fib.sh) | A separate, end-to-end benchmark: whole fibonacci proofs (core, compressed, Groth16) through `node` on CUDA, HIP or SYCL, one build or two alternating. See [`bench-fib.md`](bench-fib.md). |
 
 ---
 

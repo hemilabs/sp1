@@ -27,10 +27,16 @@ pub struct Server {
     pub cuda_device_id: u32,
 }
 
+/// The prover every connection uses: one per process. Building one takes seconds and it keeps its
+/// caches (proving keys, compiled recursion programs, GPU memory pool) from proof to proof, so a
+/// client that reconnects does not pay for them again. One prover is also what the GPU has room
+/// for: a prover per concurrent connection would each claim its own GPU memory.
+type SharedProver = Arc<tokio::sync::OnceCell<Arc<SP1LocalNode>>>;
+
 /// The context for a single connection to the server.
 struct ConnectionCtx {
     pk_cache: HashMap<[u8; 32], CachedProgram>,
-    prover: tokio::sync::OnceCell<Arc<SP1LocalNode>>,
+    prover: SharedProver,
     task_scope: TaskScope,
 }
 
@@ -48,6 +54,7 @@ impl Server {
         let mut listener = Listener::bind(&socket_path).expect("Failed to bind to socket addr");
 
         tracing::info!("Server listening @ {}", socket_path.display());
+        let prover = SharedProver::default();
         loop {
             tokio::select! {
                 res = listener.accept() => {
@@ -55,11 +62,12 @@ impl Server {
                         tracing::info!("Connection accepted");
 
                         let task_scope = task_scope.clone();
+                        let prover = prover.clone();
 
                         tokio::spawn(async move {
                             let mut stream = stream;
 
-                            if let Err(e) = Self::handle_connection(task_scope, &mut stream).await {
+                            if let Err(e) = Self::handle_connection(task_scope, prover, &mut stream).await {
                                 if e.kind() == io::ErrorKind::UnexpectedEof
                                     || e.kind() == io::ErrorKind::BrokenPipe
                                 {
@@ -86,10 +94,10 @@ impl Server {
 
     async fn handle_connection(
         task_scope: TaskScope,
+        prover: SharedProver,
         stream: &mut ServerStream,
     ) -> Result<(), io::Error> {
-        let mut ctx =
-            ConnectionCtx { pk_cache: Default::default(), prover: Default::default(), task_scope };
+        let mut ctx = ConnectionCtx { pk_cache: Default::default(), prover, task_scope };
 
         loop {
             let mut len = [0_u8; 4];
@@ -109,8 +117,22 @@ impl Server {
                 }
             };
 
+            let proved = matches!(request, Request::ProveWithMode { .. });
             let response = Self::handle_request(&mut ctx, request).await;
-            send_response(stream, response).await?;
+            let sent = send_response(stream, response).await;
+            // Between proofs, hand the memory the allocator kept for reuse back to the OS. This
+            // takes seconds after a large proof (~4 s after rsp on a 186 GB host), so it runs after
+            // the proof is sent, and off the runtime's worker threads. Also when the client has
+            // gone and the proof could not be sent.
+            if proved {
+                tokio::task::spawn_blocking(|| {
+                    if !sp1_gpu_host_alloc::keep_warm() {
+                        sp1_core_executor::release_recycled_event_buffers();
+                    }
+                    sp1_gpu_host_alloc::release_free_memory();
+                });
+            }
+            sent?;
         }
     }
 
@@ -169,14 +191,10 @@ impl Server {
                     );
                 };
                 let context = SP1Context::builder().proof_nonce(proof_nonce).build();
-                let response = match prover.prove_with_mode(&cached.elf, stdin, context, mode).await
-                {
+                match prover.prove_with_mode(&cached.elf, stdin, context, mode).await {
                     Ok(proof) => Response::Proof { proof },
                     Err(e) => Response::ProverError(e.to_string()),
-                };
-                // Between proofs, hand the memory the allocator kept for reuse back to the OS.
-                sp1_gpu_host_alloc::release_free_memory();
-                response
+                }
             }
         }
     }

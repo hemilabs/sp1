@@ -69,6 +69,18 @@ where
         &self.chips
     }
 
+    /// The names of the chips that count their byte lookups while they write their trace
+    /// ([`MachineAir::dependencies_in_trace`]), for a record that asks them to, rather than in
+    /// [`Self::generate_dependencies`].
+    #[must_use]
+    pub fn chips_counting_in_trace(&self) -> Vec<String> {
+        self.chips
+            .iter()
+            .filter(|chip| chip.dependencies_in_trace())
+            .map(|chip| chip.name().to_string())
+            .collect()
+    }
+
     /// Returns the number of public values elements.
     #[must_use]
     pub const fn num_pv_elts(&self) -> usize {

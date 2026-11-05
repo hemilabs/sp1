@@ -17,6 +17,8 @@ pub const POSEIDON2_ELF: &[u8] =
     include_bytes!("../../prover_components/programs/poseidon2/riscv64im-succinct-zkvm-elf");
 pub const MIXED_OPS_ELF: &[u8] =
     include_bytes!("../../prover_components/programs/mixed-ops/riscv64im-succinct-zkvm-elf");
+pub const GENERAL_COMPUTE_ELF: &[u8] =
+    include_bytes!("../../prover_components/programs/general-compute/riscv64im-succinct-zkvm-elf");
 pub const RSP_ELF: &[u8] = include_bytes!("../programs/rsp/elf/rsp-client");
 pub const TRAP_ELF: &[u8] =
     include_bytes!("../../prover_components/programs/trap/riscv64im-succinct-zkvm-elf");
@@ -55,6 +57,12 @@ pub fn get_program_and_input(program: String, param: String) -> (Vec<u8>, SP1Std
             let n = param.parse::<u32>().unwrap_or(100000);
             stdin.write(&n);
             return (MIXED_OPS_ELF.to_vec(), stdin);
+        } else if program_path == "general-compute" {
+            // `param` is the number of rounds: ~1.44M RISC-V instructions each.
+            let mut stdin = SP1Stdin::new();
+            let rounds = param.parse::<u32>().unwrap_or(150);
+            stdin.write(&rounds);
+            return (GENERAL_COMPUTE_ELF.to_vec(), stdin);
         } else if program_path == "rsp" {
             let mut stdin = SP1Stdin::new();
             let client_input_path = format!("sp1-gpu/crates/perf/programs/rsp/input/{param}.bin");

@@ -65,8 +65,10 @@ twoRoundFoldQuad(const DenseData& denseData, size_t baseIdx, ext_t alpha1, ext_t
 // Slots 8 and 9 accumulate the eq mass (eqRow * eqInteraction) of the materialized rows
 // restricted to Y = 0 and Y = 1 respectively: the host needs eq[8] + eq[9] for round 1's
 // padding correction and their alpha_1-interpolation for round 2's.
+// RDNA: without the occupancy floor the scheduler lets this kernel reach 256 VGPRs (5 waves/SIMD) with 68
+// spills; at 8 waves/SIMD it fits in 192 with none (RX 9070 XT: 1.95 -> 1.34 ms at 2^22 pairs, bit-identical).
 template <typename DenseData>
-__global__ void logupGkrTwoRoundSumLayer(
+__global__ __launch_bounds__(256) SP1_RDNA_WAVES_PER_EU(8) void logupGkrTwoRoundSumLayer(
     ext_t* __restrict__ result,
     const JaggedMle<DenseData> inputJaggedMle,
     const ext_t* __restrict__ eqRow,

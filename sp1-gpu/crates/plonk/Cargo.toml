@@ -30,5 +30,19 @@ dirs = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 
+# The GPU benchmarks call the kernels through `sp1-gpu-sys`, which only the `cuda` feature (the
+# GPU backends: CUDA, HIP or SYCL) pulls in.
+[[example]]
+name = "hip_msm_bench"
+required-features = ["cuda"]
+
+[[example]]
+name = "hip_vk_bench"
+required-features = ["cuda"]
+
+[[example]]
+name = "pcie_bench"
+required-features = ["cuda"]
+
 [lints]
 workspace = true

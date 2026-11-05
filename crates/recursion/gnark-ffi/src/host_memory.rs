@@ -16,6 +16,39 @@ pub fn available() -> Option<u64> {
     )
 }
 
+/// [`available`], or on Windows, where that is unknown, the physical memory the system reports
+/// available (`GlobalMemoryStatusEx`): for the decisions made on Windows hosts too, such as
+/// prestarting the GPU Groth16 helper. [`available`] itself stays unknown there, for the decisions
+/// tuned on Linux only.
+pub fn available_on_any_host() -> Option<u64> {
+    #[cfg(windows)]
+    {
+        #[repr(C)]
+        struct MemoryStatusEx {
+            length: u32,
+            memory_load: u32,
+            total_phys: u64,
+            avail_phys: u64,
+            total_page_file: u64,
+            avail_page_file: u64,
+            total_virtual: u64,
+            avail_virtual: u64,
+            avail_extended_virtual: u64,
+        }
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn GlobalMemoryStatusEx(buffer: *mut MemoryStatusEx) -> i32;
+        }
+        // SAFETY: a zeroed MEMORYSTATUSEX with its length set, as the call requires.
+        let mut status: MemoryStatusEx = unsafe { std::mem::zeroed() };
+        status.length = std::mem::size_of::<MemoryStatusEx>() as u32;
+        // SAFETY: `status` is a valid MEMORYSTATUSEX for the call to fill in.
+        (unsafe { GlobalMemoryStatusEx(&mut status) } != 0).then_some(status.avail_phys)
+    }
+    #[cfg(not(windows))]
+    available()
+}
+
 /// This process's cgroup v2 path, from `/proc/self/cgroup`.
 #[cfg(feature = "native")]
 pub(crate) fn own_cgroup() -> Option<String> {

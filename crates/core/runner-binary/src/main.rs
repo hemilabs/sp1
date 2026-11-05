@@ -1,5 +1,15 @@
+// Built without the native executor (a host other than x86-64 Linux, or sp1-core-executor's
+// `profiling` or `mprotect` feature), where sp1-core-executor-runner runs programs in process and
+// never starts this binary. Should it be started anyway, as by a runner built for the native
+// executor that embedded this variant, it fails instead of exiting as if it had run the program.
 #[cfg(not(sp1_use_native_executor))]
-fn main() {}
+fn main() {
+    eprintln!(
+        "sp1-core-executor-runner-binary was built without the native executor and cannot run \
+         programs"
+    );
+    std::process::exit(sp1_core_executor_runner_binary::EXIT_WITHOUT_NATIVE_EXECUTOR);
+}
 
 #[cfg(sp1_use_native_executor)]
 pub mod signal {
@@ -73,6 +83,7 @@ fn main() {
     compiled.memory.open_readwrite(&input.id).expect("initialize memory");
     compiled.with_initial_memory_image(input.program.memory_image.clone());
     compiled.set_input_buffer(input.input.clone());
+    compiled.set_max_chunk_cycles(input.max_chunk_cycles);
 
     if transpiler.tracing() {
         // Tracing mode is on

@@ -22,7 +22,6 @@ import (
 	"github.com/consensys/gnark/constraint"
 	"github.com/consensys/gnark/constraint/solver"
 	fcs "github.com/consensys/gnark/frontend/cs"
-	"github.com/consensys/gnark/frontend"
 )
 
 // Package-level cache for R1CS and PK used by ExportGroth16GpuWitness.
@@ -111,6 +110,10 @@ func hasGroth16Commitments(r constraint.ConstraintSystem) bool {
 // cache ahead of the proof, so that the solve does not wait ~2 s for it. Reading the circuit needs
 // none of the environment variables the solve sets, so this runs without touching the environment
 // (other threads read it concurrently).
+//
+// The prover runs meanwhile; gnark decodes the circuit in 4 goroutines, which bounds the read's
+// share of the CPU. (Lowering GOMAXPROCS for it, as this once did, throttled all other Go work in
+// the process too: another proof's solve or export.)
 func PrefetchGroth16GpuWitnessCircuit(dataDir string, pkDir string) {
 	gpuWitnessCircuit(dataDir, pkDir)
 }
@@ -142,8 +145,7 @@ func ExportGroth16GpuWitness(dataDir string, witnessPath string, pkDir string, o
 	if err := json.Unmarshal(witnessFile, &witnessInput); err != nil {
 		panic(fmt.Sprintf("Failed to unmarshal witness: %v", err))
 	}
-	assignment := NewCircuit(witnessInput)
-	witness, err := frontend.NewWitness(&assignment, ecc.BN254.ScalarField())
+	witness, err := newWitness(witnessInput)
 	if err != nil {
 		panic(fmt.Sprintf("Failed to create witness: %v", err))
 	}

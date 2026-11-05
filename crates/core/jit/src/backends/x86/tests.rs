@@ -1551,3 +1551,134 @@ mod trace {
         assert_eq!(mem_reads[4].clk, 10);
     }
 }
+
+mod chunk_cycles {
+    use super::*;
+
+    const LOOP_PC: u64 = 100;
+
+    extern "C" fn halt(ctx: *mut JitContext) {
+        let ctx = unsafe { &mut *ctx };
+        ctx.pc = 1;
+    }
+
+    extern "C" fn enter_unconstrained(ctx: *mut JitContext) {
+        let ctx = unsafe { &mut *ctx };
+        ctx.is_unconstrained = 1;
+    }
+
+    extern "C" fn exit_unconstrained(ctx: *mut JitContext) {
+        let ctx = unsafe { &mut *ctx };
+        ctx.is_unconstrained = 0;
+    }
+
+    /// `x5 += 1` while `x5 < x6`, then halt: a loop with no memory reads, which before chunking
+    /// by cycles ran as one chunk however long it was.
+    fn counting_loop() -> JitFunction<AnonymousMemory> {
+        let mut backend = TranspilerBackend::new(3, 1024 * 2, 1000, LOOP_PC, LOOP_PC, 8).unwrap();
+
+        // pc 100
+        backend.start_instr();
+        backend.add(RiscRegister::X5, RiscRegister::X5.into(), RiscOperand::Immediate(1));
+        backend.end_instr();
+
+        // pc 104: a taken branch jumps back to pc 100.
+        backend.start_instr();
+        backend.bltu(RiscRegister::X5, RiscRegister::X6, (-4_i64) as u64);
+        backend.end_instr();
+
+        // pc 108
+        backend.start_instr();
+        backend.call_extern_fn(halt);
+        backend.end_instr();
+
+        backend.finalize().expect("Failed to finalize function")
+    }
+
+    /// Runs `func` to the end, one call per chunk, checking that each chunk starts where the
+    /// previous one ended. Returns the global clk at the end of each chunk.
+    fn run_chunks(func: &mut JitFunction<AnonymousMemory>) -> Vec<u64> {
+        let mut ends = Vec::new();
+        let (mut clk, mut pc, mut registers) = (func.clk, func.pc, func.registers);
+        while func.pc != 1 {
+            let trace = run_func(func).expect("No trace returned");
+            assert_eq!(trace.clk_start(), clk);
+            assert_eq!(trace.pc_start(), pc);
+            assert_eq!(trace.start_registers(), registers);
+            assert_eq!(trace.clk_end(), func.clk);
+            assert_eq!(trace.global_clk_end(), func.global_clk);
+            (clk, pc, registers) = (func.clk, func.pc, func.registers);
+            ends.push(func.global_clk);
+            assert!(ends.len() <= 1000, "no progress");
+        }
+        ends
+    }
+
+    #[test]
+    fn test_chunks_end_on_cycles_at_the_branch_target() {
+        const N: u64 = 1000;
+
+        let mut whole = counting_loop();
+        whole.registers[6] = N;
+        assert_eq!(run_chunks(&mut whole), vec![2 * N + 1]);
+
+        let mut chunked = counting_loop();
+        chunked.registers[6] = N;
+        chunked.set_max_chunk_cycles(Some(64));
+        let ends = run_chunks(&mut chunked);
+
+        // Each chunk ends at the first taken branch at or after 64 more cycles, and resumes at the
+        // branch target, not after the branch.
+        let mut expected = (1..=(2 * N) / 64).map(|i| 64 * i).collect::<Vec<_>>();
+        expected.push(2 * N + 1);
+        assert_eq!(ends, expected);
+
+        // The execution is the same.
+        assert_eq!(chunked.pc, whole.pc);
+        assert_eq!(chunked.clk, whole.clk);
+        assert_eq!(chunked.global_clk, whole.global_clk);
+        assert_eq!(chunked.registers, whole.registers);
+        assert_eq!(chunked.registers[5], N);
+    }
+
+    #[test]
+    fn test_chunk_cycles_do_not_split_unconstrained_blocks() {
+        const N: u64 = 100;
+
+        let mut backend = TranspilerBackend::new(5, 1024 * 2, 1000, LOOP_PC, LOOP_PC, 8).unwrap();
+
+        // pc 100
+        backend.start_instr();
+        backend.call_extern_fn(enter_unconstrained);
+        backend.end_instr();
+
+        // pc 104
+        backend.start_instr();
+        backend.add(RiscRegister::X5, RiscRegister::X5.into(), RiscOperand::Immediate(1));
+        backend.end_instr();
+
+        // pc 108: a taken branch jumps back to pc 104.
+        backend.start_instr();
+        backend.bltu(RiscRegister::X5, RiscRegister::X6, (-4_i64) as u64);
+        backend.end_instr();
+
+        // pc 112
+        backend.start_instr();
+        backend.call_extern_fn(exit_unconstrained);
+        backend.end_instr();
+
+        // pc 116
+        backend.start_instr();
+        backend.call_extern_fn(halt);
+        backend.end_instr();
+
+        let mut func = backend.finalize().expect("Failed to finalize function");
+        func.registers[6] = N;
+        // The limit is reached from the start, but the loop is unconstrained.
+        func.set_max_chunk_cycles(Some(0));
+        run_func(&mut func);
+
+        assert_eq!(func.pc, 1);
+        assert_eq!(func.registers[5], N);
+    }
+}

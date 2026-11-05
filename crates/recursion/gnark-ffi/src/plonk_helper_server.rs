@@ -20,6 +20,10 @@
 //!   block on the reply on stdout.
 //! - On any I/O error or unexpected response, the server is torn down and
 //!   the next call respawns it.
+//! - A banner or reply that takes longer than the helper time limit
+//!   (`SP1_GROTH16_HELPER_TIMEOUT_SECS`, as for the one-shot helpers) fails
+//!   the call, and the server is killed: a hung server would otherwise hold
+//!   this process's final-wrap slot, and stall every prover on the host.
 //! - On `Drop` the server is best-effort shut down.
 //!
 //! ## Activation
@@ -35,10 +39,11 @@
 //!
 //! Request:
 //! ```json
-//! {"witness_init_dir":"…","witness_json":"…","vkey_hash_hex":"…","out":"…"}
+//! {"witness_init_dir":"…","witness_json":"…","witness_dir":"…","vkey_hash_hex":"…","out":"…"}
 //! {"command":"shutdown"}
 //! {"command":"ping"}
 //! ```
+//! `witness_dir` holds the proof's solved witness (the server's `--gpu-dir` if absent).
 //! `witness_init_dir` is required iff the server was started with
 //! `--prep-circuit-dir` (Phase H GPU SCS solver path).
 //!
@@ -56,17 +61,24 @@
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{mpsc, Mutex, OnceLock, TryLockError};
+use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
+
+use crate::subprocess::{exited_within, kill_and_reap};
 
 /// State for one long-lived helper subprocess in `--server` mode.
 pub struct PlonkHelperServer {
     child: Child,
     stdin: ChildStdin,
-    stdout: BufReader<ChildStdout>,
+    /// The lines the server writes to stdout, read on a thread of their own so that a wait for
+    /// one can time out.
+    lines: mpsc::Receiver<std::io::Result<String>>,
     /// Identity used to detect `(gpu_dir, prep_circuit_dir)` changes.
     key: ServerKey,
+    /// Whether it has been told to stop, or killed: it is not waited for again.
+    stopped: bool,
     /// Reported by the server in its ready banner. Mostly informational.
     pub initial_setup_ms: u64,
 }
@@ -116,45 +128,78 @@ impl PlonkHelperServer {
             .with_context(|| {
                 format!("spawn plonk_gpu_helper --server via {}", helper_path.display())
             })?;
-        let stdin = child.stdin.take().ok_or_else(|| anyhow!("server stdin missing"))?;
-        let stdout_pipe = child.stdout.take().ok_or_else(|| anyhow!("server stdout missing"))?;
-        let mut stdout = BufReader::new(stdout_pipe);
+        // Set from here rather than between fork and exec (`pre_exec`), which would make the
+        // spawn fork this large process instead of using posix_spawn.
+        crate::subprocess::kill_child_first_when_out_of_memory(&child);
+        let stdin = child.stdin.take().expect("stdin is piped");
+        let lines = match read_lines(child.stdout.take().expect("stdout is piped")) {
+            Ok(lines) => lines,
+            Err(e) => {
+                kill_and_reap(&mut child);
+                return Err(e);
+            }
+        };
+        // From here on, dropping `server` (on an error below) shuts the child down.
+        let mut server = Self {
+            child,
+            stdin,
+            lines,
+            key: ServerKey {
+                gpu_dir: gpu_dir.to_path_buf(),
+                prep_circuit_dir: prep_circuit_dir.map(|p| p.to_path_buf()),
+            },
+            stopped: false,
+            initial_setup_ms: 0,
+        };
 
         // Block on banner.
-        let mut line = String::new();
-        let n = stdout.read_line(&mut line).context("read server banner")?;
-        if n == 0 {
-            return Err(anyhow!("server exited before emitting ready banner"));
-        }
+        let line = server.next_line("ready banner")?;
         let v: serde_json::Value = serde_json::from_str(line.trim_end())
             .with_context(|| format!("server banner is not JSON: {line}"))?;
         let status = v.get("status").and_then(|s| s.as_str()).unwrap_or("");
         if status != "ready" {
             return Err(anyhow!("server returned non-ready banner: {line}"));
         }
-        let initial_setup_ms = v.get("initial_setup_ms").and_then(|x| x.as_u64()).unwrap_or(0);
+        server.initial_setup_ms = v.get("initial_setup_ms").and_then(|x| x.as_u64()).unwrap_or(0);
+        Ok(server)
+    }
 
-        Ok(Self {
-            child,
-            stdin,
-            stdout,
-            key: ServerKey {
-                gpu_dir: gpu_dir.to_path_buf(),
-                prep_circuit_dir: prep_circuit_dir.map(|p| p.to_path_buf()),
-            },
-            initial_setup_ms,
-        })
+    /// The next line the server writes, waiting at most the helper time limit
+    /// (`SP1_GROTH16_HELPER_TIMEOUT_SECS`). `what` names it in errors. A server that does not send
+    /// it is killed, so that it neither proves on unsupervised nor answers a later request with
+    /// this one's reply.
+    fn next_line(&mut self, what: &str) -> Result<String> {
+        let timeout = crate::subprocess::timeout_from_env();
+        let line = match timeout {
+            Some(timeout) => self.lines.recv_timeout(timeout),
+            None => self.lines.recv().map_err(|_| mpsc::RecvTimeoutError::Disconnected),
+        };
+        let failure = match line {
+            Ok(Ok(line)) => return Ok(line),
+            Ok(Err(e)) => anyhow!(e).context(format!("read server {what}")),
+            Err(mpsc::RecvTimeoutError::Timeout) => anyhow!(
+                "the PLONK helper server sent no {what} within {:?} \
+                 (SP1_GROTH16_HELPER_TIMEOUT_SECS)",
+                timeout.unwrap_or_default()
+            ),
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                anyhow!("the PLONK helper server closed its stdout before its {what}")
+            }
+        };
+        self.stopped = true;
+        kill_and_reap(&mut self.child);
+        Err(failure)
     }
 
     /// Run one prove. Returns server-reported timing on success.
     ///
-    /// `witness_init_dir` is REQUIRED iff this server was spawned with a
-    /// `prep_circuit_dir` (Phase H GPU SCS solver path). Otherwise None —
-    /// witness data is loaded by the helper from `gpu_dir` (the gnark.spr.Solve
-    /// disk-load path).
+    /// `witness_dir` holds the proof's solved witness. `witness_init_dir` is REQUIRED iff this
+    /// server was spawned with a `prep_circuit_dir` (Phase H GPU SCS solver path), which solves
+    /// from it instead.
     pub fn prove(
         &mut self,
         witness_json: &Path,
+        witness_dir: &Path,
         vkey_hash_hex: &str,
         out: &Path,
         witness_init_dir: Option<&Path>,
@@ -164,6 +209,7 @@ impl PlonkHelperServer {
         }
         let mut req = serde_json::Map::new();
         req.insert("witness_json".into(), witness_json.to_string_lossy().into_owned().into());
+        req.insert("witness_dir".into(), witness_dir.to_string_lossy().into_owned().into());
         req.insert("vkey_hash_hex".into(), vkey_hash_hex.into());
         req.insert("out".into(), out.to_string_lossy().into_owned().into());
         if let Some(d) = witness_init_dir {
@@ -173,11 +219,7 @@ impl PlonkHelperServer {
         writeln!(self.stdin, "{req_line}").context("write server request")?;
         self.stdin.flush().context("flush server stdin")?;
 
-        let mut line = String::new();
-        let n = self.stdout.read_line(&mut line).context("read server reply")?;
-        if n == 0 {
-            return Err(anyhow!("server stdout closed mid-reply"));
-        }
+        let line = self.next_line("reply")?;
         let v: serde_json::Value = serde_json::from_str(line.trim_end())
             .with_context(|| format!("server reply not JSON: {line}"))?;
         match v.get("status").and_then(|s| s.as_str()).unwrap_or("") {
@@ -198,37 +240,119 @@ impl PlonkHelperServer {
         &self.key
     }
 
-    /// Best-effort cooperative shutdown (sends `{"command":"shutdown"}`).
-    /// Waits for the child to exit. Prefer this over dropping directly when
-    /// you want a clean shutdown.
+    /// Best-effort cooperative shutdown (sends `{"command":"shutdown"}`), giving the server a few
+    /// seconds to exit before it is killed. Prefer this over dropping directly when you want a
+    /// clean shutdown.
     pub fn shutdown(mut self) {
+        self.stop(Duration::from_secs(5));
+    }
+
+    /// Asks a running server to exit and waits `grace` for it, then kills it, waiting at most
+    /// [`REAP_WITHIN`](crate::subprocess::REAP_WITHIN) for it to go. Once: a server stopped or killed before, which may be stuck in
+    /// the kernel, is not waited for again.
+    fn stop(&mut self, grace: Duration) {
+        if std::mem::replace(&mut self.stopped, true) || !matches!(self.child.try_wait(), Ok(None))
+        {
+            return;
+        }
+        // Best-effort: if stdin is already closed or the child is dead, ignore the write error.
         let _ = writeln!(self.stdin, "{{\"command\":\"shutdown\"}}");
         let _ = self.stdin.flush();
-        let _ = self.child.wait();
-    }
-}
-
-impl Drop for PlonkHelperServer {
-    fn drop(&mut self) {
-        if matches!(self.child.try_wait(), Ok(None)) {
-            // Best-effort: attempt cooperative shutdown first. If stdin is
-            // already closed or the child is dead, ignore the write error.
-            let _ = writeln!(self.stdin, "{{\"command\":\"shutdown\"}}");
-            let _ = self.stdin.flush();
-            // Give it a moment, then kill if still alive.
-            std::thread::sleep(std::time::Duration::from_millis(200));
-            if matches!(self.child.try_wait(), Ok(None)) {
-                let _ = self.child.kill();
-            }
-            let _ = self.child.wait();
+        if !exited_within(&mut self.child, grace) && !kill_and_reap(&mut self.child) {
+            tracing::warn!(
+                "[plonk-server] the killed server has not exited (stuck in the kernel?)"
+            );
         }
     }
 }
 
-/// Process-global singleton.
-pub fn singleton() -> &'static Mutex<Option<PlonkHelperServer>> {
+/// Reads `stdout`'s lines on a thread of their own. The channel closes at the end of the stream,
+/// after an error.
+fn read_lines(stdout: ChildStdout) -> Result<mpsc::Receiver<std::io::Result<String>>> {
+    let (tx, rx) = mpsc::channel();
+    std::thread::Builder::new()
+        .name("plonk-server-stdout".into())
+        .spawn(move || {
+            let mut stdout = BufReader::new(stdout);
+            loop {
+                let mut line = String::new();
+                match stdout.read_line(&mut line) {
+                    Ok(0) => break,
+                    Ok(_) => {
+                        if tx.send(Ok(line)).is_err() {
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        let _ = tx.send(Err(e));
+                        break;
+                    }
+                }
+            }
+        })
+        .context("failed to start a thread to read the PLONK helper server's stdout")?;
+    Ok(rx)
+}
+
+impl Drop for PlonkHelperServer {
+    fn drop(&mut self) {
+        self.stop(Duration::from_millis(200));
+    }
+}
+
+/// Process-global singleton. Changed only through [`replace`], which keeps [`SERVER_KEY`] with it.
+fn singleton() -> &'static Mutex<Option<PlonkHelperServer>> {
     static SERVER: OnceLock<Mutex<Option<PlonkHelperServer>>> = OnceLock::new();
     SERVER.get_or_init(|| Mutex::new(None))
+}
+
+/// The key of the server in the singleton, or of the one being started for it, for
+/// [`keep_only_for`] while a proof holds the singleton's lock.
+static SERVER_KEY: Mutex<Option<ServerKey>> = Mutex::new(None);
+
+/// Puts `server` in the singleton, whose lock `kept` is, and returns the one it held.
+fn replace(
+    kept: &mut Option<PlonkHelperServer>,
+    server: Option<PlonkHelperServer>,
+) -> Option<PlonkHelperServer> {
+    *SERVER_KEY.lock().unwrap_or_else(|e| e.into_inner()) = server.as_ref().map(|s| s.key.clone());
+    std::mem::replace(kept, server)
+}
+
+/// Whether the singleton server has a helper running that the next proof can use: one that
+/// proves from the key in `gpu_dir` (without a prep-circuit directory), started by an earlier
+/// proof, or proving for another one now (its lock is held). A server it cannot use is shut down
+/// here, before that proof measures the host memory it needs, which the server would otherwise
+/// hold for nothing (~71 GB): one for another key, or any, when the proof has no lasting key
+/// directory (`None`: with the GPU cache off, each proof exports a key of its own). So is one that
+/// has exited since (the kernel kills it first when memory runs out).
+pub fn keep_only_for(gpu_dir: Option<&Path>) -> bool {
+    let wanted =
+        gpu_dir.map(|dir| ServerKey { gpu_dir: dir.to_path_buf(), prep_circuit_dir: None });
+    let mut kept = match singleton().try_lock() {
+        Ok(kept) => kept,
+        Err(TryLockError::WouldBlock) => {
+            return wanted.is_some()
+                && *SERVER_KEY.lock().unwrap_or_else(|e| e.into_inner()) == wanted;
+        }
+        Err(TryLockError::Poisoned(_)) => return false,
+    };
+    let Some(server) = kept.as_mut() else { return false };
+    if !matches!(server.child.try_wait(), Ok(None)) {
+        tracing::info!("[plonk-server] the long-lived helper has exited");
+        replace(&mut kept, None);
+        return false;
+    }
+    if wanted.as_ref() == Some(&server.key) {
+        return true;
+    }
+    tracing::info!(
+        "[plonk-server] the next proof cannot use the long-lived helper; shutting it down"
+    );
+    if let Some(server) = replace(&mut kept, None) {
+        server.shutdown();
+    }
+    false
 }
 
 /// Returns true iff `SP1_PLONK_GPU_SERVER` is set to `1`/`true`/`on`.
@@ -250,6 +374,7 @@ pub fn with_server(
     prep_circuit_dir: Option<&Path>,
     extra_env: &[(String, String)],
     witness_json: &Path,
+    witness_dir: &Path,
     vkey_hash_hex: &str,
     out: &Path,
     witness_init_dir: Option<&Path>,
@@ -264,7 +389,7 @@ pub fn with_server(
     if let Some(s) = guard.as_ref() {
         if s.key != key {
             tracing::info!("[plonk-server] (gpu_dir,prep_circuit_dir) changed; respawning server");
-            if let Some(old) = guard.take() {
+            if let Some(old) = replace(&mut guard, None) {
                 old.shutdown();
             }
         }
@@ -273,23 +398,163 @@ pub fn with_server(
     if guard.is_none() {
         let t0 = std::time::Instant::now();
         tracing::info!("[plonk-server] spawning long-lived helper (one-time PK + circuit load)");
+        // A proof deciding meanwhile counts on this server.
+        *SERVER_KEY.lock().unwrap_or_else(|e| e.into_inner()) = Some(key.clone());
         let s = PlonkHelperServer::spawn(helper_path, gpu_dir, prep_circuit_dir, extra_env)
+            .inspect_err(|_| *SERVER_KEY.lock().unwrap_or_else(|e| e.into_inner()) = None)
             .context("spawn plonk_gpu_helper --server")?;
         tracing::info!(
             "[plonk-server] server ready in {:?} (server-reported initial_setup={} ms)",
             t0.elapsed(),
             s.initial_setup_ms,
         );
-        *guard = Some(s);
+        replace(&mut guard, Some(s));
     }
 
     let server = guard.as_mut().expect("server just inserted");
-    match server.prove(witness_json, vkey_hash_hex, out, witness_init_dir) {
+    match server.prove(witness_json, witness_dir, vkey_hash_hex, out, witness_init_dir) {
         Ok(outcome) => Ok(outcome),
         Err(e) => {
             tracing::warn!("[plonk-server] prove failed ({e}); tearing down server for respawn");
-            let _ = guard.take(); // Drop kills the child.
+            replace(&mut guard, None); // Drop kills the child.
             Err(e)
         }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    /// A fake `plonk_gpu_helper --server` in `dir`, running `body`.
+    fn fake_helper(dir: &Path, body: &str) -> PathBuf {
+        let path = dir.join("plonk_gpu_helper");
+        // Written by a child process: a file this process held open for writing could be inherited
+        // by a fork in another test's thread, and exec'ing it would then fail ("text file busy").
+        let mut writer = Command::new("sh")
+            .args(["-c", r#"cat > "$1" && chmod 755 "$1""#, "sh"])
+            .arg(&path)
+            .stdin(Stdio::piped())
+            .spawn()
+            .unwrap();
+        writer.stdin.take().unwrap().write_all(format!("#!/bin/sh\n{body}\n").as_bytes()).unwrap();
+        assert!(writer.wait().unwrap().success());
+        path
+    }
+
+    /// Serves proofs until told to shut down, which it notes in `stopped`.
+    fn serving(dir: &Path) -> String {
+        format!(
+            r#"echo '{{"status":"ready","initial_setup_ms":3}}'
+while read -r line; do
+  case "$line" in
+    *shutdown*) touch '{stopped}'; echo '{{"status":"shutdown"}}'; exit 0 ;;
+    *'"witness_dir":"{dir}"'*) echo '{{"status":"ok","prove_ms":5,"proof_size":7}}' ;;
+    *) echo '{{"status":"error","msg":"no witness_dir"}}' ;;
+  esac
+done"#,
+            stopped = dir.join("stopped").display(),
+            dir = dir.display(),
+        )
+    }
+
+    fn prove(server: &mut PlonkHelperServer, dir: &Path) -> Result<ProveOutcome> {
+        server.prove(&dir.join("witness.json"), dir, "00", &dir.join("proof.json"), None)
+    }
+
+    fn exited(server: &mut PlonkHelperServer) -> bool {
+        !matches!(server.child.try_wait(), Ok(None))
+    }
+
+    // Each test holds `test_env::lock()`: the time limit the server's waits read is an environment
+    // variable that one of them sets.
+
+    #[test]
+    fn a_server_proves_until_it_is_shut_down() {
+        let _env = crate::test_env::lock();
+        let dir = tempfile::tempdir().unwrap();
+        let helper = fake_helper(dir.path(), &serving(dir.path()));
+        let mut server = PlonkHelperServer::spawn(&helper, dir.path(), None, &[]).unwrap();
+        assert_eq!(server.initial_setup_ms, 3);
+        for _ in 0..2 {
+            let outcome = prove(&mut server, dir.path()).unwrap();
+            assert_eq!((outcome.prove_ms, outcome.proof_size), (5, 7));
+        }
+        let e = prove(&mut server, &dir.path().join("elsewhere")).err().unwrap();
+        assert!(e.to_string().contains("no witness_dir"), "{e:#}");
+        server.shutdown();
+        assert!(dir.path().join("stopped").exists());
+    }
+
+    #[test]
+    fn a_server_that_sends_no_reply_in_time_is_killed() {
+        let _env = crate::test_env::lock();
+        let _timeout = crate::test_env::set_var("SP1_GROTH16_HELPER_TIMEOUT_SECS", "1");
+        let dir = tempfile::tempdir().unwrap();
+        let body = r#"echo '{"status":"ready"}'
+read -r line
+exec sleep 1000"#;
+        let helper = fake_helper(dir.path(), body);
+        let spawned = PlonkHelperServer::spawn(&helper, dir.path(), None, &[]);
+        let mut server = spawned.unwrap();
+        let e = prove(&mut server, dir.path()).err().unwrap();
+        assert!(e.to_string().contains("sent no reply within 1s"), "{e:#}");
+        assert!(exited(&mut server), "the server was not killed");
+    }
+
+    #[test]
+    fn a_server_that_stops_before_its_banner_or_sends_another_is_gone() {
+        let _env = crate::test_env::lock();
+        let dir = tempfile::tempdir().unwrap();
+        let helper = fake_helper(dir.path(), "exit 3");
+        let e = PlonkHelperServer::spawn(&helper, dir.path(), None, &[]).err().unwrap();
+        assert!(e.to_string().contains("closed its stdout before its ready banner"), "{e:#}");
+
+        let pid_file = dir.path().join("pid");
+        let body = format!("echo $$ > '{}'\necho nonsense\nexec sleep 1000", pid_file.display());
+        let helper = fake_helper(dir.path(), &body);
+        let e = PlonkHelperServer::spawn(&helper, dir.path(), None, &[]).err().unwrap();
+        assert!(e.to_string().contains("banner is not JSON"), "{e:#}");
+        let pid: libc::pid_t = std::fs::read_to_string(&pid_file).unwrap().trim().parse().unwrap();
+        // SAFETY: signal 0 only checks whether the process exists.
+        assert_ne!(unsafe { libc::kill(pid, 0) }, 0, "the server was left running");
+    }
+
+    /// Keeps `server` in the singleton.
+    fn keep(server: PlonkHelperServer) {
+        replace(&mut singleton().lock().unwrap(), Some(server));
+    }
+
+    #[test]
+    fn only_a_live_server_the_next_proof_can_use_is_kept() {
+        let _env = crate::test_env::lock();
+        let dir = tempfile::tempdir().unwrap();
+        let helper = fake_helper(dir.path(), &serving(dir.path()));
+        let spawn = || PlonkHelperServer::spawn(&helper, dir.path(), None, &[]).unwrap();
+        let stopped = dir.path().join("stopped");
+
+        keep(spawn());
+        assert!(keep_only_for(Some(dir.path())));
+        assert!(!keep_only_for(Some(&dir.path().join("other"))));
+        assert!(singleton().lock().unwrap().is_none(), "a server for another key was kept");
+        assert!(std::fs::remove_file(&stopped).is_ok(), "it was not shut down");
+
+        keep(spawn());
+        assert!(!keep_only_for(None));
+        assert!(singleton().lock().unwrap().is_none(), "a server was kept with the cache off");
+        assert!(std::fs::remove_file(&stopped).is_ok(), "it was not shut down");
+
+        keep(spawn());
+        assert!(kill_and_reap(&mut singleton().lock().unwrap().as_mut().unwrap().child));
+        assert!(!keep_only_for(Some(dir.path())));
+        assert!(singleton().lock().unwrap().is_none(), "the exited server was kept");
+
+        // While a proof holds the singleton, the key it was last given decides.
+        keep(spawn());
+        let held = singleton().lock().unwrap();
+        assert!(keep_only_for(Some(dir.path())));
+        assert!(!keep_only_for(Some(&dir.path().join("other"))));
+        drop(held);
+        replace(&mut singleton().lock().unwrap(), None);
     }
 }

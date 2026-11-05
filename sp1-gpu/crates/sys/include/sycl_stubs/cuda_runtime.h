@@ -8,3 +8,4 @@ typedef void* cudaStream_t;
 typedef void* cudaEvent_t;
 #define cudaStreamDefault nullptr
 inline const char* cudaGetErrorString(cudaError_t) { return "SYCL error"; }
+inline cudaError_t cudaGetLastError() { return cudaSuccess; }

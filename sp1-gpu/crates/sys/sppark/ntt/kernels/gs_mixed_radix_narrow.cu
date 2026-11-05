@@ -177,6 +177,10 @@ void _GS_NTT(const unsigned int radix, const unsigned int lg_domain_size,
     idx1 = (idx1 & ~mask) | (rotw & mask);
 
     if (coalesced) {
+        // The exchange loop's last pass (s >= 6) reads other warps' rows of shared_exchange,
+        // which transpose() overwrites: wait for every warp to be done with them. (The CT
+        // kernel ends each pass with a barrier instead.)
+        __syncthreads();
         transpose<z_count>(r[0]);
         __syncwarp();
         transpose<z_count>(r[1]);

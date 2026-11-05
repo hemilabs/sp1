@@ -1,0 +1,407 @@
+use std::{
+    alloc::Layout,
+    ptr::NonNull,
+    sync::{
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        Arc, Mutex, Weak,
+    },
+};
+
+use slop_alloc::{mem::CopyDirection, mem::DeviceMemory, Allocator, Buffer};
+
+use crate::{CudaError, CudaEvent, CudaStream, DeviceCopy, TaskScope};
+
+/// A stream for host-to-device uploads that do not wait for the work queued on a task's primary
+/// stream, e.g. the next shard's traces while the current shard is being proved.
+///
+/// [`TaskScope::copy_host_to_device_aux_async`] orders each copy after everything already on the
+/// primary stream, because the destination is allocated there. Here both the allocation and the
+/// copy are on this stream, so the copy engine runs while the primary stream's kernels do.
+#[derive(Debug)]
+pub struct UploadStream {
+    stream: Arc<CudaStream>,
+    /// Events for [`StagedUpload`]s, reused: creating one can block for tens of milliseconds
+    /// behind other threads' synchronous copies in the driver.
+    events: Arc<Mutex<Vec<CudaEvent>>>,
+}
+
+/// A device copy of host data made by [`UploadStream::upload`], waiting to be taken over by a
+/// task's primary stream with [`StagedUpload::take`].
+///
+/// Staged uploads only use device memory the rest of the process does not. An upload is skipped
+/// if, added to the peak live device memory of everything else so far, it would exceed the
+/// stream's limit. An allocation that would take the live device memory above the limit, or that
+/// runs out of device memory, first frees all staged uploads not yet taken; [`StagedUpload::take`]
+/// then returns `None`. The host data is still there, so the owner copies it the ordinary way.
+pub struct StagedUpload {
+    /// `None` once taken or reclaimed.
+    allocation: Mutex<Option<DevicePtr>>,
+    /// Recorded on the upload stream after the copy; `None` only while dropping.
+    uploaded: Option<CudaEvent>,
+    stream: Arc<CudaStream>,
+    events: Arc<Mutex<Vec<CudaEvent>>>,
+}
+
+struct DevicePtr(NonNull<u8>, Layout);
+
+// SAFETY: a device pointer is not tied to a host thread.
+unsafe impl Send for DevicePtr {}
+
+/// The staged uploads not yet taken, for [`reclaim_staged_uploads`].
+static STAGED: Mutex<Vec<Weak<StagedUpload>>> = Mutex::new(Vec::new());
+/// The bytes of the staged uploads not yet taken.
+static STAGED_BYTES: AtomicU64 = AtomicU64::new(0);
+/// The live device memory (see [`crate::vram_current_bytes`]) staged uploads must stay under.
+static STAGED_LIMIT: AtomicU64 = AtomicU64::new(u64::MAX);
+/// The peak live device memory other than staged uploads.
+static UNSTAGED_PEAK: AtomicU64 = AtomicU64::new(0);
+
+impl UploadStream {
+    /// Creates an upload stream whose uploads keep the process's live device memory under
+    /// `limit` bytes (the limit is process-wide: the last one set applies).
+    pub fn create(limit: u64) -> Result<Self, CudaError> {
+        STAGED_LIMIT.store(limit, Ordering::Relaxed);
+        Ok(Self { stream: Arc::new(CudaStream::create()?), events: Default::default() })
+    }
+
+    /// Allocates device memory for `len` elements and enqueues the copy of `src` into it, both
+    /// on this stream. Returns `None` if the upload would exceed the limit or the allocation
+    /// fails.
+    ///
+    /// # Safety
+    /// `src` must point to `len` initialized elements of pinned host memory that stay live and
+    /// unchanged until the copy completes: until the [`StagedUpload`] is dropped, or until the
+    /// primary stream of the task that took it has reached the point where it took it.
+    pub unsafe fn upload<T: DeviceCopy>(
+        &self,
+        src: *const T,
+        len: usize,
+    ) -> Option<Arc<StagedUpload>> {
+        let layout = Layout::array::<T>(len).ok()?;
+        let size = layout.size() as u64;
+        // The device caches count too: an upload they leave no room for would only make the next
+        // allocation free them, and this upload with them (see `make_room_for`). So do entries they
+        // let go of that a shard still uses, which no allocation can free.
+        let staged = STAGED_BYTES.load(Ordering::Relaxed);
+        let cached = CACHED_BYTES.load(Ordering::Relaxed) + RELEASED_BYTES.load(Ordering::Relaxed);
+        if UNSTAGED_PEAK.load(Ordering::Relaxed) + staged + cached + size
+            > STAGED_LIMIT.load(Ordering::Relaxed)
+        {
+            return None;
+        }
+        // Counted as staged before it is allocated, so that the allocation does not count it as
+        // the prover's own (unstaged) memory, raising the peak every later upload must leave room
+        // for.
+        STAGED_BYTES.fetch_add(size, Ordering::Relaxed);
+        let Ok(ptr) = self.stream.allocate(layout) else {
+            STAGED_BYTES.fetch_sub(size, Ordering::Relaxed);
+            return None;
+        };
+        let ptr = ptr.cast::<u8>();
+        let uploaded = self.events.lock().unwrap_or_else(|e| e.into_inner()).pop();
+        let uploaded = match uploaded {
+            Some(event) => Some(event),
+            None => CudaEvent::create().ok(),
+        };
+        let copied = uploaded.as_ref().is_some_and(|uploaded| {
+            self.stream
+                .copy_nonoverlapping(
+                    src as *const u8,
+                    ptr.as_ptr(),
+                    layout.size(),
+                    CopyDirection::HostToDevice,
+                )
+                .is_ok()
+                && CudaError::result_from_ffi(sp1_gpu_sys::runtime::cuda_event_record(
+                    uploaded.0,
+                    self.stream.0,
+                ))
+                .is_ok()
+        });
+        if !copied {
+            self.stream.deallocate(ptr, layout);
+            STAGED_BYTES.fetch_sub(size, Ordering::Relaxed);
+            if let Some(event) = uploaded {
+                self.events.lock().unwrap_or_else(|e| e.into_inner()).push(event);
+            }
+            return None;
+        }
+        let upload = Arc::new(StagedUpload {
+            allocation: Mutex::new(Some(DevicePtr(ptr, layout))),
+            uploaded,
+            stream: self.stream.clone(),
+            events: self.events.clone(),
+        });
+        let mut registry = STAGED.lock().unwrap_or_else(|e| e.into_inner());
+        registry.retain(|s| s.strong_count() > 0);
+        registry.push(Arc::downgrade(&upload));
+        Some(upload)
+    }
+}
+
+impl StagedUpload {
+    /// Orders `scope`'s primary stream after the copy and hands the buffer over to it: it is
+    /// freed on that stream. Returns `None` if the upload was reclaimed.
+    ///
+    /// `T` must be the element type the upload was made with.
+    pub fn take<T: DeviceCopy>(
+        &self,
+        scope: &TaskScope,
+    ) -> Result<Option<Buffer<T, TaskScope>>, CudaError> {
+        let mut allocation = self.allocation.lock().unwrap_or_else(|e| e.into_inner());
+        if allocation.is_none() {
+            return Ok(None);
+        }
+        // Before the allocation is taken: if the wait fails, it stays here, for `free` (on drop)
+        // to give back.
+        CudaError::result_from_ffi(unsafe {
+            sp1_gpu_sys::runtime::cuda_stream_wait_event(
+                scope.stream.0,
+                self.uploaded.as_ref().unwrap().0,
+            )
+        })?;
+        let Some(DevicePtr(ptr, layout)) = allocation.take() else { unreachable!() };
+        STAGED_BYTES.fetch_sub(layout.size() as u64, Ordering::Relaxed);
+        let len = layout.size() / std::mem::size_of::<T>();
+        // SAFETY: the memory was allocated from the device's memory pool for `len` elements of
+        // `T`, and the primary stream now waits for the copy, so freeing it there is ordered
+        // after the copy.
+        Ok(Some(unsafe { Buffer::from_raw_parts(ptr.as_ptr() as *mut T, len, len, scope.clone()) }))
+    }
+
+    /// Frees the allocation if not yet taken, on the upload stream (after the copy into it).
+    /// Returns whether anything was freed.
+    fn free(&self) -> bool {
+        let taken = self.allocation.lock().unwrap_or_else(|e| e.into_inner()).take();
+        let Some(DevicePtr(ptr, layout)) = taken else {
+            return false;
+        };
+        unsafe { self.stream.deallocate(ptr, layout) };
+        STAGED_BYTES.fetch_sub(layout.size() as u64, Ordering::Relaxed);
+        true
+    }
+}
+
+impl Drop for StagedUpload {
+    fn drop(&mut self) {
+        self.free();
+        // A stream wait uses the event's state when it is enqueued, so re-recording the event
+        // for later uploads does not affect the waits on it so far.
+        if let Some(event) = self.uploaded.take() {
+            self.events.lock().unwrap_or_else(|e| e.into_inner()).push(event);
+        }
+    }
+}
+
+/// A cache of device data that can be rebuilt, emptied when device memory runs low.
+///
+/// Like staged uploads, cached data only uses device memory the rest of the process does not:
+/// it is left out of the peak that [`UploadStream::upload`] checks, and an allocation that would
+/// take the live device memory above the upload limit, or that runs out of device memory, first
+/// empties the caches (see [`register_device_cache`]).
+pub trait DeviceCache: Send + Sync {
+    /// Drops what the cache holds. Called inside device allocations, so it must not allocate.
+    /// With `wait`, also waits until the memory is back in the pool. Returns whether anything
+    /// was dropped.
+    fn release(&self, wait: bool) -> bool;
+}
+
+/// The registered device caches.
+static CACHES: Mutex<Vec<Weak<dyn DeviceCache>>> = Mutex::new(Vec::new());
+/// The device bytes the registered caches hold (see [`CachedDeviceBytes`]).
+static CACHED_BYTES: AtomicU64 = AtomicU64::new(0);
+/// The device bytes of entries the caches let go of that are not freed yet: a shard still using
+/// one keeps it until it is done. Live, but neither the caches' nor the prover's own memory.
+static RELEASED_BYTES: AtomicU64 = AtomicU64::new(0);
+
+/// The device bytes of one entry of a cache (see [`DeviceCache`]): the caches' while the cache
+/// holds the entry; once the cache lets go of it ([`Self::release`]), live until this is dropped,
+/// but neither the caches' memory nor the prover's own (a shard may still use the entry). An entry
+/// holds this as its last field, so that it drops after the entry's device buffers are freed: an
+/// allocation meanwhile must not count them as the prover's own memory, which would raise for good
+/// the peak every later upload must leave room for.
+#[must_use = "the bytes are counted only while this is alive"]
+pub struct CachedDeviceBytes {
+    bytes: u64,
+    released: AtomicBool,
+}
+
+impl CachedDeviceBytes {
+    /// Counts `bytes` as a cache's.
+    pub fn new(bytes: u64) -> Self {
+        CACHED_BYTES.fetch_add(bytes, Ordering::Relaxed);
+        Self { bytes, released: AtomicBool::new(false) }
+    }
+
+    /// Records that the cache let go of the entry. Only the first call counts.
+    pub fn release(&self) {
+        if !self.released.swap(true, Ordering::Relaxed) {
+            RELEASED_BYTES.fetch_add(self.bytes, Ordering::Relaxed);
+            CACHED_BYTES.fetch_sub(self.bytes, Ordering::Relaxed);
+        }
+    }
+}
+
+impl Drop for CachedDeviceBytes {
+    fn drop(&mut self) {
+        let counted = if *self.released.get_mut() { &RELEASED_BYTES } else { &CACHED_BYTES };
+        counted.fetch_sub(self.bytes, Ordering::Relaxed);
+    }
+}
+
+/// Registers a cache to empty when device memory runs low.
+pub fn register_device_cache(cache: Weak<dyn DeviceCache>) {
+    let mut caches = CACHES.lock().unwrap_or_else(|e| e.into_inner());
+    caches.retain(|c| c.strong_count() > 0);
+    caches.push(cache);
+}
+
+/// The device bytes held by caches (see [`DeviceCache`]).
+pub fn device_cache_bytes() -> u64 {
+    CACHED_BYTES.load(Ordering::Relaxed)
+}
+
+/// Empties the registered caches. Returns whether anything was dropped. With `wait`, also gives the
+/// small device blocks the streams keep for reuse back to the pool (last: the caches' release frees
+/// small blocks into it too), for an allocation that failed, or for a process handing the device to
+/// another one (the final wrap's GPU helpers), which would otherwise not get that memory.
+pub fn release_device_caches(wait: bool) -> bool {
+    let caches: Vec<Arc<dyn DeviceCache>> = {
+        let caches = CACHES.lock().unwrap_or_else(|e| e.into_inner());
+        caches.iter().filter_map(Weak::upgrade).collect()
+    };
+    let mut released = false;
+    for cache in caches {
+        released |= cache.release(wait);
+    }
+    if released {
+        tracing::debug!(wait, "device memory low: released device caches");
+    }
+    if wait {
+        crate::stream::release_small_block_cache();
+    }
+    released
+}
+
+/// Sets the live device memory above which [`make_room_for`] frees staged uploads and device
+/// caches, unless an upload stream set it ([`UploadStream::create`]): for device caches in a
+/// process without the trace prefetch (off by default on Windows), which would otherwise never be
+/// released under pressure, since WDDM spills over-budget memory instead of failing allocations.
+pub fn limit_device_memory_if_unset(limit: u64) {
+    let _ = STAGED_LIMIT.compare_exchange(u64::MAX, limit, Ordering::Relaxed, Ordering::Relaxed);
+}
+
+/// Called after a device allocation, with the live device memory including it.
+pub(crate) fn note_live_bytes(live: u64) {
+    let unstaged = live
+        .saturating_sub(STAGED_BYTES.load(Ordering::Relaxed))
+        .saturating_sub(CACHED_BYTES.load(Ordering::Relaxed))
+        .saturating_sub(RELEASED_BYTES.load(Ordering::Relaxed));
+    UNSTAGED_PEAK.fetch_max(unstaged, Ordering::Relaxed);
+}
+
+/// Called before a device allocation of `size` bytes: if staged uploads or caches hold memory
+/// and the allocation would take the live device memory above the limit, frees them (see
+/// [`StagedUpload`] and [`DeviceCache`]): the caches first, and the staged uploads, which the
+/// shards about to be proved are waiting for, only if the live memory is still above the limit
+/// then (entries a shard still uses stay live).
+pub(crate) fn make_room_for(size: u64) {
+    let fits = || crate::vram_current_bytes() + size <= STAGED_LIMIT.load(Ordering::Relaxed);
+    let staged = STAGED_BYTES.load(Ordering::Relaxed);
+    let cached = CACHED_BYTES.load(Ordering::Relaxed);
+    if fits() || (staged == 0 && cached == 0) {
+        return;
+    }
+    if cached > 0 {
+        // Measured whoever releases them: another thread may have just done so.
+        release_device_caches(false);
+        if fits() {
+            return;
+        }
+    }
+    if staged > 0 {
+        reclaim_staged_uploads(false);
+    }
+}
+
+/// Frees every staged upload not yet taken. With `wait`, also waits until that memory is back in
+/// the pool, for an allocation that failed to retry. Returns whether anything was freed.
+pub(crate) fn reclaim_staged_uploads(wait: bool) -> bool {
+    let staged: Vec<Arc<StagedUpload>> = {
+        let registry = STAGED.lock().unwrap_or_else(|e| e.into_inner());
+        registry.iter().filter_map(Weak::upgrade).collect()
+    };
+    let mut freed = false;
+    for s in &staged {
+        if s.free() {
+            freed = true;
+            // The frees are stream-ordered; once the stream is done, the memory can be reused
+            // from any stream.
+            if wait {
+                let _ = unsafe {
+                    CudaError::result_from_ffi(sp1_gpu_sys::runtime::cuda_stream_synchronize(
+                        s.stream.0,
+                    ))
+                };
+            }
+        }
+    }
+    if freed {
+        tracing::debug!(wait, "device memory low: reclaimed prefetched uploads");
+    }
+    freed
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{run_sync_in_place, PinnedBuffer};
+
+    /// A cache entry's bytes are the caches' until the cache lets go of it, then live but nobody's
+    /// until it is dropped. (No other test of this binary has a cache.)
+    #[test]
+    fn a_cache_entry_counts_as_cached_then_released_until_dropped() {
+        let counts =
+            || (CACHED_BYTES.load(Ordering::Relaxed), RELEASED_BYTES.load(Ordering::Relaxed));
+        let (cached, released) = counts();
+        let charge = CachedDeviceBytes::new(1000);
+        assert_eq!(counts(), (cached + 1000, released));
+        charge.release();
+        charge.release();
+        assert_eq!(counts(), (cached, released + 1000));
+        drop(charge);
+        assert_eq!(counts(), (cached, released));
+        drop(CachedDeviceBytes::new(10));
+        assert_eq!(counts(), (cached, released));
+    }
+
+    #[test]
+    fn test_staged_upload() {
+        const LEN: usize = 1 << 20;
+        let mut src = PinnedBuffer::<u32>::with_capacity(LEN);
+        for (i, x) in src.as_mut_slice().iter_mut().enumerate() {
+            x.write(3 * i as u32 + 1);
+        }
+        run_sync_in_place(|scope| {
+            let stream = UploadStream::create(u64::MAX).unwrap();
+
+            // Taken: the primary stream sees the data, and the upload cannot be taken twice.
+            let upload = unsafe { stream.upload(src.as_ptr(), LEN) }.unwrap();
+            let buffer = upload.take::<u32>(&scope).unwrap().unwrap();
+            assert!(upload.take::<u32>(&scope).unwrap().is_none());
+            let host = unsafe { buffer.copy_into_host_vec() };
+            assert!(host.iter().enumerate().all(|(i, &x)| x == 3 * i as u32 + 1));
+
+            // Reclaimed before it is taken.
+            let upload = unsafe { stream.upload(src.as_ptr(), LEN) }.unwrap();
+            assert!(reclaim_staged_uploads(true));
+            assert!(upload.take::<u32>(&scope).unwrap().is_none());
+            assert!(!reclaim_staged_uploads(true));
+
+            // Over the limit.
+            let stream = UploadStream::create(0).unwrap();
+            assert!(unsafe { stream.upload(src.as_ptr(), LEN) }.is_none());
+        })
+        .unwrap();
+    }
+}

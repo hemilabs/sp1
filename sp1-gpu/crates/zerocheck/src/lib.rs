@@ -1855,4 +1855,175 @@ pub mod tests {
         })
         .await;
     }
+    /// The wave-uniform sequential kernels (`SP1_GPU_ZEROCHECK_UNIFORM`, with
+    /// each VGPR register-file size `SP1_GPU_ZEROCHECK_VRF` /
+    /// `SP1_GPU_ZEROCHECK_BIV_VRF`) must produce
+    /// exactly the same zerocheck proof and opened values as the generic
+    /// kernels (and the wide cooperative kernel, `SP1_GPU_ZEROCHECK_COOP_WIDE`,
+    /// the same as the thread-per-row fallback it replaces) on real RISC-V
+    /// chip bytecode and traces, through both the fused
+    /// bivariate first rounds and the legacy univariate base-field round (which
+    /// exercises the felt kernels). The new path's proof must also verify.
+    #[tokio::test]
+    #[serial]
+    async fn test_zerocheck_uniform_kernel_bit_identical() {
+        let (machine, record, program) =
+            tracegen_setup::setup(&test_artifacts::FIBONACCI_ELF, SP1Stdin::new()).await;
+
+        run_in_place(|t| async move {
+            let mut rng = rand::thread_rng();
+            let capacity = CORE_MAX_TRACE_SIZE as usize;
+            let buffer = PinnedBuffer::<Felt>::with_capacity(capacity);
+            let queue = Arc::new(WorkerQueue::new(vec![buffer]));
+            let buffer = queue.pop().await.unwrap();
+            let (public_values, trace_mle, chips, _permit) = full_tracegen(
+                &machine,
+                program.clone(),
+                Arc::new(record),
+                &buffer,
+                CORE_MAX_TRACE_SIZE as usize,
+                LOG_STACKING_HEIGHT,
+                CORE_MAX_LOG_ROW_COUNT,
+                &t,
+                ProverSemaphore::new(1),
+                true,
+            )
+            .await;
+            let chips = machine.smallest_cluster(&chips).unwrap();
+            let trace_mle = Arc::new(trace_mle);
+            let machine_chip_set: BTreeSet<_> = machine.chips().iter().cloned().collect();
+
+            let zeta = Point::<Ext>::rand(&mut rng, CORE_MAX_LOG_ROW_COUNT);
+            let individual_column_evals = evaluate_jagged_columns(&trace_mle, zeta.clone());
+            let mut preprocessed_ptr: usize = 0;
+            let mut main_ptr = chips.iter().map(|x| x.preprocessed_width()).sum::<usize>() + 1;
+            let mut chip_openings: BTreeMap<String, ChipEvaluation<Ext>> = BTreeMap::new();
+            for chip in chips.iter() {
+                let preprocessed_width = chip.preprocessed_width();
+                let main_width = chip.width();
+                let chip_eval = ChipEvaluation {
+                    preprocessed_trace_evaluations: match preprocessed_width {
+                        0 => None,
+                        _ => Some(MleEval::new(Tensor::from(
+                            individual_column_evals
+                                [preprocessed_ptr..preprocessed_ptr + preprocessed_width]
+                                .to_vec(),
+                        ))),
+                    },
+                    main_trace_evaluations: MleEval::new(Tensor::from(
+                        individual_column_evals[main_ptr..main_ptr + main_width].to_vec(),
+                    )),
+                };
+                chip_openings.insert(chip.air.name().to_string(), chip_eval);
+                preprocessed_ptr += preprocessed_width;
+                main_ptr += main_width;
+            }
+            let logup_evaluations = LogUpEvaluations { point: zeta, chip_openings };
+
+            let mut challenger = TestGC::default_challenger();
+            challenger.observe(Felt::from_canonical_u32(0x2013));
+            challenger.observe(Felt::from_canonical_u32(0x2015));
+
+            // Compile (the register ranking depends on the environment) and
+            // prove; returns the Debug rendering of (opened values, proof).
+            let prove = |verify: bool| {
+                let compiled = compile_chips(&machine_chip_set, ChunkBudget::recommended());
+                let mb = Arc::new(upload_compiled_bytecode(compiled, &t));
+                let mut challenger_prover = challenger.clone();
+                let batching_challenge = challenger_prover.sample_ext_element();
+                let gkr_opening_batch_randomness = challenger_prover.sample_ext_element();
+                let (opened_values, zerocheck_proof) = zerocheck(
+                    chips,
+                    &mb,
+                    trace_mle.as_ref(),
+                    batching_challenge,
+                    gkr_opening_batch_randomness,
+                    &logup_evaluations,
+                    public_values.clone(),
+                    &mut challenger_prover,
+                    CORE_MAX_LOG_ROW_COUNT,
+                );
+                // Debug renders host buffers with their heap addresses; drop those.
+                let raw = format!("{opened_values:?}\n{zerocheck_proof:?}");
+                let mut rendered = String::with_capacity(raw.len());
+                let mut rest = raw.as_str();
+                while let Some(p) = rest.find("ptr: 0x") {
+                    rendered.push_str(&rest[..p]);
+                    rest = rest[p + 7..].trim_start_matches(|c: char| c.is_ascii_hexdigit());
+                }
+                rendered.push_str(rest);
+                if verify {
+                    let mut challenger_verifier = challenger.clone();
+                    crate::tests::verify_zerocheck(
+                        chips,
+                        &opened_values,
+                        &logup_evaluations,
+                        zerocheck_proof,
+                        &public_values,
+                        &mut challenger_verifier,
+                        CORE_MAX_LOG_ROW_COUNT as usize,
+                    );
+                }
+                rendered
+            };
+
+            for legacy_first_rounds in [false, true] {
+                if legacy_first_rounds {
+                    std::env::set_var("SP1_GPU_ZEROCHECK_LEGACY_FIRST_ROUNDS", "1");
+                } else {
+                    std::env::remove_var("SP1_GPU_ZEROCHECK_LEGACY_FIRST_ROUNDS");
+                }
+                std::env::set_var("SP1_GPU_ZEROCHECK_UNIFORM", "0");
+                std::env::set_var("SP1_GPU_ZEROCHECK_COOP_WIDE", "0");
+                let reference = prove(false);
+                let again = prove(false);
+                if again != reference {
+                    let at =
+                        again.bytes().zip(reference.bytes()).take_while(|(a, b)| a == b).count();
+                    let lo = at.saturating_sub(400);
+                    println!(
+                        "nondeterminism at byte {at} of {}:\n again: {}\n ref: {}",
+                        reference.len(),
+                        &again[lo..(at + 200).min(again.len())],
+                        &reference[lo..(at + 200).min(reference.len())]
+                    );
+                }
+                assert!(again == reference, "the generic kernels are not deterministic run to run");
+                for (vrf, wide) in [("0", "1"), ("16", "2"), ("32", "1"), ("32", "2")] {
+                    std::env::set_var("SP1_GPU_ZEROCHECK_COOP_WIDE", wide);
+                    std::env::set_var("SP1_GPU_ZEROCHECK_UNIFORM", "1");
+                    std::env::set_var("SP1_GPU_ZEROCHECK_VRF", vrf);
+                    std::env::set_var("SP1_GPU_ZEROCHECK_BIV_VRF", vrf);
+                    let got = prove(true);
+                    if got != reference {
+                        let at =
+                            got.bytes().zip(reference.bytes()).take_while(|(a, b)| a == b).count();
+                        let lo = at.saturating_sub(300);
+                        println!(
+                            "first difference at byte {at}:\n got: {}\n ref: {}",
+                            &got[lo..(at + 200).min(got.len())],
+                            &reference[lo..(at + 200).min(reference.len())]
+                        );
+                    }
+                    assert!(
+                        got == reference,
+                        "uniform kernel (VRF={vrf}, coop wide={wide}, legacy first \
+                         rounds={legacy_first_rounds}) differs from the generic kernel"
+                    );
+                    println!(
+                        "uniform kernel VRF={vrf} coop_wide={wide} \
+                         legacy_first_rounds={legacy_first_rounds}: bit-identical ({} bytes of \
+                         proof text)",
+                        got.len()
+                    );
+                }
+            }
+            std::env::remove_var("SP1_GPU_ZEROCHECK_UNIFORM");
+            std::env::remove_var("SP1_GPU_ZEROCHECK_VRF");
+            std::env::remove_var("SP1_GPU_ZEROCHECK_BIV_VRF");
+            std::env::remove_var("SP1_GPU_ZEROCHECK_COOP_WIDE");
+            std::env::remove_var("SP1_GPU_ZEROCHECK_LEGACY_FIRST_ROUNDS");
+        })
+        .await;
+    }
 }

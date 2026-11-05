@@ -419,11 +419,23 @@ impl PersistentMsm {
     /// GLV endomorphism buffers are lazily allocated on first GLV invoke.
     pub fn new(points: &[G1Affine]) -> Self {
         use crate::BN254G1Affine;
+        assert_eq!(std::mem::size_of::<G1Affine>(), std::mem::size_of::<BN254G1Affine>());
+        // SAFETY: same size, and `G1Affine`'s alignment (8) is a multiple of `BN254G1Affine`'s;
+        // the context reads the points as `BN254G1Affine`s, Montgomery limbs in LE order.
+        let points = unsafe {
+            std::slice::from_raw_parts(points.as_ptr() as *const BN254G1Affine, points.len())
+        };
+        Self::from_bn254_points(points)
+    }
+
+    /// [`Self::new`] for points already in the layout the context reads (`G1Affine::from_bn254`
+    /// only regroups the same little-endian limbs), without converting a copy of them first.
+    pub fn from_bn254_points(points: &[crate::BN254G1Affine]) -> Self {
+        use crate::BN254G1Affine;
         use std::ffi::c_void;
 
         let n = points.len();
-        assert_eq!(std::mem::size_of::<G1Affine>(), std::mem::size_of::<BN254G1Affine>());
-        let points_ptr = points.as_ptr() as *const BN254G1Affine;
+        let points_ptr = points.as_ptr();
 
         let mut ctx: *mut c_void = std::ptr::null_mut();
         let err = unsafe {

@@ -15,18 +15,12 @@ use core::{
 };
 use std::marker::PhantomData;
 
-use hashbrown::HashMap;
-use itertools::Itertools;
-use rayon::{
-    iter::{IndexedParallelIterator, IntoParallelRefIterator},
-    slice::ParallelSliceMut,
-};
 use slop_air::{Air, BaseAir};
 use slop_algebra::{AbstractField, PrimeField, PrimeField32};
 use slop_matrix::Matrix;
 use slop_maybe_rayon::prelude::{ParallelIterator, ParallelSlice};
 use sp1_core_executor::{
-    events::{AluEvent, ByteLookupEvent, ByteRecord},
+    events::{AluEvent, ByteRecord},
     ByteOpcode, ExecutionRecord, Opcode, Program, CLK_INC, PC_INC,
 };
 use sp1_derive::AlignedBorrow;
@@ -102,6 +96,63 @@ impl<F: PrimeField32, M: TrustMode> MachineAir<F> for BitwiseChip<M> {
         _output: &mut ExecutionRecord,
         buffer: &mut [MaybeUninit<F>],
     ) {
+        self.generate_trace_into_with::<F>(input, buffer, false);
+    }
+
+    fn dependencies_in_trace(&self) -> bool {
+        true
+    }
+
+    fn generate_trace_into_with_dependencies(
+        &self,
+        input: &ExecutionRecord,
+        buffer: &mut [MaybeUninit<F>],
+    ) {
+        self.generate_trace_into_with::<F>(input, buffer, true);
+    }
+
+    fn generate_dependencies(&self, input: &Self::Record, _output: &mut Self::Record) {
+        if input.program.enable_untrusted_programs == M::IS_TRUSTED {
+            return;
+        }
+
+        let chunk_size = std::cmp::max(input.bitwise_events.len() / num_cpus::get(), 1);
+        let width = <BitwiseChip<M> as BaseAir<F>>::width(self);
+
+        input.bitwise_events.par_chunks(chunk_size).for_each(|events| {
+            input.byte_lookup_counts.count(|blu| {
+                // One scratch row per chunk instead of an allocation per event.
+                let mut row = vec![F::zero(); width];
+                events.iter().for_each(|event| {
+                    row.fill(F::zero());
+                    let cols: &mut BitwiseCols<F, M> = row.as_mut_slice().borrow_mut();
+                    cols.adapter.populate(blu, event.1);
+                    self.event_to_row(&event.0, cols, blu);
+                    cols.state.populate(blu, event.0.clk, event.0.pc);
+                });
+            });
+        });
+    }
+
+    fn included(&self, shard: &Self::Record) -> bool {
+        if let Some(shape) = shard.shape.as_ref() {
+            shape.included::<F, _>(self)
+        } else {
+            !shard.bitwise_events.is_empty()
+                && (M::IS_TRUSTED != shard.program.enable_untrusted_programs)
+        }
+    }
+}
+
+impl<M: TrustMode> BitwiseChip<M> {
+    /// Writes the trace into `buffer`. With `count`, the byte lookups of the rows are counted
+    /// into `input.byte_lookup_counts`, as `generate_dependencies` does.
+    fn generate_trace_into_with<F: PrimeField32>(
+        &self,
+        input: &ExecutionRecord,
+        buffer: &mut [MaybeUninit<F>],
+        count: bool,
+    ) {
         if input.program.enable_untrusted_programs == M::IS_TRUSTED {
             return;
         }
@@ -121,59 +172,24 @@ impl<F: PrimeField32, M: TrustMode> MachineAir<F> for BitwiseChip<M> {
         let buffer_ptr = buffer.as_mut_ptr() as *mut F;
         let values = unsafe { core::slice::from_raw_parts_mut(buffer_ptr, padded_nb_rows * width) };
 
-        values[..nb_rows * width]
-            .par_chunks_exact_mut(width)
-            .zip(input.bitwise_events.par_iter())
-            .for_each(|(row, event)| {
+        crate::utils::populate_event_rows(
+            input,
+            &mut values[..nb_rows * width],
+            width,
+            count,
+            |idx, row, blu| {
+                let event = &input.bitwise_events[idx];
                 let cols: &mut BitwiseCols<F, M> = row.borrow_mut();
 
-                let mut blu = sp1_core_executor::events::DiscardByteRecord;
-                cols.adapter.populate(&mut blu, event.1);
-                self.event_to_row(&event.0, cols, &mut blu);
-                cols.state.populate(&mut blu, event.0.clk, event.0.pc);
+                cols.adapter.populate(blu, event.1);
+                self.event_to_row(&event.0, cols, blu);
+                cols.state.populate(blu, event.0.clk, event.0.pc);
                 if !M::IS_TRUSTED {
                     let cols: &mut BitwiseCols<F, UserMode> = row.borrow_mut();
                     cols.adapter_cols.is_trusted = F::from_bool(!event.1.is_untrusted);
                 }
-            });
-    }
-
-    fn generate_dependencies(&self, input: &Self::Record, output: &mut Self::Record) {
-        if input.program.enable_untrusted_programs == M::IS_TRUSTED {
-            return;
-        }
-
-        let chunk_size = std::cmp::max(input.bitwise_events.len() / num_cpus::get(), 1);
-        let width = <BitwiseChip<M> as BaseAir<F>>::width(self);
-
-        let blu_batches = input
-            .bitwise_events
-            .par_chunks(chunk_size)
-            .map(|events| {
-                let mut blu: HashMap<ByteLookupEvent, usize> = HashMap::new();
-                // One scratch row per chunk instead of an allocation per event.
-                let mut row = vec![F::zero(); width];
-                events.iter().for_each(|event| {
-                    row.fill(F::zero());
-                    let cols: &mut BitwiseCols<F, M> = row.as_mut_slice().borrow_mut();
-                    cols.adapter.populate(&mut blu, event.1);
-                    self.event_to_row(&event.0, cols, &mut blu);
-                    cols.state.populate(&mut blu, event.0.clk, event.0.pc);
-                });
-                blu
-            })
-            .collect::<Vec<_>>();
-
-        output.add_byte_lookup_events_from_maps(blu_batches.iter().collect_vec());
-    }
-
-    fn included(&self, shard: &Self::Record) -> bool {
-        if let Some(shape) = shard.shape.as_ref() {
-            shape.included::<F, _>(self)
-        } else {
-            !shard.bitwise_events.is_empty()
-                && (M::IS_TRUSTED != shard.program.enable_untrusted_programs)
-        }
+            },
+        );
     }
 }
 

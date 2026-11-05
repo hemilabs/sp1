@@ -8,6 +8,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::future::ready;
 use std::marker::PhantomData;
 use std::mem::MaybeUninit;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio::join;
 use tokio::sync::Mutex;
@@ -26,7 +27,7 @@ use sp1_gpu_cudart::sys::kernels::{
     sum_to_trace_kernel,
 };
 use sp1_gpu_cudart::{args, DeviceBuffer, DeviceTensor, PinnedBuffer, TaskScope};
-use sp1_gpu_tracegen::{CudaTracegenAir, PreprocessedPrep};
+use sp1_gpu_tracegen::{CudaTracegenAir, PreprocessedPrep, StagedInput};
 use sp1_hypercube::prover::{ProverPermit, ProverSemaphore};
 
 use sp1_core_executor::ELEMENT_THRESHOLD;
@@ -52,6 +53,133 @@ pub struct HostPhaseTracegen<A> {
     /// Host-side preparation for each of `device_airs` (preprocessed phase only; empty for main),
     /// computed before the prover permit is taken.
     pub device_preps: Vec<Option<PreprocessedPrep>>,
+    /// Pinned copy of the input of each of `device_airs`, if staged (see [`InputStager`]).
+    pub device_staged: Vec<Option<StagedInput>>,
+    /// Signals that the packed inputs among `device_staged` are written (they are packed by rayon
+    /// jobs, see [`CudaTracegenAir::pack_main_device_input`]).
+    pub device_staged_ready: Vec<futures::channel::oneshot::Receiver<()>>,
+}
+
+/// Whether device-tracegen inputs are staged in pinned memory (`SP1_GPU_STAGE_INPUTS=0` turns it
+/// off, as an A/B switch).
+fn stage_inputs() -> bool {
+    static STAGE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *STAGE.get_or_init(|| std::env::var("SP1_GPU_STAGE_INPUTS").map(|v| v != "0").unwrap_or(true))
+}
+
+/// Copies the inputs of the device-generated traces (recursion events and instructions, core
+/// global interaction events) into the unused tail of the shard's pinned trace buffer, before the
+/// prover permit is taken.
+///
+/// Uploaded from pageable memory, these inputs (about 6 GB per rsp proof) went through the
+/// driver's bounce buffer at about 3 GB/s, each copy blocking its tokio worker until the stream
+/// had drained up to it. From pinned memory the upload is an asynchronous DMA at full PCIe speed.
+/// The trace buffer is held until the shard's prove (or setup) is done with the stream, as it
+/// already must be for the host traces in it, so the staged copies outlive their uploads.
+struct InputStager {
+    base: usize,
+    /// End of the used part of the buffer, in bytes.
+    end: usize,
+    /// Capacity of the buffer, in bytes.
+    capacity: usize,
+    staged_bytes: usize,
+    unstaged_bytes: usize,
+}
+
+impl InputStager {
+    /// Alignment of each staged input, in bytes.
+    const ALIGN: usize = 64;
+
+    /// A stager for the part of the buffer at `buffer_ptr` (`buffer_len` felts) past `start` felts.
+    fn new(buffer_ptr: usize, buffer_len: usize, start: usize) -> Self {
+        let size = std::mem::size_of::<Felt>();
+        Self {
+            base: buffer_ptr,
+            end: start * size,
+            capacity: buffer_len * size,
+            staged_bytes: 0,
+            unstaged_bytes: 0,
+        }
+    }
+
+    /// Copies `input` into the buffer, or returns `None` if it does not fit (it is then uploaded
+    /// from where it is).
+    fn stage(&mut self, input: Option<&[MaybeUninit<u8>]>) -> Option<StagedInput> {
+        let input = input.filter(|input| !input.is_empty() && stage_inputs())?;
+        let start = self.end.next_multiple_of(Self::ALIGN);
+        if start + input.len() > self.capacity {
+            self.unstaged_bytes += input.len();
+            return None;
+        }
+        let dst = (self.base + start) as *mut u8;
+        // SAFETY: `[start, start + len)` is inside the buffer and past everything else written to
+        // it (host traces and earlier inputs).
+        unsafe { std::ptr::copy_nonoverlapping(input.as_ptr().cast(), dst, input.len()) };
+        self.end = start + input.len();
+        self.staged_bytes += input.len();
+        // SAFETY: the buffer is pinned and outlives the upload (see the type docs).
+        Some(unsafe { StagedInput::new(dst, input.len()) })
+    }
+
+    /// Reserves `len` bytes of the buffer for an input written later, or returns `None` if they
+    /// do not fit (the input is then packed and uploaded by its device tracegen).
+    fn reserve(&mut self, len: usize) -> Option<StagedInput> {
+        if len == 0 || !stage_inputs() {
+            return None;
+        }
+        let start = self.end.next_multiple_of(Self::ALIGN);
+        if start + len > self.capacity {
+            self.unstaged_bytes += len;
+            return None;
+        }
+        self.end = start + len;
+        self.staged_bytes += len;
+        // SAFETY: the buffer is pinned and outlives the upload (see the type docs); the reserved
+        // bytes are written before the upload (`device_staged_ready`).
+        Some(unsafe { StagedInput::new((self.base + start) as *const u8, len) })
+    }
+
+    /// End of the used part of the buffer, in felts.
+    fn end_felts(&self) -> usize {
+        self.end.div_ceil(std::mem::size_of::<Felt>())
+    }
+
+    fn log(&self, phase: &str) {
+        tracing::debug!(
+            phase,
+            staged_bytes = self.staged_bytes,
+            unstaged_bytes = self.unstaged_bytes,
+            "staged device tracegen inputs"
+        );
+    }
+}
+
+/// Stages the preprocessed inputs of `phase` into the buffer past `start` felts.
+async fn stage_preprocessed_inputs<A: CudaTracegenAir<Felt>>(
+    phase: HostPhaseTracegen<A>,
+    buffer_ptr: usize,
+    buffer_len: usize,
+    start: usize,
+) -> HostPhaseTracegen<A> {
+    if !stage_inputs() {
+        return phase;
+    }
+    tokio::task::spawn_blocking(move || {
+        let mut phase = phase;
+        let mut stager = InputStager::new(buffer_ptr, buffer_len, start);
+        phase.device_staged = phase
+            .device_airs
+            .iter()
+            .zip_eq(phase.device_preps.iter())
+            .map(|(air, prep)| {
+                stager.stage(prep.as_ref().and_then(|prep| air.preprocessed_device_input(prep)))
+            })
+            .collect();
+        stager.log("preprocessed");
+        phase
+    })
+    .await
+    .unwrap()
 }
 
 /// Information about the traces generated in the host phase.
@@ -60,6 +188,8 @@ pub struct HostPhaseShapeInfo<A> {
     pub traces_by_name: BTreeMap<String, Trace<TaskScope>>,
     /// The set of chips we need to generate traces for.
     pub chip_set: BTreeSet<Chip<Felt, A>>,
+    /// The total number of elements of the host traces.
+    pub host_traces_len: usize,
 }
 
 /// Traces generated
@@ -131,6 +261,143 @@ fn host_trace(storage: Buffer<Felt, TaskScope>, height: usize, width: usize) -> 
     })
 }
 
+/// A host trace waiting in the pinned buffer: (chip name, start pointer, height, width).
+type HostTraceRef = (String, usize, usize, usize);
+
+/// Uploads a shard's host traces before it gets the prover, while the GPU proves the shard ahead
+/// of it.
+///
+/// Without it, a shard's host traces are copied to the device after it takes the prover permit,
+/// and the copies are ordered after the work on the prover's stream, so the GPU runs no kernels
+/// during them (about 60 ms per rsp core shard, 2.4 s per rsp proof). Here the next shard's
+/// traces are uploaded on a separate stream as they are generated, into their own device
+/// buffers, and the prover's stream only waits for those uploads when it takes them over.
+///
+/// One shard uploads at a time, and the next one starts once this one's traces are in place, so
+/// the extra device memory is at most one shard's host traces. The prefetch is skipped for a
+/// shard whose host traces exceed `SP1_GPU_TRACE_PREFETCH_MIB` (default 4096 off Windows on CUDA
+/// cards with more than 24 GiB and HIP cards of 64 GiB or more, else 0; `0` disables the
+/// prefetch). On Windows CUDA it spilled
+/// too: on an RTX 5090 most proofs of a 1.44B-cycle program took 35-69 s instead of ~8.7 s, the
+/// memory pool's reserve (outside this limit) pushing the card past its memory, and with it
+/// 144M-cycle proofs were no faster. It is off by default on SYCL and smaller HIP cards:
+/// their device memory caches hold freed blocks this limit doesn't see, and on an Arc Pro B70
+/// (32 GB, Windows) a third of compressed proofs then spilled to shared system memory (4.3 s ->
+/// 10-26 s), with an occasional device loss, while proofs that didn't spill were no faster than
+/// without the prefetch. On an MI300X (192 GB, Linux), core proofs were 2.9% faster with it.
+/// The uploads also only use memory the prover
+/// does not: they keep the live device memory `SP1_GPU_TRACE_PREFETCH_HEADROOM_MIB` (default
+/// 1536) below what the process can use (on an otherwise idle 32 GiB card, the pool's peak then
+/// stays where it was without them), and are dropped when the prover needs that memory (see
+/// [`sp1_gpu_cudart::StagedUpload`]). A trace not uploaded or dropped is copied after the
+/// permit, as before.
+pub struct TracePrefetcher {
+    stream: sp1_gpu_cudart::UploadStream,
+    slot: Arc<tokio::sync::Semaphore>,
+    max_bytes: usize,
+}
+
+impl TracePrefetcher {
+    /// Returns `None` if the prefetch is disabled.
+    pub fn new() -> Option<Self> {
+        const MIB: usize = 1 << 20;
+        let env_mib = |name: &str| std::env::var(name).ok().and_then(|v| v.parse::<usize>().ok());
+        let (_, total) = sp1_gpu_cudart::cuda_memory_info().ok()?;
+        let large = match sp1_gpu_cudart::sys::BACKEND {
+            "cuda" => total > 24 << 30,
+            "hip" => total >= 64 << 30,
+            _ => false,
+        };
+        let default_mib = if large && !cfg!(windows) { 4096 } else { 0 };
+        let max_mib = env_mib("SP1_GPU_TRACE_PREFETCH_MIB").unwrap_or(default_mib);
+        if max_mib == 0 {
+            return None;
+        }
+        // The memory this process can use (with HIP's arena, the arena's).
+        let usable = sp1_gpu_cudart::usable_device_memory().ok()?;
+        let headroom = env_mib("SP1_GPU_TRACE_PREFETCH_HEADROOM_MIB").unwrap_or(1536) * MIB;
+        let limit = usable.saturating_sub(headroom as u64);
+        tracing::debug!(limit_mib = limit >> 20, "trace prefetch enabled");
+        Some(Self {
+            stream: sp1_gpu_cudart::UploadStream::create(limit).ok()?,
+            slot: Arc::new(tokio::sync::Semaphore::new(1)),
+            max_bytes: max_mib * MIB,
+        })
+    }
+
+    /// Whether a shard whose host traces have `host_traces_len` elements is prefetched.
+    fn accepts(&self, host_traces_len: usize) -> bool {
+        host_traces_len * std::mem::size_of::<Felt>() <= self.max_bytes
+    }
+
+    /// Waits for the prefetch slot, then uploads the shard's host traces as they are generated.
+    /// The slot is released when the returned permit is dropped.
+    ///
+    /// The packed inputs of the device tracegens (`packed_inputs`, written once `ready`) go first.
+    async fn prefetch(
+        &self,
+        host_traces: impl futures::Stream<Item = HostTraceRef>,
+        packed_inputs: Vec<Option<StagedInput>>,
+        ready: Vec<futures::channel::oneshot::Receiver<()>>,
+    ) -> (PrefetchedTraces, tokio::sync::OwnedSemaphorePermit) {
+        let slot = self.slot.clone().acquire_owned().await.unwrap();
+        for ready in ready {
+            ready.await.expect("packing a device tracegen input failed");
+        }
+        let inputs = packed_inputs
+            .into_iter()
+            .map(|input| {
+                // Packed inputs are whole 8-byte words (`CudaTracegenAir::pack_main_device_input`).
+                let input = input.filter(|input| input.len() % 8 == 0)?;
+                // SAFETY: the input lives in the shard's pinned buffer, which the shard holds until
+                // its proof is done, after the upload.
+                unsafe { self.stream.upload(input.as_ptr() as *const u64, input.len() / 8) }
+            })
+            .collect();
+        let mut prefetched = PrefetchedTraces { uploads: Vec::new(), rest: Vec::new(), inputs };
+        let mut host_traces = pin!(host_traces);
+        while let Some(host_trace_ref) = host_traces.next().await {
+            let (_, ptr, height, width) = host_trace_ref;
+            // SAFETY: the trace lives in the shard's pinned buffer, which the shard holds until
+            // its proof is done, after the upload.
+            match unsafe { self.stream.upload(ptr as *const Felt, height * width) } {
+                Some(upload) => prefetched.uploads.push((host_trace_ref, upload)),
+                None => prefetched.rest.push(host_trace_ref),
+            }
+        }
+        (prefetched, slot)
+    }
+}
+
+/// Host traces uploaded by a [`TracePrefetcher`].
+struct PrefetchedTraces {
+    uploads: Vec<(HostTraceRef, Arc<sp1_gpu_cudart::StagedUpload>)>,
+    /// The traces that could not be uploaded.
+    rest: Vec<HostTraceRef>,
+    /// The uploads of the device tracegens' packed inputs, by device chip.
+    inputs: Vec<Option<Arc<sp1_gpu_cudart::StagedUpload>>>,
+}
+
+impl PrefetchedTraces {
+    /// Hands the uploaded traces over to the prover's stream. Returns them and the traces still
+    /// to copy (those not uploaded, or whose upload was reclaimed).
+    fn into_traces(self, backend: &TaskScope) -> (Vec<(String, Trace)>, Vec<HostTraceRef>) {
+        let mut uploaded = Vec::new();
+        let mut rest = self.rest;
+        assert!(self.inputs.is_empty(), "take the packed inputs first");
+        for (host_trace_ref, upload) in self.uploads {
+            match upload.take::<Felt>(backend).unwrap() {
+                Some(storage) => {
+                    let (name, _, height, width) = host_trace_ref;
+                    uploaded.push((name, host_trace(storage, height, width)));
+                }
+                None => rest.push(host_trace_ref),
+            }
+        }
+        (uploaded, rest)
+    }
+}
+
 /// Read-only data shared across all concurrent shards using this proving key:
 /// the preprocessed PCS commitment and the derived per-table heights.
 ///
@@ -177,6 +444,20 @@ impl<GC: IopCtx, Air: MachineAir<GC::F>> CudaShardProverShared<GC, Air> {
     pub fn release_main_traces(&self, traces: &mut JaggedTraceMle<Felt, TaskScope>) {
         if self.persistent {
             shrink_to_preprocessed(traces);
+        }
+    }
+
+    /// A copy without the preprocessed codeword, which basefold then encodes again from the
+    /// traces when it opens them. The Merkle tree is copied on the device.
+    pub fn without_codeword(&self) -> Self {
+        let mut preprocessed_data = self.preprocessed_data.clone();
+        preprocessed_data.pcs_prover_data.codeword_mle = None;
+        Self {
+            preprocessed_data,
+            preprocessed_table_heights: self.preprocessed_table_heights.clone(),
+            full_trace_size: self.full_trace_size,
+            persistent: self.persistent,
+            phantom: PhantomData,
         }
     }
 }
@@ -237,6 +518,15 @@ impl<GC: IopCtx, Air: MachineAir<GC::F>> CudaShardProverData<GC, Air> {
         });
         let trace_buffer_pool = Arc::new(WorkerQueue::new(trace_buffers));
         Self { shared, trace_buffer_pool }
+    }
+
+    /// Data for `trace_buffers`, whose preprocessed slots hold the traces `shared` commits to.
+    pub fn from_shared(
+        shared: Arc<CudaShardProverShared<GC, Air>>,
+        trace_buffers: Vec<JaggedTraceMle<Felt, TaskScope>>,
+    ) -> Self {
+        assert!(!trace_buffers.is_empty(), "CudaShardProverData requires a trace buffer");
+        Self { shared, trace_buffer_pool: Arc::new(WorkerQueue::new(trace_buffers)) }
     }
 
     pub fn preprocessed_table_heights(&self) -> &BTreeMap<String, usize> {
@@ -608,7 +898,16 @@ async fn host_preprocessed_tracegen<A: CudaTracegenAir<Felt>>(
         .await
         .unwrap();
 
-    (HostPhaseTracegen { device_airs, host_traces, device_preps }, total_size)
+    (
+        HostPhaseTracegen {
+            device_airs,
+            host_traces,
+            device_preps,
+            device_staged: Vec::new(),
+            device_staged_ready: Vec::new(),
+        },
+        total_size,
+    )
 }
 
 #[instrument(skip_all, level = "debug")]
@@ -617,8 +916,10 @@ async fn device_preprocessed_tracegen<A: CudaTracegenAir<Felt>>(
     host_phase_tracegen: HostPhaseTracegen<A>,
     backend: &TaskScope,
 ) -> BTreeMap<String, Trace<TaskScope>> {
-    let HostPhaseTracegen { device_airs, host_traces, device_preps } = host_phase_tracegen;
+    let HostPhaseTracegen { device_airs, host_traces, device_preps, device_staged, .. } =
+        host_phase_tracegen;
     let mut device_preps = device_preps.into_iter();
+    let mut device_staged = device_staged.into_iter();
 
     // Stream that, when polled, copies the host traces to the device.
     let copied_host_traces =
@@ -655,9 +956,10 @@ async fn device_preprocessed_tracegen<A: CudaTracegenAir<Felt>>(
             // We want to borrow the program and move the air.
             let program = program.as_ref();
             let prep = device_preps.next().flatten();
+            let staged = device_staged.next().flatten();
             async move {
                 let maybe_trace = air
-                    .generate_preprocessed_trace_device_prepared(program, prep, backend)
+                    .generate_preprocessed_trace_device_prepared(program, prep, staged, backend)
                     .await
                     .unwrap();
                 (air, maybe_trace)
@@ -789,6 +1091,7 @@ async fn copy_main_jagged_traces(
     log_stacking_height: u32,
     max_log_row_count: u32,
     global_dependencies_opt: bool,
+    lookup_counts: Option<Buffer<u32, TaskScope>>,
 ) {
     // At this point, all traces are on device. Now we need to copy them into the Jagged MLE struct.
     let JaggedMle {
@@ -848,6 +1151,27 @@ async fn copy_main_jagged_traces(
         update_global_dependencies(dense_data, main_table_index);
     }
 
+    // The byte lookups the device traces counted, as the host traces count theirs into the
+    // record before the Byte and Range traces are generated.
+    if let Some(counts) = lookup_counts {
+        let byte = main_table_index.get("Byte").expect("the Byte trace counts the lookups");
+        let range = main_table_index.get("Range").expect("the Range trace counts the lookups");
+        assert_eq!(byte.num_polys * byte.poly_size, byte.dense_offset.len());
+        assert_eq!(range.num_polys * range.poly_size, range.dense_offset.len());
+        assert_eq!(range.poly_size, 1 << 17);
+        unsafe {
+            sp1_gpu_tracegen::add_lookup_counts_to_traces(
+                dense_data.as_mut_ptr().add(byte.dense_offset.start),
+                byte.poly_size,
+                dense_data.as_mut_ptr().add(range.dense_offset.start),
+                counts.as_ptr(),
+                &backend,
+            );
+        }
+        // Freed in stream order, after the kernel.
+        drop(counts);
+    }
+
     // Shrink the len of the dense data to match the actual size.
     unsafe {
         dense_data.set_len(final_offset);
@@ -863,6 +1187,7 @@ pub async fn setup_tracegen<A: CudaTracegenAir<Felt>>(
     machine: &Machine<Felt, A>,
     program: Arc<<A as MachineAir<Felt>>::Program>,
     buffer_ptr: usize,
+    buffer_len: usize,
     max_trace_size: usize,
     log_stacking_height: u32,
     max_log_row_count: u32,
@@ -870,8 +1195,10 @@ pub async fn setup_tracegen<A: CudaTracegenAir<Felt>>(
     backend: &TaskScope,
 ) -> (JaggedTraceMle<Felt, TaskScope>, ProverPermit) {
     // Generate traces on host.
-    let (host_phase_tracegen, _) =
+    let (host_phase_tracegen, host_size) =
         host_preprocessed_tracegen(machine, buffer_ptr, Arc::clone(&program)).await;
+    let host_phase_tracegen =
+        stage_preprocessed_inputs(host_phase_tracegen, buffer_ptr, buffer_len, host_size).await;
 
     let permit = prover_permit.acquire().await.unwrap();
     // - Copying host traces to the device.
@@ -906,6 +1233,7 @@ pub async fn setup_tracegen_permit<A: CudaTracegenAir<Felt>>(
         machine,
         program,
         buffer.as_ptr() as usize,
+        buffer.capacity(),
         max_trace_size,
         log_stacking_height,
         max_log_row_count,
@@ -916,14 +1244,109 @@ pub async fn setup_tracegen_permit<A: CudaTracegenAir<Felt>>(
     (jagged_traces, permit)
 }
 
+type HostTraceSender = futures::channel::mpsc::UnboundedSender<(String, usize, usize, usize)>;
+
+/// The host main tracegen of one shard, shared by its per-chip rayon tasks.
+///
+/// Every chip is its own `rayon::spawn` and the traces that read dependencies generated by the
+/// other host traces (`late_jobs`) are spawned by whichever chip finishes last, so no rayon thread
+/// blocks waiting for this shard's chips. A blocking wait (a `par_iter` inside a rayon task) lets
+/// the waiting thread steal another shard's chips and finish them first: at the start of a proof
+/// this held a shard's last traces back for up to 0.7 s after its other chips were done while the
+/// GPU waited. Spawned from outside the pool, the chips also queue in arrival order, so the oldest
+/// shard's chips run first. The traces are unchanged.
+struct HostMainTracegenJob<A: MachineAir<Felt>> {
+    /// `None` only once dropped.
+    record: Option<Arc<A::Record>>,
+    buffer_ptr: usize,
+    outer_span: tracing::Span,
+    /// Chips not finished yet in the current phase (main chips, then late chips).
+    pending: AtomicUsize,
+    late_jobs: std::sync::Mutex<Vec<(Arc<A>, usize)>>,
+    /// The shard's host tracegen turn (see [`host_tracegen_gate`]), given back when its last chip
+    /// is done.
+    _turn: Option<tokio::sync::OwnedSemaphorePermit>,
+}
+
+/// Lets only a few core shards generate their host main traces at a time, in arrival order.
+///
+/// The chips of a shard run in the global rayon pool, and a chip's own parallel loops wait for
+/// each other. While the chips of several shards share the pool, a waiting thread runs another
+/// shard's work first, so at the start of a proof the shards finished their traces together, up to
+/// 0.9 s late, while the GPU waited for the first of them. In turns the oldest shard has the pool
+/// and reaches the GPU first; one shard's traces still take a fraction of a GPU shard proof. The
+/// traces are unchanged. `SP1_GPU_HOST_TRACEGEN_TURNS` sets how many shards run at once (default
+/// 1; `0` lets them all run). Only machines with [`CudaTracegenAir::HOST_MAIN_TRACEGEN_IN_TURNS`]
+/// take turns.
+fn host_tracegen_gate() -> Option<Arc<tokio::sync::Semaphore>> {
+    static GATE: std::sync::OnceLock<Option<Arc<tokio::sync::Semaphore>>> =
+        std::sync::OnceLock::new();
+    GATE.get_or_init(|| {
+        let turns = std::env::var("SP1_GPU_HOST_TRACEGEN_TURNS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(1);
+        (turns > 0).then(|| Arc::new(tokio::sync::Semaphore::new(turns)))
+    })
+    .clone()
+}
+
+impl<A: CudaTracegenAir<Felt>> HostMainTracegenJob<A> {
+    fn run(self: Arc<Self>, (air, offset): (Arc<A>, usize), tx: HostTraceSender, main: bool) {
+        tracing::trace_span!(parent: &self.outer_span, "chip host main tracegen", chip = %air.name())
+            .in_scope(|| {
+                let record = self.record.as_deref().unwrap();
+                let base_ptr = self.buffer_ptr as *mut MaybeUninit<Felt>;
+                let height = air.num_rows(record).unwrap();
+                let width = air.width();
+                let trace_len = height * width;
+                let slice: &mut [MaybeUninit<Felt>] =
+                    unsafe { std::slice::from_raw_parts_mut(base_ptr.add(offset), trace_len) };
+                if air.host_trace_generates_dependencies(record) {
+                    air.generate_trace_into_with_dependencies(record, slice);
+                } else {
+                    air.generate_trace_into(record, &mut A::Record::default(), slice);
+                }
+                let start_pointer = unsafe { base_ptr.add(offset) as usize };
+                // If the receiver dropped (task cancelled), exit gracefully instead of panicking.
+                let _ = tx.unbounded_send((air.name().to_string(), start_pointer, height, width));
+            });
+        if self.pending.fetch_sub(1, Ordering::AcqRel) == 1 && main {
+            Self::spawn_late_jobs(&self, tx);
+        }
+    }
+
+    /// Runs the late chips once every main chip is done.
+    fn spawn_late_jobs(this: &Arc<Self>, tx: HostTraceSender) {
+        let late_jobs = std::mem::take(&mut *this.late_jobs.lock().unwrap());
+        this.pending.store(late_jobs.len(), Ordering::Release);
+        for air_job in late_jobs {
+            let job = this.clone();
+            let tx = tx.clone();
+            rayon::spawn(move || job.run(air_job, tx, false));
+        }
+    }
+}
+
+impl<A: MachineAir<Felt>> Drop for HostMainTracegenJob<A> {
+    /// Runs when the shard's last chip is done. If it was the last user of the record, gives it
+    /// back for reuse.
+    fn drop(&mut self) {
+        if let Some(record) = self.record.take().and_then(Arc::into_inner) {
+            record.recycle();
+        }
+    }
+}
+
 /// Returns a tuple of (host phase tracegen, shape info).
 #[instrument(skip_all, level = "debug")]
 async fn host_main_tracegen<A>(
     machine: &Machine<Felt, A>,
     buffer_ptr: usize,
+    buffer_len: usize,
     start_idx: usize,
     record: Arc<<A as MachineAir<Felt>>::Record>,
-) -> (HostPhaseTracegen<A>, HostPhaseShapeInfo<A>)
+) -> (HostPhaseTracegen<A>, HostPhaseShapeInfo<A>, usize)
 where
     A: CudaTracegenAir<Felt>,
 {
@@ -931,64 +1354,137 @@ where
     let chips: Vec<_> = machine.chips().to_vec();
     let shape = machine.shape().clone();
     let outer_span = tracing::Span::current();
+    let turn = match host_tracegen_gate() {
+        Some(gate) if A::HOST_MAIN_TRACEGEN_IN_TURNS => Some(
+            gate.acquire_owned()
+                .instrument(tracing::debug_span!("host tracegen turn"))
+                .await
+                .unwrap(),
+        ),
+        _ => None,
+    };
 
     // Move ALL CPU-intensive work into spawn_blocking to avoid blocking the async runtime.
     // This includes: chip filtering, num_rows() calls, and trace generation.
-    let (device_airs, host_traces, chip_set, shard_chips) =
-        tokio::task::spawn_blocking(move || {
-            // Set of chips we need to generate traces for.
-            let chip_set: BTreeSet<_> = chips
-                .iter()
-                .filter(|chip| chip.included(&record))
-                .cloned()
-                .collect();
+    let (
+        device_airs,
+        host_traces,
+        chip_set,
+        shard_chips,
+        host_traces_len,
+        device_staged,
+        device_staged_ready,
+        staged_end,
+    ) = tokio::task::spawn_blocking(move || {
+        // Set of chips we need to generate traces for.
+        let chip_set: BTreeSet<_> =
+            chips.iter().filter(|chip| chip.included(&record)).cloned().collect();
 
-            // Split chips based on where we will generate their traces.
-            let (device_airs, host_airs): (Vec<_>, Vec<_>) = chip_set
-                .iter()
-                .map(|chip| chip.air.clone())
-                .partition(|c| c.supports_device_main_tracegen());
+        // Split chips based on where we will generate their traces.
+        let (device_airs, host_airs): (Vec<_>, Vec<_>) = chip_set
+            .iter()
+            .map(|chip| chip.air.clone())
+            .partition(|c| c.supports_device_main_tracegen());
 
-            let mut total_size = start_idx;
-            let mut jobs = Vec::new();
-            for air in host_airs.iter() {
-                jobs.push((air.clone(), total_size));
-                total_size += air.num_rows(&record).unwrap() * air.width();
-            }
+        let mut total_size = start_idx;
+        let mut jobs = Vec::new();
+        for air in host_airs.iter() {
+            jobs.push((air.clone(), total_size));
+            total_size += air.num_rows(&record).unwrap() * air.width();
+        }
 
-            // Get the smallest cluster containing our tracegen chip set.
-            let shard_chips = shape.smallest_cluster(&chip_set).unwrap().clone();
+        // Get the smallest cluster containing our tracegen chip set.
+        let shard_chips = shape.smallest_cluster(&chip_set).unwrap().clone();
 
-            // Spawn a rayon task to generate the traces on the CPU.
-            // `host_traces` is a futures Stream that will immediately begin buffering traces.
-            let (host_traces_tx, host_traces) = futures::channel::mpsc::unbounded();
-            rayon::spawn(move || {
-                jobs.into_par_iter().for_each_with(host_traces_tx, |tx, (air, offset)| {
-                    tracing::trace_span!(parent: &outer_span, "chip host main tracegen", chip = %air.name()).in_scope(
-                        || {
-                            let base_ptr = buffer_ptr as *mut MaybeUninit<Felt>;
-                            let height = air.num_rows(&record).unwrap();
-                            let width = air.width();
-                            let trace_len = height * width;
-                            let slice: &mut [MaybeUninit<Felt>] = unsafe {
-                                std::slice::from_raw_parts_mut(base_ptr.add(offset), trace_len)
-                            };
-                            air.generate_trace_into(&record, &mut A::Record::default(), slice);
-                            let start_pointer = unsafe { base_ptr.add(offset) as usize };
-                            // If the receiver dropped (task cancelled), exit gracefully instead of panicking.
-                            let _ = tx.unbounded_send((air.name().to_string(), start_pointer, height, width));
-                        },
-                    );
+        // Traces that read dependencies generated by other host traces come last.
+        let (late_jobs, jobs): (Vec<_>, Vec<_>) =
+            jobs.into_iter().partition(|(air, _)| air.host_trace_after_dependencies(&record));
+
+        // Stage the device chips' inputs past the host traces, while those are generated.
+        let mut stager = InputStager::new(buffer_ptr, buffer_len, total_size);
+        let staging_record = stage_inputs().then(|| record.clone());
+
+        // Pack the inputs of the device chips that upload packed events, first: rayon runs jobs
+        // spawned from outside the pool in order, so the packing is done well before the permit.
+        let mut packed_staged = vec![None; device_airs.len()];
+        let mut device_staged_ready = Vec::new();
+        if let Some(record) = &staging_record {
+            for (air, packed_staged) in device_airs.iter().zip(packed_staged.iter_mut()) {
+                let Some(staged) =
+                    air.packed_main_device_input_len(record).and_then(|len| stager.reserve(len))
+                else {
+                    continue;
+                };
+                *packed_staged = Some(staged);
+                let (ready_tx, ready_rx) = futures::channel::oneshot::channel();
+                device_staged_ready.push(ready_rx);
+                let air = air.clone();
+                let record = record.clone();
+                let span = tracing::trace_span!(parent: &outer_span, "pack device tracegen input", chip = %air.name());
+                rayon::spawn(move || {
+                    span.in_scope(|| {
+                        // SAFETY: the bytes are reserved for this input in the shard's pinned
+                        // buffer, which outlives its upload.
+                        let out = unsafe {
+                            std::slice::from_raw_parts_mut(
+                                staged.as_ptr() as *mut MaybeUninit<u8>,
+                                staged.len(),
+                            )
+                        };
+                        air.pack_main_device_input(&record, out);
+                    });
+                    let _ = ready_tx.send(());
                 });
-                // Make this explicit.
-                // If we are the last users of the record, this will expensively drop it.
-                drop(record);
-            });
+            }
+        }
 
-            (device_airs, host_traces, chip_set, shard_chips)
-        })
-        .await
-        .unwrap();
+        // Generate the traces on the CPU, one rayon task per chip. `host_traces` is a futures
+        // Stream that will immediately begin buffering traces.
+        let (host_traces_tx, host_traces) = futures::channel::mpsc::unbounded();
+        let job = Arc::new(HostMainTracegenJob {
+            record: Some(record),
+            buffer_ptr,
+            outer_span,
+            pending: AtomicUsize::new(jobs.len()),
+            late_jobs: std::sync::Mutex::new(late_jobs),
+            _turn: turn,
+        });
+        if jobs.is_empty() {
+            HostMainTracegenJob::spawn_late_jobs(&job, host_traces_tx);
+        } else {
+            for air_job in jobs {
+                let job = job.clone();
+                let tx = host_traces_tx.clone();
+                rayon::spawn(move || job.run(air_job, tx, true));
+            }
+        }
+
+        let device_staged: Vec<_> = match staging_record {
+            Some(record) => device_airs
+                .iter()
+                .zip(packed_staged)
+                .map(|(air, packed)| {
+                    packed.or_else(|| stager.stage(air.main_device_input(&record)))
+                })
+                .collect(),
+            None => Vec::new(),
+        };
+        stager.log("main");
+        let staged_end = stager.end_felts();
+
+        (
+            device_airs,
+            host_traces,
+            chip_set,
+            shard_chips,
+            total_size - start_idx,
+            device_staged,
+            device_staged_ready,
+            staged_end,
+        )
+    })
+    .await
+    .unwrap();
 
     // For every AIR in the cluster, make a (virtual) padded trace.
     let initial_traces = shard_chips
@@ -1000,23 +1496,73 @@ where
         })
         .collect::<BTreeMap<_, _>>();
 
-    let host_phase_shape_info = HostPhaseShapeInfo { traces_by_name: initial_traces, chip_set };
+    let host_phase_shape_info =
+        HostPhaseShapeInfo { traces_by_name: initial_traces, chip_set, host_traces_len };
 
-    let host_phase_tracegen =
-        HostPhaseTracegen { device_airs, host_traces, device_preps: Vec::new() };
+    let host_phase_tracegen = HostPhaseTracegen {
+        device_airs,
+        host_traces,
+        device_preps: Vec::new(),
+        device_staged,
+        device_staged_ready,
+    };
 
-    (host_phase_tracegen, host_phase_shape_info)
+    (host_phase_tracegen, host_phase_shape_info, staged_end)
 }
 
-/// Puts traces on device. Returns (traces, public values).
+/// The staged inputs of the device chips, and the signals that their packed ones are written.
+type DeviceInputs = (Vec<Option<StagedInput>>, Vec<futures::channel::oneshot::Receiver<()>>);
+
+/// The traces, the public values, and the byte lookups the device traces counted (to add into the
+/// Byte and Range traces).
+type DeviceMainTraces = (BTreeMap<String, Trace>, Vec<Felt>, Option<Buffer<u32, TaskScope>>);
+
+/// Puts traces on device. Returns (traces, public values, device lookup counts).
 #[instrument(skip_all, level = "debug")]
 async fn device_main_tracegen<A: CudaTracegenAir<Felt>>(
-    host_phase_tracegen: HostPhaseTracegen<A>,
+    device_airs: Vec<Arc<A>>,
+    host_traces: impl futures::Stream<Item = HostTraceRef>,
+    (device_staged, device_staged_ready): DeviceInputs,
+    prefetched: Option<PrefetchedTraces>,
     record: Arc<<A as MachineAir<Felt>>::Record>,
     initial_traces: BTreeMap<String, Trace>,
     backend: &TaskScope,
-) -> (BTreeMap<String, Trace>, Vec<Felt>) {
-    let HostPhaseTracegen { device_airs, host_traces, .. } = host_phase_tracegen;
+) -> DeviceMainTraces {
+    // The device chips' byte lookups that the Byte and Range traces must count, if any.
+    let mut lookup_counts =
+        device_airs.iter().any(|air| air.device_trace_counts_lookups(&record)).then(|| {
+            let mut counts = Buffer::<u32, TaskScope>::with_capacity_in(
+                sp1_gpu_tracegen::BYTE_LOOKUP_SLOTS,
+                backend.clone(),
+            );
+            unsafe {
+                backend
+                    .write_bytes(
+                        counts.as_mut_ptr() as *mut u8,
+                        0u8,
+                        sp1_gpu_tracegen::BYTE_LOOKUP_SLOTS * std::mem::size_of::<u32>(),
+                    )
+                    .unwrap();
+                counts.set_len(sp1_gpu_tracegen::BYTE_LOOKUP_SLOTS);
+            }
+            counts
+        });
+    let counts_ptr = lookup_counts
+        .as_mut()
+        .map(|counts| unsafe { sp1_gpu_tracegen::DeviceLookupCounts::new(counts.as_mut_ptr()) });
+    // The packed inputs must be written before they are uploaded.
+    for ready in device_staged_ready {
+        ready.await.expect("packing a device tracegen input failed");
+    }
+
+    let mut all_traces = initial_traces;
+    let mut prefetched = prefetched;
+    let mut input_uploads =
+        prefetched.as_mut().map(|p| std::mem::take(&mut p.inputs)).unwrap_or_default().into_iter();
+    let (uploaded, rest) = prefetched.map(|p| p.into_traces(backend)).unwrap_or_default();
+    all_traces.extend(uploaded);
+    let host_traces = host_traces.chain(futures::stream::iter(rest));
+    let mut device_staged = device_staged.into_iter();
 
     let outer_span = tracing::Span::current();
     // Stream that, when polled, copies the host traces to the device.
@@ -1053,9 +1599,20 @@ async fn device_main_tracegen<A: CudaTracegenAir<Felt>>(
             // We want to borrow the record and move the chip.
             let record = record.as_ref();
             let outer_span = outer_span.clone();
+            let staged = sp1_gpu_tracegen::StagedDeviceInput {
+                pinned: device_staged.next().flatten(),
+                uploaded: input_uploads.next().flatten(),
+            };
+            let counts = counts_ptr.filter(|_| air.device_trace_counts_lookups(record));
             async move {
                 let trace = air
-                    .generate_trace_device(record, &mut A::Record::default(), backend)
+                    .generate_trace_device_counted(
+                        record,
+                        &mut A::Record::default(),
+                        staged,
+                        counts,
+                        backend,
+                    )
                     .instrument(tracing::trace_span!(parent: &outer_span, "device chip tracegen", chip = %air.name()))
                     .await
                     .unwrap();
@@ -1063,8 +1620,6 @@ async fn device_main_tracegen<A: CudaTracegenAir<Felt>>(
             }
         })
         .collect::<FuturesUnordered<_>>();
-
-    let mut all_traces = initial_traces;
 
     // Combine the host and device trace streams and insert them into `all_traces`.
     futures::stream_select!(copied_host_traces, device_traces)
@@ -1079,12 +1634,20 @@ async fn device_main_tracegen<A: CudaTracegenAir<Felt>>(
     // That is, this value will have the correct global cumulative sum.
     let public_values = record.public_values::<Felt>();
 
-    // If we're the last users of the record, expensively drop it in a separate task.
-    // TODO: in general, figure out the best way to drop expensive-to-drop things.
-    tokio::task::spawn_blocking(move || drop(record));
+    // If we're the last users of the record, give it back for reuse in a separate task.
+    tokio::task::spawn_blocking(move || {
+        if let Some(record) = Arc::into_inner(record) {
+            record.recycle();
+        }
+    });
 
-    (all_traces, public_values)
+    (all_traces, public_values, lookup_counts)
 }
+
+/// The public values, the shard's chips, the prover permit, and the trace buffer holding the main
+/// traces.
+type MainTraces<A> =
+    (Vec<Felt>, BTreeSet<Chip<Felt, A>>, ProverPermit, Worker<JaggedTraceMle<Felt, TaskScope>>);
 
 /// Corresponds to `generate_main_traces`.
 /// Pops a trace buffer from the per-PK pool, fills its main slots, and
@@ -1102,23 +1665,59 @@ pub async fn main_tracegen<GC: IopCtx<F = Felt>, A: CudaTracegenAir<Felt>>(
     backend: &TaskScope,
     prover_permit: ProverSemaphore,
     global_dependencies_opt: bool,
-) -> (Vec<Felt>, BTreeSet<Chip<Felt, A>>, ProverPermit, Worker<JaggedTraceMle<Felt, TaskScope>>) {
+    prefetcher: Option<&TracePrefetcher>,
+) -> MainTraces<A> {
     // Start generating traces on host.
-    let (host_phase_tracegen, host_phase_shape_info) =
-        host_main_tracegen(machine, buffer.as_ptr() as usize, 0, record.clone()).await;
+    let (host_phase_tracegen, host_phase_shape_info, _) =
+        host_main_tracegen(machine, buffer.as_ptr() as usize, buffer.capacity(), 0, record.clone())
+            .await;
 
-    let HostPhaseShapeInfo { traces_by_name: initial_traces, chip_set } = host_phase_shape_info;
+    let HostPhaseShapeInfo { traces_by_name: initial_traces, chip_set, host_traces_len } =
+        host_phase_shape_info;
 
     // Acquire a trace buffer from the per-PK pool. With N=1 (default) this
     // serialises shards identically to the old single-buffer Mutex; with N>1
     // (env-gated, future) it lets shard N+1's tracegen begin while shard N's
     // prove still holds its buffer.
     let pool = jagged_traces.lock().await.trace_buffer_pool.clone();
-    let mut trace_buffer = pool
-        .pop()
-        .instrument(tracing::debug_span!("acquire trace buffer"))
-        .await
-        .expect("acquire trace buffer from pool");
+    let HostPhaseTracegen {
+        device_airs, host_traces, device_staged, mut device_staged_ready, ..
+    } = host_phase_tracegen;
+
+    // If another shard holds the trace buffer, it is being proved: upload this shard's host traces
+    // meanwhile (see `TracePrefetcher`). Otherwise copy them as they are generated. The next
+    // shard's upload waits until this shard's traces are in place (`slot`): the device
+    // tracegen's own copies would queue behind it.
+    let mut slot = None;
+    let (trace_buffer, host_traces, prefetched) = match (pool.clone().try_pop(), prefetcher) {
+        (Ok(trace_buffer), _) => (Ok(trace_buffer), host_traces.left_stream(), None),
+        (Err(_), Some(prefetcher)) if prefetcher.accepts(host_traces_len) => {
+            // The packed inputs of the device chips, uploaded with the host traces.
+            let packed_inputs = device_airs
+                .iter()
+                .zip(device_staged.iter().chain(std::iter::repeat(&None)))
+                .map(|(air, staged)| {
+                    staged.filter(|_| air.packed_main_device_input_len(&record).is_some())
+                })
+                .collect();
+            let ready = std::mem::take(&mut device_staged_ready);
+            let (prefetched, prefetch_slot) = prefetcher
+                .prefetch(host_traces, packed_inputs, ready)
+                .instrument(tracing::debug_span!("prefetch host traces"))
+                .await;
+            slot = Some(prefetch_slot);
+            (Err(()), futures::stream::empty().right_stream(), Some(prefetched))
+        }
+        (Err(_), _) => (Err(()), host_traces.left_stream(), None),
+    };
+    let mut trace_buffer = match trace_buffer {
+        Ok(trace_buffer) => trace_buffer,
+        Err(()) => pool
+            .pop()
+            .instrument(tracing::debug_span!("acquire trace buffer"))
+            .await
+            .expect("acquire trace buffer from pool"),
+    };
 
     let permit =
         prover_permit.acquire().instrument(tracing::debug_span!("acquire permit")).await.unwrap();
@@ -1127,19 +1726,29 @@ pub async fn main_tracegen<GC: IopCtx<F = Felt>, A: CudaTracegenAir<Felt>>(
     // Now that the permit is acquired, we can begin the following two tasks:
     // - Copying host traces to the device.
     // - Generating traces on the device.
-    let (traces, public_values) =
-        device_main_tracegen(host_phase_tracegen, record, initial_traces, backend).await;
+    let (traces, public_values, lookup_counts) = device_main_tracegen(
+        device_airs,
+        host_traces,
+        (device_staged, device_staged_ready),
+        prefetched,
+        record,
+        initial_traces,
+        backend,
+    )
+    .await;
 
     log_chip_stats(machine, &chip_set, &traces);
 
     copy_main_jagged_traces(
         traces,
-        &mut *trace_buffer,
+        &mut trace_buffer,
         log_stacking_height,
         max_log_row_count,
         global_dependencies_opt,
+        lookup_counts,
     )
     .await;
+    drop(slot);
 
     (public_values, chip_set, permit, trace_buffer)
 }
@@ -1155,6 +1764,7 @@ pub async fn main_tracegen_permit<GC: IopCtx<F = Felt>, A: CudaTracegenAir<Felt>
     backend: &TaskScope,
     prover_permit: ProverSemaphore,
     global_dependencies_opt: bool,
+    prefetcher: Option<&TracePrefetcher>,
 ) -> (Vec<Felt>, BTreeSet<Chip<Felt, A>>, ProverPermit, Worker<JaggedTraceMle<Felt, TaskScope>>) {
     main_tracegen(
         machine,
@@ -1166,6 +1776,7 @@ pub async fn main_tracegen_permit<GC: IopCtx<F = Felt>, A: CudaTracegenAir<Felt>
         backend,
         prover_permit,
         global_dependencies_opt,
+        prefetcher,
     )
     .await
 }
@@ -1190,8 +1801,25 @@ pub async fn full_tracegen<A: CudaTracegenAir<Felt>>(
     let (prep_host_phase_tracegen, start_idx) =
         host_preprocessed_tracegen(machine, buffer.as_ptr() as usize, program.clone()).await;
 
-    let (main_host_phase_tracegen, HostPhaseShapeInfo { traces_by_name: initial_traces, chip_set }) =
-        host_main_tracegen(machine, buffer.as_ptr() as usize, start_idx, record.clone()).await;
+    let (
+        main_host_phase_tracegen,
+        HostPhaseShapeInfo { traces_by_name: initial_traces, chip_set, .. },
+        staged_end,
+    ) = host_main_tracegen(
+        machine,
+        buffer.as_ptr() as usize,
+        buffer.capacity(),
+        start_idx,
+        record.clone(),
+    )
+    .await;
+    let prep_host_phase_tracegen = stage_preprocessed_inputs(
+        prep_host_phase_tracegen,
+        buffer.as_ptr() as usize,
+        buffer.capacity(),
+        staged_end,
+    )
+    .await;
 
     // Wait for a prover to be available.
     let permit =
@@ -1201,9 +1829,17 @@ pub async fn full_tracegen<A: CudaTracegenAir<Felt>>(
     // - Copying host traces to the device.
     // - Generating traces on the device.
 
-    let (preprocessed_traces, (main_traces, public_values)) = join!(
+    let (preprocessed_traces, (main_traces, public_values, lookup_counts)) = join!(
         device_preprocessed_tracegen(program, prep_host_phase_tracegen, backend),
-        device_main_tracegen(main_host_phase_tracegen, record, initial_traces, backend)
+        device_main_tracegen(
+            main_host_phase_tracegen.device_airs,
+            main_host_phase_tracegen.host_traces,
+            (main_host_phase_tracegen.device_staged, main_host_phase_tracegen.device_staged_ready),
+            None,
+            record,
+            initial_traces,
+            backend
+        )
     );
 
     log_chip_stats(machine, &chip_set, &main_traces);
@@ -1223,16 +1859,105 @@ pub async fn full_tracegen<A: CudaTracegenAir<Felt>>(
         log_stacking_height,
         max_log_row_count,
         global_dependencies_opt,
+        lookup_counts,
     )
     .await;
 
     (public_values, jagged_mle, chip_set, permit)
 }
 
+/// Copies the first `len` elements of `src` into a new device buffer of `capacity` elements.
+fn copy_prefix_into<T: Copy>(
+    src: &Buffer<T, TaskScope>,
+    len: usize,
+    capacity: usize,
+    backend: &TaskScope,
+) -> Buffer<T, TaskScope> {
+    let mut dst: Buffer<T, TaskScope> = Buffer::with_capacity_in(capacity, backend.clone());
+    unsafe {
+        dst.assume_init();
+        dst[..len].copy_from_slice(&src[..len], backend).unwrap();
+    }
+    dst
+}
+
+/// Copies the preprocessed part of `traces` (what [`setup_tracegen`] and [`full_tracegen`] put
+/// there before the main traces) into device buffers of its own size, to be reused by
+/// [`full_tracegen_permit`] for later shards of the same program.
+///
+/// The main traces never write below `preprocessed_offset` (nor below `preprocessed_cols` in the
+/// column tables), so this can be taken after the shard is proved.
+pub fn copy_preprocessed_traces(
+    traces: &JaggedTraceMle<Felt, TaskScope>,
+    backend: &TaskScope,
+) -> JaggedTraceMle<Felt, TaskScope> {
+    let dense = traces.dense();
+    let (offset, cols) = (dense.preprocessed_offset, dense.preprocessed_cols);
+    copy_preprocessed_into(traces, offset, cols + 1, backend)
+}
+
+/// The preprocessed part of `traces` (the layout `allocate_and_initialize_traces` gives it)
+/// copied into new device buffers, with no main part: dense values and column indices with room
+/// for `dense_capacity` values, start indices for `start_indices_capacity` columns. The cache's
+/// copy ([`copy_preprocessed_traces`]) has room for just the preprocessed part; a shard's traces
+/// for the shard's main traces too.
+fn copy_preprocessed_into(
+    traces: &JaggedTraceMle<Felt, TaskScope>,
+    dense_capacity: usize,
+    start_indices_capacity: usize,
+    backend: &TaskScope,
+) -> JaggedTraceMle<Felt, TaskScope> {
+    let dense = traces.dense();
+    let (offset, cols) = (dense.preprocessed_offset, dense.preprocessed_cols);
+    let dense_data = TraceDenseData {
+        dense: copy_prefix_into(&dense.dense, offset, dense_capacity, backend),
+        preprocessed_offset: offset,
+        preprocessed_cols: cols,
+        preprocessed_table_index: dense.preprocessed_table_index.clone(),
+        main_table_index: BTreeMap::new(),
+        preprocessed_padding: dense.preprocessed_padding,
+        main_padding: 0,
+        prep_padding_col_count: dense.prep_padding_col_count,
+        main_padding_col_count: 0,
+    };
+    JaggedTraceMle(JaggedMle {
+        dense_data,
+        col_index: copy_prefix_into(&traces.col_index, offset >> 1, dense_capacity >> 1, backend),
+        start_indices: copy_prefix_into(
+            &traces.start_indices,
+            cols + 1,
+            start_indices_capacity,
+            backend,
+        ),
+        column_heights: copy_prefix_into(&traces.column_heights, cols, cols, backend),
+        host_column_heights: None,
+    })
+}
+
+/// The device bytes [`copy_preprocessed_traces`] would copy out of `traces` (a shard's whole
+/// traces), for deciding whether to copy them at all. Kept beside the copy, which allocates these
+/// lengths.
+pub fn preprocessed_copy_bytes(traces: &JaggedTraceMle<Felt, TaskScope>) -> usize {
+    let dense = traces.dense();
+    let (offset, cols) = (dense.preprocessed_offset, dense.preprocessed_cols);
+    offset * std::mem::size_of::<Felt>()
+        + ((offset >> 1) + (cols + 1) + cols) * std::mem::size_of::<u32>()
+}
+
+/// The device bytes held by a copy made by [`copy_preprocessed_traces`].
+pub fn preprocessed_traces_bytes(traces: &JaggedTraceMle<Felt, TaskScope>) -> usize {
+    traces.dense().dense.capacity() * std::mem::size_of::<Felt>()
+        + (traces.col_index.capacity()
+            + traces.start_indices.capacity()
+            + traces.column_heights.capacity())
+            * std::mem::size_of::<u32>()
+}
+
 #[allow(clippy::type_complexity, clippy::too_many_arguments)]
 pub async fn full_tracegen_permit<A: CudaTracegenAir<Felt>>(
     machine: &Machine<Felt, A>,
     program: Arc<<A as MachineAir<Felt>>::Program>,
+    preprocessed: Option<&JaggedTraceMle<Felt, TaskScope>>,
     record: Arc<<A as MachineAir<Felt>>::Record>,
     buffer: &Worker<PinnedBuffer<Felt>>,
     max_trace_size: usize,
@@ -1242,19 +1967,61 @@ pub async fn full_tracegen_permit<A: CudaTracegenAir<Felt>>(
     prover_permits: ProverSemaphore,
     global_dependencies_opt: bool,
 ) -> (Vec<Felt>, JaggedTraceMle<Felt, TaskScope>, BTreeSet<Chip<Felt, A>>, ProverPermit) {
-    let (public_values, jagged_mle, chip_set, permit) = full_tracegen(
-        machine,
-        program,
+    let Some(preprocessed) = preprocessed else {
+        return full_tracegen(
+            machine,
+            program,
+            record,
+            buffer,
+            max_trace_size,
+            log_stacking_height,
+            max_log_row_count,
+            backend,
+            prover_permits,
+            global_dependencies_opt,
+        )
+        .await;
+    };
+    // The program's preprocessed traces were copied by [`copy_preprocessed_traces`]: copy them
+    // on the device into the shard's traces instead of generating (and uploading) them again.
+    // The traces are the same.
+    drop(program);
+    let (
+        main_host_phase_tracegen,
+        HostPhaseShapeInfo { traces_by_name: initial_traces, chip_set, .. },
+        _,
+    ) = host_main_tracegen(machine, buffer.as_ptr() as usize, buffer.capacity(), 0, record.clone())
+        .await;
+
+    let permit =
+        prover_permits.acquire().instrument(tracing::debug_span!("acquire")).await.unwrap();
+
+    let (main_traces, public_values, lookup_counts) = device_main_tracegen(
+        main_host_phase_tracegen.device_airs,
+        main_host_phase_tracegen.host_traces,
+        (main_host_phase_tracegen.device_staged, main_host_phase_tracegen.device_staged_ready),
+        None,
         record,
-        buffer,
-        max_trace_size,
-        log_stacking_height,
-        max_log_row_count,
+        initial_traces,
         backend,
-        prover_permits,
-        global_dependencies_opt,
     )
     .await;
+
+    log_chip_stats(machine, &chip_set, &main_traces);
+
+    let mut jagged_mle =
+        copy_preprocessed_into(preprocessed, max_trace_size, MAX_COLS_PER_TRACE, backend);
+
+    copy_main_jagged_traces(
+        main_traces,
+        &mut jagged_mle,
+        log_stacking_height,
+        max_log_row_count,
+        global_dependencies_opt,
+        lookup_counts,
+    )
+    .await;
+
     (public_values, jagged_mle, chip_set, permit)
 }
 

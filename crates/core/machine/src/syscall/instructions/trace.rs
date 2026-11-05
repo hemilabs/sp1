@@ -2,9 +2,9 @@ use std::{borrow::BorrowMut, mem::MaybeUninit};
 
 use hashbrown::HashMap;
 use itertools::Itertools;
-use slop_maybe_rayon::prelude::{IndexedParallelIterator, ParallelIterator, ParallelSliceMut};
 use slop_air::BaseAir;
 use slop_algebra::PrimeField32;
+use slop_maybe_rayon::prelude::{IndexedParallelIterator, ParallelIterator, ParallelSliceMut};
 use sp1_core_executor::{
     events::{ByteLookupEvent, ByteRecord, MemoryRecordEnum, SyscallEvent},
     ExecutionRecord, Program, RTypeRecord, SyscallCode, HALT_PC,

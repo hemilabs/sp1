@@ -1,22 +1,20 @@
 use std::{borrow::BorrowMut, mem::MaybeUninit};
 
 use slop_algebra::PrimeField32;
-use slop_keccak_air::{generate_trace_rows, NUM_KECCAK_COLS, NUM_ROUNDS};
-use slop_matrix::Matrix;
-use slop_maybe_rayon::prelude::{ParallelBridge, ParallelIterator, ParallelSlice};
+use slop_keccak_air::{KeccakCols, NUM_ROUNDS, RC, U64_LIMBS};
+use slop_maybe_rayon::prelude::{IndexedParallelIterator, ParallelIterator, ParallelSliceMut};
 use sp1_core_executor::{
-    events::{ByteLookupEvent, KeccakPermuteEvent, PrecompileEvent, SyscallEvent},
+    events::{KeccakPermuteEvent, PrecompileEvent},
     ExecutionRecord, Program, SyscallCode,
 };
 use sp1_hypercube::air::MachineAir;
 
-use crate::utils::{next_multiple_of_32, zeroed_f_vec};
+use crate::utils::next_multiple_of_32;
 
 use super::{
     columns::{KeccakMemCols, NUM_KECCAK_MEM_COLS},
     KeccakPermuteChip, STATE_SIZE,
 };
-use sp1_core_executor::events::ByteRecord;
 
 impl<F: PrimeField32> MachineAir<F> for KeccakPermuteChip {
     type Record = ExecutionRecord;
@@ -26,31 +24,9 @@ impl<F: PrimeField32> MachineAir<F> for KeccakPermuteChip {
         "KeccakPermute"
     }
 
-    fn generate_dependencies(&self, input: &Self::Record, output: &mut Self::Record) {
-        let chunk_size = 8;
-
-        let blu_events: Vec<Vec<ByteLookupEvent>> = input
-            .get_precompile_events(SyscallCode::KECCAK_PERMUTE)
-            .par_chunks(chunk_size)
-            .map(|ops: &[(SyscallEvent, PrecompileEvent)]| {
-                // The blu map stores shard -> map(byte lookup event -> multiplicity).
-                let mut blu = Vec::new();
-                let mut chunk = zeroed_f_vec::<F>(NUM_KECCAK_MEM_COLS * NUM_ROUNDS);
-                ops.iter().for_each(|(syscall_event, op)| {
-                    if let PrecompileEvent::KeccakPermute(event) = op {
-                        if syscall_event.trap_error.is_none() {
-                            Self::populate_chunk(event, &mut chunk, &mut blu);
-                        }
-                    } else {
-                        unreachable!();
-                    }
-                });
-                blu
-            })
-            .collect();
-        for blu in blu_events {
-            output.add_byte_lookup_events(blu);
-        }
+    fn generate_dependencies(&self, _input: &Self::Record, _output: &mut Self::Record) {
+        // This chip has no byte lookups and adds no events (`populate_chunk` ignores its byte
+        // record), so there is nothing to generate.
     }
 
     fn num_rows(&self, input: &Self::Record) -> Option<usize> {
@@ -85,32 +61,19 @@ impl<F: PrimeField32> MachineAir<F> for KeccakPermuteChip {
             core::slice::from_raw_parts_mut(buffer_ptr, padded_nb_rows * NUM_KECCAK_MEM_COLS)
         };
 
-        let dummy_keccak_rows = generate_trace_rows::<F>(vec![[0; STATE_SIZE]]);
-        let mut dummy_chunk = Vec::new();
-        for i in 0..NUM_ROUNDS {
-            let dummy_row = dummy_keccak_rows.row(i);
-            let mut row = [F::zero(); NUM_KECCAK_MEM_COLS];
-            row[..NUM_KECCAK_COLS].copy_from_slice(dummy_row.collect::<Vec<_>>().as_slice());
-            dummy_chunk.extend_from_slice(&row);
-        }
+        // The rows of a permutation of the zero state, for padding and trapped events.
+        let mut dummy_chunk = vec![F::zero(); NUM_ROUNDS * NUM_KECCAK_MEM_COLS];
+        Self::populate_keccak_rows(&[0; STATE_SIZE], &mut dummy_chunk);
 
-        values
-            .chunks_mut(chunk_size * NUM_KECCAK_MEM_COLS * NUM_ROUNDS)
-            .enumerate()
-            .par_bridge()
-            .for_each(|(i, rows)| {
+        values.par_chunks_mut(chunk_size * NUM_KECCAK_MEM_COLS * NUM_ROUNDS).enumerate().for_each(
+            |(i, rows)| {
                 rows.chunks_mut(NUM_ROUNDS * NUM_KECCAK_MEM_COLS).enumerate().for_each(
                     |(j, rounds)| {
                         let idx = i * chunk_size + j;
                         if idx < num_events {
-                            let mut new_byte_lookup_events = Vec::new();
                             if let PrecompileEvent::KeccakPermute(event) = &events[idx].1 {
                                 if events[idx].0.trap_error.is_none() {
-                                    Self::populate_chunk(
-                                        event,
-                                        rounds,
-                                        &mut new_byte_lookup_events,
-                                    );
+                                    Self::populate_chunk(event, rounds);
                                 } else {
                                     rounds.copy_from_slice(&dummy_chunk[..rounds.len()]);
                                 }
@@ -122,7 +85,8 @@ impl<F: PrimeField32> MachineAir<F> for KeccakPermuteChip {
                         }
                     },
                 );
-            });
+            },
+        );
     }
 
     fn included(&self, shard: &Self::Record) -> bool {
@@ -134,20 +98,21 @@ impl<F: PrimeField32> MachineAir<F> for KeccakPermuteChip {
     }
 }
 
-impl KeccakPermuteChip {
-    pub fn populate_chunk<F: PrimeField32>(
-        event: &KeccakPermuteEvent,
-        chunk: &mut [F],
-        _: &mut Vec<ByteLookupEvent>,
-    ) {
-        let p3_keccak_trace = generate_trace_rows::<F>(vec![event.pre_state]);
+/// The rotation offsets of the Keccak rho step, indexed `[x][y]` (as in `slop_keccak_air`).
+const R: [[u32; 5]; 5] = [
+    [0, 36, 3, 41, 18],
+    [1, 44, 10, 45, 2],
+    [62, 6, 43, 15, 61],
+    [28, 55, 25, 21, 56],
+    [27, 20, 39, 8, 14],
+];
 
-        // Create all the rows for the permutation.
+impl KeccakPermuteChip {
+    pub fn populate_chunk<F: PrimeField32>(event: &KeccakPermuteEvent, chunk: &mut [F]) {
+        Self::populate_keccak_rows(&event.pre_state, chunk);
+
         for i in 0..NUM_ROUNDS {
-            let p3_keccak_row = p3_keccak_trace.row(i);
             let row = &mut chunk[i * NUM_KECCAK_MEM_COLS..(i + 1) * NUM_KECCAK_MEM_COLS];
-            // Copy p3_keccak_row into start of cols
-            row[..NUM_KECCAK_COLS].copy_from_slice(p3_keccak_row.collect::<Vec<_>>().as_slice());
             let cols: &mut KeccakMemCols<F> = row.borrow_mut();
             cols.clk_high = F::from_canonical_u32((event.clk >> 24) as u32);
             cols.clk_low = F::from_canonical_u32((event.clk & 0xFFFFFF) as u32);
@@ -158,6 +123,85 @@ impl KeccakPermuteChip {
             ];
             cols.index = F::from_canonical_u32(i as u32);
             cols.is_real = F::one();
+        }
+    }
+
+    /// Writes the `KeccakCols` of the `NUM_ROUNDS` rows of the permutation of `input` (each row
+    /// `NUM_KECCAK_MEM_COLS` wide) with the values of `slop_keccak_air::generate_trace_rows`.
+    /// The rounds are computed on 64-bit lanes and only the columns are written per bit.
+    fn populate_keccak_rows<F: PrimeField32>(input: &[u64; STATE_SIZE], chunk: &mut [F]) {
+        let bit = |v: u64, z: usize| F::from_bool((v >> z) & 1 != 0);
+        let limb = |v: u64, l: usize| F::from_canonical_u16((v >> (16 * l)) as u16);
+        // The round input, `a[y][x]`.
+        let mut a: [[u64; 5]; 5] =
+            core::array::from_fn(|y| core::array::from_fn(|x| input[y * 5 + x]));
+        for round in 0..NUM_ROUNDS {
+            let row = &mut chunk[round * NUM_KECCAK_MEM_COLS..(round + 1) * NUM_KECCAK_MEM_COLS];
+            let cols: &mut KeccakMemCols<F> = row.borrow_mut();
+            let k: &mut KeccakCols<F> = &mut cols.keccak;
+
+            for (r, flag) in k.step_flags.iter_mut().enumerate() {
+                *flag = F::from_bool(r == round);
+            }
+            k.export = F::zero();
+            for y in 0..5 {
+                for x in 0..5 {
+                    for l in 0..U64_LIMBS {
+                        k.preimage[y][x][l] = limb(input[y * 5 + x], l);
+                        k.a[y][x][l] = limb(a[y][x], l);
+                    }
+                }
+            }
+
+            // C[x] = xor of the column; C'[x] = C[x] ^ C[x - 1] ^ rot(C[x + 1], 1).
+            let c: [u64; 5] =
+                core::array::from_fn(|x| a[0][x] ^ a[1][x] ^ a[2][x] ^ a[3][x] ^ a[4][x]);
+            let c_prime: [u64; 5] =
+                core::array::from_fn(|x| c[x] ^ c[(x + 4) % 5] ^ c[(x + 1) % 5].rotate_left(1));
+            // A'[x, y] = A[x, y] ^ C[x] ^ C'[x].
+            let a_prime: [[u64; 5]; 5] =
+                core::array::from_fn(|y| core::array::from_fn(|x| a[y][x] ^ c[x] ^ c_prime[x]));
+            for x in 0..5 {
+                for z in 0..64 {
+                    k.c[x][z] = bit(c[x], z);
+                    k.c_prime[x][z] = bit(c_prime[x], z);
+                }
+            }
+            for y in 0..5 {
+                for x in 0..5 {
+                    for z in 0..64 {
+                        k.a_prime[y][x][z] = bit(a_prime[y][x], z);
+                    }
+                }
+            }
+
+            // B[x, y] = rot(A'[(x + 3y) % 5, x], R[(x + 3y) % 5][x]); A'' = B ^ (!B[x + 1] & B[x + 2]).
+            let b: [[u64; 5]; 5] = core::array::from_fn(|x| {
+                core::array::from_fn(|y| {
+                    let ax = (x + 3 * y) % 5;
+                    a_prime[x][ax].rotate_left(R[ax][x])
+                })
+            });
+            let a_prime_prime: [[u64; 5]; 5] = core::array::from_fn(|y| {
+                core::array::from_fn(|x| b[x][y] ^ (!b[(x + 1) % 5][y] & b[(x + 2) % 5][y]))
+            });
+            for y in 0..5 {
+                for x in 0..5 {
+                    for l in 0..U64_LIMBS {
+                        k.a_prime_prime[y][x][l] = limb(a_prime_prime[y][x], l);
+                    }
+                }
+            }
+            for z in 0..64 {
+                k.a_prime_prime_0_0_bits[z] = bit(a_prime_prime[0][0], z);
+            }
+            let a_prime_prime_prime_0_0 = a_prime_prime[0][0] ^ RC[round];
+            for l in 0..U64_LIMBS {
+                k.a_prime_prime_prime_0_0_limbs[l] = limb(a_prime_prime_prime_0_0, l);
+            }
+
+            a = a_prime_prime;
+            a[0][0] = a_prime_prime_prime_0_0;
         }
     }
 }

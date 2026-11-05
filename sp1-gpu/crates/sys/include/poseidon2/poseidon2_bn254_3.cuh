@@ -807,7 +807,12 @@ class Bn254 {
         F_t s = state[0] + state[1] + state[2];
         state[0] += s;
         state[1] += s;
+#ifdef SP1_PORTABLE
         state[2] = state[2].dbl() + s;
+#else
+        // sppark's mont_t (CUDA's BN254 field) has no dbl().
+        state[2] = state[2] + state[2] + s;
+#endif
     }
 
     __device__ static void externalLinearLayer(F_t state[WIDTH]) {

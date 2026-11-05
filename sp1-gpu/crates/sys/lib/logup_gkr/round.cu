@@ -3,6 +3,10 @@
 #include "tracegen/jagged_tracegen/jagged.cuh"
 #include "logup_gkr/round.cuh"
 #include "config.cuh"
+#include "challenger/challenger.cuh"
+#ifndef SP1_SYCL
+#include "challenger/warp_duplex.cuh"
+#endif
 
 #include <cstdio>
 
@@ -229,8 +233,10 @@ SP1_KERNEL void fixLastVariableInteractionsLayer(
     const ext_t* __restrict__ input,
     ext_t* __restrict__ output,
     ext_t alpha,
+    const ext_t* __restrict__ alphaDev,
     size_t height,
     size_t outputHeight) {
+    if (alphaDev) alpha = *alphaDev;
     for (size_t i = blockDim.x * blockIdx.x + threadIdx.x; i < outputHeight;
          i += blockDim.x * gridDim.x) {
         fixLastVariableInteractionsLayerInner(input, output, alpha, height, outputHeight, i);
@@ -238,15 +244,143 @@ SP1_KERNEL void fixLastVariableInteractionsLayer(
 }
 
 
+// A LogUp-GKR sumcheck round's finalize on the device (sumcheck.rs, materialized_rounds_on_device):
+// what the host does after each round (finalize_univariate, process_univariate_polynomial, and
+// the next round's claim and padding adjustment), done by the last block of the round's
+// fix-and-sum kernel to finish, so that a layer's rounds run without a round trip to the host
+// each. Null `counter`: the host finalizes the round.
+//
+// `consts`: the round's constants, from the host: the point coordinate the round removes (c), the
+// point's last coordinate after it (z), whether the round turns the last circuit layer into an
+// interactions layer (nonzero), the root b of the eq factor, where the round polynomial vanishes,
+// and 1/(0 - b), 1/(1 - b), 1/(1/2 - b). `state`: the round claim, padding adjustment and eq
+// adjustment, carried between rounds. The round's 4 coefficients go to `coefficients`, and the
+// challenge the challenger samples after observing them to the word after the kernel's alpha.
+// `counter`: the blocks done, 0 between rounds.
+struct GkrRoundFinalize {
+    const ext_t* consts;
+    ext_t* state;
+    ext_t* coefficients;
+    DuplexChallenger challenger;
+    uint32_t* counter;
+};
+
+#ifndef SP1_SYCL
+// The finalize, by one warp, from the kernel's per-block partial sums (3 x numPartials: the
+// evaluation at 0, at 1/2, the eq mass). `alpha[0]` is the challenge the round folded with;
+// this round's goes to `alpha[1]`. The challenger samples it with the warp-cooperative Poseidon2,
+// bit for bit as the host challenger does.
+__device__ __noinline__ void gkrRoundFinalizeWarp(
+    const ext_t* partials,
+    uint32_t numPartials,
+    ext_t* alpha,
+    const GkrRoundFinalize& f,
+    kb31_t* sh,
+    size_t* shs) {
+    ext_t evalZero = ext_t::zero(), evalHalf = ext_t::zero(), eqSum = ext_t::zero();
+    for (uint32_t i = threadIdx.x; i < numPartials; i += 32) {
+        evalZero += partials[i];
+        evalHalf += partials[numPartials + i];
+        eqSum += partials[2 * numPartials + i];
+    }
+    evalZero = warpSumExt(evalZero);
+    evalHalf = warpSumExt(evalHalf);
+    eqSum = warpSumExt(eqSum);
+
+    // Every lane computes the same values; lane 0 stores them.
+    const ext_t* consts = f.consts;
+    ext_t* state = f.state;
+    const ext_t one = ext_t::one();
+    const ext_t c = consts[0], z = consts[1], b = consts[3];
+    const ext_t previous = alpha[0];
+    ext_t padding = state[1] * (c * previous + (one - c) * (one - previous));
+    ext_t eqAdjustment = state[2];
+    if (consts[2] != ext_t::zero()) {
+        eqAdjustment = padding;
+        padding = one;
+    }
+    const ext_t correction = padding - eqSum;
+    evalZero += correction * (one - z);
+    evalHalf += correction * kb31_t::from_canonical_u32(4);
+    evalHalf *= kb31_t::from_canonical_u32(1864368129);  // 1/8
+    evalZero *= eqAdjustment;
+    evalHalf *= eqAdjustment;
+    const ext_t evalOne = state[0] - evalZero;
+    // The round polynomial p, through (0, evalZero), (1, evalOne), (1/2, evalHalf), (b, 0): p =
+    // (X - b) q, with q the quadratic through (x, p(x) / (x - b)) at those three nodes,
+    // q = A + B X + C X^2.
+    const ext_t q0 = evalZero * consts[4], q1 = evalOne * consts[5], qHalf = evalHalf * consts[6];
+    const ext_t qHalf2 = qHalf + qHalf, qHalf4 = qHalf2 + qHalf2;
+    const ext_t A = q0;
+    const ext_t B = qHalf4 - q0 - q0 - q0 - q1;
+    const ext_t C = q1 + q1 + q0 + q0 - qHalf4;
+    ext_t coefficient[4];
+    coefficient[0] = -(b * A);
+    coefficient[1] = A - b * B;
+    coefficient[2] = B - b * C;
+    coefficient[3] = C;
+
+    WarpDuplex w = WarpDuplex::stage(f.challenger, sh, shs);
+#pragma unroll
+    for (int k = 0; k < 4; k++) w.observe_ext(coefficient[k]);
+    const ext_t next = w.sample_ext();
+    w.unstage(f.challenger);
+
+    if (threadIdx.x == 0) {
+        ext_t claim = coefficient[3];
+        claim = claim * next + coefficient[2];
+        claim = claim * next + coefficient[1];
+        claim = claim * next + coefficient[0];
+#pragma unroll
+        for (int k = 0; k < 4; k++) f.coefficients[k] = coefficient[k];
+        alpha[1] = next;
+        state[0] = claim;
+        state[1] = padding;
+        state[2] = eqAdjustment;
+    }
+}
+#endif
+
+// Called by every thread of a fix-and-sum kernel after its block stored its partial sums: the
+// last block to get here finalizes the round (see GkrRoundFinalize), if the host asked for it.
+__device__ __forceinline__ void gkrRoundFinalizeIfLast(
+    const ext_t* partials,
+    ext_t* alpha,
+    const GkrRoundFinalize& f) {
+#ifndef SP1_SYCL
+    if (f.counter == nullptr) return;
+    SP1_SHARED_ARRAY(bool, last, [1]);
+    SP1_SHARED_ARRAY(kb31_t, sh, [48]);
+    SP1_SHARED_ARRAY(size_t, shs, [2]);
+    // The block's partial sums before its count; the other blocks' after it (threadfence
+    // reduction).
+    __threadfence();
+    __syncthreads();
+    if (threadIdx.x == 0) last[0] = atomicAdd(f.counter, 1u) == gridDim.x - 1;
+    __syncthreads();
+    if (!last[0]) return;
+    __threadfence();
+    if (threadIdx.x < 32) gkrRoundFinalizeWarp(partials, gridDim.x, alpha, f, sh, shs);
+    if (threadIdx.x == 0) *f.counter = 0;
+#endif
+}
+
+// The fix-and-sum kernels below take alpha by value, or, where `alphaDev` is not null, from the
+// device: the previous round's challenge, sampled there by its finalize (GkrRoundFinalize, which
+// they run when `finalize.counter` is not null, and which writes the next one after it).
+
 // Invoke this one during normal circuit layers
 SP1_KERNEL void fixAndSumCircuitLayer(
     ext_t* __restrict__ univariate_result,
     const JaggedMle<JaggedGkrLayer> inputJaggedMle,
     JaggedMle<JaggedGkrLayer> outputJaggedMle,
     ext_t alpha,
+    ext_t* alphaDev,
     const ext_t* __restrict__ eqRow,
     const ext_t* __restrict__ eqInteraction,
-    const ext_t lambda) {
+    const ext_t lambda,
+    const GkrRoundFinalize finalize) {
+    if (alphaDev) alpha = *alphaDev;
 
     ext_t evalZero = ext_t::zero();
     ext_t evalHalf = ext_t::zero();
@@ -302,6 +436,7 @@ SP1_KERNEL void fixAndSumCircuitLayer(
         ext_t::store(univariate_result, gridDim.x + blockIdx.x, evalHalfblockSum);
         ext_t::store(univariate_result, 2 * gridDim.x + blockIdx.x, eqSumBlockSum);
     }
+    gkrRoundFinalizeIfLast(univariate_result, alphaDev, finalize);
 }
 
 // Invoke this one for the last circuit layer, when you transition to interactions.
@@ -309,9 +444,12 @@ SP1_KERNEL void fixAndSumLastCircuitLayer(
     ext_t* __restrict__ univariate_result,
     const JaggedGkrLayer inputJaggedMle,
     ext_t alpha,
+    ext_t* alphaDev,
     ext_t* __restrict__ output,
     const ext_t* __restrict__ eqInteraction,
-    const ext_t lambda) {
+    const ext_t lambda,
+    const GkrRoundFinalize finalize) {
+    if (alphaDev) alpha = *alphaDev;
 
     ext_t evalZero = ext_t::zero();
     ext_t evalHalf = ext_t::zero();
@@ -392,6 +530,7 @@ SP1_KERNEL void fixAndSumLastCircuitLayer(
         ext_t::store(univariate_result, gridDim.x + blockIdx.x, evalHalfblockSum);
         ext_t::store(univariate_result, 2 * gridDim.x + blockIdx.x, eqSumBlockSum);
     }
+    gkrRoundFinalizeIfLast(univariate_result, alphaDev, finalize);
 }
 
 // Invoke this one for interactions layers
@@ -400,10 +539,13 @@ SP1_KERNEL void fixAndSumInteractionsLayer(
     const ext_t* __restrict__ input,
     ext_t* __restrict__ output,
     ext_t alpha,
+    ext_t* alphaDev,
     size_t height,
     size_t outputHeight,
     const ext_t* __restrict__ eqInteraction,
-    const ext_t lambda) {
+    const ext_t lambda,
+    const GkrRoundFinalize finalize) {
+    if (alphaDev) alpha = *alphaDev;
 
     ext_t evalZero = ext_t::zero();
     ext_t evalHalf = ext_t::zero();
@@ -452,6 +594,7 @@ SP1_KERNEL void fixAndSumInteractionsLayer(
         ext_t::store(univariate_result, gridDim.x + blockIdx.x, evalHalfblockSum);
         ext_t::store(univariate_result, 2 * gridDim.x + blockIdx.x, eqSumBlockSum);
     }
+    gkrRoundFinalizeIfLast(univariate_result, alphaDev, finalize);
 }
 
 extern "C" void* logup_gkr_sum_as_poly_circuit_layer() {
@@ -486,4 +629,14 @@ extern "C" void* logup_gkr_fix_and_sum_last_circuit_layer() {
 
 extern "C" void* logup_gkr_fix_and_sum_interactions_layer() {
     return SP1_KERNEL_PTR(fixAndSumInteractionsLayer);
+}
+
+// 1 where the fix-and-sum kernels can finalize their round on the device (GkrRoundFinalize), with
+// the KoalaBear duplex challenger; 0 on SYCL, where the rounds stay on the host.
+extern "C" uint32_t logup_gkr_device_rounds() {
+#ifndef SP1_SYCL
+    return 1;
+#else
+    return 0;
+#endif
 }

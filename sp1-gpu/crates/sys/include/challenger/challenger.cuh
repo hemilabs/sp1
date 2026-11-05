@@ -155,9 +155,16 @@ class DuplexChallenger {
     }
 
     // Whether another thread has found a witness. On SYCL and HIP an atomic load: Intel's per-core
-    // L1 and AMD's per-CU caches are not coherent, so a plain (even volatile) load can keep returning
-    // the stale `false` and leave other work-groups grinding long after the hit. The flag is a
-    // 4-byte allocation (see grinding_challenger.rs), set with a 4-byte atomicExch.
+    // L1 is not coherent, so a plain load can keep returning the stale `false`. (On gfx942 a
+    // volatile load already bypasses the caches, `sc0 sc1`.) The flag is a 4-byte allocation (see
+    // grinding_challenger.rs), set with a 4-byte atomicExch.
+    //
+    // The grind loops publish a hit INSIDE the loop and let this check end it, with no `return` on
+    // the hit: with a `return`, the AMDGPU structurizer turned the hit into a loop exit and moved
+    // the `result` store and the flag atomic past the loop, after the wave reconverged, so the flag
+    // was set only once all 64 lanes of the finder's wave had swept their whole range. The finder
+    // re-reads the flag it just set (a volatile or atomic load, which the compiler cannot fold), so
+    // it leaves at the next check, and the rest of its wave and the other waves with it.
     static __device__ __forceinline__ bool grind_found(volatile bool* found_flag) {
 #ifdef SP1_SYCL
         return ::sp1sycl::device_atomic<int>(*(int*)found_flag).load() != 0;
@@ -200,10 +207,10 @@ class DuplexChallenger {
             for (int j = 0; j < WIDTH; j++) state[j] = (uint32_t)j == pending ? witness : initial[j];
             hasher.permute(state, state);
             if ((state[RATE - 1].as_canonical_u32() & mask) == 0) {
+                // No `return`: the loop condition sees the flag (see `grind_found`).
                 result[0] = witness;
                 atomicExch((int*)found_flag, 1);
                 __threadfence();
-                return;
             }
         }
     }
@@ -269,10 +276,10 @@ class DuplexChallenger {
 
             kb31_t witness = kb31_t((int)i);
             if (temp_challenger.check_witness(bits, &witness)) {
+                // No `return`: the loop condition sees the flag (see `grind_found`).
                 result[0] = witness;
                 atomicExch((int*)found_flag, 1);
                 __threadfence();
-                return;
             }
         }
     }
@@ -408,17 +415,28 @@ class MultiField32Challenger {
         return sample_bits(bits) == 0;
     }
 
-    // As DuplexChallenger::grind_found: an atomic load on SYCL.
+    // As DuplexChallenger::grind_found: an atomic load on SYCL and HIP. The grind loop below depends
+    // on it being a volatile or atomic load, as described there. With the plain load on HIP, the
+    // wrap's grinding took 1.2 s a search on an RX 9060 XT against 12 ms on an RTX 5060 Ti: the
+    // other work-groups kept searching after the hit.
     static __device__ __forceinline__ bool grind_found(volatile bool* found_flag) {
 #ifdef SP1_SYCL
         return ::sp1sycl::device_atomic<int>(*(int*)found_flag).load() != 0;
+#elif defined(__HIPCC__)
+        return __hip_atomic_load((int*)found_flag, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT) != 0;
 #else
         return *found_flag;
 #endif
     }
 
+    // Tries the candidates in [start, end). The host launches bounded ranges and checks the found
+    // flag between launches. Within one launch, a finder's wave used to keep sweeping its whole
+    // share: the `result` store and the flag atomic sat after the loop (see
+    // DuplexChallenger::grind_found), so the flag was set too late for the other waves to stop.
+    // Publishing inside the loop lets a launch stop early; the bounded ranges keep the cost of a
+    // launch small regardless.
     __device__ __forceinline__ void
-    grind(size_t bits, kb31_t* result, volatile bool* found_flag, size_t n) {
+    grind(size_t bits, kb31_t* result, volatile bool* found_flag, size_t start, size_t end) {
         size_t idx = threadIdx.x + blockIdx.x * blockDim.x;
 
         size_t original_buffer_sizes[NUM_BUFFER_SIZES];
@@ -469,7 +487,8 @@ class MultiField32Challenger {
         kb31_t local_output_buffer[OUTPUT_BUFFER_SIZE];
         size_t local_buffer_sizes[NUM_BUFFER_SIZES];
 
-        for (size_t i = idx; i < n && !grind_found(found_flag); i += blockDim.x * gridDim.x) {
+        for (size_t i = start + idx; i < end && !grind_found(found_flag);
+             i += blockDim.x * gridDim.x) {
             // Reset local state from shared memory.
             for (size_t j = 0; j < NUM_BUFFER_SIZES; j++) {
                 local_buffer_sizes[j] = original_buffer_sizes[j];
@@ -489,10 +508,10 @@ class MultiField32Challenger {
 
             kb31_t witness = kb31_t((int)i);
             if (temp_challenger.check_witness(bits, &witness)) {
+                // No `return`: the loop condition sees the flag (see `grind_found`).
                 result[0] = witness;
                 atomicExch((int*)found_flag, 1);
                 __threadfence();
-                return;
             }
         }
     }

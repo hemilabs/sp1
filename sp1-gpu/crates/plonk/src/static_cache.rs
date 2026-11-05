@@ -408,7 +408,8 @@ impl PlonkCanonicalCache {
 
         let elem_sz = std::mem::size_of::<Fr>();
 
-        let mut sources: Vec<(CanonicalSlot, String, &[Fr])> = Vec::with_capacity(9 + qcp_coeffs.len());
+        let mut sources: Vec<(CanonicalSlot, String, &[Fr])> =
+            Vec::with_capacity(9 + qcp_coeffs.len());
         sources.push((CanonicalSlot::Ql, "ql_can".to_string(), ql));
         sources.push((CanonicalSlot::Qr, "qr_can".to_string(), qr));
         sources.push((CanonicalSlot::Qo, "qo_can".to_string(), qo));

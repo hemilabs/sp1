@@ -3,11 +3,11 @@ package sp1
 import (
 	"bufio"
 	"encoding/json"
+	"fmt"
 	"os"
 
 	"github.com/consensys/gnark-crypto/ecc"
 	"github.com/consensys/gnark/backend/plonk"
-	"github.com/consensys/gnark/frontend"
 )
 
 func ProvePlonk(dataDir string, witnessPath string) Proof {
@@ -22,28 +22,34 @@ func ProvePlonk(dataDir string, witnessPath string) Proof {
 	if err != nil {
 		panic(err)
 	}
-	scs := plonk.NewCS(ecc.BN254)
-	scs.ReadFrom(scsFile)
 	defer scsFile.Close()
+	scs := plonk.NewCS(ecc.BN254)
+	if _, err := scs.ReadFrom(bufio.NewReaderSize(scsFile, 1024*1024)); err != nil {
+		panic(fmt.Sprintf("failed to read the PLONK circuit: %v", err))
+	}
 
 	// Read the proving key.
 	pkFile, err := os.Open(dataDir + "/" + plonkPkPath)
 	if err != nil {
 		panic(err)
 	}
+	defer pkFile.Close()
 	pk := plonk.NewProvingKey(ecc.BN254)
 	bufReader := bufio.NewReaderSize(pkFile, 1024*1024)
-	pk.UnsafeReadFrom(bufReader)
-	defer pkFile.Close()
+	if _, err := pk.UnsafeReadFrom(bufReader); err != nil {
+		panic(fmt.Sprintf("failed to read the PLONK proving key: %v", err))
+	}
 
 	// Read the verifier key.
 	vkFile, err := os.Open(dataDir + "/" + plonkVkPath)
 	if err != nil {
 		panic(err)
 	}
-	vk := plonk.NewVerifyingKey(ecc.BN254)
-	vk.ReadFrom(vkFile)
 	defer vkFile.Close()
+	vk := plonk.NewVerifyingKey(ecc.BN254)
+	if _, err := vk.ReadFrom(vkFile); err != nil {
+		panic(fmt.Sprintf("failed to read the PLONK verifying key: %v", err))
+	}
 
 	// Read the file.
 	data, err := os.ReadFile(witnessPath)
@@ -59,8 +65,7 @@ func ProvePlonk(dataDir string, witnessPath string) Proof {
 	}
 
 	// Generate the witness.
-	assignment := NewCircuit(witnessInput)
-	witness, err := frontend.NewWitness(&assignment, ecc.BN254.ScalarField())
+	witness, err := newWitness(witnessInput)
 	if err != nil {
 		panic(err)
 	}

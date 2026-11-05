@@ -62,11 +62,12 @@ impl MinimalExecutorRunner {
         memory_limit: u64,
         shm_slot_size: usize,
     ) -> Self {
-        let id = format!("sp1_{}", URL_SAFE.encode(uuid::Uuid::new_v4().as_bytes()));
+        let id = new_shm_id();
         let input = Input {
             program,
             is_debug,
             max_trace_size,
+            max_chunk_cycles: None,
             input: VecDeque::new(),
             shm_slot_size,
             id,
@@ -85,6 +86,18 @@ impl MinimalExecutorRunner {
             global_clk: 0,
             clk: 0,
         }
+    }
+
+    /// Whether [`Self::set_max_chunk_cycles`] has an effect: it does with the native executor.
+    pub const SUPPORTS_MAX_CHUNK_CYCLES: bool = true;
+
+    /// Also end a trace chunk once it has run `cycles` cycles, not only when its trace buffer is
+    /// full, so a compute-bound program yields its first chunk early. `None` or `Some(0)` splits on
+    /// the trace size only. Execution is unchanged; only where the trace is split differs.
+    pub fn set_max_chunk_cycles(&mut self, cycles: Option<u64>) {
+        // The cap is sent to the child when it starts.
+        assert!(self.process.is_none());
+        self.input.max_chunk_cycles = cycles.filter(|&cycles| cycles > 0);
     }
 
     /// Redirect guest output to the configured channels.
@@ -147,11 +160,12 @@ impl MinimalExecutorRunner {
 
         if self.process.is_none() {
             // Start the process
-            let (mut child, monitor) = spawn_restricted(
-                Command::new(crate::binary::get_binary_path()),
-                self.input.memory_limit,
-            )
-            .map_err(|e| ExecutionError::Other(format!("failed to spawn child process: {e}")))?;
+            let memory_limit = if take_kill_inject() { 0 } else { self.input.memory_limit };
+            let (mut child, monitor) =
+                spawn_restricted(Command::new(crate::binary::get_binary_path()), memory_limit)
+                    .map_err(|e| {
+                        ExecutionError::Other(format!("failed to spawn child process: {e}"))
+                    })?;
 
             // Start draining stderr before sending input. The input write is blocking, so a
             // child that fills its stderr pipe first would deadlock the exchange; draining
@@ -186,7 +200,9 @@ impl MinimalExecutorRunner {
                 monitor.stop.store(true, Ordering::SeqCst);
                 let _ = log_handle.join();
                 let error = if status.success() {
-                    ExecutionError::Other(format!("failed sending input to child: {send_err}"))
+                    ExecutionError::Other(format!(
+                        "the executor runner exited before reading its input ({send_err})"
+                    ))
                 } else {
                     child_exit_error(&status, &monitor)
                 };
@@ -420,7 +436,14 @@ impl MinimalExecutorRunner {
             child.kill().expect("running child cannot be killed");
         }
         self.output = None;
+        // Like the JIT executor's reset: the next run reads only the input it is given.
+        self.input.input.clear();
 
+        // Recreate the shared memory and the trace ring under a fresh id. Under the old id the
+        // new objects would be the old ones' names, and dropping the old owners (when the fields
+        // are overwritten below, or later by a trace chunk still holding the ring) would unlink
+        // them, so the next child could not open them.
+        self.input.id = new_shm_id();
         let (memory, consumer) = create(&self.input);
         self.memory = memory;
         self.consumer = consumer;
@@ -443,6 +466,11 @@ fn redirect_output(consumers: &OutputConsumers, line: &str) -> bool {
     };
 
     publish_output_line(sender, content)
+}
+
+/// A new, process-unique id for the shared memory objects of an executor.
+fn new_shm_id() -> String {
+    format!("sp1_{}", URL_SAFE.encode(uuid::Uuid::new_v4().as_bytes()))
 }
 
 // Create partial field variables, so the common logic can be shared
@@ -492,10 +520,31 @@ fn child_exit_error(status: &std::process::ExitStatus, monitor: &MonitorState) -
         }
         (_, Some(libc::SIGKILL)) => ExecutionError::ChildKilled(),
         (_, Some(libc::SIGILL)) => ExecutionError::Unimplemented(),
+        (Some(sp1_core_executor_runner_binary::EXIT_WITHOUT_NATIVE_EXECUTOR), _) => {
+            ExecutionError::Other(
+                "the executor runner binary was built without the native executor (see \
+                 sp1-core-executor-runner's build.rs)"
+                    .to_string(),
+            )
+        }
         (code, signal) => ExecutionError::Other(format!(
             "Child native executor terminated abnormally, code: {code:?}, signal: {signal:?}"
         )),
     }
+}
+
+/// Test hook: with `SP1_EXECUTOR_KILL_INJECT=N` the memory monitor kills the next `N` executor
+/// children at their first sample, as if over the limit, so that the recovery from a killed
+/// execution can be run end to end. Unset (the default), it does nothing.
+fn take_kill_inject() -> bool {
+    static REMAINING: std::sync::OnceLock<AtomicU64> = std::sync::OnceLock::new();
+    REMAINING
+        .get_or_init(|| {
+            let n = std::env::var("SP1_EXECUTOR_KILL_INJECT").ok().and_then(|s| s.parse().ok());
+            AtomicU64::new(n.unwrap_or(0))
+        })
+        .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+        .is_ok()
 }
 
 /// Spawns a process with piped I/O and an RSS memory monitor thread.
@@ -532,10 +581,28 @@ fn spawn_restricted(
         let mut sys = System::new();
         let pid = Pid::from_u32(child_pid);
         let poll_interval = Duration::from_millis(MEMORY_MONITOR_INTERAL_MILLIS);
+        let parent_exe = std::fs::read_link("/proc/self/exe").ok();
+        let mut exec_done = false;
 
         loop {
             if monitor.stop.load(Ordering::SeqCst) {
                 break; // The parent is done with the child; a later poll could hit a recycled PID.
+            }
+
+            // `spawn` can return before the child is on its own address space: posix_spawn's
+            // child shares ours (CLONE_VM | CLONE_VFORK) and the kernel wakes the parent at exec
+            // before it switches the child's mm. Read then, the child's RSS is the parent's
+            // (30 GB on rsp, against a child that peaks under 0.5 GB), and a loaded host
+            // stretches that window. Read its RSS only once its exe is no longer ours.
+            if !exec_done {
+                match std::fs::read_link(format!("/proc/{child_pid}/exe")) {
+                    Ok(exe) if Some(&exe) != parent_exe.as_ref() => exec_done = true,
+                    Ok(_) => {
+                        thread::sleep(Duration::from_millis(1));
+                        continue;
+                    }
+                    Err(_) => break, // Process is finished or gone
+                }
             }
 
             // Refresh only this specific process for performance
@@ -578,6 +645,54 @@ impl Drop for MinimalExecutorRunner {
             monitor.stop.store(true, Ordering::SeqCst);
             let _ = child.kill();
         }
+    }
+}
+
+#[cfg(test)]
+mod monitor_tests {
+    use super::spawn_restricted;
+    use std::{
+        process::Command,
+        sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        },
+    };
+
+    /// A child's first RSS sample, taken right after `spawn`, must not be the parent's: under
+    /// load the child can still be on the parent's address space then (see the monitor), and a
+    /// parent above the limit got a child of a few MB killed.
+    #[test]
+    fn a_child_is_not_measured_on_the_parents_address_space() {
+        const LIMIT: u64 = 256 << 20;
+        // A parent well above the limit, its pages resident.
+        let resident = vec![1u8; 2 * LIMIT as usize];
+        // Keep every core busy mapping and unmapping memory, as a prover's allocators do: the
+        // child's exec waits for our address space's lock between waking us and leaving it.
+        let stop = Arc::new(AtomicBool::new(false));
+        let busy: Vec<_> = (0..std::thread::available_parallelism().map_or(4, |n| n.get()))
+            .map(|_| {
+                let stop = stop.clone();
+                std::thread::spawn(move || {
+                    while !stop.load(Ordering::Relaxed) {
+                        std::hint::black_box(vec![0u8; 4 << 20]);
+                    }
+                })
+            })
+            .collect();
+        let mut killed = 0;
+        for _ in 0..300 {
+            let mut cmd = Command::new("sleep");
+            cmd.arg("0.01");
+            let (mut child, monitor) = spawn_restricted(cmd, LIMIT).expect("spawn sleep");
+            child.wait().expect("wait for sleep");
+            monitor.stop.store(true, Ordering::SeqCst);
+            killed += usize::from(monitor.killed.load(Ordering::SeqCst));
+        }
+        stop.store(true, Ordering::Relaxed);
+        busy.into_iter().for_each(|t| t.join().unwrap());
+        assert_eq!(std::hint::black_box(&resident)[LIMIT as usize], 1);
+        assert_eq!(killed, 0, "children of a few MB killed by the memory monitor");
     }
 }
 

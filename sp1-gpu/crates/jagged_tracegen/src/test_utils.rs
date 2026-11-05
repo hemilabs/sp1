@@ -15,7 +15,8 @@
 /// and then halves repeatedly, so the effective requirement is "stay even all the way
 /// down" — multiples of 32 give us margin and keep synthetic heights shaped like real
 /// shards.
-#[cfg(any(test, feature = "test-utils"))]
+// Needs the `test-utils` dependencies (serde, criterion), which plain `cargo test` lacks.
+#[cfg(feature = "test-utils")]
 pub mod random {
     use std::path::Path;
 
@@ -267,7 +268,8 @@ pub mod random {
 /// shape of input the bench's closure receives — a log_2 area only ([`SizeOnlyKind`]), the
 /// trace MLE ([`JaggedKind`]), or the full execution context ([`FullKind`]). The CLI source arg
 /// (`random` / `json/<path>` / `real/<program>`) is parsed once and applied uniformly.
-#[cfg(any(test, feature = "test-utils"))]
+// Needs the `test-utils` dependencies (serde, criterion), which plain `cargo test` lacks.
+#[cfg(feature = "test-utils")]
 pub mod bench_utils {
     use std::sync::Arc;
 

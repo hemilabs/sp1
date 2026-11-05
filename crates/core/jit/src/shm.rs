@@ -143,6 +143,45 @@ impl Drop for PosixSemaphore {
     }
 }
 
+/// The shared memory objects this process created and has not unlinked yet: the name, and
+/// whether it is a trace ring (whose two semaphores go with it). Their owners unlink them on drop;
+/// a process that exits without running destructors (`std::process::exit`) calls
+/// [`unlink_owned_shm`] first, or the names stay in /dev/shm.
+static OWNED_SHM: Mutex<Vec<(String, bool)>> = Mutex::new(Vec::new());
+
+fn owned_shm() -> std::sync::MutexGuard<'static, Vec<(String, bool)>> {
+    OWNED_SHM.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+fn disown_shm(name: &str) {
+    let mut owned = owned_shm();
+    if let Some(i) = owned.iter().position(|(owned_name, _)| owned_name == name) {
+        owned.swap_remove(i);
+    }
+}
+
+fn unlink_shm(name: &str, is_ring: bool) {
+    let Ok(c_name) = CString::new(name) else { return };
+    unsafe { shm_unlink(c_name.as_ptr()) };
+    if is_ring {
+        let c_fill = CString::new(format!("{}_filled", name)).unwrap();
+        let c_empty = CString::new(format!("{}_empty", name)).unwrap();
+        unsafe {
+            sem_unlink(c_fill.as_ptr());
+            sem_unlink(c_empty.as_ptr());
+        }
+    }
+}
+
+/// Unlinks every shared memory object (and semaphore) this process created and still owns. For a
+/// process about to exit without running destructors; the owners stay usable through their open
+/// descriptors and mappings.
+pub fn unlink_owned_shm() {
+    for (name, is_ring) in std::mem::take(&mut *owned_shm()) {
+        unlink_shm(&name, is_ring);
+    }
+}
+
 struct InnerRing {
     _file: File,
     _mmap: MmapMut,
@@ -163,14 +202,8 @@ unsafe impl Sync for InnerRing {}
 impl Drop for InnerRing {
     fn drop(&mut self) {
         if self.is_owner {
-            let c_name = CString::new(self.name.clone()).unwrap();
-            let c_fill = CString::new(format!("{}_filled", self.name)).unwrap();
-            let c_empty = CString::new(format!("{}_empty", self.name)).unwrap();
-            unsafe {
-                shm_unlink(c_name.as_ptr());
-                sem_unlink(c_fill.as_ptr());
-                sem_unlink(c_empty.as_ptr());
-            }
+            disown_shm(&self.name);
+            unlink_shm(&self.name, true);
         }
     }
 }
@@ -346,6 +379,9 @@ impl ShmTraceRing {
             }
         }
 
+        if is_owner {
+            owned_shm().push((base_name.clone(), true));
+        }
         Ok(Self {
             inner: Arc::new(InnerRing {
                 _file: file,
@@ -587,6 +623,7 @@ impl ShmMemory {
         // Safety: We just created the file, so mapping it is valid.
         let map = unsafe { Mmap::map(&file)? };
 
+        owned_shm().push((name.clone(), false));
         Ok(Self {
             name,
             file,
@@ -650,6 +687,9 @@ impl ShmMemory {
     /// Manually flags this instance to NOT unlink on drop.
     /// Useful if you want the shared memory to persist after the process exits.
     pub fn keep_on_drop(&mut self) {
+        if self.should_unlink {
+            disown_shm(&self.name);
+        }
         self.should_unlink = false;
     }
 }
@@ -689,12 +729,39 @@ impl Drop for ShmMemory {
     fn drop(&mut self) {
         if self.should_unlink {
             // Ignore errors here (e.g., if it was already unlinked externally)
-            if let Ok(c_name) = CString::new(self.name.as_str()) {
-                unsafe {
-                    libc::shm_unlink(c_name.as_ptr());
-                }
-            }
+            disown_shm(&self.name);
+            unlink_shm(&self.name, false);
         }
         // self.file drops here, closing the FD automatically.
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn shm_exists(name: &str) -> bool {
+        let c_name = CString::new(name).unwrap();
+        let fd = unsafe { shm_open(c_name.as_ptr(), O_RDWR, 0) };
+        if fd >= 0 {
+            unsafe { libc::close(fd) };
+        }
+        fd >= 0
+    }
+
+    /// What a process exiting through `std::process::exit` relies on: the names it still owns are
+    /// unlinked although no destructor runs.
+    #[test]
+    fn unlink_owned_shm_unlinks_live_owners() {
+        let id = format!("sp1_test_{}", std::process::id());
+        let memory = ShmMemory::create_readonly(&id, 4096).unwrap();
+        let ring = ShmTraceRing::create(&id, 2, 4096).unwrap();
+        let (memory_name, ring_name) = (format!("/{id}_m"), format!("/{id}_t"));
+        assert!(shm_exists(&memory_name) && shm_exists(&ring_name));
+
+        unlink_owned_shm();
+        assert!(!shm_exists(&memory_name) && !shm_exists(&ring_name));
+        assert!(owned_shm().iter().all(|(name, _)| name != &memory_name && name != &ring_name));
+        drop((memory, ring));
     }
 }

@@ -42,14 +42,18 @@ extern "C" void* fix_last_variable_ext_ext_kernel() { return SP1_KERNEL_PTR(fixL
 
 
 
+// `alphaDev`, when not null, holds alpha on the device (the LogUp-GKR rounds that sample their
+// challenges there; logup_gkr/round.cu), and the `alpha` argument is unused.
 template <typename F, typename EF>
 __global__ void fixLastVariableConstantPadding(
     const F* input,
     EF* __restrict__ output,
     F paddingValue,
     EF alpha,
+    const EF* __restrict__ alphaDev,
     size_t inputHeight,
     size_t width) {
+    if (alphaDev) alpha = *alphaDev;
     size_t outputHeight = (inputHeight + 1) >> 1;
     bool padding = inputHeight & 1;
     for (size_t j = blockDim.y * blockIdx.y + threadIdx.y; j < width; j += blockDim.y * gridDim.y) {

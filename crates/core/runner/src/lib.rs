@@ -66,13 +66,15 @@ mod binary {
             let mut target_path = std::env::temp_dir();
             target_path.push(&filename);
 
-            // 2. Fast Path: if it exists, we just trust and use it;
-            if target_path.exists() {
+            // 2. Get the embedded bytes
+            const BYTES: &[u8] = include_bytes!(env!("SP1_CORE_RUNNER_BINARY"));
+
+            // 3. Fast Path: an existing file with exactly these bytes. Not just by its name: a file
+            //    a build with different bytes under the same name left behind would run the wrong
+            //    binary (it is replaced below).
+            if fs::read(&target_path).is_ok_and(|existing| existing == BYTES) {
                 return target_path;
             }
-
-            // 3. Get the embedded bytes
-            const BYTES: &[u8] = include_bytes!(env!("SP1_CORE_RUNNER_BINARY"));
 
             // 4. Create a generic temp file first to ensure atomicity
             let temp_path = {

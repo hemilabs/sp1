@@ -71,6 +71,7 @@ impl<A: ArtifactClient, W: WorkerClient, C: SP1ProverComponents> SP1ProverEngine
             wrap_air_prover_init,
         )
         .await;
+        recursion_prover.prewarm_wrap_prover().await;
 
         let core_prover = SP1CoreProver::new(
             config.core_prover_config,

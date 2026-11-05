@@ -1,3 +1,5 @@
+use std::sync::OnceLock;
+
 use serde::{Deserialize, Serialize};
 use sp1_core_machine::riscv::RiscvAir;
 use sp1_hypercube::Machine;
@@ -18,6 +20,16 @@ impl From<Machine<SP1Field, RiscvAir<SP1Field>>> for SerializableRiscvMachine {
 
 impl From<SerializableRiscvMachine> for Machine<SP1Field, RiscvAir<SP1Field>> {
     fn from(_: SerializableRiscvMachine) -> Self {
-        RiscvAir::machine()
+        riscv_machine()
     }
+}
+
+/// `RiscvAir::machine()`, built once per process.
+///
+/// Building the machine evaluates every chip's constraints symbolically (0.1-1 s), and a
+/// `CoreExecute` request deserializes into one before the executor starts. The chips are
+/// reference counted, so the clone is cheap.
+pub fn riscv_machine() -> Machine<SP1Field, RiscvAir<SP1Field>> {
+    static MACHINE: OnceLock<Machine<SP1Field, RiscvAir<SP1Field>>> = OnceLock::new();
+    MACHINE.get_or_init(RiscvAir::machine).clone()
 }

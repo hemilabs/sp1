@@ -17,18 +17,62 @@ use bind::*;
 /// Registers the host's GPU entry points for the Groth16 prover (see `go/sp1/groth16_gpu.go`), as
 /// C function pointers: `compute_h` for gnark's quotient polynomial, `msm_g1` and `msm_g2` for its
 /// multi-scalar multiplications. Zeros unregister them; the prover then runs on the CPU, as it does
-/// when `SP1_GROTH16_GPU=0`.
-pub fn set_groth16_gpu_hooks(compute_h: usize, msm_g1: usize, msm_g2: usize) {
+/// when `SP1_GROTH16_GPU=0`. `gpu_total_memory` is the GPU's total memory in bytes (0 if unknown),
+/// which picks where the G2 MSM runs by default.
+pub fn set_groth16_gpu_hooks(
+    compute_h: usize,
+    msm_g1: usize,
+    msm_g2: usize,
+    gpu_total_memory: u64,
+) {
     GROTH16_GPU_HOOKS.store(compute_h != 0, std::sync::atomic::Ordering::Relaxed);
-    unsafe { SetGroth16GpuHooks(compute_h as _, msm_g1 as _, msm_g2 as _) }
+    unsafe { SetGroth16GpuHooks(compute_h as _, msm_g1 as _, msm_g2 as _, gpu_total_memory as _) }
 }
 
 static GROTH16_GPU_HOOKS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Records whether the GPU registered above runs the Groth16 prover's G2 MSM faster than the CPU
+/// does alongside the G1 MSMs, in place of the default choice (by the GPU's memory and the host's
+/// CPU count). `SP1_GROTH16_G2_ON_CPU` still overrides it.
+pub fn set_groth16_g2_msm_on_gpu(on_gpu: bool) {
+    unsafe { SetGroth16G2MsmOnGpu(on_gpu as _) }
+}
 
 /// Whether this process registered GPU entry points for the Groth16 prover. They exist only in this
 /// process, so `prove_isolated` then proves here rather than in a CPU helper.
 pub fn groth16_gpu_hooks_registered() -> bool {
     GROTH16_GPU_HOOKS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Registers the host's GPU R1CS solver for the Groth16 prover above (sp1-gpu's
+/// `sp1_r1cs_solver_create`, `_solve` and `_destroy`, as C function pointers), which then solves
+/// the circuit on the GPU where [`set_groth16_r1cs_prep_dir`] names its data. Zeros unregister it.
+pub fn set_groth16_gpu_r1cs_solver(create: usize, solve: usize, destroy: usize) {
+    GROTH16_GPU_R1CS_SOLVER.store(create != 0, std::sync::atomic::Ordering::Relaxed);
+    unsafe { SetGroth16GpuR1csSolver(create as _, solve as _, destroy as _) }
+}
+
+static GROTH16_GPU_R1CS_SOLVER: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Whether this process registered a GPU R1CS solver for the Groth16 prover.
+pub fn groth16_gpu_r1cs_solver_registered() -> bool {
+    GROTH16_GPU_R1CS_SOLVER.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Destroys the GPU R1CS solver the Groth16 prover keeps between proofs (with its circuit data, ~5
+/// GB of device memory), if any. The next proof creates it again.
+pub fn release_groth16_gpu_r1cs_solver() {
+    unsafe { ReleaseGroth16GpuR1csSolver() }
+}
+
+/// Names the GPU R1CS solver's circuit data (`r1cs_solve_plan prep-circuit-prod`'s output) for the
+/// Groth16 proofs in this process of the circuit in `data_dir` (as passed to
+/// [`prove_groth16_bn254`]); `None` has gnark solve them on the CPU.
+pub fn set_groth16_r1cs_prep_dir(data_dir: &str, dir: Option<&str>) {
+    let data_dir = CString::new(data_dir).expect("CString::new failed");
+    let dir = CString::new(dir.unwrap_or("")).expect("CString::new failed");
+    unsafe { SetGroth16R1csPrepDir(data_dir.as_ptr() as *mut c_char, dir.as_ptr() as *mut c_char) }
 }
 
 enum ProofSystem {
@@ -351,6 +395,12 @@ pub fn prefetch_groth16_gpu_witness_circuit(data_dir: &str, pk_dir: &str) -> Res
 /// the memory to the host. The next call reloads them.
 pub fn release_groth16_caches() {
     unsafe { bind::ReleaseGroth16Caches() }
+}
+
+/// [`release_groth16_caches`], except that the circuit [`export_groth16_gpu_witness`] solves stays
+/// cached for the next proof.
+pub fn trim_groth16_caches() {
+    unsafe { bind::TrimGroth16Caches() }
 }
 
 /// Writes the Groth16 R1CS in `data_dir` to `output_path` without its debug information, which

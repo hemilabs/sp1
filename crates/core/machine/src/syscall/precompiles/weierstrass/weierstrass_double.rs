@@ -21,8 +21,8 @@ use slop_matrix::Matrix;
 use slop_maybe_rayon::prelude::{ParallelBridge, ParallelIterator, ParallelSlice};
 use sp1_core_executor::{
     events::{
-        ByteLookupEvent, ByteRecord, EllipticCurveDoubleEvent, FieldOperation, MemoryRecordEnum,
-        MemoryWriteRecord, PrecompileEvent, SyscallEvent,
+        ByteRecord, EllipticCurveDoubleEvent, FieldOperation, MemoryRecordEnum, MemoryWriteRecord,
+        PrecompileEvent, SyscallEvent,
     },
     ExecutionRecord, Program, SyscallCode,
 };
@@ -87,7 +87,7 @@ impl<E: EllipticCurve + WeierstrassParameters, M: TrustMode> WeierstrassDoubleAs
     }
 
     fn populate_field_ops<F: PrimeField32>(
-        blu_events: &mut Vec<ByteLookupEvent>,
+        blu_events: &mut impl ByteRecord,
         cols: &mut WeierstrassDoubleAssignCols<F, E::BaseField, M>,
         p_x: BigUint,
         p_y: BigUint,
@@ -206,7 +206,7 @@ impl<F: PrimeField32, E: EllipticCurve + WeierstrassParameters, M: TrustMode> Ma
         Some(padded_nb_rows)
     }
 
-    fn generate_dependencies(&self, input: &Self::Record, output: &mut Self::Record) {
+    fn generate_dependencies(&self, input: &Self::Record, _output: &mut Self::Record) {
         if input.program.enable_untrusted_programs == M::IS_TRUSTED {
             return;
         }
@@ -221,11 +221,8 @@ impl<F: PrimeField32, E: EllipticCurve + WeierstrassParameters, M: TrustMode> Ma
         let num_cols = <WeierstrassDoubleAssignChip<E, M> as BaseAir<F>>::width(self);
         let chunk_size = std::cmp::max(events.len() / num_cpus::get(), 1);
 
-        let blu_events: Vec<Vec<ByteLookupEvent>> = events
-            .par_chunks(chunk_size)
-            .map(|ops: &[(SyscallEvent, PrecompileEvent)]| {
-                // The blu map stores shard -> map(byte lookup event -> multiplicity).
-                let mut blu = Vec::new();
+        events.par_chunks(chunk_size).for_each(|ops: &[(SyscallEvent, PrecompileEvent)]| {
+            input.byte_lookup_counts.count(|blu| {
                 ops.iter().for_each(|(_, op)| match op {
                     PrecompileEvent::Secp256k1Double(event)
                     | PrecompileEvent::Secp256r1Double(event)
@@ -234,17 +231,12 @@ impl<F: PrimeField32, E: EllipticCurve + WeierstrassParameters, M: TrustMode> Ma
                         let mut row = zeroed_f_vec(num_cols);
                         let cols: &mut WeierstrassDoubleAssignCols<F, E::BaseField, M> =
                             row.as_mut_slice().borrow_mut();
-                        Self::populate_row(event, cols, &mut blu);
+                        Self::populate_row(event, cols, blu);
                     }
                     _ => unreachable!(),
                 });
-                blu
-            })
-            .collect();
-
-        for blu in blu_events {
-            output.add_byte_lookup_events(blu);
-        }
+            });
+        });
     }
 
     fn generate_trace_into(
@@ -252,6 +244,54 @@ impl<F: PrimeField32, E: EllipticCurve + WeierstrassParameters, M: TrustMode> Ma
         input: &ExecutionRecord,
         _output: &mut ExecutionRecord,
         buffer: &mut [MaybeUninit<F>],
+    ) {
+        self.generate_trace_into_with::<F>(input, buffer, false);
+    }
+
+    fn dependencies_in_trace(&self) -> bool {
+        true
+    }
+
+    fn generate_trace_into_with_dependencies(
+        &self,
+        input: &ExecutionRecord,
+        buffer: &mut [MaybeUninit<F>],
+    ) {
+        self.generate_trace_into_with::<F>(input, buffer, true);
+    }
+
+    fn included(&self, shard: &Self::Record) -> bool {
+        if let Some(shape) = shard.shape.as_ref() {
+            shape.included::<F, _>(self)
+        } else {
+            let has_events = match E::CURVE_TYPE {
+                CurveType::Secp256k1 => {
+                    !shard.get_precompile_events(SyscallCode::SECP256K1_DOUBLE).is_empty()
+                }
+                CurveType::Secp256r1 => {
+                    !shard.get_precompile_events(SyscallCode::SECP256R1_DOUBLE).is_empty()
+                }
+                CurveType::Bn254 => {
+                    !shard.get_precompile_events(SyscallCode::BN254_DOUBLE).is_empty()
+                }
+                CurveType::Bls12381 => {
+                    !shard.get_precompile_events(SyscallCode::BLS12381_DOUBLE).is_empty()
+                }
+                _ => panic!("Unsupported curve"),
+            };
+            has_events && (M::IS_TRUSTED != shard.program.enable_untrusted_programs)
+        }
+    }
+}
+
+impl<E: EllipticCurve + WeierstrassParameters, M: TrustMode> WeierstrassDoubleAssignChip<E, M> {
+    /// Writes the trace into `buffer`. With `count`, the byte lookups of the rows are counted
+    /// into `input.byte_lookup_counts`, as `generate_dependencies` does.
+    fn generate_trace_into_with<F: PrimeField32>(
+        &self,
+        input: &ExecutionRecord,
+        buffer: &mut [MaybeUninit<F>],
+        count: bool,
     ) {
         if input.program.enable_untrusted_programs == M::IS_TRUSTED {
             return;
@@ -300,49 +340,27 @@ impl<F: PrimeField32, E: EllipticCurve + WeierstrassParameters, M: TrustMode> Ma
         Self::populate_field_ops(&mut vec![], cols, zero, one);
 
         values.chunks_mut(chunk_size * num_cols).enumerate().par_bridge().for_each(|(i, rows)| {
-            rows.chunks_mut(num_cols).enumerate().for_each(|(j, row)| {
-                let idx = i * chunk_size + j;
-                if idx < events.len() {
-                    let mut new_byte_lookup_events = Vec::new();
-                    let cols: &mut WeierstrassDoubleAssignCols<F, E::BaseField, M> =
-                        row.borrow_mut();
-                    match &events[idx].1 {
-                        PrecompileEvent::Secp256k1Double(event)
-                        | PrecompileEvent::Secp256r1Double(event)
-                        | PrecompileEvent::Bn254Double(event)
-                        | PrecompileEvent::Bls12381Double(event) => {
-                            Self::populate_row(event, cols, &mut new_byte_lookup_events);
+            input.byte_lookup_counts.count_if(count, |blu| {
+                rows.chunks_mut(num_cols).enumerate().for_each(|(j, row)| {
+                    let idx = i * chunk_size + j;
+                    if idx < events.len() {
+                        let cols: &mut WeierstrassDoubleAssignCols<F, E::BaseField, M> =
+                            row.borrow_mut();
+                        match &events[idx].1 {
+                            PrecompileEvent::Secp256k1Double(event)
+                            | PrecompileEvent::Secp256r1Double(event)
+                            | PrecompileEvent::Bn254Double(event)
+                            | PrecompileEvent::Bls12381Double(event) => {
+                                Self::populate_row(event, cols, blu);
+                            }
+                            _ => unreachable!(),
                         }
-                        _ => unreachable!(),
+                    } else {
+                        row.copy_from_slice(&dummy_row);
                     }
-                } else {
-                    row.copy_from_slice(&dummy_row);
-                }
+                });
             });
         });
-    }
-
-    fn included(&self, shard: &Self::Record) -> bool {
-        if let Some(shape) = shard.shape.as_ref() {
-            shape.included::<F, _>(self)
-        } else {
-            let has_events = match E::CURVE_TYPE {
-                CurveType::Secp256k1 => {
-                    !shard.get_precompile_events(SyscallCode::SECP256K1_DOUBLE).is_empty()
-                }
-                CurveType::Secp256r1 => {
-                    !shard.get_precompile_events(SyscallCode::SECP256R1_DOUBLE).is_empty()
-                }
-                CurveType::Bn254 => {
-                    !shard.get_precompile_events(SyscallCode::BN254_DOUBLE).is_empty()
-                }
-                CurveType::Bls12381 => {
-                    !shard.get_precompile_events(SyscallCode::BLS12381_DOUBLE).is_empty()
-                }
-                _ => panic!("Unsupported curve"),
-            };
-            has_events && (M::IS_TRUSTED != shard.program.enable_untrusted_programs)
-        }
     }
 }
 
@@ -350,7 +368,7 @@ impl<E: EllipticCurve + WeierstrassParameters, M: TrustMode> WeierstrassDoubleAs
     pub fn populate_row<F: PrimeField32>(
         event: &EllipticCurveDoubleEvent,
         cols: &mut WeierstrassDoubleAssignCols<F, E::BaseField, M>,
-        new_byte_lookup_events: &mut Vec<ByteLookupEvent>,
+        new_byte_lookup_events: &mut impl ByteRecord,
     ) {
         // Decode affine points.
         let p = &event.p;

@@ -6799,6 +6799,7 @@ dependencies = [
  "itertools 0.14.0",
  "p3-merkle-tree",
  "rand 0.8.6",
+ "rayon",
  "serde",
  "slop-algebra 6.8.1",
  "slop-alloc",
@@ -7205,6 +7206,7 @@ dependencies = [
  "serde",
  "sp1-core-executor",
  "sp1-jit",
+ "sp1-primitives 6.8.1",
  "tracing-subscriber 0.3.23",
 ]
 
@@ -7616,6 +7618,7 @@ dependencies = [
  "sp1-core-executor",
  "sp1-core-machine",
  "sp1-gpu-basefold",
+ "sp1-gpu-challenger",
  "sp1-gpu-cudart",
  "sp1-gpu-jagged-tracegen",
  "sp1-gpu-utils",
@@ -7787,6 +7790,7 @@ name = "sp1-gpu-shard-prover"
 version = "6.8.1"
 dependencies = [
  "criterion",
+ "libc",
  "rand 0.8.6",
  "rayon",
  "serde_json",

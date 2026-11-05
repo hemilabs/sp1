@@ -98,7 +98,11 @@ fn main() {
 
     // Run our GPU path first so we always get its numbers even if Icicle crashes
     // on a later iteration (Icicle has a known flaky multi-proof re-entry bug).
-    let mut gpu_times = Vec::with_capacity(iterations);
+    #[cfg(feature = "cuda")]
+    let mut gpu_times: Vec<std::time::Duration> = Vec::with_capacity(iterations);
+    // Without our GPU path there are no GPU times (still printed, as an empty series).
+    #[cfg(not(feature = "cuda"))]
+    let gpu_times: Vec<std::time::Duration> = Vec::new();
     // Per-iter PASS/FAIL accumulators for stability sweep (used under cuda feature).
     #[cfg(feature = "cuda")]
     let mut gpu_pass = 0usize;

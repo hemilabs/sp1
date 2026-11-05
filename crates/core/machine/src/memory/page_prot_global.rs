@@ -91,10 +91,8 @@ impl<F: PrimeField32> MachineAir<F> for PageProtGlobalChip {
 
         let chunk_size = std::cmp::max(page_prot_events.len() / num_cpus::get(), 1);
         let indices = (0..page_prot_events.len()).collect::<Vec<_>>();
-        let blu_batches = indices
-            .par_chunks(chunk_size)
-            .map(|chunk| {
-                let mut blu: Vec<ByteLookupEvent> = Vec::new();
+        indices.par_chunks(chunk_size).for_each(|chunk| {
+            input.byte_lookup_counts.count(|blu| {
                 let mut row = [F::zero(); NUM_PAGE_PROT_INIT_COLS];
                 let cols: &mut PageProtInitCols<F> = row.as_mut_slice().borrow_mut();
                 chunk.iter().for_each(|&i| {
@@ -112,18 +110,11 @@ impl<F: PrimeField32> MachineAir<F> for PageProtGlobalChip {
                     blu.add_bit_range_check(page_idx_limbs[0], 4);
                     blu.add_u16_range_checks(&[page_idx_limbs[1], page_idx_limbs[2]]);
                     if i != 0 || prev_page_idx != 0 || page_idx != 0 {
-                        cols.lt_cols.populate_unsigned(
-                            &mut blu,
-                            1,
-                            prev_page_idx << 12,
-                            page_idx << 12,
-                        );
+                        cols.lt_cols.populate_unsigned(blu, 1, prev_page_idx << 12, page_idx << 12);
                     }
                 });
-                blu
-            })
-            .collect::<Vec<_>>();
-        output.add_byte_lookup_events(blu_batches.into_iter().flatten().collect());
+            });
+        });
 
         let events = page_prot_events.into_iter().map(|event| {
             let interaction_clk_high = if is_receive { (event.timestamp >> 24) as u32 } else { 0 };

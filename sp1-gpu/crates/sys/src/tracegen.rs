@@ -4,6 +4,11 @@ extern "C" {
     pub fn riscv_global_generate_trace_decompress_kernel() -> KernelPtr;
     pub fn riscv_global_generate_trace_finalize_kernel() -> KernelPtr;
     pub fn riscv_global_search_offsets_kernel() -> KernelPtr;
+    pub fn riscv_mul_generate_trace_kernel_ptr() -> KernelPtr;
+    pub fn riscv_add_lookup_counts_kernel_ptr() -> KernelPtr;
+    pub fn riscv_shift_right_generate_trace_kernel_ptr() -> KernelPtr;
+    pub fn riscv_simple_alu_generate_trace_kernel_ptr() -> KernelPtr;
+    pub fn riscv_branch_generate_trace_kernel_ptr() -> KernelPtr;
     pub fn recursion_base_alu_generate_preprocessed_trace_koala_bear_kernel() -> KernelPtr;
     pub fn recursion_base_alu_generate_trace_koala_bear_kernel() -> KernelPtr;
     pub fn recursion_ext_alu_generate_preprocessed_trace_koala_bear_kernel() -> KernelPtr;

@@ -8,15 +8,13 @@ use crate::{
     utils::next_multiple_of_32,
     SupervisorMode, TrustMode, UserMode,
 };
-use hashbrown::HashMap;
-use itertools::Itertools;
 use rayon::iter::{IndexedParallelIterator, ParallelBridge, ParallelIterator};
 use slop_air::{Air, AirBuilder, BaseAir, PairBuilder};
 use slop_algebra::{AbstractField, PrimeField32};
 use slop_matrix::Matrix;
 use slop_maybe_rayon::prelude::ParallelSliceMut;
 use sp1_core_executor::{
-    events::{ByteLookupEvent, ByteRecord, MemoryRecordEnum, PrecompileEvent},
+    events::{ByteRecord, MemoryRecordEnum, PrecompileEvent},
     ExecutionRecord, Program, SyscallCode,
 };
 use sp1_derive::AlignedBorrow;
@@ -285,7 +283,7 @@ impl<F: PrimeField32, M: TrustMode> MachineAir<F> for Poseidon2Chip<M> {
         });
     }
 
-    fn generate_dependencies(&self, input: &Self::Record, output: &mut Self::Record) {
+    fn generate_dependencies(&self, input: &Self::Record, _output: &mut Self::Record) {
         if input.program.enable_untrusted_programs == M::IS_TRUSTED {
             return;
         }
@@ -309,10 +307,8 @@ impl<F: PrimeField32, M: TrustMode> MachineAir<F> for Poseidon2Chip<M> {
         let chunk_size = std::cmp::max(events.len() / num_cpus::get(), 1);
         let event_iter = events.chunks(chunk_size);
 
-        let blu_batches = event_iter
-            .par_bridge()
-            .map(|events| {
-                let mut blu: HashMap<ByteLookupEvent, usize> = HashMap::new();
+        event_iter.par_bridge().for_each(|events| {
+            input.byte_lookup_counts.count(|blu| {
                 events.iter().for_each(|event| {
                     let mut row = vec![F::zero(); width];
                     let cols: &mut Poseidon2Cols2<F, M> = row.as_mut_slice().borrow_mut();
@@ -323,7 +319,7 @@ impl<F: PrimeField32, M: TrustMode> MachineAir<F> for Poseidon2Chip<M> {
                         unreachable!()
                     };
 
-                    cols.ptr.populate(&mut blu, event.ptr, 64);
+                    cols.ptr.populate(blu, event.ptr, 64);
 
                     let mut is_not_trap = true;
                     let mut trap_code = 0u8;
@@ -332,7 +328,7 @@ impl<F: PrimeField32, M: TrustMode> MachineAir<F> for Poseidon2Chip<M> {
                         let cols: &mut Poseidon2Cols2<F, UserMode> =
                             row.as_mut_slice().borrow_mut();
                         cols.address_slice_page_prot_access.populate(
-                            &mut blu,
+                            blu,
                             event.ptr,
                             event.ptr + 7 * 8,
                             event.clk,
@@ -345,7 +341,7 @@ impl<F: PrimeField32, M: TrustMode> MachineAir<F> for Poseidon2Chip<M> {
                     let cols: &mut Poseidon2Cols2<F, M> = row.as_mut_slice().borrow_mut();
                     // Populate memory columns for the 8 u64 words.
                     for i in 0..8 {
-                        cols.addrs[i].populate(&mut blu, event.ptr, 8 * i as u64);
+                        cols.addrs[i].populate(blu, event.ptr, 8 * i as u64);
                         cols.hash_result[i] = if is_not_trap {
                             Word::from(event.memory_records[i].value)
                         } else {
@@ -360,7 +356,7 @@ impl<F: PrimeField32, M: TrustMode> MachineAir<F> for Poseidon2Chip<M> {
                                 F::zero(),
                                 F::zero(),
                             ]),
-                            &mut blu,
+                            blu,
                         );
                         cols.hash_result_range_checkers[2 * i + 1].populate(
                             Word([
@@ -369,12 +365,12 @@ impl<F: PrimeField32, M: TrustMode> MachineAir<F> for Poseidon2Chip<M> {
                                 F::zero(),
                                 F::zero(),
                             ]),
-                            &mut blu,
+                            blu,
                         );
 
                         if is_not_trap {
                             let memory_record = MemoryRecordEnum::Write(event.memory_records[i]);
-                            cols.memory[i].populate(memory_record, &mut blu);
+                            cols.memory[i].populate(memory_record, blu);
                         } else {
                             cols.memory[i] = MemoryAccessCols::default();
                         }
@@ -386,15 +382,12 @@ impl<F: PrimeField32, M: TrustMode> MachineAir<F> for Poseidon2Chip<M> {
                         let val_lo = val as u32;
                         let val_hi = (val >> 32) as u32;
                         blu.add_u16_range_checks_field::<F>(&Word::from(val).0);
-                        cols.input_range_checkers[2 * i].populate(Word::from(val_lo), &mut blu);
-                        cols.input_range_checkers[2 * i + 1].populate(Word::from(val_hi), &mut blu);
+                        cols.input_range_checkers[2 * i].populate(Word::from(val_lo), blu);
+                        cols.input_range_checkers[2 * i + 1].populate(Word::from(val_hi), blu);
                     }
                 });
-                blu
-            })
-            .collect::<Vec<_>>();
-
-        output.add_byte_lookup_events_from_maps(blu_batches.iter().collect_vec());
+            });
+        });
     }
 
     fn included(&self, shard: &Self::Record) -> bool {

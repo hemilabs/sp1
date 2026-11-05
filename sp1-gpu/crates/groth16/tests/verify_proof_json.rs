@@ -24,7 +24,15 @@ fn verify_manual_phase11_proof() {
         o[32 - be.len()..].copy_from_slice(&be);
         o
     });
-    let vk = std::fs::read("/home/max/.sp1/circuits/groth16/v6.0.0/groth16_vk.bin").unwrap();
+    // The installed circuit for this checkout's version (the repo-root `SP1_CIRCUIT_VERSION`),
+    // under `SP1_GROTH16_CIRCUIT_PATH` or `~/.sp1/circuits/groth16`, as the prover resolves it.
+    let base = match std::env::var("SP1_GROTH16_CIRCUIT_PATH") {
+        Ok(path) => std::path::PathBuf::from(path),
+        Err(_) => dirs::home_dir().expect("home directory not found").join(".sp1/circuits/groth16"),
+    };
+    let version = include_str!("../../../../SP1_CIRCUIT_VERSION").trim();
+    let vk_path = base.join(version).join("groth16_vk.bin");
+    let vk = std::fs::read(&vk_path).unwrap_or_else(|e| panic!("read {}: {e}", vk_path.display()));
     match sp1_verifier::Groth16Verifier::verify_gnark_proof(solidity, &pubs, &vk) {
         Ok(()) => eprintln!("PASS"),
         Err(e) => panic!("verify failed: {e:?}"),

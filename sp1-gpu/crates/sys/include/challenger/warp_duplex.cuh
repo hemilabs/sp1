@@ -1,9 +1,10 @@
 // Warp-cooperative DuplexChallenger on a shared-memory staged copy of the device challenger state
 // (same layout/semantics as DuplexChallenger::stage()/unstage()), using the 4-lanes-per-state
 // Poseidon2 of poseidon2_kb31_16_fast.cuh. All 32 lanes of one warp must call every method (control
-// flow depends only on buffer sizes).
+// flow depends only on buffer sizes). CUDA and HIP (32-lane warps; on HIP the quads exchange through
+// DPP).
 #pragma once
-#ifndef SP1_PORTABLE
+#ifndef SP1_SYCL
 #include "challenger/challenger.cuh"
 #include "poseidon2/poseidon2_kb31_16_fast.cuh"
 
@@ -98,9 +99,13 @@ __device__ __forceinline__ kb31_extension_t warpSumExt(kb31_extension_t v) {
         kb31_extension_t t;
 #pragma unroll
         for (int k = 0; k < 4; k++)
+#ifdef __HIPCC__
+            t.value[k] = kb31_t((uint32_t)__shfl_xor((int)v.value[k].val, o, 32));
+#else
             t.value[k] = kb31_t(__shfl_xor_sync(0xffffffffu, v.value[k].val, o));
+#endif
         v += t;
     }
     return v;
 }
-#endif  // SP1_PORTABLE
+#endif  // SP1_SYCL

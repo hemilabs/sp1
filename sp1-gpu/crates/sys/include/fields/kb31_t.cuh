@@ -165,6 +165,26 @@ class kb31_t {
 
     static inline uint32_t from_monty(uint32_t x) { return monty_reduce((uint64_t)x); }
 
+#ifdef __HIP_DEVICE_COMPILE__
+    // HIP: x / 2^32 mod MOD for x < 2^63, in (x / 2^32, x / 2^32 + MOD], with a signed Montgomery
+    // factor (RDNA runs 32-bit multiplies at a quarter of the add rate): x' = x + 2^31 MOD (the
+    // product mad's addend), m = lo(x') * MOD^-1 = lo + (lo << 24) + (lo << 31) taken as a signed
+    // 32-bit value, and (x' - m MOD) / 2^32 with one v_mad_co_i64_i32. The shift amounts sit in
+    // registers behind empty asm statements: LLVM folds visible shift-adds back into v_mul_lo_u32.
+    // On an RX 9070 XT the base multiply runs 1.27x as fast as with the reduction in mul() below.
+    static __device__ __forceinline__ uint32_t redc_signed(uint64_t x) {
+        uint32_t s24 = 24, s31 = 31;
+        __asm__("" : "+s"(s24));
+        __asm__("" : "+s"(s31));
+        x += (uint64_t)MOD << 31;
+        const uint32_t lo = (uint32_t)x;
+        uint32_t t = (lo << s24) + lo;
+        __asm__("" : "+v"(t));  // two v_lshl_add_u32 (else two shifts and a v_add3_u32)
+        const uint32_t m = (lo << s31) + t;
+        return (uint32_t)((x + (uint64_t)((int64_t)(int32_t)m * (int64_t)(-(int32_t)MOD))) >> 32);
+    }
+#endif
+
     static inline kb31_t from_canonical_u32(uint32_t x) { return kb31_t(to_monty(x)); }
 
     static inline kb31_t from_canonical_u16(uint16_t x) { return from_canonical_u32((uint32_t)x); }
@@ -311,7 +331,16 @@ class kb31_t {
     }
 
   private:
-    static inline void final_sub(uint32_t& val) { val = val >= MOD ? val - MOD : val; }
+    static inline void final_sub(uint32_t& val) {
+#ifdef __HIP_DEVICE_COMPILE__
+        // A subtract and an unsigned min instead of the compare, subtract and select LLVM makes
+        // of the expression below (the same result for every val: val - MOD wraps above val
+        // exactly when val < MOD).
+        val = __builtin_elementwise_min(val - MOD, val);
+#else
+        val = val >= MOD ? val - MOD : val;
+#endif
+    }
 
     // Montgomery multiplication
 
@@ -329,6 +358,10 @@ class kb31_t {
             final_sub(val);
             return *this;
         }
+#elif defined(__HIP_DEVICE_COMPILE__)
+        val = redc_signed((uint64_t)val * b.val);
+        final_sub(val);
+        return *this;
 #endif
         uint64_t t;
         uint32_t tl, th, red;
@@ -948,6 +981,9 @@ class kb31_t {
     friend kb31_t operator^(kb31_t a, uint32_t b) { return a ^= b; }
 
     inline kb31_t& sqr() { return *this; }
+
+    // To Montgomery form, as the device class does (kernels call it; nvcc parses them here too).
+    inline void to() { val = (uint32_t)(((uint64_t)val << 32) % MOD); }
 
     inline void set_to_zero() { val = 0; }
 

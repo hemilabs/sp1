@@ -967,6 +967,19 @@ struct sp1_bn254_glv_scalar_buffers {
 extern "C" rustCudaError_t sp1_bn254_glv_pool_get_scalar_buffers(
     sp1_bn254_glv_scalar_buffers* out);
 extern "C" rustCudaError_t sp1_bn254_glv_pool_reserve(size_t max_n);
+extern "C" void sp1_bn254_glv_pool_lock();
+extern "C" void sp1_bn254_glv_pool_unlock();
+extern "C" bool sp1_bn254_glv_pool_take_pending(const void* scalars, size_t npoints,
+                                                hipEvent_t* out_event);
+
+// Holds the shared GLV pool (bn254_msm_hip.cu) for a scope: another prover's
+// G1 MSM must not use or regrow the scalar buffers while a G2 MSM uses them.
+struct g2_glv_pool_guard {
+    g2_glv_pool_guard() { sp1_bn254_glv_pool_lock(); }
+    ~g2_glv_pool_guard() { sp1_bn254_glv_pool_unlock(); }
+    g2_glv_pool_guard(const g2_glv_pool_guard&) = delete;
+    g2_glv_pool_guard& operator=(const g2_glv_pool_guard&) = delete;
+};
 
 // ------------------------------------------------------------
 // Per-context GLV state: expanded points (2N) and window results.
@@ -1222,6 +1235,10 @@ rustCudaError_t sp1_bn254_g2_msm_invoke_glv(
         return rustCudaError_t{.message = "g2_msm_invoke_glv: npoints exceeds context capacity"};
     }
 
+    // Hold the shared pool until the result is back (the pipeline ends with
+    // a stream sync).
+    g2_glv_pool_guard pool_guard;
+
     rustCudaError_t err = g2_glv_init_ctx(ctx);
     if (err.message != CUDA_SUCCESS_CSL.message) return err;
 
@@ -1250,15 +1267,16 @@ rustCudaError_t sp1_bn254_g2_msm_invoke_glv(
     // are already in d_scalars[cur_buf]. We use hipStreamWaitEvent for
     // GPU-side cross-stream ordering (the upload ran on copy_stream; our
     // compute runs on ctx->stream).
+    // A pending upload of some other prover's scalars is waited for (it
+    // targets the same buffer) and then overwritten by our own upload.
     {
-        extern bool sp1_bn254_glv_pool_check_pending(hipEvent_t* out_event);
         hipEvent_t upload_event = nullptr;
-        bool pending = sp1_bn254_glv_pool_check_pending(&upload_event);
-        if (pending && upload_event) {
+        bool preuploaded = sp1_bn254_glv_pool_take_pending(scalars, npoints, &upload_event);
+        if (upload_event) {
             // GPU-side wait: ctx->stream waits until upload_event is recorded.
             hipStreamWaitEvent(ctx->stream, upload_event, 0);
-            // Scalars already in bufs.d_scalars — skip H2D.
-        } else {
+        }
+        if (!preuploaded) {
             if (hipMemcpyAsync(bufs.d_scalars, scalars,
                                (size_t)n * G2_SCALAR_LIMBS * sizeof(uint32_t),
                                hipMemcpyHostToDevice, ctx->stream) != hipSuccess) {

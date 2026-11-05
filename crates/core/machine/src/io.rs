@@ -7,7 +7,8 @@ use sp1_primitives::SP1GlobalContext;
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct SP1Stdin {
     /// Input stored as a vec of vec of bytes. It's stored this way because the read syscall reads
-    /// a vec of bytes at a time.
+    /// a vec of bytes at a time. Each one is serialized as a byte buffer.
+    #[serde(with = "sp1_primitives::serde_bytes::vec_vec")]
     pub buffer: Vec<Vec<u8>>,
     pub ptr: usize,
     pub proofs: Vec<(
@@ -102,3 +103,41 @@ impl SP1Stdin {
 //         }
 //     }
 // }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `SP1Stdin` as it was before its buffers were serialized as bytes.
+    #[derive(Serialize, Deserialize)]
+    struct PlainStdin {
+        buffer: Vec<Vec<u8>>,
+        ptr: usize,
+        proofs: Vec<(
+            SP1RecursionProof<SP1GlobalContext, SP1PcsProofInner>,
+            MachineVerifyingKey<SP1GlobalContext>,
+        )>,
+    }
+
+    /// The bincode (artifact store) and JSON encodings of `SP1Stdin` match the old ones, and old
+    /// data reads back.
+    #[test]
+    fn stdin_encoding_unchanged() {
+        let mut stdin = SP1Stdin::new();
+        stdin.write(&0x1234_5678u32);
+        stdin.write_vec((0..=255u8).cycle().take(10_000).collect());
+        stdin.write_slice(&[]);
+        stdin.ptr = 1;
+        let plain = PlainStdin { buffer: stdin.buffer.clone(), ptr: 1, proofs: Vec::new() };
+
+        let old = bincode::serialize(&plain).unwrap();
+        assert_eq!(bincode::serialize(&stdin).unwrap(), old);
+        let back: SP1Stdin = bincode::deserialize(&old).unwrap();
+        assert_eq!((back.buffer, back.ptr), (stdin.buffer.clone(), 1));
+
+        let old_json = serde_json::to_string(&plain).unwrap();
+        assert_eq!(serde_json::to_string(&stdin).unwrap(), old_json);
+        let back: SP1Stdin = serde_json::from_str(&old_json).unwrap();
+        assert_eq!(back.buffer, stdin.buffer);
+    }
+}

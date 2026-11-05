@@ -132,6 +132,9 @@ impl<F: Field, A: MachineAir<F>> TraceGenerator<F, A, CpuBackend>
         let airs = self.machine.chips().to_vec();
         let (tx, rx) = oneshot::channel();
         // Spawn a rayon task to generate the traces on the CPU.
+        // This generator runs no chip before the byte and range chips: a record whose
+        // dependencies leave out chips' would get short byte and range traces.
+        debug_assert!(!record.dependencies_in_trace(), "record needs dependencies in traces");
         slop_futures::rayon::spawn(move || {
             let chips_and_traces = airs
                 .into_par_iter()
@@ -259,6 +262,8 @@ impl<F: Field, A: MachineAir<F>> TraceGenerator<F, A, CpuBackend>
     ) -> TraceData<F, A, CpuBackend> {
         let airs = self.machine.chips().to_vec();
         let (tx, rx) = oneshot::channel();
+        // As in `generate_main_traces`.
+        debug_assert!(!record.dependencies_in_trace(), "record needs dependencies in traces");
         // Spawn a rayon task to generate the traces on the CPU.
         slop_futures::rayon::spawn(move || {
             let named_preprocessed_traces = airs

@@ -204,3 +204,36 @@ fn test_gas_depends_on_chunk_threshold() {
         "expected cost inflation: smallest-threshold cost {smallest_cost} !> baseline {baseline}",
     );
 }
+
+/// A reset executor runs again (the fixed-PK controller reuses its executor across proofs):
+/// it used to recreate its shared memory under the same names and then unlink them when the
+/// old handles dropped, so the second child died opening them; it also kept the old input.
+#[test]
+fn test_reset_reruns_with_new_input() {
+    use bincode::serialize;
+
+    let program = Arc::new(Program::from(&KECCAK256_ELF).expect("parse program"));
+    let new_runner = || {
+        MinimalExecutorRunner::new(program.clone(), false, Some(1 << 16), DEFAULT_MEMORY_LIMIT, 1)
+    };
+    let with_inputs = |runner: &mut MinimalExecutorRunner, count: usize| {
+        runner.with_input(&serialize(&count).unwrap());
+        for i in 0..count {
+            runner.with_input(&serialize(&vec![i as u8; 64]).unwrap());
+        }
+    };
+
+    let mut fresh = new_runner();
+    with_inputs(&mut fresh, 3);
+    assert_eq!(run(&mut fresh), None);
+
+    let mut reused = new_runner();
+    with_inputs(&mut reused, 2);
+    assert_eq!(run(&mut reused), None);
+    reused.reset();
+    with_inputs(&mut reused, 3);
+    assert_eq!(run(&mut reused), None);
+
+    assert_eq!(reused.public_values_stream(), fresh.public_values_stream());
+    assert_eq!(reused.global_clk(), fresh.global_clk());
+}

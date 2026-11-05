@@ -79,7 +79,6 @@ pub enum MemoryAccessPosition {
 /// includes the value, timestamp, and the previous timestamp.
 #[allow(clippy::manual_non_exhaustive)]
 #[derive(Debug, Copy, Clone, Default, Serialize, Deserialize, PartialEq, Eq, DeepSizeOf)]
-#[repr(C)]
 pub struct MemoryReadRecord {
     /// The value.
     pub value: u64,
@@ -97,7 +96,6 @@ pub struct MemoryReadRecord {
 /// includes the value, timestamp, previous value, and previous timestamp.
 #[allow(clippy::manual_non_exhaustive)]
 #[derive(Debug, Copy, Clone, Default, Serialize, Deserialize, PartialEq, Eq, DeepSizeOf)]
-#[repr(C)]
 pub struct MemoryWriteRecord {
     /// The previous timestamp.
     pub prev_timestamp: u64,
@@ -318,7 +316,6 @@ pub struct MemoryLocalEvent {
 /// This object encapsulates the information needed to prove a page prot access operation. This
 /// includes the clk and page prot value.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, DeepSizeOf, PartialEq, Eq)]
-#[repr(C)]
 pub struct PageProtRecord {
     /// The external flag.
     pub external_flag: bool,

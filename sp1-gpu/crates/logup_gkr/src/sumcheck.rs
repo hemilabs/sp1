@@ -5,7 +5,7 @@ use slop_algebra::{
     interpolate_univariate_polynomial, AbstractExtensionField, AbstractField, Field,
     UnivariatePolynomial,
 };
-use slop_alloc::{Buffer, HasBackend};
+use slop_alloc::{Buffer, CpuBackend, HasBackend, Slice};
 use slop_challenger::{FieldChallenger, IopCtx};
 use slop_multilinear::{Mle, Point};
 use slop_sumcheck::PartialSumcheckProof;
@@ -15,6 +15,7 @@ use sp1_gpu_cudart::{
     args,
     sys::{
         kernels::{
+            logup_gkr_device_rounds,
             logup_gkr_first_sum_as_poly_circuit_layer as first_sum_as_poly_layer_circuit_layer_kernel,
             logup_gkr_fix_and_sum_circuit_layer as fix_and_sum_circuit_layer_kernel,
             logup_gkr_fix_and_sum_first_layer as fix_and_sum_first_layer_kernel,
@@ -43,6 +44,8 @@ use crate::{
 };
 use rayon::prelude::*;
 use slop_sumcheck::partially_verify_sumcheck_proof;
+use sp1_gpu_basefold::DeviceGrindingChallenger;
+use sp1_gpu_challenger::{DuplexChallenger, DuplexChallengerRawMut};
 use sp1_gpu_utils::{fold_jagged_metadata_dev_tracked, DenseData, Ext, Felt, JaggedMle};
 
 /// Raise an under-filled grid so small layers spread across the SMs instead of looping
@@ -64,12 +67,23 @@ pub(crate) fn fill_grid(iters: usize, block: usize, old: usize) -> usize {
 /// One wave took ~11% less kernel time on an RTX 5090 (rsp-compressed: 412 -> 368 ms), with fewer
 /// per-block partials to sum. `fixAndSumCircuitLayer` was unchanged within noise, and the
 /// two-round fix-and-sum and jagged sumcheck kernels got slower, so they keep their grids.
+/// Not on RDNA (HIP with 32-wide waves): one 256-thread block per compute unit left too few waves
+/// to hide memory latency on an RX 9060 XT (32 CUs), where the kernel ran ~7x as long as on an RTX
+/// 5060 Ti; without the cap, bench-fib core took 5.84 -> 5.53 s and compressed 10.34 -> 9.80 s (an
+/// RTX 5060 Ti was unchanged either way). Wave64 HIP (CDNA, the MI300X) keeps the cap it was
+/// measured with.
 /// `SP1_GPU_REDUCE_BLOCKS_PER_SM=<n>` sets the blocks per SM, `0` removes the cap (A/B switch).
 fn fill_grid_one_wave(iters: usize, block: usize, old: usize) -> usize {
     static CAP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     let cap = *CAP.get_or_init(|| {
         match std::env::var("SP1_GPU_REDUCE_BLOCKS_PER_SM").ok().and_then(|v| v.parse().ok()) {
             Some(0) => usize::MAX,
+            // SAFETY: takes nothing and only reads the current device's attributes.
+            None if sp1_gpu_cudart::sys::BACKEND == "hip"
+                && unsafe { sp1_gpu_cudart::sys::runtime::sp1_hip_wave64() } == 0 =>
+            {
+                usize::MAX
+            }
             per_sm => per_sm.unwrap_or(1) * sp1_gpu_cudart::cuda_sm_count_cached(),
         }
     });
@@ -182,7 +196,9 @@ fn two_round_sum_as_poly<D: DenseData<TaskScope>>(
         fill_grid_one_wave(height >> 1, BLOCK_SIZE, height.div_ceil(BLOCK_SIZE * STRIDE * 2));
     let mut output = Tensor::<Ext, TaskScope>::with_sizes_in([10, grid_dim], scope.clone());
 
-    let num_tiles = BLOCK_SIZE.checked_div(STRIDE).unwrap_or(1);
+    // One shared slot per 32-wide reduction tile (`partialBlockReduce`), not per STRIDE.
+
+    let num_tiles = BLOCK_SIZE.checked_div(32).unwrap_or(1);
     let shared_mem = num_tiles * std::mem::size_of::<Ext>();
 
     unsafe {
@@ -474,7 +490,9 @@ fn sum_as_poly_first_layer(poly: &FirstLayerPolynomial, claim: Ext) -> Univariat
     let grid_dim = fill_grid(height, BLOCK_SIZE, height.div_ceil(BLOCK_SIZE).div_ceil(STRIDE));
     let mut output = Tensor::<Ext, TaskScope>::with_sizes_in([3, grid_dim], scope.clone());
 
-    let num_tiles = BLOCK_SIZE.checked_div(STRIDE).unwrap_or(1);
+    // One shared slot per 32-wide reduction tile (`partialBlockReduce`), not per STRIDE.
+
+    let num_tiles = BLOCK_SIZE.checked_div(32).unwrap_or(1);
     let shared_mem = num_tiles * std::mem::size_of::<Ext>();
 
     unsafe {
@@ -534,12 +552,12 @@ fn sum_as_poly_first_layer(poly: &FirstLayerPolynomial, claim: Ext) -> Univariat
 
 fn fix_last_variable_materialized_round(
     mut poly: LogupRoundPolynomial,
-    alpha: Ext,
+    alpha: Challenge,
 ) -> LogupRoundPolynomial {
     // Remove the last coordinate from the point
     let last_coordinate = poly.point.remove_last_coordinate();
-    let padding_adjustment = poly.padding_adjustment
-        * (last_coordinate * alpha + (Ext::one() - last_coordinate) * (Ext::one() - alpha));
+    let padding_adjustment = alpha.padding_adjustment(poly.padding_adjustment, last_coordinate);
+    let (alpha_value, alpha_device) = alpha.kernel_args();
 
     match &poly.layer {
         PolynomialLayer::InteractionsLayer(guts) => {
@@ -556,7 +574,14 @@ fn fix_last_variable_materialized_round(
             let grid_size = (grid_size_x, 1, 1);
 
             unsafe {
-                let args = args!(guts.as_ptr(), output.as_mut_ptr(), alpha, height, output_height);
+                let args = args!(
+                    guts.as_ptr(),
+                    output.as_mut_ptr(),
+                    alpha_value,
+                    alpha_device,
+                    height,
+                    output_height
+                );
                 output.assume_init();
                 backend
                     .launch_kernel(
@@ -571,8 +596,7 @@ fn fix_last_variable_materialized_round(
 
             let layer = PolynomialLayer::InteractionsLayer(output);
 
-            let eq_interaction =
-                poly.eq_interaction.fix_last_variable_constant_padding(alpha, Ext::zero());
+            let eq_interaction = alpha.fix_eq(&poly.eq_interaction);
 
             LogupRoundPolynomial {
                 layer,
@@ -612,7 +636,7 @@ fn fix_last_variable_materialized_round(
                         )
                         .unwrap();
                 }
-                let eq_row = poly.eq_row.fix_last_variable_constant_padding(alpha, Ext::zero());
+                let eq_row = alpha.fix_eq(&poly.eq_row);
 
                 return LogupRoundPolynomial {
                     layer: PolynomialLayer::InteractionsLayer(output),
@@ -677,7 +701,9 @@ fn fix_and_sum_first_layer(
     let grid_size = (grid_size_x, 1, 1);
     let block_dim = BLOCK_SIZE;
 
-    let num_tiles = BLOCK_SIZE.checked_div(STRIDE).unwrap_or(1);
+    // One shared slot per 32-wide reduction tile (`partialBlockReduce`), not per STRIDE.
+
+    let num_tiles = BLOCK_SIZE.checked_div(32).unwrap_or(1);
     let shared_mem = num_tiles * std::mem::size_of::<Ext>();
 
     unsafe {
@@ -737,7 +763,8 @@ fn sum_as_poly_materialized_round(
             let grid_dim =
                 fill_grid(height, BLOCK_SIZE, height.div_ceil(BLOCK_SIZE).div_ceil(STRIDE));
             let mut output = Tensor::<Ext, TaskScope>::with_sizes_in([3, grid_dim], scope.clone());
-            let num_tiles = BLOCK_SIZE.checked_div(STRIDE).unwrap_or(1);
+            // One shared slot per 32-wide reduction tile (`partialBlockReduce`), not per STRIDE.
+            let num_tiles = BLOCK_SIZE.checked_div(32).unwrap_or(1);
             let shared_mem = num_tiles * std::mem::size_of::<Ext>();
             unsafe {
                 let kernel = if poly.eq_row.guts().total_len() == 2 {
@@ -767,20 +794,108 @@ fn sum_as_poly_materialized_round(
 
 // returns (next univariate, next round polynomial)
 fn fix_and_sum_materialized_round(
-    mut poly: LogupRoundPolynomial,
+    poly: LogupRoundPolynomial,
     alpha: Ext,
     claim: Ext,
 ) -> (UnivariatePolynomial<Ext>, LogupRoundPolynomial) {
+    let (partials, poly) = fix_and_sum_materialized_round_partials(
+        poly,
+        Challenge::Host(alpha),
+        GkrRoundFinalize::on_host(),
+    );
+    let univariate = finalize_univariate(&poly, partials, claim);
+    (univariate, poly)
+}
+
+/// The device finalize of a round (logup_gkr/round.cu: GkrRoundFinalize), which the last block of
+/// its fix-and-sum kernel runs: see [`materialized_rounds_on_device`].
+#[repr(C)]
+struct GkrRoundFinalize {
+    constants: *const Ext,
+    state: *mut Ext,
+    coefficients: *mut Ext,
+    challenger: DuplexChallengerRawMut<Felt>,
+    /// Null: the host finalizes the round.
+    counter: *mut u32,
+}
+
+impl GkrRoundFinalize {
+    fn on_host() -> Self {
+        use std::ptr::{null, null_mut};
+        GkrRoundFinalize {
+            constants: null(),
+            state: null_mut(),
+            coefficients: null_mut(),
+            challenger: DuplexChallengerRawMut {
+                sponge_state: null_mut(),
+                input_buffer: null_mut(),
+                buffer_sizes: null_mut(),
+                output_buffer: null_mut(),
+            },
+            counter: null_mut(),
+        }
+    }
+}
+
+/// A round's challenge: on the host, or sampled on the device (see [`materialized_rounds_on_device`]).
+#[derive(Clone, Copy)]
+enum Challenge {
+    Host(Ext),
+    /// Device memory holding the challenge, written by work queued before the kernels using it.
+    Device(*const Ext),
+}
+
+impl Challenge {
+    /// The kernels' alpha arguments: the value (unused when the challenge is on the device) and
+    /// the device pointer (null on the host).
+    fn kernel_args(self) -> (Ext, *const Ext) {
+        match self {
+            Challenge::Host(alpha) => (alpha, std::ptr::null()),
+            Challenge::Device(alpha) => (Ext::zero(), alpha),
+        }
+    }
+
+    /// An eq polynomial with its last variable fixed at the challenge.
+    fn fix_eq(self, eq: &DeviceMle<Ext>) -> DeviceMle<Ext> {
+        match self {
+            Challenge::Host(alpha) => eq.fix_last_variable_constant_padding(alpha, Ext::zero()),
+            Challenge::Device(alpha) => {
+                eq.fix_last_variable_constant_padding_at_device_challenge(alpha, Ext::zero())
+            }
+        }
+    }
+
+    /// The padding adjustment after the round removes `last_coordinate` from the point. With the
+    /// challenge on the device, the device keeps it (logupGkrRoundFinalize), and this returns
+    /// `padding_adjustment` unchanged.
+    fn padding_adjustment(self, padding_adjustment: Ext, last_coordinate: Ext) -> Ext {
+        match self {
+            Challenge::Host(alpha) => {
+                padding_adjustment
+                    * (last_coordinate * alpha
+                        + (Ext::one() - last_coordinate) * (Ext::one() - alpha))
+            }
+            Challenge::Device(_) => padding_adjustment,
+        }
+    }
+}
+
+/// [`fix_and_sum_materialized_round`] up to the per-block partial sums, which
+/// [`finalize_univariate`] turns into the round polynomial, or `finalize` on the device.
+fn fix_and_sum_materialized_round_partials(
+    mut poly: LogupRoundPolynomial,
+    alpha: Challenge,
+    finalize: GkrRoundFinalize,
+) -> (Tensor<Ext, TaskScope>, LogupRoundPolynomial) {
     // Remove the last coordinate from the point
     let last_coordinate = poly.point.remove_last_coordinate();
-    let padding_adjustment = poly.padding_adjustment
-        * (last_coordinate * alpha + (Ext::one() - last_coordinate) * (Ext::one() - alpha));
+    let padding_adjustment = alpha.padding_adjustment(poly.padding_adjustment, last_coordinate);
+    let (alpha_value, alpha_device) = alpha.kernel_args();
 
     match &poly.layer {
         PolynomialLayer::InteractionsLayer(guts) => {
             // First, fix_last_variable on the eq_interaction
-            let eq_interaction =
-                poly.eq_interaction.fix_last_variable_constant_padding(alpha, Ext::zero());
+            let eq_interaction = alpha.fix_eq(&poly.eq_interaction);
             let height = guts.sizes()[1];
             let output_height = height.div_ceil(2);
             let backend = guts.backend();
@@ -807,11 +922,13 @@ fn fix_and_sum_materialized_round(
                     univariate_evals.as_mut_ptr(),
                     guts.as_ptr(),
                     output.as_mut_ptr(),
-                    alpha,
+                    alpha_value,
+                    alpha_device,
                     height,
                     output_height,
                     eq_interaction.guts().as_ptr(),
-                    poly.lambda
+                    poly.lambda,
+                    finalize
                 );
                 backend
                     .launch_kernel(
@@ -835,7 +952,6 @@ fn fix_and_sum_materialized_round(
                 eq_adjustment: poly.eq_adjustment,
                 padding_adjustment,
             };
-            let univariate_evals = finalize_univariate(&poly, univariate_evals, claim);
             (univariate_evals, poly)
         }
         PolynomialLayer::CircuitLayer(circuit) => {
@@ -848,7 +964,7 @@ fn fix_and_sum_materialized_round(
                 let mut output: Tensor<Ext, TaskScope> =
                     Tensor::with_sizes_in([4, height], backend.clone());
 
-                let eq_row = poly.eq_row.fix_last_variable_constant_padding(alpha, Ext::zero());
+                let eq_row = alpha.fix_eq(&poly.eq_row);
 
                 const BLOCK_SIZE: usize = 256;
                 const STRIDE: usize = 32;
@@ -869,10 +985,12 @@ fn fix_and_sum_materialized_round(
                     let args = args!(
                         univariate_evals.as_mut_ptr(),
                         circuit.jagged_mle.dense_data.as_ptr(),
-                        alpha,
+                        alpha_value,
+                        alpha_device,
                         output.as_mut_ptr(),
                         poly.eq_interaction.guts().as_ptr(),
-                        poly.lambda
+                        poly.lambda,
+                        finalize
                     );
                     backend
                         .launch_kernel(
@@ -893,10 +1011,9 @@ fn fix_and_sum_materialized_round(
                     eq_adjustment: padding_adjustment,
                     padding_adjustment: Ext::one(),
                 };
-                let univariate_evals = finalize_univariate(&poly, univariate_evals, claim);
                 (univariate_evals, poly)
             } else {
-                let eq_row = poly.eq_row.fix_last_variable_constant_padding(alpha, Ext::zero());
+                let eq_row = alpha.fix_eq(&poly.eq_row);
 
                 let (
                     output_interaction_start_indices,
@@ -945,10 +1062,12 @@ fn fix_and_sum_materialized_round(
                         univariate_evals.as_mut_ptr(),
                         circuit.jagged_mle.as_raw(),
                         output_jagged_mle.as_mut_raw(),
-                        alpha,
+                        alpha_value,
+                        alpha_device,
                         eq_row.guts().as_ptr(),
                         poly.eq_interaction.guts().as_ptr(),
-                        poly.lambda
+                        poly.lambda,
+                        finalize
                     );
                     backend
                         .launch_kernel(
@@ -976,9 +1095,7 @@ fn fix_and_sum_materialized_round(
                     eq_adjustment: poly.eq_adjustment,
                     padding_adjustment,
                 };
-
-                let univariate = finalize_univariate(&poly, univariate_evals, claim);
-                (univariate, poly)
+                (univariate_evals, poly)
             }
         }
     }
@@ -1004,13 +1121,277 @@ where
     alpha
 }
 
+/// The fewest rounds worth running on the device ([`materialized_rounds_on_device`]): that costs
+/// a copy of the challenger to the device and one read back of the round messages, where the host
+/// pays a round trip per round.
+const DEVICE_ROUNDS_MIN: usize = 3;
+
+/// `SP1_GPU_GKR_DEVICE_ROUNDS=1` runs a layer's rounds on the device
+/// ([`materialized_rounds_on_device`]); by default they stay on the host. On an RX 9070 XT the
+/// device finalize (one warp, two Poseidon2 permutations: ~23 us a round) costs what the host's
+/// round trip does, and an RSP block (21000000) proved compressed in the same time either way
+/// (49.90 s against 49.91 s), with 115,000 fewer stream waits; untested on CUDA, CDNA (64-wide
+/// waves) and Windows, where a wait costs more.
+fn device_rounds_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("SP1_GPU_GKR_DEVICE_ROUNDS").is_ok_and(|v| v.trim() == "1"))
+}
+
+/// The last `rounds` rounds of a layer's sumcheck (after the first, whose challenge is
+/// `point[0]`), each a [`fix_and_sum_materialized_round`], then the last fix: on the device where
+/// the challenger can continue there ([`materialized_rounds_on_device`]), else on the host.
+/// Returns the component polynomial evaluations.
+fn remaining_rounds<C: FieldChallenger<Felt> + DeviceGrindingChallenger>(
+    mut poly: LogupRoundPolynomial,
+    rounds: usize,
+    challenger: &mut C,
+    univariate_poly_msgs: &mut Vec<UnivariatePolynomial<Ext>>,
+    point: &mut Vec<Ext>,
+) -> Vec<Ext> {
+    // SAFETY: takes nothing.
+    let supported = unsafe { logup_gkr_device_rounds() } != 0;
+    if rounds >= DEVICE_ROUNDS_MIN && supported && device_rounds_enabled() {
+        if let Some(duplex) = challenger.device_duplex_state() {
+            return materialized_rounds_on_device(
+                poly,
+                rounds,
+                &duplex,
+                challenger,
+                univariate_poly_msgs,
+                point,
+            );
+        }
+    }
+    for _ in 0..rounds {
+        let alpha = point[0];
+        // Get the round claim from the last round's univariate poly message.
+        let round_claim = univariate_poly_msgs.last().unwrap().eval_at_point(alpha);
+        let (uni_poly, next_poly) = fix_and_sum_materialized_round(poly, alpha, round_claim);
+        poly = next_poly;
+        process_univariate_polynomial(uni_poly, challenger, univariate_poly_msgs, point);
+    }
+    poly = fix_last_variable_materialized_round(poly, Challenge::Host(point[0]));
+    get_component_poly_evals(&poly)
+}
+
+/// The constants logupGkrRoundFinalize reads for each round.
+const ROUND_CONSTANTS: usize = 7;
+
+/// Where [`materialized_rounds_on_device`] keeps the device challenger and its rounds' data, in
+/// one buffer of u32 words, read back whole at the end: the challenger (sponge, input and output
+/// buffers, then the two buffer lengths as u64s), the finalize's block counter (word 56), then
+/// from word 64 extension elements: the round
+/// state (claim, padding adjustment, eq adjustment), the challenges (the first one's in `alpha`),
+/// the round messages (4 coefficients each), the rounds' constants, the component evaluations.
+struct DeviceRoundsLayout {
+    rounds: usize,
+}
+
+impl DeviceRoundsLayout {
+    const CHALLENGER_WIDTH: usize = 16;
+    /// The word counting the fix-and-sum blocks done (see GkrRoundFinalize), 0 between rounds.
+    const COUNTER: usize = 56;
+    /// The word where the extension elements start (16-byte aligned, past the challenger).
+    const EXT_START: usize = 64;
+
+    fn state(&self) -> usize {
+        0
+    }
+    fn alphas(&self) -> usize {
+        3
+    }
+    fn messages(&self) -> usize {
+        self.alphas() + self.rounds + 1
+    }
+    fn constants(&self) -> usize {
+        self.messages() + 4 * self.rounds
+    }
+    fn evaluations(&self) -> usize {
+        self.constants() + ROUND_CONSTANTS * self.rounds
+    }
+    fn words(&self) -> usize {
+        Self::EXT_START + 4 * (self.evaluations() + 4)
+    }
+}
+
+/// The u32 words of KoalaBear elements or their degree-4 extension, as the device stores them
+/// (Montgomery form): `MontyField31` is `repr(transparent)` over a u32, and
+/// `BinomialExtensionField` is `repr(C)` over 4 of them.
+fn field_words<T: Copy>(values: &[T]) -> &[u32] {
+    const { assert!(std::mem::size_of::<Felt>() == 4 && std::mem::size_of::<Ext>() == 16) };
+    assert_eq!(std::mem::size_of::<T>() % 4, 0);
+    // SAFETY: T is Felt or Ext (sizes checked), made of u32s in memory, and u32 needs less
+    // alignment than T.
+    unsafe {
+        std::slice::from_raw_parts(values.as_ptr().cast::<u32>(), std::mem::size_of_val(values) / 4)
+    }
+}
+
+/// The extension element at extension index `index` of the words read back (see
+/// [`DeviceRoundsLayout`]).
+fn ext_at(words: &[u32], index: usize) -> Ext {
+    let at = DeviceRoundsLayout::EXT_START + 4 * index;
+    Ext::from_base_fn(|i| {
+        // SAFETY: Felt is a repr(transparent) u32 holding the Montgomery form the device wrote.
+        unsafe { std::mem::transmute::<u32, Felt>(words[at + i]) }
+    })
+}
+
+/// Copies `words` to the end of `buffer` in pieces of at most 2 KiB, which the HIP runtime
+/// uploads as kernel arguments, in stream order, without waiting for the stream.
+fn upload_in_pieces(buffer: &mut DeviceBuffer<u32>, words: &[u32]) {
+    for piece in words.chunks(512) {
+        // Safety: `piece` is pageable memory, which the copy has read when it returns.
+        unsafe { buffer.extend_from_host_slice(piece).unwrap() };
+    }
+}
+
+/// [`remaining_rounds`] with the challenges sampled on the device. The last block of each round's
+/// fix-and-sum kernel to finish does what the host would (finalize_univariate,
+/// process_univariate_polynomial, the next round's claim and padding adjustment) with a device
+/// copy of the challenger (`duplex`, this challenger's state), and the next round's kernels read
+/// the challenge it samples, so the host queues all the rounds without waiting for any. It then
+/// reads the round messages back once and replays them through its own challenger, which samples
+/// the same challenges (checked) and stays in step for the rest of the proof.
+fn materialized_rounds_on_device<C: FieldChallenger<Felt>>(
+    mut poly: LogupRoundPolynomial,
+    rounds: usize,
+    duplex: &DuplexChallenger<Felt, CpuBackend>,
+    challenger: &mut C,
+    univariate_poly_msgs: &mut Vec<UnivariatePolynomial<Ext>>,
+    point: &mut Vec<Ext>,
+) -> Vec<Ext> {
+    let backend = poly.eq_row.backend().clone();
+    let alpha = point[0];
+    let round_claim = univariate_poly_msgs.last().unwrap().eval_at_point(alpha);
+    let layout = DeviceRoundsLayout { rounds };
+
+    // Each round's constants, from the point and the layer's shape as the rounds will change
+    // them: the coordinate the round removes, the last one left (finalize_univariate's
+    // `point_last`), whether the round turns the last circuit layer into an interactions layer,
+    // then the root b of the eq factor, where the round polynomial vanishes (its fourth node), and
+    // 1/(0 - b), 1/(1 - b), 1/(1/2 - b), with which the device interpolates it from its values at
+    // 0, 1 and 1/2 as (X - b) times the quadratic through those values divided by the node minus b.
+    let half = Ext::two().inverse();
+    let mut constants = Vec::with_capacity(rounds * ROUND_CONSTANTS);
+    let mut remaining_point = poly.point.clone();
+    let mut circuit_row_variables = match &poly.layer {
+        PolynomialLayer::CircuitLayer(circuit) => Some(circuit.num_row_variables),
+        PolynomialLayer::InteractionsLayer(_) => None,
+    };
+    for _ in 0..rounds {
+        let removed = remaining_point.remove_last_coordinate();
+        let last = *remaining_point.last().unwrap();
+        let transition = circuit_row_variables == Some(1);
+        circuit_row_variables = circuit_row_variables.filter(|&k| k > 1).map(|k| k - 1);
+        let root = (Ext::one() - last) / (Ext::one() - last.double());
+        constants.extend([
+            removed,
+            last,
+            if transition { Ext::one() } else { Ext::zero() },
+            root,
+            (-root).inverse(),
+            (Ext::one() - root).inverse(),
+            (half - root).inverse(),
+        ]);
+    }
+
+    // The buffer: the challenger, the state and the first challenge, then (unwritten) the other
+    // challenges and the messages, then the constants. The evaluations come last, below.
+    let mut words = vec![0u32; DeviceRoundsLayout::EXT_START];
+    let width = DeviceRoundsLayout::CHALLENGER_WIDTH;
+    words[..width].copy_from_slice(field_words(&duplex.sponge_state));
+    words[width..2 * width].copy_from_slice(field_words(&duplex.input_buffer));
+    words[2 * width..3 * width].copy_from_slice(field_words(&duplex.output_buffer));
+    for (i, &size) in duplex.buffer_sizes.iter().enumerate() {
+        let size = size as u64;
+        words[3 * width + 2 * i] = size as u32;
+        words[3 * width + 2 * i + 1] = (size >> 32) as u32;
+    }
+    words.extend_from_slice(field_words(&[
+        round_claim,
+        poly.padding_adjustment,
+        poly.eq_adjustment,
+        alpha,
+    ]));
+    let mut device = DeviceBuffer::<u32>::with_capacity_in(layout.words(), backend.clone());
+    upload_in_pieces(&mut device, &words);
+    // Safety: the round finalize kernels write the challenges and messages before anything reads
+    // them.
+    unsafe { device.set_len(DeviceRoundsLayout::EXT_START + 4 * layout.constants()) };
+    upload_in_pieces(&mut device, field_words(&constants));
+
+    let base = device.as_mut_ptr();
+    // Safety: within the buffer's capacity (`layout.words()`).
+    let ext = unsafe { base.add(DeviceRoundsLayout::EXT_START).cast::<Ext>() };
+    for round in 0..rounds {
+        // Safety: within the buffer (see `DeviceRoundsLayout`).
+        let (alpha, finalize) = unsafe {
+            (
+                ext.add(layout.alphas() + round),
+                GkrRoundFinalize {
+                    constants: ext.add(layout.constants() + round * ROUND_CONSTANTS),
+                    state: ext.add(layout.state()),
+                    coefficients: ext.add(layout.messages() + 4 * round),
+                    challenger: DuplexChallengerRawMut {
+                        sponge_state: base.cast(),
+                        input_buffer: base.add(width).cast(),
+                        output_buffer: base.add(2 * width).cast(),
+                        buffer_sizes: base.add(3 * width).cast(),
+                    },
+                    counter: base.add(DeviceRoundsLayout::COUNTER),
+                },
+            )
+        };
+        // The fix-and-sum kernel's partial sums go when it is done (stream ordered).
+        let (_partials, next_poly) =
+            fix_and_sum_materialized_round_partials(poly, Challenge::Device(alpha), finalize);
+        poly = next_poly;
+    }
+    // Safety: the last challenge is within the buffer.
+    poly = fix_last_variable_materialized_round(
+        poly,
+        Challenge::Device(unsafe { ext.add(layout.alphas() + rounds) }),
+    );
+    let PolynomialLayer::InteractionsLayer(guts) = &poly.layer else { unreachable!() };
+    debug_assert_eq!(guts.sizes(), [4, 1]);
+    debug_assert_eq!(device.len(), DeviceRoundsLayout::EXT_START + 4 * layout.evaluations());
+    // The 4 component evaluations, as words, at the buffer's end.
+    // Safety: the evaluations are 4 extension elements, 16 words of device memory, which stay
+    // allocated (`poly`) until the copy has been queued.
+    let evaluation_words: &Slice<u32, TaskScope> =
+        unsafe { Slice::from_raw_parts(guts.as_buffer().as_ptr().cast::<u32>(), 16) };
+    device.extend_from_device_slice(evaluation_words).unwrap();
+
+    let host = device.to_host().unwrap();
+    for round in 0..rounds {
+        let message = UnivariatePolynomial::new(
+            (0..4).map(|k| ext_at(&host, layout.messages() + 4 * round + k)).collect(),
+        );
+        // The device built the message from the claim the host's messages imply.
+        let claim = univariate_poly_msgs.last().unwrap().eval_at_point(point[0]);
+        assert_eq!(
+            message.eval_one_plus_eval_zero(),
+            claim,
+            "LogUp-GKR sumcheck: the device's round {round} message does not sum to its claim"
+        );
+        let alpha = process_univariate_polynomial(message, challenger, univariate_poly_msgs, point);
+        assert_eq!(
+            alpha,
+            ext_at(&host, layout.alphas() + round + 1),
+            "LogUp-GKR sumcheck: the device challenger diverged from the host's in round {round}"
+        );
+    }
+    (0..4).map(|k| ext_at(&host, layout.evaluations() + k)).collect()
+}
+
 pub fn first_round_sumcheck<C>(
     poly: FirstLayerPolynomial,
     challenger: &mut C,
     claim: Ext,
 ) -> (PartialSumcheckProof<Ext>, Vec<Ext>)
 where
-    C: FieldChallenger<Felt>,
+    C: FieldChallenger<Felt> + DeviceGrindingChallenger,
 {
     // Check that all the polynomials have the same number of variables.
     let num_variables = poly.num_variables();
@@ -1029,7 +1410,7 @@ where
     // halves that allocation on top of saving a pass over the leaf.
     let use_lookahead = poly.layer.num_row_variables > 2;
 
-    let (mut alpha, mut poly, rounds_processed) = if use_lookahead {
+    let (alpha, poly, rounds_processed) = if use_lookahead {
         let grid = two_round_sum_as_poly(
             &poly.layer.jagged_mle,
             poly.layer.jagged_mle.dense_data.height,
@@ -1084,26 +1465,16 @@ where
         (alpha, next_poly, 2)
     };
 
-    for _ in rounds_processed..num_variables as usize {
-        // Get the round claims from the last round's univariate poly messages.
-        let round_claim = univariate_poly_msgs.last().unwrap().eval_at_point(alpha);
-
-        let (uni_poly, next_poly) = fix_and_sum_materialized_round(poly, alpha, round_claim);
-        poly = next_poly;
-
-        alpha = process_univariate_polynomial(
-            uni_poly,
-            challenger,
-            &mut univariate_poly_msgs,
-            &mut point,
-        );
-    }
-
-    poly = fix_last_variable_materialized_round(poly, *point.first().unwrap());
+    debug_assert_eq!(alpha, point[0]);
+    let component_poly_evals = remaining_rounds(
+        poly,
+        num_variables as usize - rounds_processed,
+        challenger,
+        &mut univariate_poly_msgs,
+        &mut point,
+    );
 
     let evals = univariate_poly_msgs.last().unwrap().eval_at_point(*point.first().unwrap());
-
-    let component_poly_evals = get_component_poly_evals(&poly);
 
     (
         PartialSumcheckProof {
@@ -1115,7 +1486,7 @@ where
     )
 }
 
-pub fn materialized_round_sumcheck<C: FieldChallenger<Felt>>(
+pub fn materialized_round_sumcheck<C: FieldChallenger<Felt> + DeviceGrindingChallenger>(
     mut poly: LogupRoundPolynomial,
     challenger: &mut C,
     claim: Ext,
@@ -1134,9 +1505,9 @@ pub fn materialized_round_sumcheck<C: FieldChallenger<Felt>>(
         PolynomialLayer::CircuitLayer(circuit) if circuit.num_row_variables > 2
     );
 
-    let mut round_claim;
-    let rounds_processed;
-    if use_lookahead {
+    // The rounds done before `remaining_rounds`, which takes the round claim from the last
+    // message at the last challenge.
+    let rounds_processed = if use_lookahead {
         let PolynomialLayer::CircuitLayer(circuit) = &poly.layer else { unreachable!() };
         let grid = two_round_sum_as_poly(
             &circuit.jagged_mle,
@@ -1161,14 +1532,8 @@ pub fn materialized_round_sumcheck<C: FieldChallenger<Felt>>(
         let (uni_poly, next_poly) =
             two_round_fix_and_sum_circuit_layer(poly, alpha_1, alpha_2, claim_3);
         poly = next_poly;
-        let alpha = process_univariate_polynomial(
-            uni_poly,
-            challenger,
-            &mut univariate_poly_msgs,
-            &mut point,
-        );
-        round_claim = univariate_poly_msgs.last().unwrap().eval_at_point(alpha);
-        rounds_processed = 3;
+        process_univariate_polynomial(uni_poly, challenger, &mut univariate_poly_msgs, &mut point);
+        3
     } else {
         // First round: compute initial univariate polynomial
         let uni_poly = sum_as_poly_materialized_round(&poly, claim);
@@ -1181,7 +1546,7 @@ pub fn materialized_round_sumcheck<C: FieldChallenger<Felt>>(
 
         // Early return for single variable case
         if num_variables == 1 {
-            poly = fix_last_variable_materialized_round(poly, alpha);
+            poly = fix_last_variable_materialized_round(poly, Challenge::Host(alpha));
             let eval = univariate_poly_msgs[0].eval_at_point(alpha);
             let component_poly_evals = get_component_poly_evals(&poly);
 
@@ -1195,30 +1560,20 @@ pub fn materialized_round_sumcheck<C: FieldChallenger<Felt>>(
             );
         }
 
-        round_claim = univariate_poly_msgs[0].eval_at_point(alpha);
-        rounds_processed = 1;
-    }
+        1
+    };
 
-    // Process remaining rounds
-    for _round in rounds_processed..num_variables as usize {
-        let (uni_poly, next_poly) = fix_and_sum_materialized_round(poly, point[0], round_claim);
-        poly = next_poly;
-
-        let alpha = process_univariate_polynomial(
-            uni_poly,
-            challenger,
-            &mut univariate_poly_msgs,
-            &mut point,
-        );
-        round_claim = univariate_poly_msgs.last().unwrap().eval_at_point(alpha);
-    }
-
-    // Final fix_last_variable
-    poly = fix_last_variable_materialized_round(poly, point[0]);
+    // Process remaining rounds, then the final fix_last_variable
+    let component_poly_evals = remaining_rounds(
+        poly,
+        num_variables as usize - rounds_processed,
+        challenger,
+        &mut univariate_poly_msgs,
+        &mut point,
+    );
 
     // Compute final evaluation
     let eval = univariate_poly_msgs.last().unwrap().eval_at_point(point[0]);
-    let component_poly_evals = get_component_poly_evals(&poly);
 
     (
         PartialSumcheckProof {
@@ -1235,7 +1590,7 @@ pub fn bench_materialized_sumcheck<GC: IopCtx>(
     rng: &mut impl rand::Rng,
     num_row_variables: Option<u32>,
 ) where
-    GC::Challenger: FieldChallenger<Felt>,
+    GC::Challenger: FieldChallenger<Felt> + DeviceGrindingChallenger,
 {
     let get_challenger = move || GC::default_challenger();
     let now = std::time::Instant::now();

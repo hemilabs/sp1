@@ -4,7 +4,6 @@ use core::{
 };
 use std::marker::PhantomData;
 
-use hashbrown::HashMap;
 use slop_air::{Air, BaseAir};
 use slop_algebra::{AbstractField, PrimeField, PrimeField32};
 use slop_matrix::Matrix;
@@ -12,7 +11,7 @@ use slop_maybe_rayon::prelude::{
     IndexedParallelIterator, ParallelIterator, ParallelSlice, ParallelSliceMut,
 };
 use sp1_core_executor::{
-    events::{AluEvent, ByteLookupEvent, ByteRecord},
+    events::{AluEvent, ByteRecord},
     ExecutionRecord, Opcode, Program, CLK_INC, PC_INC,
 };
 use sp1_derive::AlignedBorrow;
@@ -109,6 +108,63 @@ impl<F: PrimeField32, M: TrustMode> MachineAir<F> for MulChip<M> {
         _output: &mut ExecutionRecord,
         buffer: &mut [MaybeUninit<F>],
     ) {
+        self.generate_trace_into_with::<F>(input, buffer, false);
+    }
+
+    fn dependencies_in_trace(&self) -> bool {
+        true
+    }
+
+    fn generate_trace_into_with_dependencies(
+        &self,
+        input: &ExecutionRecord,
+        buffer: &mut [MaybeUninit<F>],
+    ) {
+        self.generate_trace_into_with::<F>(input, buffer, true);
+    }
+
+    fn generate_dependencies(&self, input: &Self::Record, _output: &mut Self::Record) {
+        if input.program.enable_untrusted_programs == M::IS_TRUSTED {
+            return;
+        }
+
+        let chunk_size = std::cmp::max(input.mul_events.len() / num_cpus::get(), 1);
+        let width = <MulChip<M> as BaseAir<F>>::width(self);
+
+        input.mul_events.par_chunks(chunk_size).for_each(|events| {
+            input.byte_lookup_counts.count(|blu| {
+                // One scratch row per chunk instead of an allocation per event.
+                let mut row = vec![F::zero(); width];
+                events.iter().for_each(|event| {
+                    row.fill(F::zero());
+                    let cols: &mut MulCols<F, M> = row.as_mut_slice().borrow_mut();
+                    cols.adapter.populate(blu, event.1);
+                    self.event_to_row(&event.0, cols, blu);
+                    cols.state.populate(blu, event.0.clk, event.0.pc);
+                });
+            });
+        });
+    }
+
+    fn included(&self, shard: &Self::Record) -> bool {
+        if let Some(shape) = shard.shape.as_ref() {
+            shape.included::<F, _>(self)
+        } else {
+            !shard.mul_events.is_empty()
+                && (M::IS_TRUSTED != shard.program.enable_untrusted_programs)
+        }
+    }
+}
+
+impl<M: TrustMode> MulChip<M> {
+    /// Writes the trace into `buffer`. With `count`, the byte lookups of the rows are counted
+    /// into `input.byte_lookup_counts`, as `generate_dependencies` does.
+    fn generate_trace_into_with<F: PrimeField32>(
+        &self,
+        input: &ExecutionRecord,
+        buffer: &mut [MaybeUninit<F>],
+        count: bool,
+    ) {
         if input.program.enable_untrusted_programs == M::IS_TRUSTED {
             return;
         }
@@ -131,61 +187,24 @@ impl<F: PrimeField32, M: TrustMode> MachineAir<F> for MulChip<M> {
         let values = unsafe { core::slice::from_raw_parts_mut(buffer_ptr, nb_rows * width) };
 
         values.par_chunks_mut(chunk_size * width).enumerate().for_each(|(i, rows)| {
-            rows.chunks_mut(width).enumerate().for_each(|(j, row)| {
-                let idx = i * chunk_size + j;
-                let cols: &mut MulCols<F, M> = row.borrow_mut();
+            input.byte_lookup_counts.count_if(count, |blu| {
+                rows.chunks_mut(width).enumerate().for_each(|(j, row)| {
+                    let idx = i * chunk_size + j;
+                    let cols: &mut MulCols<F, M> = row.borrow_mut();
 
-                if idx < nb_rows {
-                    let mut byte_lookup_events = sp1_core_executor::events::DiscardByteRecord;
-                    let event = &input.mul_events[idx];
-                    cols.adapter.populate(&mut byte_lookup_events, event.1);
-                    self.event_to_row(&event.0, cols, &mut byte_lookup_events);
-                    cols.state.populate(&mut byte_lookup_events, event.0.clk, event.0.pc);
-                    if !M::IS_TRUSTED {
-                        let cols: &mut MulCols<F, UserMode> = row.borrow_mut();
-                        cols.adapter_cols.is_trusted = F::from_bool(!event.1.is_untrusted);
+                    if idx < nb_rows {
+                        let event = &input.mul_events[idx];
+                        cols.adapter.populate(blu, event.1);
+                        self.event_to_row(&event.0, cols, blu);
+                        cols.state.populate(blu, event.0.clk, event.0.pc);
+                        if !M::IS_TRUSTED {
+                            let cols: &mut MulCols<F, UserMode> = row.borrow_mut();
+                            cols.adapter_cols.is_trusted = F::from_bool(!event.1.is_untrusted);
+                        }
                     }
-                }
+                });
             });
         });
-    }
-
-    fn generate_dependencies(&self, input: &Self::Record, output: &mut Self::Record) {
-        if input.program.enable_untrusted_programs == M::IS_TRUSTED {
-            return;
-        }
-
-        let chunk_size = std::cmp::max(input.mul_events.len() / num_cpus::get(), 1);
-        let width = <MulChip<M> as BaseAir<F>>::width(self);
-
-        let blu_batches = input
-            .mul_events
-            .par_chunks(chunk_size)
-            .map(|events| {
-                let mut blu: HashMap<ByteLookupEvent, usize> = HashMap::new();
-                // One scratch row per chunk instead of an allocation per event.
-                let mut row = vec![F::zero(); width];
-                events.iter().for_each(|event| {
-                    row.fill(F::zero());
-                    let cols: &mut MulCols<F, M> = row.as_mut_slice().borrow_mut();
-                    cols.adapter.populate(&mut blu, event.1);
-                    self.event_to_row(&event.0, cols, &mut blu);
-                    cols.state.populate(&mut blu, event.0.clk, event.0.pc);
-                });
-                blu
-            })
-            .collect::<Vec<_>>();
-
-        output.add_byte_lookup_events_from_maps(blu_batches.iter().collect::<Vec<_>>());
-    }
-
-    fn included(&self, shard: &Self::Record) -> bool {
-        if let Some(shape) = shard.shape.as_ref() {
-            shape.included::<F, _>(self)
-        } else {
-            !shard.mul_events.is_empty()
-                && (M::IS_TRUSTED != shard.program.enable_untrusted_programs)
-        }
     }
 }
 

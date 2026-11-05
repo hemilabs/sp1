@@ -173,11 +173,56 @@ __device__ __forceinline__ void global_store_search(
 
 constexpr static const int GLOBAL_SEARCH_PER_LANE = 8;
 
-__global__ void riscv_global_search_offsets_kernel(
+// RDNA: a 128-thread work-group bound matching the launcher's block size (tracegen/src/riscv/global.rs).
+// Without it the kernel is compiled for 1024-thread blocks, and the per-thread arrays the compiler
+// promotes to LDS are sized for 1024 threads: 53 KB per block, two 128-thread blocks per WGP (2 waves/SIMD).
+// (CDNA and CUDA keep their current code: not measured there.)
+// RDNA (32-wide waves) runs the per-warp work queue below like CUDA; the portable fallback stays for
+// wave64 (CDNA) and SYCL. RX 9070 XT, 2^19 random events: 11.1 ms -> 6.9 ms (bounds) -> 2.9 ms (bounds
+// + queue), identical output.
+#if defined(__HIP_DEVICE_COMPILE__) && (defined(__GFX11__) || defined(__GFX12__))
+#define SP1_GLOBAL_WARP_QUEUE_HIP 1
+#define SP1_GLOBAL_RDNA_BOUNDS __attribute__((amdgpu_flat_work_group_size(1, 128)))
+#else
+#define SP1_GLOBAL_RDNA_BOUNDS
+#endif
+__global__ SP1_GLOBAL_RDNA_BOUNDS void riscv_global_search_offsets_kernel(
     const sp1_gpu_sys::GlobalInteractionEvent* __restrict__ events,
     uintptr_t nb_events,
     GlobalSearchOut* __restrict__ out) {
-#if defined(__HIP_PLATFORM_AMD__) || defined(SP1_SYCL)
+#if defined(SP1_GLOBAL_WARP_QUEUE_HIP)
+    const uint32_t lane = threadIdx.x & 31;
+    const size_t warp = (blockIdx.x * (size_t)blockDim.x + threadIdx.x) >> 5;
+    const size_t base = warp * 32 * GLOBAL_SEARCH_PER_LANE;
+    if (base >= nb_events) return;
+    const size_t end = min((size_t)nb_events, base + 32 * GLOBAL_SEARCH_PER_LANE);
+    size_t next = base + 32;
+    long long idx = (base + lane < end) ? (long long)(base + lane) : -1;
+    uint32_t offset = 0;
+#pragma unroll(1)
+    while (__any(idx >= 0)) {
+        bool done = false;
+        if (idx >= 0) {
+            kb31_t x[7];
+            kb31_septic_extension_t y_sq;
+            kb31_t pr;
+            bool sq = global_trial(&events[idx], offset, x, y_sq, pr);
+            if (sq || offset == 255) {
+                global_store_search(&out[idx], x, y_sq, pr, sq ? offset : 256u);
+                done = true;
+            } else {
+                offset++;
+            }
+        }
+        const uint32_t done_mask = (uint32_t)__ballot(done);  // wave32: the low 32 bits
+        if (done) {
+            size_t ni = next + __popc(done_mask & ((1u << lane) - 1));
+            idx = ni < end ? (long long)ni : -1;
+            offset = 0;
+        }
+        next += __popc(done_mask);
+    }
+#elif defined(__HIP_PLATFORM_AMD__) || defined(SP1_SYCL)
     // Portable fallback (wave size may be 64; 16-wide sub-groups on SYCL): one event per thread.
     size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
     if (i >= nb_events) return;
@@ -347,7 +392,7 @@ __global__ void riscv_global_generate_trace_decompress_kernel(
 
 // SP1 perf: only the interaction x/y (dummy rows), cumulative_sum and initial_digest columns change here;
 // the old version read and rewrote all GLOBAL_COLUMNS per row (9.8-11.6x slower, same output).
-__global__ void riscv_global_generate_trace_finalize_kernel(
+__global__ SP1_GLOBAL_RDNA_BOUNDS void riscv_global_generate_trace_finalize_kernel(
     kb31_t* trace,
     uintptr_t trace_height,
     const bb31_septic_curve_t* cumulative_sums,

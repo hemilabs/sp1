@@ -4,15 +4,10 @@ use std::{
 };
 
 use crate::{air::SP1CoreAirBuilder, utils::next_multiple_of_32};
-use hashbrown::HashMap;
-use itertools::Itertools;
 use slop_air::{Air, AirBuilder, BaseAir};
 use slop_algebra::{AbstractField, Field, PrimeField32};
 use slop_matrix::Matrix;
-use sp1_core_executor::{
-    events::{ByteLookupEvent, ByteRecord},
-    ByteOpcode, ExecutionRecord, Program, PC_INC,
-};
+use sp1_core_executor::{events::ByteRecord, ByteOpcode, ExecutionRecord, Program, PC_INC};
 use sp1_derive::AlignedBorrow;
 use sp1_hypercube::air::MachineAir;
 use struct_reflection::{StructReflection, StructReflectionHelper};
@@ -56,13 +51,10 @@ impl<F: PrimeField32> MachineAir<F> for StateBumpChip {
         "StateBump"
     }
 
-    fn generate_dependencies(&self, input: &Self::Record, output: &mut Self::Record) {
-        let chunk_size = 1;
-        let event_iter = input.bump_state_events.chunks(chunk_size);
-
-        let blu_batches = event_iter
-            .map(|events| {
-                let mut blu: HashMap<ByteLookupEvent, usize> = HashMap::new();
+    fn generate_dependencies(&self, input: &Self::Record, _output: &mut Self::Record) {
+        // One counter for all the events (rare: a sequential loop needs no more).
+        std::iter::once(&input.bump_state_events[..]).for_each(|events| {
+            input.byte_lookup_counts.count(|blu| {
                 events.iter().for_each(|(clk, increment, _, pc)| {
                     let next_clk = clk + increment;
                     let next_clk_0_16 = (next_clk & 0xFFFF) as u16;
@@ -78,11 +70,8 @@ impl<F: PrimeField32> MachineAir<F> for StateBumpChip {
                     blu.add_u8_range_checks(&[next_clk_16_24, next_clk_24_32]);
                     blu.add_u16_range_checks(&[pc_0, pc_1, pc_2]);
                 });
-                blu
-            })
-            .collect::<Vec<_>>();
-
-        output.add_byte_lookup_events_from_maps(blu_batches.iter().collect_vec());
+            });
+        });
     }
 
     fn num_rows(&self, input: &Self::Record) -> Option<usize> {

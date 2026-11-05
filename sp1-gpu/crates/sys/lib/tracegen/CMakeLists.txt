@@ -9,6 +9,10 @@ add_library(tracegen_objs OBJECT
     recursion/sbox.cu
     recursion/select.cu
     riscv/global.cu
+    riscv/mul.cu
+    riscv/shift_right.cu
+    riscv/simple_alu.cu
+    riscv/branch.cu
 )
 target_link_libraries(tracegen_objs PRIVATE sp1_gpu_common)
 
@@ -23,4 +27,8 @@ if(USE_HIP)
     set_source_files_properties(recursion/sbox.cu PROPERTIES LANGUAGE HIP)
     set_source_files_properties(recursion/select.cu PROPERTIES LANGUAGE HIP)
     set_source_files_properties(riscv/global.cu PROPERTIES LANGUAGE HIP)
+    set_source_files_properties(riscv/mul.cu PROPERTIES LANGUAGE HIP)
+    set_source_files_properties(riscv/shift_right.cu PROPERTIES LANGUAGE HIP)
+    set_source_files_properties(riscv/simple_alu.cu PROPERTIES LANGUAGE HIP)
+    set_source_files_properties(riscv/branch.cu PROPERTIES LANGUAGE HIP)
 endif()

@@ -129,6 +129,18 @@ impl<M: ExecutionMode> ShapeChecker<M> {
         self.is_commit_on = true;
     }
 
+    /// Whether the shard has a commit syscall, after which it is not cut until the program halts,
+    /// and is past the room for `syscall_halt` (`HALT_AREA`, `HALT_HEIGHT`) beyond the sharding
+    /// threshold (from which the splicing VM takes that room off). `syscall_halt`'s commits come
+    /// just before the halt, so such a shard committed long before it, and would grow until the
+    /// halt, past what can be proven.
+    #[must_use]
+    pub fn commit_outgrew_halt_room(&self) -> bool {
+        self.is_commit_on
+            && (self.trace_area >= self.sharding_threshold.element_threshold + HALT_AREA
+                || self.max_height >= self.sharding_threshold.height_threshold + HALT_HEIGHT)
+    }
+
     #[inline]
     pub fn handle_trap_exec_event(&mut self) {
         self.trace_area += self.costs[RiscvAirId::TrapExec];

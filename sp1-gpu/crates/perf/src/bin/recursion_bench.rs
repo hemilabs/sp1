@@ -10,7 +10,7 @@ use sp1_gpu_prover::{
 use sp1_hypercube::{
     inner_perm,
     prover::{AirProver, ProverSemaphore},
-    SP1PcsProofInner,
+    MachineProof, SP1PcsProofInner,
 };
 use sp1_primitives::{SP1ExtensionField, SP1Field, SP1GlobalContext};
 use sp1_prover::{
@@ -198,9 +198,11 @@ async fn main() {
         tracing::info!("warmup run starting");
         let warmup_start = Instant::now();
 
-        let (_vk, _proof, _) = prover
+        let (warmup_vk, warmup_proof, _) = prover
             .setup_and_prove_shard(program.clone(), record.clone(), None, permits.clone())
             .await;
+        let warmup_main_commitment = warmup_proof.main_commitment;
+        let warmup_public_values = warmup_proof.public_values.clone();
 
         tracing::info!("warmup run finished in {:.3}s", warmup_start.elapsed().as_secs_f64());
 
@@ -208,11 +210,21 @@ async fn main() {
         for i in 0..repetitions {
             let prove_start = Instant::now();
 
-            let (_vk, _proof, _) = prover
+            let (vk, proof, _) = prover
                 .setup_and_prove_shard(program.clone(), record.clone(), None, permits.clone())
                 .await;
 
             let elapsed = prove_start.elapsed().as_secs_f64();
+            // Every run must give the warmup's vk and main commitment, and a valid proof (the
+            // later runs set up from the prover's cached preprocessed data, if enabled). The rest
+            // of the proof differs from run to run: it follows the LogUp-GKR grinding witness.
+            assert_eq!(vk, warmup_vk, "run {} gave a different vk", i + 1);
+            assert_eq!(proof.main_commitment, warmup_main_commitment, "run {}", i + 1);
+            assert_eq!(proof.public_values, warmup_public_values, "run {}", i + 1);
+            prover_verifier
+                .verify(&vk, &MachineProof::from(vec![proof]))
+                .unwrap_or_else(|e| panic!("run {} gave an invalid proof: {e}", i + 1));
+
             tracing::info!("{:?} run {}/{}: {elapsed:.3}s", mode, i + 1, repetitions);
             timings.push(elapsed);
         }

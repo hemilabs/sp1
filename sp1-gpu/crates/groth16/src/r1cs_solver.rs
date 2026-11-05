@@ -128,39 +128,6 @@ impl Groth16R1csSolver {
             return Err(anyhow!("sp1_r1cs_solver_solve returned {}", rc));
         }
 
-        // Pin the four big vecs so the prove pipeline's async H2D actually
-        // uses SDMA — same pattern as `Groth16WitnessData::load` so callers
-        // get parity with the disk-load path. Failure is non-fatal: the
-        // sync H2D path still works, just slower.
-        let pinned_on_device = unsafe {
-            let pin_slice = |ptr: *const u8, len: usize| -> bool {
-                if len == 0 {
-                    return true;
-                }
-                let err =
-                    sp1_gpu_sys::runtime::cuda_host_register(ptr as *const std::ffi::c_void, len);
-                err == sp1_gpu_sys::runtime::CUDA_SUCCESS_CSL
-            };
-            let mut ok = true;
-            ok &= pin_slice(
-                wire_values.as_ptr() as *const u8,
-                wire_values.len() * std::mem::size_of::<Fr>(),
-            );
-            ok &= pin_slice(
-                solution_a.as_ptr() as *const u8,
-                solution_a.len() * std::mem::size_of::<BN254Fr>(),
-            );
-            ok &= pin_slice(
-                solution_b.as_ptr() as *const u8,
-                solution_b.len() * std::mem::size_of::<BN254Fr>(),
-            );
-            ok &= pin_slice(
-                solution_c.as_ptr() as *const u8,
-                solution_c.len() * std::mem::size_of::<BN254Fr>(),
-            );
-            ok
-        };
-
         Ok(Groth16WitnessData {
             wire_values,
             solution_a,
@@ -172,8 +139,6 @@ impl Groth16R1csSolver {
                 x: BN254Fq { limbs: [0; 8] },
                 y: BN254Fq { limbs: [0; 8] },
             },
-            #[cfg(feature = "cuda")]
-            pinned_on_device,
         })
     }
 }

@@ -386,6 +386,81 @@ fn annotate_forwarding(bc: &mut ChunkBytecode) {
     }
 }
 
+/// Register-file operands of an instruction: `(reads, writes the register file)`.
+/// Reads that the kernel forwards from the previous instruction's result
+/// (`FLAG_A_PREV` / `FLAG_B_PREV`) and stores elided by `FLAG_NO_STORE` do not
+/// touch the register file and are not reported.
+fn register_file_accesses(ins: &DagInstr) -> ([Option<u16>; 2], bool) {
+    let a = (ins._pad & FLAG_A_PREV == 0).then_some(ins.a);
+    let b = (ins._pad & FLAG_B_PREV == 0).then_some(ins.b);
+    let reads = match ins.opcode {
+        x if x == BcOp::AddF as u8 || x == BcOp::SubF as u8 || x == BcOp::MulF as u8 => [a, b],
+        x if x == BcOp::NegF as u8 || x == BcOp::MulConst as u8 => [a, None],
+        _ => [None, None],
+    };
+    (reads, ins._pad & FLAG_NO_STORE == 0)
+}
+
+/// Renumber a chunk's registers by register-file traffic, most-accessed
+/// first, so that a kernel keeping only the lowest-numbered registers in fast
+/// storage (the VGPR register file of the wave-uniform sequential kernel) sends
+/// as few accesses as possible to its overflow. A consistent renaming of
+/// register names: the instruction order, operands' values, forwarding flags,
+/// assertions and `max_reg` are unchanged, so every interpreter computes the
+/// same values. Ties keep the original order, so the result is deterministic.
+pub fn rank_registers_by_use(bc: &mut ChunkBytecode) {
+    let n = bc.max_reg as usize;
+    if n == 0 {
+        return;
+    }
+    let mut uses = vec![0u64; n];
+    for ins in &bc.instrs {
+        let (reads, writes) = register_file_accesses(ins);
+        for r in reads.into_iter().flatten() {
+            uses[r as usize] += 1;
+        }
+        if writes {
+            uses[ins.out as usize] += 1;
+        }
+    }
+    let mut order: Vec<u16> = (0..n as u16).collect();
+    order.sort_by(|&x, &y| uses[y as usize].cmp(&uses[x as usize]).then(x.cmp(&y)));
+    let mut rename = vec![0u16; n];
+    for (new, &old) in order.iter().enumerate() {
+        rename[old as usize] = new as u16;
+    }
+    for ins in &mut bc.instrs {
+        ins.out = rename[ins.out as usize];
+        match ins.opcode {
+            x if x == BcOp::AddF as u8 || x == BcOp::SubF as u8 || x == BcOp::MulF as u8 => {
+                ins.a = rename[ins.a as usize];
+                ins.b = rename[ins.b as usize];
+            }
+            // `MulConst`'s `b` is a constant-pool index, not a register.
+            x if x == BcOp::NegF as u8 || x == BcOp::MulConst as u8 => {
+                ins.a = rename[ins.a as usize];
+            }
+            // Loads: `a` indexes the leaf / constant / public pool.
+            _ => {}
+        }
+    }
+}
+
+/// Fraction of a chunk's register-file accesses that go to registers
+/// numbered `>= v` (diagnostics for the VGPR register file).
+pub fn register_overflow_accesses(bc: &ChunkBytecode, v: u16) -> (u64, u64) {
+    let (mut total, mut over) = (0u64, 0u64);
+    for ins in &bc.instrs {
+        let (reads, writes) = register_file_accesses(ins);
+        let regs = reads.into_iter().flatten().chain(writes.then_some(ins.out));
+        for r in regs {
+            total += 1;
+            over += (r >= v) as u64;
+        }
+    }
+    (total, over)
+}
+
 fn const_index(value: F, pool: &mut Vec<F>, indices: &mut HashMap<u32, u16>) -> u16 {
     *indices.entry(value.as_canonical_u32()).or_insert_with(|| {
         let idx = pool.len() as u16;

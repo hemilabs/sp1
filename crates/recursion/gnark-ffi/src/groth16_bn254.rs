@@ -54,7 +54,7 @@ fn shm_named_tempfile() -> tempfile::NamedTempFile {
 /// per-prove tempdir behavior.
 #[cfg(feature = "native")]
 fn pk_cache_dir(vkey_hash_hex: &str) -> Option<std::path::PathBuf> {
-    if std::env::var_os("SP1_GROTH16_PK_CACHE_DISABLE").is_some() {
+    if pk_cache_disabled() {
         return None;
     }
     let root = std::env::var("SP1_GROTH16_PK_CACHE").ok().unwrap_or_else(|| {
@@ -67,6 +67,12 @@ fn pk_cache_dir(vkey_hash_hex: &str) -> Option<std::path::PathBuf> {
     Some(std::path::PathBuf::from(root).join(format!("sp1_groth16_pk_cache_{vkey_hash_hex}")))
 }
 
+/// Whether `SP1_GROTH16_PK_CACHE_DISABLE` gives each proof a proving key export of its own.
+#[cfg(feature = "native")]
+pub(crate) fn pk_cache_disabled() -> bool {
+    std::env::var_os("SP1_GROTH16_PK_CACHE_DISABLE").is_some()
+}
+
 #[cfg(feature = "native")]
 const PK_CACHE_SENTINEL: &str = ".sp1_pk_cache_complete";
 
@@ -77,6 +83,14 @@ pub(crate) struct GpuPk {
     pub(crate) dir: std::path::PathBuf,
     /// Only when the cache is disabled: this proof's private export, removed on drop.
     _private: Option<crate::gpu_cache::ProofDir>,
+}
+
+#[cfg(all(test, unix, feature = "native"))]
+impl GpuPk {
+    /// The key in `dir`, which dropping it leaves.
+    pub(crate) fn at(dir: &Path) -> Self {
+        GpuPk { dir: dir.to_path_buf(), _private: None }
+    }
 }
 
 /// Returns the GPU-format proving key for `build_dir`, exporting it first if no complete cache
@@ -112,13 +126,18 @@ pub(crate) fn gpu_pk(build_dir: &Path, vkey_hash_hex: &str) -> GpuPk {
     }
 }
 
-/// A directory for one proof's witness files, beside the PK cache. Never the cache itself: provers
-/// share the cache, and a second proof's witness written there would replace this one's before the
-/// GPU prover reads it, giving an invalid proof.
+/// A directory for one proof's files, beside the PK cache (see `gpu_cache::proof_tempdir_beside`).
+/// Never the cache itself: provers share the cache, and a second proof's witness written there
+/// would replace this one's before the GPU prover reads it, giving an invalid proof.
+#[cfg(feature = "native")]
+fn proof_dir(vkey_hash_hex: &str, prefix: &str) -> anyhow::Result<crate::gpu_cache::ProofDir> {
+    crate::gpu_cache::proof_tempdir_beside(pk_cache_dir(vkey_hash_hex).as_deref(), prefix)
+}
+
+/// A directory for one proof's witness files; see [`proof_dir`].
 #[cfg(feature = "native")]
 fn witness_dir(vkey_hash_hex: &str) -> crate::gpu_cache::ProofDir {
-    let cache = pk_cache_dir(vkey_hash_hex);
-    crate::gpu_cache::proof_tempdir(cache.as_deref().and_then(Path::parent), "sp1_groth16_witness_")
+    proof_dir(vkey_hash_hex, "sp1_groth16_witness_")
         .expect("failed to create a per-proof witness directory")
 }
 
@@ -153,6 +172,37 @@ fn memory_available() -> Option<u64> {
     crate::host_memory::available()
 }
 
+/// Free GPU memory the GPU Groth16 prover's helper needs. Measured on the v6.1.0 circuit: 14.5 GiB
+/// at peak on an RTX 4090 with gnark's solver (no `r1cs_solve_plan`). The GPU R1CS solver, the
+/// default when `r1cs_solve_plan` is installed, also uploads ~3 GB of circuit data, hence the
+/// margin. A helper that runs out anyway fails, and the CPU prover takes over.
+pub const GROTH16_GPU_HELPER_VRAM_BYTES: u64 = 18 << 30;
+
+/// Free GPU memory the GPU Groth16 prover's helper needs where it streams its G1 point sets
+/// ([`groth16_helper_streams`], on by default below 20 GiB): 6.2 GiB at
+/// peak on a 16 GB RTX 5060 Ti, with the GPU R1CS solver (`r1cs_solve_plan`) or without it
+/// (12,185 MiB in use on the card, sampled every 100 ms, of which the resident shard prover held
+/// 5,471 MiB), plus 1.8 GiB of margin. The card has 10.6 GiB free for it after the pool trim.
+pub const GROTH16_GPU_HELPER_STREAMED_VRAM_BYTES: u64 = 8 << 30;
+
+/// Whether the GPU Groth16 helper streams its G1 point sets on a card with `total` memory, as
+/// `SP1_GROTH16_STREAM_SRS` (`setting`) says or by the card's size: the rule the helper's prover
+/// decides by ([`sp1_gpu_groth16::stream::streams`]).
+pub use sp1_gpu_groth16::stream::streams as groth16_helper_streams;
+
+/// Free GPU memory the GPU Groth16 helper needs on a card with `total` memory, with
+/// `SP1_GROTH16_STREAM_SRS` read from the environment: [`GROTH16_GPU_HELPER_STREAMED_VRAM_BYTES`]
+/// where it streams its G1 point sets ([`groth16_helper_streams`]), else
+/// [`GROTH16_GPU_HELPER_VRAM_BYTES`].
+pub fn groth16_gpu_helper_vram_bytes(total: Option<u64>) -> u64 {
+    let setting = std::env::var("SP1_GROTH16_STREAM_SRS").ok();
+    if groth16_helper_streams(setting.as_deref(), total) {
+        GROTH16_GPU_HELPER_STREAMED_VRAM_BYTES
+    } else {
+        GROTH16_GPU_HELPER_VRAM_BYTES
+    }
+}
+
 /// The stripped-R1CS cache's marker and file; see `Groth16Bn254Prover::ensure_stripped_r1cs`.
 #[cfg(feature = "native")]
 pub(crate) const R1CS_CACHE_MARKER: &str = ".sp1_r1cs_cache_complete";
@@ -172,6 +222,18 @@ pub(crate) fn set_gpu_helper_env(cmd: &mut std::process::Command) {
             }
         }
     }
+}
+
+/// Whether the GPU R1CS solver solves the circuit (in the GPU Groth16 helper, or for gnark's prover
+/// in this process) when `SP1_GPU_R1CS_SOLVER` is unset or `auto`, on the backend `SP1_GPU_BACKEND`
+/// names: everywhere but Windows HIP. Its runtime has no cooperative launch, which the solver's
+/// kernel needs: on an RX 9060 XT every launch failed, and the proof fell back to gnark's CPU
+/// prover after the helper had started. The solver's per-layer kernels, which do without it, took
+/// 8-9 s there against 2.0-2.5 s for gnark's solve.
+#[cfg(feature = "native")]
+fn gpu_r1cs_solver_by_default(backend: Option<&str>, windows: bool) -> bool {
+    let hip = backend.is_some_and(|b| matches!(b.to_lowercase().as_str(), "hip" | "rocm" | "amd"));
+    !(windows && hip)
 }
 
 /// The `groth16_gpu_helper` binary: `SP1_GROTH16_GPU_HELPER` when set (and only there), else next
@@ -207,6 +269,78 @@ fn prep_circuit_cache_dir(vkey_hash_hex: &str) -> Option<std::path::PathBuf> {
 #[cfg(feature = "native")]
 const PREP_CIRCUIT_SENTINEL: &str = ".sp1_prep_circuit_complete";
 
+/// Runs `r1cs_solve_plan` (`r1cs_bin`) with `args`, as `what`.
+#[cfg(feature = "native")]
+fn run_r1cs_solve_plan(
+    r1cs_bin: &Path,
+    args: &[&std::ffi::OsStr],
+    what: &str,
+) -> anyhow::Result<()> {
+    let mut cmd = std::process::Command::new(r1cs_bin);
+    cmd.args(args);
+    let finished = crate::subprocess::run(cmd, what).map_err(|e| {
+        anyhow::anyhow!(
+            "{e:#}. Set SP1_R1CS_SOLVE_PLAN to the r1cs_solve_plan binary or place it next to \
+             the current executable"
+        )
+    })?;
+    if !finished.status.success() {
+        anyhow::bail!("{what} failed using {}: {}", r1cs_bin.display(), finished.describe());
+    }
+    Ok(())
+}
+
+/// Writes the GPU R1CS solver's circuit data for `build_dir` into `out`, with `r1cs_solve_plan
+/// prep-circuit-prod` (`r1cs_bin`).
+#[cfg(feature = "native")]
+fn prep_circuit_prod(r1cs_bin: &Path, build_dir: &Path, out: &Path) -> anyhow::Result<()> {
+    tracing::info!("Running r1cs_solve_plan prep-circuit-prod for {}...", out.display());
+    let t0 = std::time::Instant::now();
+    run_r1cs_solve_plan(
+        r1cs_bin,
+        &["prep-circuit-prod".as_ref(), build_dir.as_os_str(), out.as_os_str()],
+        "prep-circuit-prod",
+    )?;
+    tracing::info!("prep-circuit-prod completed in {:?}", t0.elapsed());
+    Ok(())
+}
+
+/// The GPU R1CS solver's circuit data for `build_dir` in the shared cache, for gnark's prover in
+/// this process, which solves with it where this process registered the solver
+/// (`ffi::set_groth16_gpu_r1cs_solver`). A complete cache is used as is; otherwise
+/// `r1cs_solve_plan` builds it (once per host, ~35-50 s). `None`, and gnark solves on the CPU, with
+/// `SP1_GPU_R1CS_SOLVER=cpu`, with the cache disabled, or when it cannot be built.
+#[cfg(feature = "native")]
+fn in_process_prep_circuit_dir(build_dir: &Path) -> Option<std::path::PathBuf> {
+    if std::env::var("SP1_GPU_R1CS_SOLVER").ok().as_deref() == Some("cpu") {
+        return None;
+    }
+    let vkey_hash_hex = hex::encode(Groth16Bn254Prover::get_vkey_hash(build_dir));
+    let dir = prep_circuit_cache_dir(&vkey_hash_hex)?;
+    if crate::gpu_cache::is_complete(&dir, PREP_CIRCUIT_SENTINEL) {
+        return Some(dir);
+    }
+    // Checked first, as in `try_prepare_gpu_r1cs_inputs`: a failed spawn forks this large process.
+    let Some(r1cs_bin) =
+        crate::cpu_helper::find_executable("r1cs_solve_plan", Some("SP1_R1CS_SOLVE_PLAN"))
+    else {
+        tracing::info!(
+            "r1cs_solve_plan not found (SP1_R1CS_SOLVE_PLAN, next to this binary, or on PATH); \
+             using gnark.Solve"
+        );
+        return None;
+    };
+    match crate::gpu_cache::ensure_built(&dir, PREP_CIRCUIT_SENTINEL, |out| {
+        prep_circuit_prod(&r1cs_bin, build_dir, out)
+    }) {
+        Ok(_) => Some(dir),
+        Err(e) => {
+            tracing::warn!("{e:#}; falling back to gnark.Solve");
+            None
+        }
+    }
+}
+
 /// Inputs for the helper's in-process GPU R1CS solver.
 #[cfg(feature = "native")]
 struct GpuR1csInputs {
@@ -240,30 +374,8 @@ fn try_prepare_gpu_r1cs_inputs(
         );
         return None;
     };
-    let run = |args: &[&std::ffi::OsStr], what: &str| -> anyhow::Result<()> {
-        let mut cmd = std::process::Command::new(&r1cs_bin);
-        cmd.args(args);
-        let finished = crate::subprocess::run(cmd, what).map_err(|e| {
-            anyhow::anyhow!(
-                "{e:#}. Set SP1_R1CS_SOLVE_PLAN to the r1cs_solve_plan binary or place it next \
-                 to the current executable"
-            )
-        })?;
-        if !finished.status.success() {
-            anyhow::bail!("{what} failed using {}: {}", r1cs_bin.display(), finished.describe());
-        }
-        Ok(())
-    };
-    let prep = |out: &Path| -> anyhow::Result<()> {
-        tracing::info!("Running r1cs_solve_plan prep-circuit-prod for {}...", out.display());
-        let t0 = std::time::Instant::now();
-        run(
-            &["prep-circuit-prod".as_ref(), build_dir.as_os_str(), out.as_os_str()],
-            "prep-circuit-prod",
-        )?;
-        tracing::info!("prep-circuit-prod completed in {:?}", t0.elapsed());
-        Ok(())
-    };
+    let run = |args: &[&std::ffi::OsStr], what: &str| run_r1cs_solve_plan(&r1cs_bin, args, what);
+    let prep = |out: &Path| prep_circuit_prod(&r1cs_bin, build_dir, out);
 
     let (prep_dir, prep_private) = match prep_circuit_cache_dir(vkey_hash_hex) {
         Some(dir) => {
@@ -283,7 +395,7 @@ fn try_prepare_gpu_r1cs_inputs(
         }
     };
 
-    let wires_dir = crate::gpu_cache::proof_tempdir(None, "sp1_groth16_wires_").ok()?;
+    let wires_dir = proof_dir(vkey_hash_hex, "sp1_groth16_wires_").ok()?;
     let wires_initial = wires_dir.path().join("wires_initial.bin");
     tracing::info!("Running r1cs_solve_plan make-witness-init...");
     let t0 = std::time::Instant::now();
@@ -318,6 +430,44 @@ pub struct PreparedGpuProof {
     witness_json: std::path::PathBuf,
     vkey_hash_hex: String,
     gpu_r1cs: Option<GpuR1csInputs>,
+    /// What gnark's solve left in the Go runtime, until it is handed back.
+    go_memory: std::sync::Mutex<Option<GoSolveMemory>>,
+}
+
+/// What gnark's solve leaves in this process's Go runtime: the cached circuit (~2.7 GB) and the
+/// solve's own garbage (~4 GB). Dropping it hands that back to the host, keeping the circuit for
+/// the next proof where the host has the memory (see [`keep_groth16_circuit`]).
+#[cfg(feature = "native")]
+pub(crate) struct GoSolveMemory(());
+
+#[cfg(feature = "native")]
+impl Drop for GoSolveMemory {
+    fn drop(&mut self) {
+        let keep_env = std::env::var("SP1_GROTH16_KEEP_R1CS").ok();
+        if keep_groth16_circuit(keep_env.as_deref(), memory_available()) {
+            crate::ffi::trim_groth16_caches();
+        } else {
+            crate::ffi::release_groth16_caches();
+        }
+    }
+}
+
+/// Least host memory available, as a proof's solve ends, for keeping the circuit it solved
+/// (~3 GB) in this process for the next proof, which then reads no R1CS (~5 s of CPU on all cores,
+/// during the next proof's start-up).
+#[cfg(feature = "native")]
+const KEEP_CIRCUIT_MIN_AVAILABLE_BYTES: u64 = 48 << 30;
+
+/// Whether to keep the solved circuit cached: as `SP1_GROTH16_KEEP_R1CS` (`keep_env`) says (`0`/
+/// `false` never, `1`/`true` always), otherwise where `available` host memory is at least
+/// [`KEEP_CIRCUIT_MIN_AVAILABLE_BYTES`].
+#[cfg(feature = "native")]
+fn keep_groth16_circuit(keep_env: Option<&str>, available: Option<u64>) -> bool {
+    match keep_env {
+        Some("0" | "false") => false,
+        Some("1" | "true") => true,
+        _ => available.is_some_and(|a| a >= KEEP_CIRCUIT_MIN_AVAILABLE_BYTES),
+    }
 }
 
 #[cfg(feature = "native")]
@@ -379,16 +529,6 @@ impl Groth16Bn254Prover {
     #[cfg(feature = "native")]
     pub fn gpu_helper_available() -> bool {
         find_gpu_helper().is_some()
-    }
-
-    /// Whether a GPU proof will try the GPU R1CS solver (`SP1_GPU_R1CS_SOLVER` is not `cpu` and
-    /// `r1cs_solve_plan` can be found) rather than gnark's solve. A prestarted helper serves only
-    /// gnark's solve, so it is not started then.
-    #[cfg(feature = "native")]
-    pub fn gpu_r1cs_solver_enabled() -> bool {
-        std::env::var("SP1_GPU_R1CS_SOLVER").ok().as_deref() != Some("cpu")
-            && crate::cpu_helper::find_executable("r1cs_solve_plan", Some("SP1_R1CS_SOLVE_PLAN"))
-                .is_some()
     }
 
     /// Executes the prover in testing mode with a circuit definition and witness.
@@ -485,6 +625,9 @@ impl Groth16Bn254Prover {
     pub fn prove_isolated_json(witness_json: &Path, build_dir: &Path) -> Result<Groth16Bn254Proof> {
         use anyhow::Context;
 
+        // A helper prestarted for a GPU proof that fell back to this one would otherwise hold the
+        // host memory (and the card) beside it.
+        crate::prestart::discard_before_new_helper();
         let _slot = crate::groth16_queue::acquire("Groth16 (CPU)");
 
         let in_process = cfg!(feature = "groth16-cuda")
@@ -507,7 +650,25 @@ impl Groth16Bn254Prover {
             fn path_str(path: &Path) -> Result<&str> {
                 path.to_str().ok_or_else(|| anyhow::anyhow!("not valid UTF-8: {}", path.display()))
             }
-            let mut proof = prove_groth16_bn254(path_str(build_dir)?, path_str(witness_json)?);
+            // gnark's prover here solves the circuit on the GPU where this process registered the
+            // GPU R1CS solver and its circuit data can be had, and `SP1_GPU_R1CS_SOLVER` wants it
+            // (by default not on Windows HIP: see `gpu_r1cs_solver_by_default`; on an RX 9060 XT
+            // the solve took 8.2 s there against 2.5 s for gnark's).
+            let build_dir_str = path_str(build_dir)?;
+            let backend = std::env::var("SP1_GPU_BACKEND").ok();
+            let gpu_solve = match std::env::var("SP1_GPU_R1CS_SOLVER").ok().as_deref() {
+                Some("gpu") => true,
+                Some("cpu") => false,
+                _ => gpu_r1cs_solver_by_default(backend.as_deref(), cfg!(windows)),
+            };
+            if gpu_solve && crate::ffi::groth16_gpu_r1cs_solver_registered() {
+                let prep_dir = in_process_prep_circuit_dir(build_dir);
+                crate::ffi::set_groth16_r1cs_prep_dir(
+                    build_dir_str,
+                    prep_dir.as_deref().and_then(Path::to_str),
+                );
+            }
+            let mut proof = prove_groth16_bn254(build_dir_str, path_str(witness_json)?);
             proof.groth16_vkey_hash = Self::get_vkey_hash(build_dir);
             return Ok(proof);
         };
@@ -794,7 +955,8 @@ impl Groth16Bn254Prover {
 
         // Step 1: write witness JSON (CPU-only, no HIP), in a scratch directory that is swept if
         // this prover dies before removing it.
-        let scratch = crate::gpu_cache::proof_tempdir(None, "sp1_groth16_gpu_")
+        let vkey_hash_hex = hex::encode(Self::get_vkey_hash(build_dir));
+        let scratch = proof_dir(&vkey_hash_hex, "sp1_groth16_gpu_")
             .expect("failed to create a scratch directory for the witness");
         let witness_json = scratch.path().join("witness.json");
         let mut writer = std::io::BufWriter::new(
@@ -807,7 +969,11 @@ impl Groth16Bn254Prover {
 
         // Steps 2 and 3. The witness must outlive the helper, which reads it.
         let prepared = Self::prepare_gpu_proof(build_dir, &witness_json);
-        Self::run_gpu_helper(&prepared)
+        let proof = Self::run_gpu_helper(&prepared);
+        // Removing the proof's files (~2 GB of witness in `/dev/shm`: ~80 ms) need not hold up
+        // the proof. Each directory stays locked by its owner until it is gone, as before.
+        std::thread::spawn(move || drop((prepared, scratch)));
+        proof
     }
 
     /// The in-process half of [`Self::prove_gpu_subprocess`], CPU-only: make sure the circuit's
@@ -836,35 +1002,40 @@ impl Groth16Bn254Prover {
         //     2026-05-06 — see `project_groth16_r1cs_solver_default_on.md`).
         //     ON for HIP (since 2026-05-10 — see
         //     `project_groth16_r1cs_hip_reattempt.md`; the HIP variant of
-        //     the kernel landed alongside the PLONK SCS HIP port).
+        //     the kernel landed alongside the PLONK SCS HIP port). OFF on
+        //     Windows HIP (`gpu_r1cs_solver_by_default`).
         //   - `gpu`: force the in-process GPU R1CS solver on either backend.
         //   - `cpu`: kill-switch — force gnark.Solve on any backend. Use
         //     this to roll back if the GPU path regresses.
-        let backend_is_cuda = matches!(
-            std::env::var("SP1_GPU_BACKEND").ok().as_deref(),
-            Some("cuda") | Some("nvidia")
-        );
+        let backend = std::env::var("SP1_GPU_BACKEND").ok();
+        let backend_is_cuda = matches!(backend.as_deref(), Some("cuda") | Some("nvidia"));
+        let by_default = gpu_r1cs_solver_by_default(backend.as_deref(), cfg!(windows));
         let solver_env = std::env::var("SP1_GPU_R1CS_SOLVER").ok();
         let solver_choice = solver_env.as_deref().unwrap_or("auto");
         let want_gpu_r1cs = match solver_choice {
             "gpu" => true,
             "cpu" => false,
-            "auto" | "" => true,
+            "auto" | "" => by_default,
             other => {
                 tracing::warn!(
                     "unknown SP1_GPU_R1CS_SOLVER={other:?}; expected one of \
                      gpu / cpu / auto. Falling back to backend-aware default."
                 );
-                true
+                by_default
             }
         };
+        // A helper prestarted for this circuit has its key loaded, and maybe uploaded, already, and
+        // proves from gnark's solve: sooner than a new helper with the GPU R1CS solver.
+        let prestarted = crate::prestart::prestarted_for(&pk.dir);
+        let want_gpu_r1cs = want_gpu_r1cs && !prestarted;
         tracing::info!(
-            "[r1cs-solver] choice={} backend_is_cuda={} env={:?} (default-on for CUDA \
-             since 2026-05-06, default-on for HIP since 2026-05-10; \
-             set SP1_GPU_R1CS_SOLVER=cpu to roll back)",
+            "[r1cs-solver] choice={} backend_is_cuda={} env={:?} prestarted_helper={} (default-on \
+             for CUDA since 2026-05-06, default-on for HIP since 2026-05-10 but not on Windows, \
+             unless a helper is prestarted; set SP1_GPU_R1CS_SOLVER=cpu to roll back)",
             if want_gpu_r1cs { "gpu" } else { "cpu" },
             backend_is_cuda,
-            solver_env.as_deref().unwrap_or("<unset>")
+            solver_env.as_deref().unwrap_or("<unset>"),
+            prestarted
         );
 
         let gpu_r1cs = if want_gpu_r1cs {
@@ -876,17 +1047,12 @@ impl Groth16Bn254Prover {
         // This proof's witness files. With the GPU R1CS solver the helper builds them itself and
         // this stays empty.
         let witness_dir = witness_dir(&vkey_hash_hex);
+        let mut go_memory = None;
         if gpu_r1cs.is_none() {
-            // The solve leaves the circuit and proving key in Go globals (~12 GB). Hand them back
-            // once it is over, failed or not: before the helper or a CPU fallback needs the
-            // memory, and so that this long-lived process does not stay that much larger.
-            struct ReleaseGoCaches;
-            impl Drop for ReleaseGoCaches {
-                fn drop(&mut self) {
-                    crate::ffi::release_groth16_caches();
-                }
-            }
-            let _release = ReleaseGoCaches;
+            // The solve leaves the circuit and its garbage in the Go runtime. They are handed back
+            // when this is dropped: here if the solve fails, otherwise in `run_gpu_helper`, before a
+            // new helper or a CPU fallback needs the memory, or while a prestarted helper proves.
+            let memory = GoSolveMemory(());
             tracing::info!("Solving R1CS and exporting witness (gnark.Solve)...");
             export_groth16_gpu_witness(
                 build_dir.to_str().unwrap(),
@@ -894,6 +1060,7 @@ impl Groth16Bn254Prover {
                 pk.dir.to_str().unwrap(),
                 witness_dir.path().to_str().unwrap(),
             );
+            go_memory = Some(memory);
         } else {
             tracing::info!("Skipping gnark.Solve — using in-process GPU R1CS solver");
         }
@@ -904,6 +1071,7 @@ impl Groth16Bn254Prover {
             witness_json: witness_json.to_path_buf(),
             vkey_hash_hex,
             gpu_r1cs,
+            go_memory: std::sync::Mutex::new(go_memory),
         }
     }
 
@@ -923,25 +1091,39 @@ impl Groth16Bn254Prover {
         // In the proof's own directory, so a crash leaves nothing behind that is not swept.
         let out_path = prepared.witness_dir.path().join("proof.json");
 
+        let mut go_memory = prepared.go_memory.lock().unwrap_or_else(|e| e.into_inner()).take();
         // A helper prestarted for this circuit has its key loaded (and maybe uploaded) already;
-        // it reads the witness files gnark's solve wrote, so not with the GPU R1CS solver.
+        // it reads the witness files gnark's solve wrote, so not with the GPU R1CS solver. It
+        // hands back the solve's memory while the helper proves.
         if prepared.gpu_r1cs.is_none() {
             if let Some(proof) = crate::prestart::prove_with_prestarted_gpu(
                 &prepared.pk.dir,
                 prepared.witness_dir.path(),
                 &prepared.witness_json,
                 &out_path,
+                &mut go_memory,
             ) {
                 return proof;
             }
         }
+        // A new helper loads its key into host memory: hand back the solve's first, and kill a
+        // prestarted helper this proof does not use.
+        drop(go_memory);
+        crate::prestart::discard_before_new_helper();
 
-        // The helper needs ~15 GB of GPU memory, which a prover keeping its shard-prover state on
-        // a 24 GB card does not have free. Only a process that exits after this proof may reset
-        // its GPU to make room; see `gpu_device`.
-        crate::gpu_device::reset_if_requested("Groth16 (GPU)");
+        // The helper needs ~15 GB of GPU memory (6.2 GiB where it streams its G1 point sets, on
+        // 16 GB cards), which a prover keeping its shard-prover state on a 24 GB card does not have
+        // free. Only a process that exits after this proof may reset its GPU to make room, and it
+        // does only where the helper would not fit otherwise; see `gpu_device`. The card's total
+        // is read once, here: after a reset, asking for it would start a new context on the card.
+        let card_total = crate::gpu_device::total_memory();
+        let helper_needs = groth16_gpu_helper_vram_bytes(card_total);
+        let helper_streams = groth16_helper_streams(
+            std::env::var("SP1_GROTH16_STREAM_SRS").ok().as_deref(),
+            card_total,
+        );
+        crate::gpu_device::reset_if_requested("Groth16 (GPU)", helper_needs);
 
-        tracing::info!("Spawning GPU Groth16 subprocess: {helper_path:?}");
         // GLV defaults:
         // - HIP build: leave SP1_GPU_GLV / SP1_GPU_G2_GLV unset so the
         //   helper's auto-detect (20 GB total VRAM threshold) decides.
@@ -955,30 +1137,50 @@ impl Groth16Bn254Prover {
         //   or it will panic at the first MSM with "GLV MSM is HIP-
         //   only". The helper's auto-detect checks the backend too; this
         //   is a second guard, keyed on SP1_GPU_BACKEND.
-        let mut cmd = std::process::Command::new(&helper_path);
-        cmd.arg("--gpu-dir")
-            .arg(&prepared.pk.dir)
-            .arg("--witness-dir")
-            .arg(prepared.witness_dir.path())
-            .arg("--witness-json")
-            .arg(&prepared.witness_json)
-            .arg("--vkey-hash-hex")
-            .arg(&prepared.vkey_hash_hex)
-            .arg("--out")
-            .arg(&out_path);
-        // Phase 11: when the GPU R1CS solver was prepared above, point the
-        // helper at the prep-circuit cache + the per-prove wires_initial.bin
-        // so it builds witness data in-process instead of disk-loading the
-        // gnark-solved files (which we did not write in this branch).
-        if let Some(ref gpu_r1cs) = prepared.gpu_r1cs {
-            cmd.arg("--prep-circuit-dir").arg(&gpu_r1cs.prep_dir);
-            cmd.arg("--wires-initial").arg(&gpu_r1cs.wires_initial);
-        }
-        // CUDA builds need GLV forced off; HIP builds let auto-detect pick.
-        set_gpu_helper_env(&mut cmd);
+        let helper_command = || {
+            let mut cmd = std::process::Command::new(&helper_path);
+            cmd.arg("--gpu-dir")
+                .arg(&prepared.pk.dir)
+                .arg("--witness-dir")
+                .arg(prepared.witness_dir.path())
+                .arg("--witness-json")
+                .arg(&prepared.witness_json)
+                .arg("--vkey-hash-hex")
+                .arg(&prepared.vkey_hash_hex)
+                .arg("--out")
+                .arg(&out_path);
+            // Phase 11: when the GPU R1CS solver was prepared above, point the
+            // helper at the prep-circuit cache + the per-prove wires_initial.bin
+            // so it builds witness data in-process instead of disk-loading the
+            // gnark-solved files (which we did not write in this branch).
+            if let Some(ref gpu_r1cs) = prepared.gpu_r1cs {
+                cmd.arg("--prep-circuit-dir").arg(&gpu_r1cs.prep_dir);
+                cmd.arg("--wires-initial").arg(&gpu_r1cs.wires_initial);
+            }
+            // CUDA builds need GLV forced off; HIP builds let auto-detect pick.
+            set_gpu_helper_env(&mut cmd);
+            // The helper streams its G1 point sets as this process measured its room for, from
+            // this process's view of the card, rather than deciding again from its own.
+            cmd.env("SP1_GROTH16_STREAM_SRS", if helper_streams { "1" } else { "0" });
+            cmd
+        };
         // Bound to this prover and its queue slot, and timed out if it hangs; see `subprocess`.
-        let finished = crate::subprocess::run(cmd, "groth16_gpu_helper")
-            .unwrap_or_else(|e| panic!("GPU Groth16 helper {}: {e:#}", helper_path.display()));
+        let run_helper = || {
+            tracing::info!("Spawning GPU Groth16 subprocess: {helper_path:?}");
+            crate::subprocess::run(helper_command(), "groth16_gpu_helper")
+                .unwrap_or_else(|e| panic!("GPU Groth16 helper {}: {e:#}", helper_path.display()))
+        };
+        let mut finished = run_helper();
+        // A helper that failed beside this process's state, which the measurement said it had
+        // room for, gets the card to itself once (SP1_GPU_RESET_BEFORE_WRAP), if it may have run
+        // out of GPU memory.
+        if crate::gpu_device::reset_after_failed_helper("Groth16 (GPU)", helper_needs, &finished) {
+            tracing::warn!(
+                "GPU Groth16 helper failed ({}); running it again on the reset GPU",
+                finished.describe()
+            );
+            finished = run_helper();
+        }
         if !finished.status.success() {
             panic!("GPU Groth16 helper {} failed: {}", helper_path.display(), finished.describe());
         }
@@ -1028,6 +1230,31 @@ impl Groth16Bn254Prover {
 #[cfg(all(test, feature = "native"))]
 mod pk_cache_tests {
     use super::*;
+
+    #[test]
+    fn the_gpu_r1cs_solver_is_the_default_except_on_windows_hip() {
+        for backend in ["hip", "rocm", "AMD"] {
+            assert!(!gpu_r1cs_solver_by_default(Some(backend), true), "{backend}");
+            assert!(gpu_r1cs_solver_by_default(Some(backend), false), "{backend}");
+        }
+        for backend in [Some("cuda"), Some("nvidia"), Some("sycl"), None] {
+            assert!(gpu_r1cs_solver_by_default(backend, true), "{backend:?}");
+            assert!(gpu_r1cs_solver_by_default(backend, false), "{backend:?}");
+        }
+    }
+
+    #[test]
+    fn the_solved_circuit_is_kept_only_where_memory_allows_or_when_asked() {
+        let gib = |n: u64| Some(n << 30);
+        assert!(keep_groth16_circuit(None, gib(48)));
+        assert!(!keep_groth16_circuit(None, gib(47)));
+        assert!(!keep_groth16_circuit(None, None));
+        assert!(!keep_groth16_circuit(Some("0"), gib(100)));
+        assert!(!keep_groth16_circuit(Some("false"), gib(100)));
+        assert!(keep_groth16_circuit(Some("1"), gib(1)));
+        assert!(keep_groth16_circuit(Some("true"), None));
+        assert!(keep_groth16_circuit(Some("yes"), gib(48)));
+    }
 
     #[test]
     fn the_cpu_helper_heap_is_limited_only_where_memory_is_short() {
