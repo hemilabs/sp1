@@ -45,13 +45,16 @@ impl MinimalExecutorRunner {
         }
     }
 
-    /// Whether [`Self::set_max_chunk_cycles`] has an effect. The portable executor splits trace
-    /// chunks on the trace size only.
-    pub const SUPPORTS_MAX_CHUNK_CYCLES: bool = false;
+    /// Whether [`Self::set_max_chunk_cycles`] has an effect. zk-miner: the portable executor now
+    /// honours a cycle-based cut (in addition to the trace-size cut), so the proving path can cut
+    /// the first chunk early and start the GPU pipeline sooner, as the native runner does.
+    pub const SUPPORTS_MAX_CHUNK_CYCLES: bool = true;
 
-    /// Accepted for API parity with the native runner: the portable executor splits trace chunks
-    /// on the trace size only.
-    pub fn set_max_chunk_cycles(&mut self, _cycles: Option<u64>) {}
+    /// zk-miner: set the optional cycle-based trace-chunk cut, forwarded to the portable executor.
+    /// `None`/`Some(0)` disables it (the measure/gas path leaves it unset — a cheap no-op).
+    pub fn set_max_chunk_cycles(&mut self, cycles: Option<u64>) {
+        self.inner.set_max_chunk_cycles(cycles);
+    }
 
     /// Redirect guest output to the configured channels.
     pub fn set_output_consumers(&mut self, consumers: OutputConsumers) {

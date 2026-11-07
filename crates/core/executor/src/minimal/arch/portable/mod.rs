@@ -62,6 +62,15 @@ pub struct MinimalExecutor<M: ExecutionMode> {
     next_clk: u64,
     exit_code: u32,
     max_trace_size: Option<u64>,
+    /// zk-miner: optional cycle-based trace-chunk cut, for API/behaviour parity with the native
+    /// runner (`set_max_chunk_cycles`). When `Some(m)`, a chunk is also closed once `m` global
+    /// cycles have elapsed since the previous chunk boundary, in addition to the trace-size cut.
+    /// This lets the proving path cut the FIRST chunk early (as native does at 2^23) so the GPU
+    /// pipeline starts sooner; splicing re-forms byte-identical shards regardless of cadence, so it
+    /// is proof-neutral. `None` (the default, and the measure/gas path) is a cheap no-op.
+    max_chunk_cycles: Option<u64>,
+    /// `global_clk` at the start of the current trace chunk; the cycle-cut compares against it.
+    chunk_start_global_clk: u64,
     public_values_stream: Vec<u8>,
     public_value_digest: [u32; PUBLIC_VALUE_DIGEST_WORDS],
     hints: Vec<(u64, Vec<u8>)>,
@@ -411,6 +420,22 @@ impl<M: ExecutionMode> SyscallContext for MinimalExecutor<M> {
 }
 
 impl<M: ExecutionMode> MinimalExecutor<M> {
+    /// zk-miner: set the optional cycle-based trace-chunk cut (parity with the native runner).
+    /// `Some(0)` is treated as `None` (disabled), matching the native runner's filter.
+    #[inline]
+    pub fn set_max_chunk_cycles(&mut self, cycles: Option<u64>) {
+        self.max_chunk_cycles = cycles.filter(|&c| c > 0);
+    }
+
+    /// zk-miner: whether the current chunk has run at least `max_chunk_cycles` cycles since its
+    /// start. Cheap `None` short-circuit on the measure/gas path and whenever the cut is disabled.
+    #[allow(clippy::inline_always)]
+    #[inline(always)]
+    fn check_chunk_cycles_exceeded(&self) -> bool {
+        matches!(self.max_chunk_cycles, Some(m)
+            if self.global_clk.wrapping_sub(self.chunk_start_global_clk) >= m)
+    }
+
     /// Create a new minimal executor with memory limit. This shall only be used
     /// by `sp1_core_executor_runner`.
     #[must_use]
@@ -448,6 +473,8 @@ impl<M: ExecutionMode> MinimalExecutor<M> {
             page_prots,
             traces: None,
             max_trace_size,
+            max_chunk_cycles: None,
+            chunk_start_global_clk: 0,
             public_values_stream: Vec::new(),
             public_value_digest: [0; PUBLIC_VALUE_DIGEST_WORDS],
             hints: Vec::new(),
@@ -1064,7 +1091,14 @@ impl MinimalExecutor<crate::SupervisorMode> {
         }
 
         self.post_instruction_update();
-        self.is_done() || self.check_trace_buffer_exceeded()
+        // zk-miner: close the chunk on is_done / trace-size / cycle-cut (parity with native). On any
+        // chunk boundary, re-anchor the per-chunk cycle counter so the next chunk measures from here.
+        let stop =
+            self.is_done() || self.check_trace_buffer_exceeded() || self.check_chunk_cycles_exceeded();
+        if stop {
+            self.chunk_start_global_clk = self.global_clk;
+        }
+        stop
     }
 
     #[inline]
@@ -1189,7 +1223,14 @@ impl MinimalExecutor<crate::UserMode> {
         }
 
         self.post_instruction_update();
-        self.is_done() || self.check_trace_buffer_exceeded()
+        // zk-miner: close the chunk on is_done / trace-size / cycle-cut (parity with native). On any
+        // chunk boundary, re-anchor the per-chunk cycle counter so the next chunk measures from here.
+        let stop =
+            self.is_done() || self.check_trace_buffer_exceeded() || self.check_chunk_cycles_exceeded();
+        if stop {
+            self.chunk_start_global_clk = self.global_clk;
+        }
+        stop
     }
 
     /// Execute a load instruction with page protection checking.

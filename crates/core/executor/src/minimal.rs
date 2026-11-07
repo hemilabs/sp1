@@ -92,6 +92,16 @@ impl MinimalExecutorEnum {
         }
     }
 
+    /// zk-miner: forward the optional cycle-based trace-chunk cut to the inner portable executor
+    /// (parity with the native runner). Portable-only: the native executor crate has no such field.
+    #[cfg(sp1_use_portable_executor)]
+    pub fn set_max_chunk_cycles(&mut self, cycles: Option<u64>) {
+        match self {
+            Self::Supervisor(e) => e.set_max_chunk_cycles(cycles),
+            Self::User(e) => e.set_max_chunk_cycles(cycles),
+        }
+    }
+
     /// Calls `execute_chunk` to respective `MinimalExecutor`.
     pub fn execute_chunk(&mut self) -> Option<TraceChunkRaw> {
         match self {
