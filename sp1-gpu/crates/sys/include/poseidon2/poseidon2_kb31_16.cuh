@@ -1,6 +1,7 @@
 #pragma once
 
 #include "fields/kb31_t.cuh"
+#include "poseidon2/poseidon2_kb31_16_sycl.cuh"
 
 namespace poseidon2_kb31_16 {
 
@@ -142,6 +143,20 @@ class KoalaBear {
     static constexpr bool DEFERRED_PARTIAL_ROUNDS = false;
 #endif
 
+#if defined(SP1_SYCL) && !defined(SP1_SYCL_P2_PORTABLE) && !defined(SP1_SYCL_P2_PORTABLE_SBOX)
+    // Round constant and S-box with one final reduction instead of one per product.
+    static constexpr bool LAZY_FULL_SBOX = true;
+    __device__ static void lazyFullSbox(F_t state[WIDTH], pF_t* rc) {
+        for (int i = 0; i < WIDTH; i++) {
+            const uint32_t y = poseidon2_kb31_16_sycl::addm(state[i].val, rc[i].val);
+            state[i].val = poseidon2_kb31_16_sycl::fsub(poseidon2_kb31_16_sycl::cube(y));
+        }
+    }
+#else
+    static constexpr bool LAZY_FULL_SBOX = false;
+    __device__ static void lazyFullSbox(F_t*, pF_t*) {}
+#endif
+
     // v / 2^32 mod p, for v < p 2^32, as kb31_t's Montgomery multiplication reduces its product
     // ((v + red p) / 2^32, red = lo(v) (-p^-1)), with shifts for the multiplications by
     // M = 2^31 - 2^24 - 1 and MOD = 2^31 - 2^24 + 1 (32-bit multiplications are quarter rate on
@@ -162,7 +177,10 @@ class KoalaBear {
     // d_i X_i + sum X on the words X, a shift and a reduction per element instead of a
     // multiplication (checked against internalLinearLayer in scratchpad opt/p2_partial.py).
     __device__ static void partialRounds(F_t state[WIDTH]) {
-#ifdef SP1_SYCL
+#if defined(SP1_SYCL) && !defined(SP1_SYCL_P2_PORTABLE)
+        // Without the per-lane multiplies: see poseidon2_kb31_16_sycl.cuh.
+        poseidon2_kb31_16_sycl::partial_rounds(reinterpret_cast<uint32_t*>(state));
+#elif defined(SP1_SYCL)
         // 32-bit operations only (Intel GPUs emulate 64-bit integers): v = hi 2^32 + lo.
         for (int r = 0; r < ROUNDS_P; r++) {
             state[0] += constants::INTERNAL_ROUND_CONSTANTS[r];
