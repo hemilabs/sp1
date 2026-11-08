@@ -17,9 +17,27 @@ pub fn detect_executor() {
     // var cannot go inconsistent. Set it fleet-wide via `.cargo/config.toml [env]` and the server
     // Dockerfile; the paired check is zk-miner's startup assert on the `USES_NATIVE_X86_EXECUTOR` const.
     println!("cargo:rerun-if-env-changed=SP1_USE_PORTABLE_EXECUTOR");
-    let force_portable = std::env::var("SP1_USE_PORTABLE_EXECUTOR")
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false);
+    // Fail-CLOSED on a malformed value: an operator who SET the var (a typo like "yes"/"on"/"tru")
+    // meant to choose, and silently falling back to the native JIT is the wrong failure direction.
+    // Only an UNSET var takes the upstream default (native on x86-64 Linux),
+    // which zk-miner always overrides via `.cargo/config.toml` + the worker startup assert. Whitespace
+    // is trimmed, so " 1 " selects portable.
+    let force_portable = match std::env::var("SP1_USE_PORTABLE_EXECUTOR") {
+        Ok(v) => {
+            let t = v.trim();
+            if t == "1" || t.eq_ignore_ascii_case("true") {
+                true
+            } else if t.is_empty() || t == "0" || t.eq_ignore_ascii_case("false") {
+                false
+            } else {
+                panic!(
+                    "SP1_USE_PORTABLE_EXECUTOR is set to an unrecognised value {v:?}; use 1/true \
+                     (portable) or 0/false (native x86-64 JIT)"
+                );
+            }
+        }
+        Err(_) => false,
+    };
 
     #[cfg(all(target_arch = "x86_64", target_endian = "little", target_os = "linux",))]
     println!("cargo:rustc-cfg=sp1_native_executor_available");

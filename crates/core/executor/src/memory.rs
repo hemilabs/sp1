@@ -319,6 +319,17 @@ impl<V: Copy> PagedMemory<V> {
         self.index.iter().filter(|&i| *i != NO_PAGE).count() * PAGE_LEN
     }
 
+    /// zk-miner: the host RESIDENT bytes this page table commits — `pages × PAGE_LEN × cell size`.
+    /// Each touched page allocates a full `Vec<Option<V>>` of `PAGE_LEN` cells regardless of how many
+    /// addresses in it are live, so a SPARSE-touch guest commits ~`PAGE_LEN × size_of::<Option<V>>()`
+    /// (~6 MiB for `MemValue`) of RSS per touched page while contributing ~1 to a per-ENTRY counter.
+    /// This is the number the in-band memory limit must bound (not the entry count) to track host RSS.
+    /// O(1).
+    #[inline]
+    pub fn allocated_bytes(&self) -> u64 {
+        self.page_table.len() as u64 * PAGE_LEN as u64 * std::mem::size_of::<Option<V>>() as u64
+    }
+
     /// Clears the page table. Drops all `Page`s, but retains the memory used by the table itself.
     pub fn clear(&mut self) {
         self.page_table.clear();
