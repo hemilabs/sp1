@@ -24,6 +24,9 @@ use crate::{
     CudaClientError,
 };
 
+/// How long to wait for a server we started to open its socket (see `connect_inner`).
+const SERVER_START_TIMEOUT: Duration = Duration::from_secs(60);
+
 /// The global client to be shared, if other clients still exist (like in a proving key.)
 static CLIENT: LazyLock<Mutex<HashMap<u32, Weak<CudaClientInner>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
@@ -137,10 +140,10 @@ impl CudaClientInner {
         }
 
         // Actually start the server now that we know there isn't one running.
-        let child = crate::server::start_server(cuda_id).await?;
+        let mut child = crate::server::start_server(cuda_id).await?;
 
         // Connect to the server we just started.
-        let connection = Self::connect_inner(cuda_id).await?;
+        let connection = Self::connect_inner(cuda_id, &mut child).await?;
         let inner = CudaClientInner { stream: Some(Mutex::new(connection)), _child: child };
 
         let inner = Arc::new(inner);
@@ -149,23 +152,32 @@ impl CudaClientInner {
         Ok(CudaClient { inner })
     }
 
-    /// Connects to the server at [`CUDA_SOCKET`], retrying if the server is not running yet.
-    async fn connect_inner(cuda_id: u32) -> Result<ClientStream, CudaClientError> {
+    /// Connects to the server at [`CUDA_SOCKET`], retrying while the server `child` we just
+    /// started is still coming up.
+    ///
+    /// The server opens its socket once its GPU runtime is up. The CUDA build does in about
+    /// 0.15 s, but the HIP build on Windows took 0.7-1.3 s on an RX 9070 XT, more on a cold start
+    /// or a loaded CPU, so a fixed second of retries made the first proofs fail with "Could not
+    /// connect to `sp1-gpu-server` socket". Wait while the server runs, up to
+    /// [`SERVER_START_TIMEOUT`]; a server that exits fails at once.
+    async fn connect_inner(
+        cuda_id: u32,
+        child: &mut Child,
+    ) -> Result<ClientStream, CudaClientError> {
         let socket_path = socket_path(cuda_id);
-
-        // Retry a few times, just in case the server hasnt started yet.
-        for _ in 0..10 {
-            let Ok(this) = Self::connect_once(&socket_path).await else {
-                tokio::time::sleep(Duration::from_millis(100)).await;
-                continue;
-            };
-
-            return Ok(this);
+        let deadline = std::time::Instant::now() + SERVER_START_TIMEOUT;
+        loop {
+            match Self::connect_once(&socket_path).await {
+                Ok(stream) => return Ok(stream),
+                Err(err) => {
+                    let exited = matches!(child.try_wait(), Ok(Some(_)));
+                    if exited || std::time::Instant::now() >= deadline {
+                        return Err(err);
+                    }
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            }
         }
-
-        // If we get here, the server is not running yet.
-        // But we want to get the actual error, so try again.
-        Self::connect_once(&socket_path).await
     }
 
     /// Connects to the server at the given path.
