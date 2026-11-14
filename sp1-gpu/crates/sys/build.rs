@@ -791,9 +791,10 @@ fn build_sycl(
     println!("cargo:rerun-if-env-changed=SP1_SYCL_DEVICE");
     let targets = env::var("SP1_SYCL_TARGETS")
         .unwrap_or_else(|_| "spir64_gen,intel_gpu_acm_g10,spir64".into());
+    let device = env::var("SP1_SYCL_DEVICE").unwrap_or_else(|_| "bmg-g21,bmg-g31".into());
+    let targets = sycl_targets_with_own_options(&targets, &device);
     args.push(format!("-fsycl-targets={targets}").into());
     if targets.split(',').any(|t| t.trim() == "spir64_gen") {
-        let device = env::var("SP1_SYCL_DEVICE").unwrap_or_else(|_| "bmg-g21,bmg-g31".into());
         args.push("-Xsycl-target-backend=spir64_gen".into());
         args.push(format!("-device {device}").into());
     }
@@ -907,6 +908,34 @@ fn build_sycl(
 
 /// `icpx`: `SP1_ICPX` if set, else the oneAPI installation's (`ONEAPI_ROOT`, or the default
 /// install location), else `icpx` on PATH.
+/// The SYCL targets with `spir64_gen` (for `device`) replaced by one `intel_gpu_<device>` target
+/// per device when the build also has the Alchemist target, whose backend options are its own.
+///
+/// icpx (oneAPI 2026.0) hands `-Xsycl-target-backend=intel_gpu_acm_g10` options to the
+/// `spir64_gen` ocloc as well, so Battlemage was compiled in 256-GRF mode too (half the threads
+/// per EU): on an Arc Pro B70, zkminer's SP1 benchmark sha256-chain took 41.8 s against 37.8 s.
+/// `intel_gpu_*` targets each get only their own options. Unchanged without the Alchemist target.
+fn sycl_targets_with_own_options(targets: &str, device: &str) -> String {
+    let list: Vec<&str> = targets.split(',').map(str::trim).filter(|t| !t.is_empty()).collect();
+    if !list.contains(&"spir64_gen") || !list.contains(&"intel_gpu_acm_g10") {
+        return targets.to_string();
+    }
+    let mut out = Vec::new();
+    for t in list {
+        if t == "spir64_gen" {
+            for d in device.split(',').map(str::trim).filter(|d| !d.is_empty()) {
+                let name = format!("intel_gpu_{}", d.replace('-', "_"));
+                if !out.contains(&name) {
+                    out.push(name);
+                }
+            }
+        } else if !out.iter().any(|o| o == t) {
+            out.push(t.to_string());
+        }
+    }
+    out.join(",")
+}
+
 fn find_icpx() -> PathBuf {
     if let Ok(icpx) = env::var("SP1_ICPX") {
         return PathBuf::from(icpx);
