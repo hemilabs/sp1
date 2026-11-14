@@ -86,7 +86,19 @@ struct ChunkStatic {
     const uint16_t* coop_assert_slots; // 8 — n_asserts entries
     uint32_t coop_n_levels;            // 4
     uint32_t coop_n_phys;              // 4 — value slots per row
+    /// Top-degree ("point at infinity") variant of this chunk, or null.
+    /// When non-null, the univariate kernels' eval-point-2 blocks run this
+    /// descriptor's bytecode on the `Δ = t1 − t0` leaves (`ZC_EVAL_INF`)
+    /// instead of the full bytecode at x = 4, producing the leading (x^3)
+    /// coefficient of the chunk's round polynomial; see `top_degree.rs` in
+    /// sp1-gpu-air. The variant has the same `chip_idx` / alpha offset, no
+    /// inline GKR (linear terms vanish at infinity) and `inf == nullptr`.
+    const struct ChunkStatic* inf;     // 8
 };
+
+// Leaf-read mode for `interp_load_pair`: `t1 − t0`, the leading coefficient of
+// the column's linear interpolation (the univariate "point at infinity").
+constexpr int ZC_EVAL_INF = 3;
 
 // Walks a chunk's assertions alongside its bytecode: after instruction `i`
 // computes `x`, `at(i, f)` calls `f(alpha_idx)` for each assertion whose root
@@ -137,7 +149,8 @@ struct BlockDispatch {
 };
 
 // Load one column's row pair `(2·row, 2·row + 1)` and interpolate the last
-// variable at eval point `e` — the univariate round-message nodes {0, 2, 4}.
+// variable at eval point `e` — the univariate round-message nodes {0, 2, 4}
+// (e = 0, 1, 2), or the leading coefficient `t1 − t0` (e = ZC_EVAL_INF).
 // Diff-doubling: `z + ep * (o - z)` is rewritten as `z + d2 (+ d2)` with
 // `d2 = 2·(o − z)`, so we never multiply by a felt; `e == 0` skips the
 // second load entirely. `e` is uniform per block, so the branches never
@@ -158,6 +171,9 @@ __device__ __forceinline__ K interp_load_pair(
     }
     K o = K::load(trace_data, base + col_off + (row_idx << 1 | 1));
     K diff = o - z;
+    if (e == ZC_EVAL_INF) {
+        return diff;
+    }
     K d2 = diff + diff;
     return (e == 1) ? (z + d2) : (z + d2 + d2);
 }

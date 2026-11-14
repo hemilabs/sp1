@@ -64,6 +64,7 @@ const uint32_t* zerocheck_layout_chunk_static() {
         (uint32_t)offsetof(ChunkStatic, coop_assert_slots),
         (uint32_t)offsetof(ChunkStatic, coop_n_levels),
         (uint32_t)offsetof(ChunkStatic, coop_n_phys),
+        (uint32_t)offsetof(ChunkStatic, inf),
     };
     return L;
 }
