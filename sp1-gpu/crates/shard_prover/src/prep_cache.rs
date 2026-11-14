@@ -20,19 +20,23 @@ use sp1_hypercube::{air::MachineAir, septic_digest::SepticDigest, MachineVerifyi
 ///
 /// `SP1_GPU_PREP_CACHE_MIB` sets it (`0` disables the caches). The default is 2048 MiB on CUDA
 /// cards with more than 24 GiB, 4096 MiB on HIP cards of 64 GiB or more (like the trace prefetch;
-/// on an MI300X compressed proofs were 3.1-5.2% faster with it), else 0. Under memory pressure
-/// the caches are emptied (see [`DeviceCache`]), so the budget only bounds what they hold between
-/// shards. It is off by default on SYCL and smaller HIP cards, like the trace prefetch: their
-/// device memory caches hold freed blocks outside the live count that pressure is measured by,
-/// and on Windows a card over its video memory budget spills to shared system memory. On large
-/// HIP cards those blocks are in the arena, which the pressure limit is measured against (see
-/// [`sp1_gpu_cudart::usable_device_memory`]).
+/// on an MI300X compressed proofs were 3.1-5.2% faster with it), 1024 MiB on SYCL cards of 30 GiB
+/// or more, else 0. Under memory pressure the caches are emptied (see [`DeviceCache`]), so the
+/// budget only bounds what they hold between shards. It is off by default on smaller SYCL and HIP
+/// cards, like the trace prefetch: their device memory caches hold freed blocks outside the live
+/// count that pressure is measured by, and on Windows a card over its video memory budget spills
+/// to shared system memory. On large HIP cards those blocks are in the arena, which the pressure
+/// limit is measured against (see [`sp1_gpu_cudart::usable_device_memory`]).
 pub(crate) fn prep_cache_budget() -> u64 {
     static BUDGET: OnceLock<u64> = OnceLock::new();
     *BUDGET.get_or_init(|| {
         let default_mib = match (sp1_gpu_cudart::cuda_memory_info(), sp1_gpu_cudart::sys::BACKEND) {
             (Ok((_, total)), "cuda") if total > 24 << 30 => 2048,
             (Ok((_, total)), "hip") if total >= 64 << 30 && !cfg!(windows) => 4096,
+            // 32 GB Intel cards (Arc Pro B70): 1 GiB. zkminer's SP1 benchmark, two rounds:
+            // zkop-mix 9.86-9.90 -> 9.51-9.55 s, sha256-chain 34.66-35.12 -> 34.37-34.39 s;
+            // a compressed 20M-step Fibonacci proof 29.3-29.7 -> 28.7-28.9 s.
+            (Ok((_, total)), "sycl") if total >= 30 << 30 => 1024,
             _ => 0,
         };
         let mib = std::env::var("SP1_GPU_PREP_CACHE_MIB")
