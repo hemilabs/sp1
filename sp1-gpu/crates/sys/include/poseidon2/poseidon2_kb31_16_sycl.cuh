@@ -50,12 +50,15 @@ constexpr uint32_t IRC_RAW[20] = {1423960925, 2101391318, 1915532054, 275400051,
 inline __attribute__((always_inline)) uint32_t fsub(uint32_t v) { return sycl::min(v, v - P); }
 inline __attribute__((always_inline)) uint32_t addm(uint32_t a, uint32_t b) { return fsub(a + b); }
 
-// Montgomery product: for a b < 2^63, a result below a b / 2^32 + p. red = tl * (2^31 - 2^24 - 1) by shifts.
+// Montgomery product: for a b < 2^63, a result in (0, a b / 2^32 + p], congruent to a b / 2^32.
+// Subtractive REDC: m = tl p^-1 mod 2^32 (p^-1 = 1 + 2^24 + 2^31, by shifts), so lo(m p) == tl
+// exactly and (a b - m p) / 2^32 = th - hi(m p), which is above -p; adding p keeps it positive with
+// no carry or compare (the additive form needed a (tl != 0) select).
 inline __attribute__((always_inline)) uint32_t mm(uint32_t a, uint32_t b) {
     const uint32_t tl = a * b;
     const uint32_t th = sycl::mul_hi(a, b);
-    const uint32_t red = (tl << 31) - (tl << 24) - tl;
-    return th + sycl::mul_hi(red, P) + (tl != 0 ? 1u : 0u);
+    const uint32_t m = tl + (tl << 24) + (tl << 31);
+    return th + P - sycl::mul_hi(m, P);
 }
 inline __attribute__((always_inline)) uint32_t cube(uint32_t x) { return mm(mm(x, x), x); }  // x < p -> < 1.75p
 
