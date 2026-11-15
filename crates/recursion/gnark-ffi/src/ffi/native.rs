@@ -75,6 +75,17 @@ pub fn set_groth16_r1cs_prep_dir(data_dir: &str, dir: Option<&str>) {
     unsafe { SetGroth16R1csPrepDir(data_dir.as_ptr() as *mut c_char, dir.as_ptr() as *mut c_char) }
 }
 
+/// Names a copy of the Groth16 R1CS in `data_dir` without its debug information (see
+/// [`export_groth16_stripped_r1cs`]), which [`prove_groth16_bn254`] then reads instead of the full
+/// one; `None` for none.
+pub fn set_groth16_stripped_r1cs(data_dir: &str, path: Option<&str>) {
+    let data_dir = CString::new(data_dir).expect("CString::new failed");
+    let path = CString::new(path.unwrap_or("")).expect("CString::new failed");
+    unsafe {
+        SetGroth16StrippedR1cs(data_dir.as_ptr() as *mut c_char, path.as_ptr() as *mut c_char)
+    }
+}
+
 enum ProofSystem {
     Plonk,
     Groth16,

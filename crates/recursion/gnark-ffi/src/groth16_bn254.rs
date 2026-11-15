@@ -687,6 +687,15 @@ impl Groth16Bn254Prover {
                     prep_dir.as_deref().and_then(Path::to_str),
                 );
             }
+            // A stripped circuit reads in ~2 s instead of ~9 s (B70 host), which this process's
+            // first proof waits for; later ones reuse the circuit gnark keeps. Only one built
+            // already: building it reads the full circuit (~14 GB at peak), which is for a
+            // short-lived helper (`--prepare`), not this process.
+            let stripped = Self::stripped_r1cs_ready(build_dir);
+            crate::ffi::set_groth16_stripped_r1cs(
+                build_dir_str,
+                stripped.as_deref().and_then(Path::to_str),
+            );
             let mut proof = prove_groth16_bn254(build_dir_str, path_str(witness_json)?);
             proof.groth16_vkey_hash = Self::get_vkey_hash(build_dir);
             return Ok(proof);
