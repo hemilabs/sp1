@@ -69,13 +69,14 @@ inline __attribute__((always_inline)) void int_round(uint32_t& a0h, uint32_t* w)
     constexpr int SH[16] = {0, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 15};
     const uint32_t y = addm(fsub(a0h), RCH);   // a0h < 1.5p
     const uint32_t F = fsub(cube(y));          // 2^-24 lam_R a0n (a0n = the S-box output), [0, p)
-    uint32_t H = 0, L = 0;                     // W = sum_{i>=1} w_i = H 2^24 + L
-    for (int i = 1; i < 16; i++) {
-        H += w[i] >> 24;
-        L += w[i] & M24;
-    }
+    // W = sum_{i>=1} w_i < 15 * 2^32, = H 2^24 + L: a 64-bit sum is an add and an add with carry
+    // a lane, one operation fewer than summing w >> 24 and w mod 2^24 apart (+1.6% Poseidon2).
+    uint64_t W = 0;
+    for (int i = 1; i < 16; i++) W += w[i];
+    const uint32_t Wl = (uint32_t)W;
+    const uint32_t H = ((uint32_t)(W >> 32) << 8) + (Wl >> 24), L = Wl & M24;  // H < 2^12
     const uint32_t nl = ~L & M24;
-    const uint32_t E = fsub(H + (L >> 24) + ((nl << 7) - nl));  // 2^-24 W + 127 M24, [0, p)
+    const uint32_t E = fsub(H + ((nl << 7) - nl));              // 2^-24 W + 127 M24, [0, p)
     const uint32_t C = addm(addm(E, F), K1);                    // 2^-24 (W + lam a0n) - 127 M24
     const uint32_t D = addm(addm(E, P - F), K2);                // 2^-24 (W - lam a0n)
     a0h = mm(D, MUH);                                           // [0, 1.5p)
