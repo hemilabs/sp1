@@ -125,7 +125,10 @@ pub(crate) enum ZcInfMode {
     /// bivariate rounds the same for the grid nodes with a coordinate 4.
     On,
     /// `SP1_GPU_ZC_INF_CHECK=1`: compute both and assert that the round
-    /// messages are identical (slow; for validation).
+    /// messages are identical (slow; for validation). Only for valid traces:
+    /// the reconstruction takes the constraints to vanish on the boolean
+    /// corners and p(1) from the claim, so a trace that violates a constraint
+    /// (whose proof fails either way) also trips the assertion.
     Check,
 }
 
@@ -134,12 +137,12 @@ pub(crate) enum ZcInfMode {
 pub(crate) fn zc_inf_mode() -> ZcInfMode {
     static MODE: std::sync::OnceLock<ZcInfMode> = std::sync::OnceLock::new();
     *MODE.get_or_init(|| {
-        let on = |k: &str| std::env::var(k).is_ok_and(|v| !v.is_empty() && v != "0");
+        // Unset or empty: None; "0": Some(false); anything else: Some(true).
+        let flag = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty()).map(|v| v != "0");
         let inf_default = sp1_gpu_cudart::sys::BACKEND == "sycl";
-        if on("SP1_GPU_ZC_INF_CHECK") {
+        if flag("SP1_GPU_ZC_INF_CHECK") == Some(true) {
             ZcInfMode::Check
-        } else if std::env::var("SP1_GPU_ZC_INF").map_or(inf_default, |v| !v.is_empty() && v != "0")
-        {
+        } else if flag("SP1_GPU_ZC_INF").unwrap_or(inf_default) {
             ZcInfMode::On
         } else {
             ZcInfMode::Off
@@ -150,7 +153,7 @@ pub(crate) fn zc_inf_mode() -> ZcInfMode {
 /// `SP1_GPU_ZC_STATS=1`: print per-chip full vs top-degree instruction counts
 /// in `compile_chips`.
 fn zc_stats_enabled() -> bool {
-    std::env::var("SP1_GPU_ZC_STATS").is_ok_and(|v| v == "1")
+    std::env::var("SP1_GPU_ZC_STATS").is_ok_and(|v| !v.is_empty() && v != "0")
 }
 
 /// Whether `compile_chips` builds the top-degree bytecode: when the mode
@@ -274,13 +277,18 @@ where
                             if zerocheck_uniform_enabled() {
                                 rank_registers_by_use(&mut ib);
                             }
-                            assert!(
-                                ib.max_reg <= MAX_FUSED_REGS,
-                                "chip {}: top-degree chunk max_reg={} exceeds fused-kernel cap",
-                                air.name(),
-                                ib.max_reg,
-                            );
-                            Some(ib)
+                            if ib.max_reg <= MAX_FUSED_REGS {
+                                Some(ib)
+                            } else {
+                                tracing::warn!(
+                                    "chip {}: top-degree chunk max_reg={} exceeds the fused-kernel \
+                                     cap; the x = 4 evaluation is used instead",
+                                    air.name(),
+                                    ib.max_reg,
+                                );
+                                inf_ok = false;
+                                None
+                            }
                         }
                         Err(e) => {
                             tracing::warn!(

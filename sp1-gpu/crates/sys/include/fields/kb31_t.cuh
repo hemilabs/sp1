@@ -254,7 +254,8 @@ class kb31_t {
     inline kb31_t& operator-=(const kb31_t b) {
 #ifdef SP1_SYCL
         // val - b wraps above val - b + MOD exactly when val < b: an add and an unsigned min
-        // instead of a compare, add and select (see final_sub).
+        // instead of a compare, add and select (see final_sub). Both canonical (below MOD), as
+        // every kb31_t is: for a val of 2^32 - MOD or more the min could pick a wrapped sum.
         const uint32_t d = val - b.val;
         val = sycl::min(d, d + MOD);
 #elif defined(SP1_PORTABLE)
