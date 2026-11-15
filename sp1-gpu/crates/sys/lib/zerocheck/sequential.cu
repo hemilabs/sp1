@@ -290,9 +290,14 @@ struct ZcScratchRegs {
     __device__ __forceinline__ void init() {}
     __device__ __forceinline__ K get(uint32_t r) const { return regs[r]; }
     __device__ __forceinline__ void set(uint32_t r, const K& x) { regs[r] = x; }
+    __device__ __forceinline__ K pick(bool forwarded, const K& prev, uint32_t r) const {
+        K v;
+        if (forwarded) v = prev; else v = regs[r];
+        return v;
+    }
 };
 
-#ifdef ZC_AMDGCN
+#if defined(ZC_AMDGCN) || defined(SP1_SYCL)
 // Registers [0, V) in VGPRs: one V-wide vector per dword of K, indexed by the
 // uniform register number; [V, MAX_REGS) in a scratch overflow array.
 template <typename K, int V, int MAX_REGS>
@@ -330,6 +335,11 @@ struct ZcVgprRegs {
         } else {
             spill[r - V] = x;
         }
+    }
+    __device__ __forceinline__ K pick(bool forwarded, const K& prev, uint32_t r) const {
+        K v;
+        if (forwarded) v = prev; else v = get(r);
+        return v;
     }
 };
 #else
@@ -413,8 +423,8 @@ __device__ __forceinline__ ext_t run_chunk_bytecode_uniform(
         case BC_SUB_F:
         case BC_MUL_F: {
             K va, vb;
-            if (f & DAG_FLAG_A_PREV) va = prev; else va = regs.get(instr.a);
-            if (f & DAG_FLAG_B_PREV) vb = prev; else vb = regs.get(instr.b);
+            va = regs.pick(f & DAG_FLAG_A_PREV, prev, instr.a);
+            vb = regs.pick(f & DAG_FLAG_B_PREV, prev, instr.b);
             if (instr.op == BC_ADD_F) x = va + vb;
             else if (instr.op == BC_SUB_F) x = va - vb;
             else x = va * vb;
@@ -422,13 +432,13 @@ __device__ __forceinline__ ext_t run_chunk_bytecode_uniform(
         }
         case BC_MUL_CONST: {
             K va;
-            if (f & DAG_FLAG_A_PREV) va = prev; else va = regs.get(instr.a);
+            va = regs.pick(f & DAG_FLAG_A_PREV, prev, instr.a);
             x = va * zc_uload(consts, instr.b);
             break;
         }
         case BC_NEG_F: {
             K va;
-            if (f & DAG_FLAG_A_PREV) va = prev; else va = regs.get(instr.a);
+            va = regs.pick(f & DAG_FLAG_A_PREV, prev, instr.a);
             x = K::zero() - va;
             break;
         }
@@ -981,8 +991,8 @@ __global__ void __launch_bounds__(256, MIN_BLOCKS) zerocheck_fused_sequential_bi
             case BC_SUB_F:
             case BC_MUL_F: {
                 NodeVec<G> va, vb;
-                if (f & DAG_FLAG_A_PREV) va = prev; else va = regs.get(instr.a);
-                if (f & DAG_FLAG_B_PREV) vb = prev; else vb = regs.get(instr.b);
+                va = regs.pick(f & DAG_FLAG_A_PREV, prev, instr.a);
+                vb = regs.pick(f & DAG_FLAG_B_PREV, prev, instr.b);
 #pragma unroll
                 for (int g = 0; g < G; g++) {
                     x.v[g] = (instr.op == BC_ADD_F)   ? va.v[g] + vb.v[g]
@@ -993,7 +1003,7 @@ __global__ void __launch_bounds__(256, MIN_BLOCKS) zerocheck_fused_sequential_bi
             }
             case BC_MUL_CONST: {
                 NodeVec<G> va;
-                if (f & DAG_FLAG_A_PREV) va = prev; else va = regs.get(instr.a);
+                va = regs.pick(f & DAG_FLAG_A_PREV, prev, instr.a);
                 const felt_t c = zc_uload(consts, instr.b);
 #pragma unroll
                 for (int g = 0; g < G; g++) x.v[g] = va.v[g] * c;
@@ -1001,7 +1011,7 @@ __global__ void __launch_bounds__(256, MIN_BLOCKS) zerocheck_fused_sequential_bi
             }
             case BC_NEG_F: {
                 NodeVec<G> va;
-                if (f & DAG_FLAG_A_PREV) va = prev; else va = regs.get(instr.a);
+                va = regs.pick(f & DAG_FLAG_A_PREV, prev, instr.a);
 #pragma unroll
                 for (int g = 0; g < G; g++) x.v[g] = felt_t::zero() - va.v[g];
                 break;
@@ -1287,6 +1297,11 @@ extern "C" void* zerocheck_fused_sequential_ext_1024_kernel() {
 
 // Wave-uniform interpreter entry points (MAX_REGS = 128 tier); the suffix is
 // the VGPR register-file size V (0 = scratch register file).
+// SYCL: the 32-register files do not fit the default 128 GRF (see `ZEROCHECK_SYCL_VRF_DEFAULT` in
+// prover.rs); with them selected, the kernels get the 256-GRF mode instead of spilling.
+SP1_SYCL_LARGE_GRF(zerocheck_fused_sequential_uniform<ext_t, 128, 32>)
+SP1_SYCL_LARGE_GRF(zerocheck_fused_sequential_bivariate_vec_uniform<4, 128, 2, 32>)
+
 extern "C" void* zerocheck_fused_sequential_uniform_kb_128_v0_kernel() {
     return SP1_KERNEL_PTR(zerocheck_fused_sequential_uniform<felt_t, 128, 0>);
 }
@@ -1295,6 +1310,9 @@ extern "C" void* zerocheck_fused_sequential_uniform_kb_128_v32_kernel() {
 }
 extern "C" void* zerocheck_fused_sequential_uniform_ext_128_v0_kernel() {
     return SP1_KERNEL_PTR(zerocheck_fused_sequential_uniform<ext_t, 128, 0>);
+}
+extern "C" void* zerocheck_fused_sequential_uniform_ext_128_v8_kernel() {
+    return SP1_KERNEL_PTR(zerocheck_fused_sequential_uniform<ext_t, 128, 8>);
 }
 extern "C" void* zerocheck_fused_sequential_uniform_ext_128_v16_kernel() {
     return SP1_KERNEL_PTR(zerocheck_fused_sequential_uniform<ext_t, 128, 16>);
@@ -1339,6 +1357,9 @@ extern "C" void* zerocheck_fused_sequential_bivariate_vec12_kb_128_kernel() {
 // suffix = VGPR register-file size.
 extern "C" void* zerocheck_fused_sequential_bivariate_vec4_uniform_kb_128_v0_kernel() {
     return SP1_KERNEL_PTR(zerocheck_fused_sequential_bivariate_vec_uniform<4, 128, 4, 0>);
+}
+extern "C" void* zerocheck_fused_sequential_bivariate_vec4_uniform_kb_128_v8_kernel() {
+    return SP1_KERNEL_PTR(zerocheck_fused_sequential_bivariate_vec_uniform<4, 128, 4, 8>);
 }
 extern "C" void* zerocheck_fused_sequential_bivariate_vec4_uniform_kb_128_v16_kernel() {
     return SP1_KERNEL_PTR(zerocheck_fused_sequential_bivariate_vec_uniform<4, 128, 4, 16>);

@@ -54,9 +54,11 @@ extern "C" {
     pub fn zerocheck_fused_sequential_uniform_kb_128_v0_kernel() -> KernelPtr;
     pub fn zerocheck_fused_sequential_uniform_kb_128_v32_kernel() -> KernelPtr;
     pub fn zerocheck_fused_sequential_uniform_ext_128_v0_kernel() -> KernelPtr;
+    pub fn zerocheck_fused_sequential_uniform_ext_128_v8_kernel() -> KernelPtr;
     pub fn zerocheck_fused_sequential_uniform_ext_128_v16_kernel() -> KernelPtr;
     pub fn zerocheck_fused_sequential_uniform_ext_128_v32_kernel() -> KernelPtr;
     pub fn zerocheck_fused_sequential_bivariate_vec4_uniform_kb_128_v0_kernel() -> KernelPtr;
+    pub fn zerocheck_fused_sequential_bivariate_vec4_uniform_kb_128_v8_kernel() -> KernelPtr;
     pub fn zerocheck_fused_sequential_bivariate_vec4_uniform_kb_128_v16_kernel() -> KernelPtr;
     pub fn zerocheck_fused_sequential_bivariate_vec4_uniform_kb_128_v32_kernel() -> KernelPtr;
     // Cooperative level-scheduled variant for small chunks.

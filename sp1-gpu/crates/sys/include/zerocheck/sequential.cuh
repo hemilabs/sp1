@@ -208,6 +208,7 @@ extern "C" void* zerocheck_fused_sequential_ext_1024_kernel();
 extern "C" void* zerocheck_fused_sequential_uniform_kb_128_v0_kernel();
 extern "C" void* zerocheck_fused_sequential_uniform_kb_128_v32_kernel();
 extern "C" void* zerocheck_fused_sequential_uniform_ext_128_v0_kernel();
+extern "C" void* zerocheck_fused_sequential_uniform_ext_128_v8_kernel();
 extern "C" void* zerocheck_fused_sequential_uniform_ext_128_v16_kernel();
 extern "C" void* zerocheck_fused_sequential_uniform_ext_128_v32_kernel();
 
@@ -250,5 +251,6 @@ extern "C" void* zerocheck_fused_sequential_bivariate_kb_1024_kernel();
 // Wave-uniform node-vectorised bivariate kernels (G = 4, MAX_REGS = 128):
 // same launch as `..._bivariate_vec4_kb_128`; suffix = VGPR register-file size.
 extern "C" void* zerocheck_fused_sequential_bivariate_vec4_uniform_kb_128_v0_kernel();
+extern "C" void* zerocheck_fused_sequential_bivariate_vec4_uniform_kb_128_v8_kernel();
 extern "C" void* zerocheck_fused_sequential_bivariate_vec4_uniform_kb_128_v16_kernel();
 extern "C" void* zerocheck_fused_sequential_bivariate_vec4_uniform_kb_128_v32_kernel();

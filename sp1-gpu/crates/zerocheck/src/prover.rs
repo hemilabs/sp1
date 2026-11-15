@@ -41,6 +41,7 @@ use sp1_gpu_cudart::sys::kernels::{
     zerocheck_fused_sequential_bivariate_vec4_uniform_kb_128_v0_kernel,
     zerocheck_fused_sequential_bivariate_vec4_uniform_kb_128_v16_kernel,
     zerocheck_fused_sequential_bivariate_vec4_uniform_kb_128_v32_kernel,
+    zerocheck_fused_sequential_bivariate_vec4_uniform_kb_128_v8_kernel,
     zerocheck_fused_sequential_coop_ext_kernel, zerocheck_fused_sequential_coop_kb_kernel,
     zerocheck_fused_sequential_coop_wide_ext_kernel,
     zerocheck_fused_sequential_coop_wide_kb_kernel, zerocheck_fused_sequential_ext_1024_kernel,
@@ -52,6 +53,7 @@ use sp1_gpu_cudart::sys::kernels::{
     zerocheck_fused_sequential_kb_64_kernel, zerocheck_fused_sequential_uniform_ext_128_v0_kernel,
     zerocheck_fused_sequential_uniform_ext_128_v16_kernel,
     zerocheck_fused_sequential_uniform_ext_128_v32_kernel,
+    zerocheck_fused_sequential_uniform_ext_128_v8_kernel,
     zerocheck_fused_sequential_uniform_kb_128_v0_kernel,
     zerocheck_fused_sequential_uniform_kb_128_v32_kernel,
     zerocheck_geq_corrections_bivariate_kernel, zerocheck_geq_corrections_kernel,
@@ -255,7 +257,7 @@ where
                 );
                 if std::env::var("SP1_GPU_DEBUG_MAXREG").is_ok() {
                     let (accesses, overflow) =
-                        register_overflow_accesses(&bc, ZEROCHECK_VRF_DEFAULT as u16);
+                        register_overflow_accesses(&bc, zerocheck_vrf_size() as u16);
                     eprintln!(
                         "compile chip={} max_reg={} n_instrs={} n_asserts={} n_leaves={} \
                          regfile_accesses={} overflow_accesses={}",
@@ -1181,6 +1183,7 @@ impl EvalKernels<Ext> for TaskScope {
         Some(unsafe {
             match zerocheck_vrf_size() {
                 0 => zerocheck_fused_sequential_uniform_ext_128_v0_kernel(),
+                8 => zerocheck_fused_sequential_uniform_ext_128_v8_kernel(),
                 16 => zerocheck_fused_sequential_uniform_ext_128_v16_kernel(),
                 _ => zerocheck_fused_sequential_uniform_ext_128_v32_kernel(),
             }
@@ -1570,12 +1573,27 @@ fn rdna_defaults() -> bool {
         && unsafe { sp1_gpu_cudart::sys::runtime::sp1_hip_wave64() } == 0
 }
 
+/// SYCL (Xe2): the register files are vectors indexed by the uniform register number, kept in
+/// GRF with indirect addressing; the overflow is a per-lane private array whose lanes lie 2 KB
+/// apart (16 cache lines per access). With 128 GRF, 16 ext registers (64 GRF) and 8 four-node
+/// registers fit without spilling; 32 ext and 16 four-node registers spill. On an Arc Pro B70
+/// (sha2 core shards) the ext kernel takes 472 ms against 705 ms with all registers private,
+/// and the bivariate kernel 572 ms against 614 ms (bit-identical partials).
+const ZEROCHECK_SYCL_VRF_DEFAULT: u32 = 16;
+const ZEROCHECK_SYCL_BIV_VRF_DEFAULT: u32 = 8;
+
 /// Registers the wave-uniform G = 4 bivariate kernel keeps in VGPRs
-/// (`SP1_GPU_ZEROCHECK_BIV_VRF` ∈ {0, 16, 32}).
+/// (`SP1_GPU_ZEROCHECK_BIV_VRF` ∈ {0, 8, 16, 32}).
 pub(crate) fn zerocheck_biv_vrf_size() -> u32 {
-    let default = if rdna_defaults() { 0 } else { ZEROCHECK_BIV_VRF_DEFAULT };
+    let default = if rdna_defaults() {
+        0
+    } else if sp1_gpu_cudart::sys::BACKEND == "sycl" {
+        ZEROCHECK_SYCL_BIV_VRF_DEFAULT
+    } else {
+        ZEROCHECK_BIV_VRF_DEFAULT
+    };
     match env_u32("SP1_GPU_ZEROCHECK_BIV_VRF", default) {
-        v @ (0 | 16 | 32) => v,
+        v @ (0 | 8 | 16 | 32) => v,
         _ => default,
     }
 }
@@ -1584,15 +1602,21 @@ pub(crate) fn zerocheck_biv_vrf_size() -> u32 {
 const ZEROCHECK_VRF_DEFAULT: u32 = 32;
 
 /// Registers the wave-uniform kernel keeps in VGPRs (`SP1_GPU_ZEROCHECK_VRF`
-/// ∈ {0, 16, 32}; 0 keeps the whole register file in scratch). 0 when the
-/// wave-uniform kernel is off.
+/// ∈ {0, 8, 16, 32}; 0 keeps the whole register file in scratch). 0 when the
+/// wave-uniform kernel is off. The base-field kernel has 0 and 32 only: any other
+/// non-zero size runs it with 32.
 pub(crate) fn zerocheck_vrf_size() -> u32 {
     if !zerocheck_uniform_enabled() {
         return 0;
     }
-    let default = if rdna_defaults() { 16 } else { ZEROCHECK_VRF_DEFAULT };
+    let default = if rdna_defaults() || sp1_gpu_cudart::sys::BACKEND == "sycl" {
+        // ZEROCHECK_SYCL_VRF_DEFAULT on SYCL; RDNA's tuned value happens to be the same.
+        ZEROCHECK_SYCL_VRF_DEFAULT
+    } else {
+        ZEROCHECK_VRF_DEFAULT
+    };
     match env_u32("SP1_GPU_ZEROCHECK_VRF", default) {
-        v @ (0 | 16 | 32) => v,
+        v @ (0 | 8 | 16 | 32) => v,
         _ => default,
     }
 }
@@ -2951,6 +2975,7 @@ fn bivariate_sequential_kernel_for(max_reg_in_tier: u16, inf: bool) -> (KernelPt
             4 if zerocheck_uniform_enabled() => Some(unsafe {
                 match zerocheck_biv_vrf_size() {
                     0 => zerocheck_fused_sequential_bivariate_vec4_uniform_kb_128_v0_kernel(),
+                    8 => zerocheck_fused_sequential_bivariate_vec4_uniform_kb_128_v8_kernel(),
                     16 => zerocheck_fused_sequential_bivariate_vec4_uniform_kb_128_v16_kernel(),
                     _ => zerocheck_fused_sequential_bivariate_vec4_uniform_kb_128_v32_kernel(),
                 }
