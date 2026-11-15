@@ -9,7 +9,7 @@ use slop_algebra::AbstractField;
 use slop_challenger::IopCtx;
 use slop_multilinear::Point;
 use sp1_gpu_cudart::{DevicePoint, TaskScope};
-use sp1_gpu_jagged_sumcheck::{generate_jagged_sumcheck_poly, jagged_sumcheck};
+use sp1_gpu_jagged_sumcheck::{generate_jagged_sumcheck_poly, jagged_sumcheck, EqZRow};
 use sp1_gpu_jagged_tracegen::test_utils::bench_utils::{with_trace_source, JaggedKind};
 use sp1_gpu_jagged_tracegen::test_utils::tracegen_setup::{
     CORE_MAX_LOG_ROW_COUNT, LOG_STACKING_HEIGHT,
@@ -48,7 +48,8 @@ fn run_jagged_sumcheck<R: Rng>(
                 out
             },
             |(z_row_device, z_col_device)| {
-                let eq_z_row = DevicePoint::new(z_row_device).partial_lagrange();
+                let eq_z_row =
+                    EqZRow::Full(DevicePoint::new(z_row_device).partial_lagrange().into());
                 let eq_z_col = DevicePoint::new(z_col_device).partial_lagrange();
                 let poly = generate_jagged_sumcheck_poly(device_mle, eq_z_col, eq_z_row);
                 let result =
