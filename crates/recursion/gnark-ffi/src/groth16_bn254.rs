@@ -444,7 +444,19 @@ pub(crate) struct GoSolveMemory(());
 impl Drop for GoSolveMemory {
     fn drop(&mut self) {
         let keep_env = std::env::var("SP1_GROTH16_KEEP_R1CS").ok();
-        if keep_groth16_circuit(keep_env.as_deref(), memory_available()) {
+        // `memory_available` is unknown on Windows, which made every proof there read the R1CS
+        // again (~2.4 s of a 5090's ~5 s Groth16 for a small program). The physical memory the
+        // system reports available answers the same question, against its own threshold.
+        let (available, min) = if cfg!(windows) {
+            (crate::host_memory::available_on_any_host(), KEEP_CIRCUIT_MIN_AVAILABLE_BYTES_WINDOWS)
+        } else {
+            (memory_available(), KEEP_CIRCUIT_MIN_AVAILABLE_BYTES)
+        };
+        tracing::debug!(
+            "Groth16: {:?} MiB of host memory available as the solve's memory is handed back",
+            available.map(|a| a >> 20)
+        );
+        if keep_groth16_circuit(keep_env.as_deref(), available, min) {
             crate::ffi::trim_groth16_caches();
         } else {
             crate::ffi::release_groth16_caches();
@@ -458,15 +470,22 @@ impl Drop for GoSolveMemory {
 #[cfg(feature = "native")]
 const KEEP_CIRCUIT_MIN_AVAILABLE_BYTES: u64 = 48 << 30;
 
-/// Whether to keep the solved circuit cached: as `SP1_GROTH16_KEEP_R1CS` (`keep_env`) says (`0`/
-/// `false` never, `1`/`true` always), otherwise where `available` host memory is at least
-/// [`KEEP_CIRCUIT_MIN_AVAILABLE_BYTES`].
+/// [`KEEP_CIRCUIT_MIN_AVAILABLE_BYTES`] on Windows, where the figure is the physical memory the
+/// system reports available, and is taken while the prestarted GPU helper (~16 GB) is resident and
+/// before the solve's garbage is handed back: 44.4 GB of a 93.6 GB host with an RTX 5090, which the
+/// Linux threshold never kept the circuit on.
 #[cfg(feature = "native")]
-fn keep_groth16_circuit(keep_env: Option<&str>, available: Option<u64>) -> bool {
+const KEEP_CIRCUIT_MIN_AVAILABLE_BYTES_WINDOWS: u64 = 24 << 30;
+
+/// Whether to keep the solved circuit cached: as `SP1_GROTH16_KEEP_R1CS` (`keep_env`) says (`0`/
+/// `false` never, `1`/`true` always), otherwise where `available` host memory is at least `min`
+/// ([`KEEP_CIRCUIT_MIN_AVAILABLE_BYTES`], or its Windows counterpart).
+#[cfg(feature = "native")]
+fn keep_groth16_circuit(keep_env: Option<&str>, available: Option<u64>, min: u64) -> bool {
     match keep_env {
         Some("0" | "false") => false,
         Some("1" | "true") => true,
-        _ => available.is_some_and(|a| a >= KEEP_CIRCUIT_MIN_AVAILABLE_BYTES),
+        _ => available.is_some_and(|a| a >= min),
     }
 }
 
@@ -1246,14 +1265,19 @@ mod pk_cache_tests {
     #[test]
     fn the_solved_circuit_is_kept_only_where_memory_allows_or_when_asked() {
         let gib = |n: u64| Some(n << 30);
-        assert!(keep_groth16_circuit(None, gib(48)));
-        assert!(!keep_groth16_circuit(None, gib(47)));
-        assert!(!keep_groth16_circuit(None, None));
-        assert!(!keep_groth16_circuit(Some("0"), gib(100)));
-        assert!(!keep_groth16_circuit(Some("false"), gib(100)));
-        assert!(keep_groth16_circuit(Some("1"), gib(1)));
-        assert!(keep_groth16_circuit(Some("true"), None));
-        assert!(keep_groth16_circuit(Some("yes"), gib(48)));
+        let min = KEEP_CIRCUIT_MIN_AVAILABLE_BYTES;
+        assert!(keep_groth16_circuit(None, gib(48), min));
+        assert!(!keep_groth16_circuit(None, gib(47), min));
+        assert!(!keep_groth16_circuit(None, None, min));
+        assert!(!keep_groth16_circuit(Some("0"), gib(100), min));
+        assert!(!keep_groth16_circuit(Some("false"), gib(100), min));
+        assert!(keep_groth16_circuit(Some("1"), gib(1), min));
+        assert!(keep_groth16_circuit(Some("true"), None, min));
+        assert!(keep_groth16_circuit(Some("yes"), gib(48), min));
+        // Windows: the 44.4 GB measured with the RTX 5090's helper resident keeps it.
+        let min = KEEP_CIRCUIT_MIN_AVAILABLE_BYTES_WINDOWS;
+        assert!(keep_groth16_circuit(None, Some(44_454 << 20), min));
+        assert!(!keep_groth16_circuit(None, gib(23), min));
     }
 
     #[test]
