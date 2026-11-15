@@ -906,24 +906,41 @@ fn build_sycl(
     println!("cargo:include={}", cbindgen_dir.display());
 }
 
-/// `icpx`: `SP1_ICPX` if set, else the oneAPI installation's (`ONEAPI_ROOT`, or the default
-/// install location), else `icpx` on PATH.
 /// The SYCL targets with `spir64_gen` (for `device`) replaced by one `intel_gpu_<device>` target
 /// per device when the build also has the Alchemist target, whose backend options are its own.
 ///
 /// icpx (oneAPI 2026.0) hands `-Xsycl-target-backend=intel_gpu_acm_g10` options to the
 /// `spir64_gen` ocloc as well, so Battlemage was compiled in 256-GRF mode too (half the threads
 /// per EU): on an Arc Pro B70, zkminer's SP1 benchmark sha256-chain took 41.8 s against 37.8 s.
-/// `intel_gpu_*` targets each get only their own options. Unchanged without the Alchemist target.
+/// `intel_gpu_*` targets each get only their own options. Unchanged without the Alchemist target,
+/// and when a device is not a platform name like `bmg-g31` (ocloc's other forms, such as `dg2` or
+/// an IP version, have no `intel_gpu_*` target), with a warning about the shared options.
 fn sycl_targets_with_own_options(targets: &str, device: &str) -> String {
     let list: Vec<&str> = targets.split(',').map(str::trim).filter(|t| !t.is_empty()).collect();
     if !list.contains(&"spir64_gen") || !list.contains(&"intel_gpu_acm_g10") {
         return targets.to_string();
     }
+    let devices: Vec<&str> = device.split(',').map(str::trim).filter(|d| !d.is_empty()).collect();
+    // `<family>-g<number>`, e.g. bmg-g31 or acm-g10.
+    let is_platform = |d: &str| {
+        d.split_once("-g").is_some_and(|(family, number)| {
+            !family.is_empty()
+                && family.chars().all(|c| c.is_ascii_lowercase())
+                && !number.is_empty()
+                && number.chars().all(|c| c.is_ascii_digit())
+        })
+    };
+    if devices.is_empty() || !devices.iter().all(|d| is_platform(d)) {
+        println!(
+            "cargo:warning=SP1_SYCL_DEVICE={device:?} has a device without an intel_gpu_* \
+             target: the spir64_gen images also get the Alchemist target's options (256 GRF)"
+        );
+        return targets.to_string();
+    }
     let mut out = Vec::new();
     for t in list {
         if t == "spir64_gen" {
-            for d in device.split(',').map(str::trim).filter(|d| !d.is_empty()) {
+            for d in &devices {
                 let name = format!("intel_gpu_{}", d.replace('-', "_"));
                 if !out.contains(&name) {
                     out.push(name);
@@ -936,6 +953,8 @@ fn sycl_targets_with_own_options(targets: &str, device: &str) -> String {
     out.join(",")
 }
 
+/// `icpx`: `SP1_ICPX` if set, else the oneAPI installation's (`ONEAPI_ROOT`, or the default
+/// install location), else `icpx` on PATH.
 fn find_icpx() -> PathBuf {
     if let Ok(icpx) = env::var("SP1_ICPX") {
         return PathBuf::from(icpx);
