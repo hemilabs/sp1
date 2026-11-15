@@ -108,6 +108,44 @@ __global__ void kbNttSpread(
     }
 }
 
+// The K DIF stages of a global pass on a thread's 2^K elements v[r] = x[r 2^lg_lo + lo], half-sizes
+// 2^s down to 2^(s-K+1), lg_lo = s - K + 1. Stage st's butterfly r (half = 2^(K-1-st), r < half
+// after masking) has twiddle w_{2^(m+1)}^(r 2^lg_lo + lo), m = s - st, which is w_{2^(m+1)}^lo times
+// w_{2^(K-st)}^r: the first from one table read for the top stage and a squaring per stage after
+// it (w_{2^m}^lo = (w_{2^(m+1)}^lo)^2), the second from the small level-(K-1-st) table, the same
+// for every thread. The top stages' tables are large, and every column read them again: reading
+// one twiddle a stage per butterfly doubled the first pass's memory traffic.
+template <int K>
+__device__ __forceinline__ void kbNttPassStages(
+    kb31_t (&v)[1 << K],
+    uint32_t s,
+    uint32_t lo,
+    const Twiddles& tw) {
+    constexpr int R = 1 << K;
+    kb31_t wlo = twiddle(tw, s, lo);
+#pragma unroll
+    for (int st = 0; st < K; st++) {
+        const int half = R >> (st + 1);
+        // w_{2^(m+1)}^(r 2^lg_lo + lo) for r < half.
+        kb31_t w[R / 2];
+        w[0] = wlo;
+        const kb31_t* small = tw.levels + ((1u << (K - 1 - st)) - 1);
+#pragma unroll
+        for (int r = 1; r < half; r++) w[r] = mont_mul(wlo, small[r]);
+#pragma unroll
+        for (int r = 0; r < R; r++) {
+            if (r & half) continue;
+            const kb31_t a = v[r];
+            const kb31_t b = v[r + half];
+            v[r] = a + b;
+            kb31_t d = a - b;
+            d *= w[r & (half - 1)];
+            v[r + half] = d;
+        }
+        if (st + 1 < K) wlo = mont_mul(wlo, wlo);
+    }
+}
+
 // K DIF stages, half-sizes 2^s down to 2^(s-K+1), over each column of 2^lg_n elements. Thread t
 // owns the 2^K elements hi * 2^(s+1) + r * 2^(s-K+1) + lo, r < 2^K, of one column.
 template <int K>
@@ -130,22 +168,7 @@ __global__ void kbNttDifPass(
         kb31_t v[R];
 #pragma unroll
         for (int r = 0; r < R; r++) v[r] = x[(uint64_t)r << lg_lo];
-#pragma unroll
-        for (int st = 0; st < K; st++) {
-            const int half = R >> (st + 1);
-            const uint32_t m = s - st;
-#pragma unroll
-            for (int r = 0; r < R; r++) {
-                if (r & half) continue;
-                const kb31_t a = v[r];
-                const kb31_t b = v[r + half];
-                v[r] = a + b;
-                kb31_t d = a - b;
-                const uint32_t j = ((uint32_t)(r & (half - 1)) << lg_lo) + lo;
-                d *= twiddle(tw, m, j);
-                v[r + half] = d;
-            }
-        }
+        kbNttPassStages<K>(v, s, lo, tw);
 #pragma unroll
         for (int r = 0; r < R; r++) x[(uint64_t)r << lg_lo] = v[r];
     }
@@ -190,22 +213,7 @@ __global__ void kbNttDifPassFirst(
                 v[r] = kb31_t(0u);
             }
         }
-#pragma unroll
-        for (int st = 0; st < K; st++) {
-            const int half = R >> (st + 1);
-            const uint32_t m = s - st;
-#pragma unroll
-            for (int r = 0; r < R; r++) {
-                if (r & half) continue;
-                const kb31_t a = v[r];
-                const kb31_t b = v[r + half];
-                v[r] = a + b;
-                kb31_t d = a - b;
-                const uint32_t j = ((uint32_t)(r & (half - 1)) << lg_lo) + lo;
-                d *= twiddle(tw, m, j);
-                v[r + half] = d;
-            }
-        }
+        kbNttPassStages<K>(v, s, lo, tw);
 #pragma unroll
         for (int r = 0; r < R; r++) x[(uint64_t)r << lg_lo] = v[r];
     }
@@ -261,6 +269,59 @@ __global__ void kbNttDifTile(kb31_t* data, uint32_t lg_top, uint64_t tiles, Twid
         }
         __syncthreads();
         for (uint32_t i = tid; i < tile; i += threads) x[i] = s[i];
+        __syncthreads();
+    }
+}
+
+// kbNttDifTile for full tiles (2^LG_TILE = 4096 elements, 512 threads), in registers: four rounds
+// of three stages (half-sizes 2^11..2^9, 2^8..2^6, 2^5..2^3, 2^2..2^0), each thread holding the 8
+// elements of one radix-8 butterfly network of the round (see kbNttPassStages), with shared memory
+// only between rounds. The first round reads the tile from global memory (threads at stride 1,
+// coalesced), the last writes each thread's 8 contiguous results as two 16-byte stores. Against
+// six radix-4 rounds through shared memory: 4 exchanges instead of 8, and 3 barriers instead of 7.
+static_assert(LG_TILE == 12, "kbNttDifTile8 is written for 4096-element tiles");
+constexpr uint32_t TILE8_THREADS = 512;
+__global__ void kbNttDifTile8(kb31_t* data, uint64_t tiles, Twiddles tw) {
+    SP1_SHARED_ARRAY(kb31_t, sh, [1 << LG_TILE]);
+    const uint32_t t = threadIdx.x;
+    for (uint64_t b = blockIdx.x; b < tiles; b += gridDim.x) {
+        kb31_t* x = data + (b << LG_TILE);
+        kb31_t v[8];
+        // Stages 11..9: elements t + 512 r.
+#pragma unroll
+        for (int r = 0; r < 8; r++) v[r] = x[t + 512 * r];
+        kbNttPassStages<3>(v, 11, t, tw);
+#pragma unroll
+        for (int r = 0; r < 8; r++) sh[t + 512 * r] = v[r];
+        __syncthreads();
+        // Stages 8..6: elements (t >> 6) 512 + 64 r + (t & 63).
+        {
+            const uint32_t lo = t & 63, base = ((t >> 6) << 9) + lo;
+#pragma unroll
+            for (int r = 0; r < 8; r++) v[r] = sh[base + 64 * r];
+            kbNttPassStages<3>(v, 8, lo, tw);
+#pragma unroll
+            for (int r = 0; r < 8; r++) sh[base + 64 * r] = v[r];
+        }
+        __syncthreads();
+        // Stages 5..3: elements (t >> 3) 64 + 8 r + (t & 7).
+        {
+            const uint32_t lo = t & 7, base = ((t >> 3) << 6) + lo;
+#pragma unroll
+            for (int r = 0; r < 8; r++) v[r] = sh[base + 8 * r];
+            kbNttPassStages<3>(v, 5, lo, tw);
+#pragma unroll
+            for (int r = 0; r < 8; r++) sh[base + 8 * r] = v[r];
+        }
+        __syncthreads();
+        // Stages 2..0: elements 8 t + r.
+#pragma unroll
+        for (int r = 0; r < 8; r++) v[r] = sh[8 * t + r];
+        kbNttPassStages<3>(v, 2, 0, tw);
+        uint4* out = reinterpret_cast<uint4*>(x + 8 * t);
+        out[0] = uint4{v[0].val, v[1].val, v[2].val, v[3].val};
+        out[1] = uint4{v[4].val, v[5].val, v[6].val, v[7].val};
+        // The next tile's first round writes shared memory this round may still read.
         __syncthreads();
     }
 }
@@ -484,7 +545,12 @@ extern "C" rustCudaError_t kb_ntt_coset_dft(
         uint32_t lt = lg_top;
         void* args[] = {&d_out, &lt, (void*)&tiles, &tw};
         const uint32_t grid = tiles > 65536 ? 65536 : (uint32_t)tiles;
-        e = launch(SP1_KERNEL_PTR(kbNttDifTile), grid, TILE_THREADS, args, stream);
+        if (lg_top == (uint32_t)LG_TILE) {
+            void* args8[] = {&d_out, (void*)&tiles, &tw};
+            e = launch(SP1_KERNEL_PTR(kbNttDifTile8), grid, TILE8_THREADS, args8, stream);
+        } else {
+            e = launch(SP1_KERNEL_PTR(kbNttDifTile), grid, TILE_THREADS, args, stream);
+        }
         if (failed(e)) return e;
     }
     if (!bit_rev_output) {
