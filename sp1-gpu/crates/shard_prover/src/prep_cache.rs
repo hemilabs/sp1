@@ -26,7 +26,9 @@ use sp1_hypercube::{air::MachineAir, septic_digest::SepticDigest, MachineVerifyi
 /// cards, like the trace prefetch: their device memory caches hold freed blocks outside the live
 /// count that pressure is measured by, and on Windows a card over its video memory budget spills
 /// to shared system memory. On large HIP cards those blocks are in the arena, which the pressure
-/// limit is measured against (see [`sp1_gpu_cudart::usable_device_memory`]).
+/// limit is measured against (see [`sp1_gpu_cudart::usable_device_memory`]). On SYCL, large
+/// allocations also empty the caches when the video memory budget is short of them even after
+/// the allocator freed its cached blocks (see `sycl_allocation_overruns_budget`).
 pub(crate) fn prep_cache_budget() -> u64 {
     static BUDGET: OnceLock<u64> = OnceLock::new();
     *BUDGET.get_or_init(|| {

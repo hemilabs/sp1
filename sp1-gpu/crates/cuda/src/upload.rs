@@ -305,11 +305,25 @@ pub(crate) fn note_live_bytes(live: u64) {
 /// [`StagedUpload`] and [`DeviceCache`]): the caches first, and the staged uploads, which the
 /// shards about to be proved are waiting for, only if the live memory is still above the limit
 /// then (entries a shard still uses stay live).
+///
+/// On SYCL the live count is what was requested: the allocator's rounding, its reuse of blocks up
+/// to twice the size and other processes show only in the video memory budget, so an allocation
+/// of 16 MiB or more also frees the caches when the budget is short even after the allocator
+/// freed its own cached blocks (see `sycl_allocation_overruns_budget`).
 pub(crate) fn make_room_for(size: u64) {
     let fits = || crate::vram_current_bytes() + size <= STAGED_LIMIT.load(Ordering::Relaxed);
     let staged = STAGED_BYTES.load(Ordering::Relaxed);
     let cached = CACHED_BYTES.load(Ordering::Relaxed);
-    if fits() || (staged == 0 && cached == 0) {
+    if staged == 0 && cached == 0 {
+        return;
+    }
+    if fits() {
+        if cached > 0
+            && size >= 16 << 20
+            && sp1_gpu_sys::runtime::sycl_allocation_overruns_budget(size as usize)
+        {
+            release_device_caches(false);
+        }
         return;
     }
     if cached > 0 {

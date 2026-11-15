@@ -35,6 +35,10 @@ extern "C" {
     /// where unknown, which is everywhere but HIP on Windows.
     pub fn sp1_video_memory_budget() -> u64;
 
+    /// SYCL only (`sycl_allocation_overruns_budget`).
+    #[cfg(sycl_backend)]
+    fn sp1_sycl_allocation_overruns_budget(size: usize) -> u32;
+
     /// 1 on HIP when the device runs 64-wide wavefronts (CDNA, e.g. the MI300X), else 0: RDNA,
     /// CUDA, SYCL, or no device.
     pub fn sp1_hip_wave64() -> u32;
@@ -271,5 +275,21 @@ impl From<(u64, u64, u64)> for Dim3 {
 impl From<(usize, usize, usize)> for Dim3 {
     fn from((x, y, z): (usize, usize, usize)) -> Self {
         Self { x: x as u32, y: y as u32, z: z as u32 }
+    }
+}
+
+/// Whether an allocation of `size` bytes would overrun the device's video memory budget (with the
+/// SYCL allocator's fit margin) even once the allocator freed its cached blocks: only on SYCL,
+/// where over-budget memory spills to shared system memory instead of failing; false elsewhere.
+pub fn sycl_allocation_overruns_budget(size: usize) -> bool {
+    #[cfg(sycl_backend)]
+    {
+        // SAFETY: reads the device's memory budget and the allocator's cache size under its lock.
+        unsafe { sp1_sycl_allocation_overruns_budget(size) != 0 }
+    }
+    #[cfg(not(sycl_backend))]
+    {
+        let _ = size;
+        false
     }
 }
