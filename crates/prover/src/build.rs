@@ -211,8 +211,10 @@ async fn try_download_dev_artifacts_from_s3(artifact_name: &str, build_dir: &Pat
         .to_str()
         .ok_or_else(|| anyhow!("failed to convert path to string: {:?}", build_dir))?;
 
+    // Without `-P`, tar strips leading `/` from member names and refuses `..`, so the archive
+    // cannot write outside `build_dir`.
     let extract_result = Command::new("tar")
-        .args(["-Pxzf", tar_path_str, "-C", build_dir_str])
+        .args(["-xzf", tar_path_str, "-C", build_dir_str])
         .output()
         .await
         .context("failed to run tar")?;
@@ -434,6 +436,22 @@ pub const CIRCUIT_ARTIFACTS_URL_BASE: &str = "https://sp1-circuits.s3-us-east-2.
 /// Created after the circuit artifact archive has been extracted successfully.
 const CIRCUIT_ARTIFACTS_COMPLETE_FILE: &str = ".complete";
 
+/// SHA-256 (lowercase hex) of each circuit artifact archive this build installs, by circuit version
+/// and artifact type. An archive is installed only if it hashes to its pin: whoever can serve the
+/// download URL can otherwise ship any proving key, or any file the unpack writes.
+const PINNED_CIRCUIT_ARTIFACTS_SHA256: &[(&str, &str, &str)] = &[
+    ("v6.1.0", "groth16", "18beebb6cd0cc9b4d4a240ee4f49511da6c2a7e51724bad4232de538a9147810"),
+    ("v6.1.0", "plonk", "b3e2f5b5dd5ca89675c73975d2d1cc4a0f9e7cde048ec5354dabc7b0694aa39b"),
+];
+
+/// The pinned SHA-256 of the `artifacts_type` archive of circuit `version`, if there is one.
+fn pinned_circuit_artifacts_sha256(version: &str, artifacts_type: &str) -> Option<&'static str> {
+    PINNED_CIRCUIT_ARTIFACTS_SHA256
+        .iter()
+        .find(|(v, t, _)| *v == version.trim() && *t == artifacts_type)
+        .map(|(_, _, sha256)| *sha256)
+}
+
 /// Whether use the development mode for the circuit artifacts.
 pub(crate) fn use_development_mode() -> bool {
     // TODO: Change this after v6.0.0 binary release
@@ -518,9 +536,15 @@ pub async fn install_circuit_artifacts(build_dir: PathBuf, artifacts_type: &str)
 async fn download_circuit_artifacts(target_dir: &Path, artifacts_type: &str) -> Result<()> {
     std::fs::create_dir_all(target_dir)?;
 
-    // Download the artifacts.
+    // Download the artifacts: only an archive with a pinned hash, checked below.
     let download_url =
         format!("{CIRCUIT_ARTIFACTS_URL_BASE}/{SP1_CIRCUIT_VERSION}-{artifacts_type}.tar.gz");
+    let expected_sha256 = pinned_circuit_artifacts_sha256(SP1_CIRCUIT_VERSION, artifacts_type)
+        .ok_or_else(|| {
+            anyhow!(
+                "no pinned SHA-256 for the {SP1_CIRCUIT_VERSION} {artifacts_type} circuit                  artifacts; refusing to install them unchecked"
+            )
+        })?;
 
     // Create a file in the build directory to store the tar.
     let tar_path = target_dir.join("artifacts.tar.gz");
@@ -530,8 +554,15 @@ async fn download_circuit_artifacts(target_dir: &Path, artifacts_type: &str) -> 
 
     // Download the file.
     let client = Client::builder().build().context("failed to create reqwest client")?;
-    download_file(&client, &download_url, &mut file).await?;
+    let sha256 = download_file_sha256(&client, &download_url, &mut file).await?;
     file.flush().await?;
+    drop(file);
+    if sha256 != expected_sha256 {
+        tokio::fs::remove_file(&tar_path).await?;
+        return Err(anyhow!(
+            "{download_url} has SHA-256 {sha256}, not the pinned {expected_sha256}; not installing it"
+        ));
+    }
 
     // Extract the tarball to the build directory.
     let tar_path_str = tar_path
@@ -541,8 +572,10 @@ async fn download_circuit_artifacts(target_dir: &Path, artifacts_type: &str) -> 
         .to_str()
         .ok_or_else(|| anyhow!("failed to convert path to string: {:?}", target_dir))?;
 
+    // Without `-P`, tar strips leading `/` from member names and refuses `..`, so the archive
+    // cannot write outside `target_dir`.
     let res =
-        Command::new("tar").args(["-Pxzf", tar_path_str, "-C", target_dir_str]).output().await?;
+        Command::new("tar").args(["-xzf", tar_path_str, "-C", target_dir_str]).output().await?;
 
     // Remove the tarball after extraction.
     tokio::fs::remove_file(&tar_path).await?;
@@ -561,8 +594,22 @@ pub async fn download_file(
     url: &str,
     file: &mut (impl tokio::io::AsyncWrite + Unpin),
 ) -> Result<()> {
-    let res =
-        client.get(url).send().await.with_context(|| format!("failed to GET from '{}'", url))?;
+    download_file_sha256(client, url, file).await.map(|_| ())
+}
+
+/// [`download_file`], returning the SHA-256 (lowercase hex) of what it wrote. An HTTP error status
+/// fails the download rather than writing the error page.
+async fn download_file_sha256(
+    client: &Client,
+    url: &str,
+    file: &mut (impl tokio::io::AsyncWrite + Unpin),
+) -> Result<String> {
+    let res = client
+        .get(url)
+        .send()
+        .await
+        .and_then(reqwest::Response::error_for_status)
+        .with_context(|| format!("failed to GET from '{}'", url))?;
 
     let total_size = res
         .content_length()
@@ -577,9 +624,11 @@ pub async fn download_file(
     );
 
     let mut downloaded: u64 = 0;
+    let mut hasher = Sha256::new();
     let mut stream = res.bytes_stream();
     while let Some(item) = stream.next().await {
         let chunk = item.context("error while downloading file")?;
+        hasher.update(&chunk);
         file.write_all(&chunk).await?;
         let new = min(downloaded + (chunk.len() as u64), total_size);
         downloaded = new;
@@ -587,7 +636,7 @@ pub async fn download_file(
     }
     pb.finish();
 
-    Ok(())
+    Ok(hasher.finalize().iter().map(|b| format!("{b:02x}")).collect())
 }
 
 fn publish_circuit_artifacts(staging_dir: tempfile::TempDir, build_dir: &Path) -> Result<()> {
@@ -655,6 +704,19 @@ mod tests {
         verify::WRAP_VK_BYTES,
         worker::{cpu_worker_builder_with_machine, SP1LocalNodeBuilder},
     };
+
+    #[test]
+    fn every_installed_circuit_has_pinned_artifacts() {
+        for artifacts_type in ["groth16", "plonk"] {
+            let sha256 =
+                super::pinned_circuit_artifacts_sha256(crate::SP1_CIRCUIT_VERSION, artifacts_type)
+                    .expect("this build's circuit artifacts are pinned");
+            assert_eq!(sha256.len(), 64);
+            assert!(sha256.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)));
+        }
+        assert_eq!(super::pinned_circuit_artifacts_sha256("v6.1.0", "other"), None);
+        assert_eq!(super::pinned_circuit_artifacts_sha256("v9.9.9", "groth16"), None);
+    }
 
     #[test]
     fn publish_replaces_incomplete_circuit_artifacts() {
