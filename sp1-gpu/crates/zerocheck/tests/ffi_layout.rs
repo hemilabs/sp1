@@ -108,6 +108,7 @@ fn chunk_static_layout_matches() {
         "coop_assert_slots" => std::mem::offset_of!(ChunkStaticC, coop_assert_slots),
         "coop_n_levels" => std::mem::offset_of!(ChunkStaticC, coop_n_levels),
         "coop_n_phys" => std::mem::offset_of!(ChunkStaticC, coop_n_phys),
+        "inf" => std::mem::offset_of!(ChunkStaticC, inf),
     );
 }
 

@@ -116,3 +116,61 @@ __device__ __forceinline__ K interp_load_quad(
     }
     return bivariate_interp(r00, r01, r10, r11, nd);
 }
+
+// ============================================================================
+// Point-at-infinity layout (`SP1_GPU_ZC_INF`, kernel argument `inf_mode`).
+//
+// The grid nodes with a coordinate 4 — e = 1, 3, 7 ((x, 4), x = 0, 1, 2),
+// e = 8, 9, 10 ((4, y), y = 0, 1, 2) and e = 11 ((4, 4)) — are replaced by
+// "infinity" nodes holding leading coefficients of the bicubic round
+// polynomial Q(x, y):
+//   (x, ∞): the y^3 coefficient of Q(x, ·),
+//   (∞, y): the x^3 coefficient of Q(·, y),
+//   (∞, ∞): the x^3·y^3 coefficient.
+// With the bilinear columns t = r00 + x·dx + y·dy + x·y·m, these are the
+// chunk's top-degree bytecode (`ChunkStatic::inf`) on the leaves dy + x·m,
+// dx + y·m and m respectively (`bivariate_inf_interp`). The host rebuilds
+// the x = 4 / y = 4 grid values from them exactly (see
+// `evaluate_zerocheck_bivariate` in prover.rs). Slot e of the partials keeps
+// node e's position; for the infinity nodes it holds the coefficient.
+// ============================================================================
+
+// Whether node `e` is an infinity node in `inf_mode`.
+__device__ __forceinline__ bool bivariate_is_inf_node(int e) {
+    return e == 1 || e == 3 || e >= 7;
+}
+
+// Leaf value of infinity node `e` (see above) from a quadruple's corners.
+template <typename K>
+__device__ __forceinline__ K bivariate_inf_interp(K r00, K r01, K r10, K r11, int e) {
+    K dy = r01 - r00;
+    K dx = r10 - r00;
+    K m = (r11 - r10) - dy;
+    switch (e) {
+    case 1:  return dy;            // (0, ∞)
+    case 3:  return dy + m;        // (1, ∞)
+    case 7:  return dy + m + m;    // (2, ∞)
+    case 8:  return dx;            // (∞, 0)
+    case 9:  return dx + m;        // (∞, 1)
+    case 10: return dx + m + m;    // (∞, 2)
+    default: return m;             // (∞, ∞)
+    }
+}
+
+// The node-vectorised kernels with G = 4 run `BIVARIATE_INF_PASSES` passes per
+// tile in `inf_mode`: two over the 5 finite nodes with the full bytecode and
+// two over the 7 infinity nodes with the top-degree bytecode. Repeated
+// entries are computed but stored once (`bivariate_inf_pass_stores`).
+constexpr int BIVARIATE_INF_PASSES = 4;
+constexpr int BIVARIATE_INF_FIRST_TOP_PASS = 2;
+__device__ __forceinline__ int bivariate_inf_pass_node(int pass, int g) {
+    switch (pass) {
+    case 0:  return g == 0 ? 0 : g == 1 ? 2 : g == 2 ? 4 : 5;
+    case 1:  return 6;
+    case 2:  return g == 0 ? 1 : g == 1 ? 3 : g == 2 ? 7 : 8;
+    default: return g == 0 ? 9 : g == 1 ? 10 : 11;
+    }
+}
+__device__ __forceinline__ bool bivariate_inf_pass_stores(int pass, int g) {
+    return pass == 1 ? g == 0 : pass == 3 ? g < 3 : true;
+}

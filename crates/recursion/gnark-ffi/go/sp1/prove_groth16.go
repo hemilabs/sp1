@@ -217,9 +217,22 @@ func loadGroth16R1cs(dataDir string) (*cs.R1CS, error) {
 	return r1cs, nil
 }
 
-// readGroth16R1cs parses the R1CS in dataDir.
+// readGroth16R1cs parses the R1CS in dataDir: its stripped copy where one is named
+// (SetGroth16StrippedR1cs) and reads, otherwise the full file.
 func readGroth16R1cs(dataDir string) (*cs.R1CS, error) {
 	start := time.Now()
+	if stripped := strippedR1csPath(dataDir); stripped != "" {
+		r1cs, err := readR1cs(stripped)
+		if err == nil {
+			if bn, ok := r1cs.(*cs.R1CS); ok {
+				fmt.Printf("Reading R1CS (stripped) took %s\n", time.Since(start))
+				return bn, nil
+			}
+			err = fmt.Errorf("it is a %T", r1cs)
+		}
+		fmt.Printf("stripped R1CS %s unusable (%v); reading the full one\n", stripped, err)
+		start = time.Now()
+	}
 	r1cs, err := readR1cs(dataDir + "/" + groth16CircuitPath)
 	if err != nil {
 		return nil, err

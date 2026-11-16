@@ -148,6 +148,133 @@ SP1_KERNEL void jaggedTwoRoundFixAndSum(
     }
 }
 
+// The two kernels above with eq(z_row, ·) factored: eqZRow[4m + l] = eqZRowQuad[m] · E[l], E the
+// eq table of z_row's last two coordinates. When every column's height is a multiple of 8 (so
+// every column starts at a multiple of 8), the 4 elements of a SumAsPoly iteration and the 8 of
+// a FixAndSum iteration lie in one column at rows 4m.. and 8m..; q is then eqZCol · eqZRowQuad[m]
+// times a constant of the iteration's position: one extension multiply where the full table took
+// one per element (and its interpolations), and 4 bytes of eq table per element instead of 16.
+// The constants are applied on the host (SumAsPoly) or passed in (FixAndSum's `qScale`, E folded
+// with both challenges). The field arithmetic is exact, so the outputs are the same values.
+
+// acc[k] = Σ (base combination k) · eqZCol · eqZRowQuad[m]: the host multiplies acc[k] by the same
+// combination of E that `jaggedTwoRoundSumAsPoly` applies to q.
+SP1_KERNEL void jaggedTwoRoundSumAsPolyFactored(
+    ext_t* evaluations,
+    const JaggedMle<JaggedSumcheckData> inputJaggedMle) {
+
+    ext_t acc[8];
+#pragma unroll
+    for (size_t k = 0; k < 8; k++) {
+        acc[k] = ext_t::zero();
+    }
+
+    for (size_t i = blockIdx.x * blockDim.x + threadIdx.x; i < inputJaggedMle.denseData.height >> 1;
+         i += blockDim.x * gridDim.x) {
+
+        // Pairs 2i and 2i + 1: elements 4i..4i + 3, rows 4m..4m + 3 of one column.
+        const size_t j = i << 1;
+        const size_t colIdx = inputJaggedMle.colIndex[j];
+        const size_t rowIdx = j - inputJaggedMle.startIndices[colIdx];
+        const ext_t w = ext_t::load(inputJaggedMle.denseData.eqZCol, colIdx) *
+                        ext_t::load(inputJaggedMle.denseData.eqZRowQuad, rowIdx >> 1);
+
+        felt_t b00 = felt_t::load(inputJaggedMle.denseData.base, i << 2);
+        felt_t b01 = felt_t::load(inputJaggedMle.denseData.base, (i << 2) + 1);
+        felt_t b10 = felt_t::load(inputJaggedMle.denseData.base, (i << 2) + 2);
+        felt_t b11 = felt_t::load(inputJaggedMle.denseData.base, (i << 2) + 3);
+
+        acc[0] += b00 * w;
+        acc[1] += b01 * w;
+        acc[2] += (b00 + b01) * w;
+        acc[3] += b10 * w;
+        acc[4] += (b10 + b11) * w;
+        acc[5] += (b00 + b10) * w;
+        acc[6] += (b01 + b11) * w;
+        acc[7] += (b00 + b01 + b10 + b11) * w;
+    }
+
+    SP1_EXTERN_SHARED(unsigned char, memory);
+    ext_t* shared = reinterpret_cast<ext_t*>(memory);
+
+    auto block = cg::this_thread_block();
+    auto tile = cg::tiled_partition<32>(block);
+#pragma unroll
+    for (size_t k = 0; k < 8; k++) {
+        ext_t blockSum = partialBlockReduce(block, tile, acc[k], shared);
+        if (threadIdx.x == 0) {
+            ext_t::store(
+                evaluations,
+                k * gridDim.x * gridDim.y + gridDim.x * blockIdx.y + blockIdx.x,
+                blockSum);
+        }
+    }
+}
+
+// The doubly folded q at rows 4m.. is eqZCol · eqZRowQuad[m] · qScale, with
+// qScale = Σ_{u,y} L_{alpha2}(u) L_{alpha1}(y) E[2u + y].
+SP1_KERNEL void jaggedTwoRoundFixAndSumFactored(
+    ext_t* evaluations,
+    const JaggedMle<JaggedSumcheckData> inputJaggedMle,
+    ext_t* output_p,
+    ext_t* output_q,
+    ext_t alpha1,
+    ext_t alpha2,
+    ext_t qScale) {
+
+    ext_t evalZero = ext_t::zero();
+    ext_t evalHalf = ext_t::zero();
+
+    for (size_t i = blockIdx.x * blockDim.x + threadIdx.x; i < inputJaggedMle.denseData.height >> 2;
+         i += blockDim.x * gridDim.x) {
+
+        // Pairs 4i..4i + 3: elements 8i..8i + 7, rows 8m..8m + 7 of one column.
+        const size_t j0 = i << 2;
+        const size_t colIdx = inputJaggedMle.colIndex[j0];
+        const size_t rowIdx = j0 - inputJaggedMle.startIndices[colIdx];
+        const ext_t w = ext_t::load(inputJaggedMle.denseData.eqZCol, colIdx) * qScale;
+
+        Pair folded[2];
+#pragma unroll
+        for (size_t t = 0; t < 2; t++) {
+            size_t k = (i << 1) + t;
+            ext_t once[2];
+#pragma unroll
+            for (size_t u = 0; u < 2; u++) {
+                size_t j = (k << 1) + u;
+                felt_t baseZero = felt_t::load(inputJaggedMle.denseData.base, j << 1);
+                felt_t baseOne = felt_t::load(inputJaggedMle.denseData.base, (j << 1) + 1);
+                once[u] = alpha1.interpolateLinear(baseOne, baseZero);
+            }
+            folded[t] = Pair{
+                alpha2.interpolateLinear(once[1], once[0]),
+                w * ext_t::load(inputJaggedMle.denseData.eqZRowQuad, (rowIdx >> 1) + t)};
+
+            ext_t::store(output_p, k, folded[t].p);
+            ext_t::store(output_q, k, folded[t].q);
+        }
+
+        evalZero += folded[0].q * folded[0].p;
+        evalHalf += (folded[0].q + folded[1].q) * (folded[0].p + folded[1].p);
+    }
+
+    SP1_EXTERN_SHARED(unsigned char, memory);
+    ext_t* shared = reinterpret_cast<ext_t*>(memory);
+
+    auto block = cg::this_thread_block();
+    auto tile = cg::tiled_partition<32>(block);
+    ext_t evalZeroblockSum = partialBlockReduce(block, tile, evalZero, shared);
+    ext_t evalHalfblockSum = partialBlockReduce(block, tile, evalHalf, shared);
+
+    if (threadIdx.x == 0) {
+        ext_t::store(evaluations, gridDim.x * blockIdx.y + blockIdx.x, evalZeroblockSum);
+        ext_t::store(
+            evaluations,
+            gridDim.x * gridDim.y + gridDim.x * blockIdx.y + blockIdx.x,
+            evalHalfblockSum);
+    }
+}
+
 SP1_KERNEL void paddedHadamardFixAndSum(
     const ext_t* __restrict__ base_input,
     const ext_t* __restrict__ ext_input,
@@ -231,6 +358,14 @@ SP1_KERNEL void paddedHadamardFixAndSum(
 extern "C" void* jagged_two_round_sum_as_poly() { return SP1_KERNEL_PTR(jaggedTwoRoundSumAsPoly); }
 
 extern "C" void* jagged_two_round_fix_and_sum() { return SP1_KERNEL_PTR(jaggedTwoRoundFixAndSum); }
+
+extern "C" void* jagged_two_round_sum_as_poly_factored() {
+    return SP1_KERNEL_PTR(jaggedTwoRoundSumAsPolyFactored);
+}
+
+extern "C" void* jagged_two_round_fix_and_sum_factored() {
+    return SP1_KERNEL_PTR(jaggedTwoRoundFixAndSumFactored);
+}
 
 extern "C" void* padded_hadamard_fix_and_sum() { return SP1_KERNEL_PTR(paddedHadamardFixAndSum); }
 

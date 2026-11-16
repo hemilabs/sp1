@@ -15,6 +15,7 @@ pub mod dag;
 pub mod expr;
 pub mod lowering;
 mod state;
+pub mod top_degree;
 pub mod var;
 
 pub use analysis::{analyze_constraints, ColumnLeaf, ConstraintInfo, ConstraintShape};
@@ -33,4 +34,5 @@ pub use expr::{DagExprEF, DagExprF};
 pub use lowering::{
     enumerate_lowerings, ColumnTilePlan, ColumnTilePlanTerm, Lowering, SequentialPlan,
 };
+pub use top_degree::{top_degree_bytecode, TopDegreeError};
 pub use var::{DagVarEF, DagVarF};

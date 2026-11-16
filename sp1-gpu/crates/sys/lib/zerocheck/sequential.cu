@@ -143,9 +143,20 @@ __global__ void zerocheck_fused_sequential(
     // {0, 2, 4} (see `interp_load_pair` for the diff-doubling interpolation)
     // of dispatch tile `tile`.
     const uint32_t tile = blockIdx.x / 3;
-    const int e = (int)(blockIdx.x - 3 * tile);
+    int e = (int)(blockIdx.x - 3 * tile);
     BlockDispatch disp = dispatch[tile];
     ChunkStatic stc = chunk_static[disp.chunk_id];
+    // Point-at-infinity mode (see `ChunkStatic::inf`): eval slot 2 holds the
+    // leading coefficient, from the chunk's top-degree bytecode on Δ leaves.
+    if (e == 2 && stc.inf != nullptr) {
+        stc = *stc.inf;
+        e = ZC_EVAL_INF;
+        if (stc.n_asserts == 0) {
+            // No constraint of top degree: the whole block contributes zero.
+            if (threadIdx.x == 0) ext_t::store(partials, blockIdx.x, ext_t::zero());
+            return;
+        }
+    }
     ChipLayout lay = chip_layouts[stc.chip_idx];
     const felt_t* consts = reinterpret_cast<const felt_t*>(stc.consts);
 
@@ -279,9 +290,14 @@ struct ZcScratchRegs {
     __device__ __forceinline__ void init() {}
     __device__ __forceinline__ K get(uint32_t r) const { return regs[r]; }
     __device__ __forceinline__ void set(uint32_t r, const K& x) { regs[r] = x; }
+    __device__ __forceinline__ K pick(bool forwarded, const K& prev, uint32_t r) const {
+        K v;
+        if (forwarded) v = prev; else v = regs[r];
+        return v;
+    }
 };
 
-#ifdef ZC_AMDGCN
+#if defined(ZC_AMDGCN) || defined(SP1_SYCL)
 // Registers [0, V) in VGPRs: one V-wide vector per dword of K, indexed by the
 // uniform register number; [V, MAX_REGS) in a scratch overflow array.
 template <typename K, int V, int MAX_REGS>
@@ -319,6 +335,11 @@ struct ZcVgprRegs {
         } else {
             spill[r - V] = x;
         }
+    }
+    __device__ __forceinline__ K pick(bool forwarded, const K& prev, uint32_t r) const {
+        K v;
+        if (forwarded) v = prev; else v = get(r);
+        return v;
     }
 };
 #else
@@ -402,8 +423,8 @@ __device__ __forceinline__ ext_t run_chunk_bytecode_uniform(
         case BC_SUB_F:
         case BC_MUL_F: {
             K va, vb;
-            if (f & DAG_FLAG_A_PREV) va = prev; else va = regs.get(instr.a);
-            if (f & DAG_FLAG_B_PREV) vb = prev; else vb = regs.get(instr.b);
+            va = regs.pick(f & DAG_FLAG_A_PREV, prev, instr.a);
+            vb = regs.pick(f & DAG_FLAG_B_PREV, prev, instr.b);
             if (instr.op == BC_ADD_F) x = va + vb;
             else if (instr.op == BC_SUB_F) x = va - vb;
             else x = va * vb;
@@ -411,13 +432,13 @@ __device__ __forceinline__ ext_t run_chunk_bytecode_uniform(
         }
         case BC_MUL_CONST: {
             K va;
-            if (f & DAG_FLAG_A_PREV) va = prev; else va = regs.get(instr.a);
+            va = regs.pick(f & DAG_FLAG_A_PREV, prev, instr.a);
             x = va * zc_uload(consts, instr.b);
             break;
         }
         case BC_NEG_F: {
             K va;
-            if (f & DAG_FLAG_A_PREV) va = prev; else va = regs.get(instr.a);
+            va = regs.pick(f & DAG_FLAG_A_PREV, prev, instr.a);
             x = K::zero() - va;
             break;
         }
@@ -453,9 +474,17 @@ __global__ void __launch_bounds__(256) SP1_RDNA_WAVES_PER_EU((V > 0 && V <= 16) 
 ) {
     // Same structure as `zerocheck_fused_sequential`; see there.
     const uint32_t tile = blockIdx.x / 3;
-    const int e = (int)(blockIdx.x - 3 * tile);
+    int e = (int)(blockIdx.x - 3 * tile);
     BlockDispatch disp = dispatch[tile];
     ChunkStatic stc = chunk_static[disp.chunk_id];
+    if (e == 2 && stc.inf != nullptr) {
+        stc = *stc.inf;
+        e = ZC_EVAL_INF;
+        if (stc.n_asserts == 0) {
+            if (threadIdx.x == 0) ext_t::store(partials, blockIdx.x, ext_t::zero());
+            return;
+        }
+    }
     ChipLayout lay = chip_layouts[stc.chip_idx];
     const felt_t* consts = reinterpret_cast<const felt_t*>(stc.consts);
 
@@ -550,13 +579,21 @@ __global__ void zerocheck_fused_sequential_bivariate(
     const ext_t* __restrict__ partial_lagrange,
     const ext_t* __restrict__ powers_of_lambda,
     uint32_t rest_point_dim,
-    ext_t* __restrict__ partials
+    ext_t* __restrict__ partials,
+    uint32_t inf_mode
 ) {
     BlockDispatch disp = dispatch[blockIdx.x];
     ChunkStatic stc = chunk_static[disp.chunk_id];
     ChipLayout lay = chip_layouts[stc.chip_idx];
     const felt_t* consts = reinterpret_cast<const felt_t*>(stc.consts);
     const ext_t lambda = ext_t::load(powers_of_lambda, stc.chip_idx);
+    // `inf_mode`: the infinity nodes (see bivariate.cuh) run the top-degree
+    // variant `stc.inf` (non-null in the launcher's linked descriptors).
+    ChunkStatic stc_inf = stc;
+    if (inf_mode != 0u) {
+        stc_inf = *stc.inf;
+    }
+    const felt_t* consts_inf = reinterpret_cast<const felt_t*>(stc_inf.consts);
 
     K regs[MAX_REGS];
     // One accumulator per grid node. Indexed by the (non-unrolled) node loop,
@@ -586,6 +623,30 @@ __global__ void zerocheck_fused_sequential_bivariate(
         const bool full_quad = ((quad_idx << 2) | 3u) < lay.height;
 
         for (int e = 0; e < BIVARIATE_NUM_NODES; e++) {
+            if (inf_mode != 0u && bivariate_is_inf_node(e)) {
+                if (stc_inf.n_asserts == 0) {
+                    continue;
+                }
+                ext_t acc = run_chunk_bytecode(
+                    stc_inf, consts_inf, public_values, powers_of_alpha, regs, [&](LeafRef leaf) {
+                        size_t base = (leaf.source == LEAF_SOURCE_MAIN_LOCAL)
+                                          ? lay.main_ptr
+                                          : lay.preprocessed_ptr;
+                        const size_t qb = base + (size_t)leaf.col * (size_t)lay.height
+                                          + ((size_t)quad_idx << 2);
+                        K r00 = K::load(trace_data, qb);
+                        K r01 = K::load(trace_data, qb + 1);
+                        K r10 = K::zero();
+                        K r11 = K::zero();
+                        if (full_quad) {
+                            r10 = K::load(trace_data, qb + 2);
+                            r11 = K::load(trace_data, qb + 3);
+                        }
+                        return bivariate_inf_interp(r00, r01, r10, r11, e);
+                    });
+                thread_acc[e] += acc * w;
+                continue;
+            }
             const BivariateNode node = bivariate_node(e);
             ext_t acc = run_chunk_bytecode(
                 stc, consts, public_values, powers_of_alpha, regs, [&](LeafRef leaf) {
@@ -652,14 +713,43 @@ __global__ void __launch_bounds__(256, MIN_BLOCKS) zerocheck_fused_sequential_bi
     const ext_t* __restrict__ partial_lagrange,
     const ext_t* __restrict__ powers_of_lambda,
     uint32_t rest_point_dim,
-    ext_t* __restrict__ partials
+    ext_t* __restrict__ partials,
+    uint32_t inf_mode
 ) {
     static_assert(BIVARIATE_NUM_NODES % G == 0, "G must divide the node count");
     constexpr uint32_t NP = BIVARIATE_NUM_NODES / G;
-    const uint32_t tile = blockIdx.x / NP;
-    const int e0 = (int)(blockIdx.x - NP * tile) * G;
+    // `inf_mode` (G = 4 only, see bivariate.cuh): BIVARIATE_INF_PASSES passes
+    // per tile; the last two run the top-degree variant on infinity leaves.
+    if (inf_mode != 0u && G != 4) __trap();
+    const uint32_t np = inf_mode != 0u ? (uint32_t)BIVARIATE_INF_PASSES : NP;
+    const uint32_t tile = blockIdx.x / np;
+    const int pass = (int)(blockIdx.x - np * tile);
+    const bool inf_pass = inf_mode != 0u && pass >= BIVARIATE_INF_FIRST_TOP_PASS;
+    // Grid node of each lane g, and whether lane g's sum is stored.
+    int node_of[G];
+    bool store_of[G];
+#pragma unroll
+    for (int g = 0; g < G; g++) {
+        node_of[g] = inf_mode != 0u ? bivariate_inf_pass_node(pass, g) : pass * G + g;
+        store_of[g] = inf_mode != 0u ? bivariate_inf_pass_stores(pass, g) : true;
+    }
     BlockDispatch disp = dispatch[tile];
     ChunkStatic stc = chunk_static[disp.chunk_id];
+    if (inf_pass) {
+        stc = *stc.inf;
+        if (stc.n_asserts == 0) {
+            // No constraint of top degree: these nodes are zero.
+            if (threadIdx.x == 0) {
+                for (int g = 0; g < G; g++) {
+                    if (store_of[g]) {
+                        ext_t::store(partials, tile * BIVARIATE_NUM_NODES + (uint32_t)node_of[g],
+                                     ext_t::zero());
+                    }
+                }
+            }
+            return;
+        }
+    }
     ChipLayout lay = chip_layouts[stc.chip_idx];
     const felt_t* consts = reinterpret_cast<const felt_t*>(stc.consts);
     const ext_t lambda = ext_t::load(powers_of_lambda, stc.chip_idx);
@@ -707,7 +797,9 @@ __global__ void __launch_bounds__(256, MIN_BLOCKS) zerocheck_fused_sequential_bi
                 }
 #pragma unroll
                 for (int g = 0; g < G; g++) {
-                    x.v[g] = bivariate_interp(r00, r01, r10, r11, bivariate_node(e0 + g));
+                    x.v[g] = inf_pass
+                                 ? bivariate_inf_interp(r00, r01, r10, r11, node_of[g])
+                                 : bivariate_interp(r00, r01, r10, r11, bivariate_node(node_of[g]));
                 }
                 break;
             }
@@ -771,8 +863,8 @@ __global__ void __launch_bounds__(256, MIN_BLOCKS) zerocheck_fused_sequential_bi
     auto tile_warp = cg::tiled_partition<32>(block);
     for (int g = 0; g < G; g++) {
         ext_t block_sum = partialBlockReduce(block, tile_warp, thread_acc[g], shared);
-        if (threadIdx.x == 0) {
-            ext_t::store(partials, tile * BIVARIATE_NUM_NODES + (uint32_t)(e0 + g), block_sum);
+        if (threadIdx.x == 0 && store_of[g]) {
+            ext_t::store(partials, tile * BIVARIATE_NUM_NODES + (uint32_t)node_of[g], block_sum);
         }
         block.sync();
     }
@@ -793,14 +885,43 @@ __global__ void __launch_bounds__(256, MIN_BLOCKS) zerocheck_fused_sequential_bi
     const ext_t* __restrict__ partial_lagrange,
     const ext_t* __restrict__ powers_of_lambda,
     uint32_t rest_point_dim,
-    ext_t* __restrict__ partials
+    ext_t* __restrict__ partials,
+    uint32_t inf_mode
 ) {
     static_assert(BIVARIATE_NUM_NODES % G == 0, "G must divide the node count");
     constexpr uint32_t NP = BIVARIATE_NUM_NODES / G;
-    const uint32_t tile = blockIdx.x / NP;
-    const int e0 = (int)(blockIdx.x - NP * tile) * G;
+    // `inf_mode` (G = 4 only, see bivariate.cuh): BIVARIATE_INF_PASSES passes
+    // per tile; the last two run the top-degree variant on infinity leaves.
+    if (inf_mode != 0u && G != 4) __trap();
+    const uint32_t np = inf_mode != 0u ? (uint32_t)BIVARIATE_INF_PASSES : NP;
+    const uint32_t tile = blockIdx.x / np;
+    const int pass = (int)(blockIdx.x - np * tile);
+    const bool inf_pass = inf_mode != 0u && pass >= BIVARIATE_INF_FIRST_TOP_PASS;
+    // Grid node of each lane g, and whether lane g's sum is stored.
+    int node_of[G];
+    bool store_of[G];
+#pragma unroll
+    for (int g = 0; g < G; g++) {
+        node_of[g] = inf_mode != 0u ? bivariate_inf_pass_node(pass, g) : pass * G + g;
+        store_of[g] = inf_mode != 0u ? bivariate_inf_pass_stores(pass, g) : true;
+    }
     BlockDispatch disp = dispatch[tile];
     ChunkStatic stc = chunk_static[disp.chunk_id];
+    if (inf_pass) {
+        stc = *stc.inf;
+        if (stc.n_asserts == 0) {
+            // No constraint of top degree: these nodes are zero.
+            if (threadIdx.x == 0) {
+                for (int g = 0; g < G; g++) {
+                    if (store_of[g]) {
+                        ext_t::store(partials, tile * BIVARIATE_NUM_NODES + (uint32_t)node_of[g],
+                                     ext_t::zero());
+                    }
+                }
+            }
+            return;
+        }
+    }
     ChipLayout lay = chip_layouts[stc.chip_idx];
     const felt_t* consts = reinterpret_cast<const felt_t*>(stc.consts);
     const ext_t lambda = ext_t::load(powers_of_lambda, stc.chip_idx);
@@ -852,7 +973,9 @@ __global__ void __launch_bounds__(256, MIN_BLOCKS) zerocheck_fused_sequential_bi
                 }
 #pragma unroll
                 for (int g = 0; g < G; g++) {
-                    x.v[g] = bivariate_interp(r00, r01, r10, r11, bivariate_node(e0 + g));
+                    x.v[g] = inf_pass
+                                 ? bivariate_inf_interp(r00, r01, r10, r11, node_of[g])
+                                 : bivariate_interp(r00, r01, r10, r11, bivariate_node(node_of[g]));
                 }
                 break;
             }
@@ -868,8 +991,8 @@ __global__ void __launch_bounds__(256, MIN_BLOCKS) zerocheck_fused_sequential_bi
             case BC_SUB_F:
             case BC_MUL_F: {
                 NodeVec<G> va, vb;
-                if (f & DAG_FLAG_A_PREV) va = prev; else va = regs.get(instr.a);
-                if (f & DAG_FLAG_B_PREV) vb = prev; else vb = regs.get(instr.b);
+                va = regs.pick(f & DAG_FLAG_A_PREV, prev, instr.a);
+                vb = regs.pick(f & DAG_FLAG_B_PREV, prev, instr.b);
 #pragma unroll
                 for (int g = 0; g < G; g++) {
                     x.v[g] = (instr.op == BC_ADD_F)   ? va.v[g] + vb.v[g]
@@ -880,7 +1003,7 @@ __global__ void __launch_bounds__(256, MIN_BLOCKS) zerocheck_fused_sequential_bi
             }
             case BC_MUL_CONST: {
                 NodeVec<G> va;
-                if (f & DAG_FLAG_A_PREV) va = prev; else va = regs.get(instr.a);
+                va = regs.pick(f & DAG_FLAG_A_PREV, prev, instr.a);
                 const felt_t c = zc_uload(consts, instr.b);
 #pragma unroll
                 for (int g = 0; g < G; g++) x.v[g] = va.v[g] * c;
@@ -888,7 +1011,7 @@ __global__ void __launch_bounds__(256, MIN_BLOCKS) zerocheck_fused_sequential_bi
             }
             case BC_NEG_F: {
                 NodeVec<G> va;
-                if (f & DAG_FLAG_A_PREV) va = prev; else va = regs.get(instr.a);
+                va = regs.pick(f & DAG_FLAG_A_PREV, prev, instr.a);
 #pragma unroll
                 for (int g = 0; g < G; g++) x.v[g] = felt_t::zero() - va.v[g];
                 break;
@@ -916,8 +1039,8 @@ __global__ void __launch_bounds__(256, MIN_BLOCKS) zerocheck_fused_sequential_bi
     auto tile_warp = cg::tiled_partition<32>(block);
     for (int g = 0; g < G; g++) {
         ext_t block_sum = partialBlockReduce(block, tile_warp, thread_acc[g], shared);
-        if (threadIdx.x == 0) {
-            ext_t::store(partials, tile * BIVARIATE_NUM_NODES + (uint32_t)(e0 + g), block_sum);
+        if (threadIdx.x == 0 && store_of[g]) {
+            ext_t::store(partials, tile * BIVARIATE_NUM_NODES + (uint32_t)node_of[g], block_sum);
         }
         block.sync();
     }
@@ -959,9 +1082,20 @@ __global__ void zerocheck_fused_sequential_coop(
     constexpr uint32_t G = LANES;
     BlockDispatch disp = dispatch[blockIdx.x];
     ChunkStatic stc = chunk_static[disp.chunk_id];
+    // Output slot; `e` below is the leaf-read mode (see `ChunkStatic::inf`).
+    const uint32_t e_slot = blockIdx.z;
+    int e = (int)e_slot;
+    if (e == 2 && stc.inf != nullptr) {
+        // The host sizes the shared memory for the larger of both schedules.
+        stc = *stc.inf;
+        e = ZC_EVAL_INF;
+        if (stc.n_asserts == 0) {
+            if (threadIdx.x == 0) ext_t::store(partials, blockIdx.x * 3 + e_slot, ext_t::zero());
+            return;
+        }
+    }
     ChipLayout lay = chip_layouts[stc.chip_idx];
     const felt_t* consts = reinterpret_cast<const felt_t*>(stc.consts);
-    const int e = blockIdx.z;
     const uint32_t grp = threadIdx.x / G, gl = threadIdx.x % G;
     const uint32_t rows_per_pass = blockDim.x / G;
 
@@ -1058,7 +1192,7 @@ __global__ void zerocheck_fused_sequential_coop(
     ext_t block_sum = partialBlockReduce(block, tile_warp, lane_acc, red);
     if (threadIdx.x == 0) {
         ext_t lambda = ext_t::load(powers_of_lambda, stc.chip_idx);
-        ext_t::store(partials, blockIdx.x * 3 + (uint32_t)e, block_sum * lambda);
+        ext_t::store(partials, blockIdx.x * 3 + e_slot, block_sum * lambda);
     }
 }
 
@@ -1163,6 +1297,11 @@ extern "C" void* zerocheck_fused_sequential_ext_1024_kernel() {
 
 // Wave-uniform interpreter entry points (MAX_REGS = 128 tier); the suffix is
 // the VGPR register-file size V (0 = scratch register file).
+// SYCL: the 32-register files do not fit the default 128 GRF (see `ZEROCHECK_SYCL_VRF_DEFAULT` in
+// prover.rs); with them selected, the kernels get the 256-GRF mode instead of spilling.
+SP1_SYCL_LARGE_GRF(zerocheck_fused_sequential_uniform<ext_t, 128, 32>)
+SP1_SYCL_LARGE_GRF(zerocheck_fused_sequential_bivariate_vec_uniform<4, 128, 2, 32>)
+
 extern "C" void* zerocheck_fused_sequential_uniform_kb_128_v0_kernel() {
     return SP1_KERNEL_PTR(zerocheck_fused_sequential_uniform<felt_t, 128, 0>);
 }
@@ -1171,6 +1310,9 @@ extern "C" void* zerocheck_fused_sequential_uniform_kb_128_v32_kernel() {
 }
 extern "C" void* zerocheck_fused_sequential_uniform_ext_128_v0_kernel() {
     return SP1_KERNEL_PTR(zerocheck_fused_sequential_uniform<ext_t, 128, 0>);
+}
+extern "C" void* zerocheck_fused_sequential_uniform_ext_128_v8_kernel() {
+    return SP1_KERNEL_PTR(zerocheck_fused_sequential_uniform<ext_t, 128, 8>);
 }
 extern "C" void* zerocheck_fused_sequential_uniform_ext_128_v16_kernel() {
     return SP1_KERNEL_PTR(zerocheck_fused_sequential_uniform<ext_t, 128, 16>);
@@ -1215,6 +1357,9 @@ extern "C" void* zerocheck_fused_sequential_bivariate_vec12_kb_128_kernel() {
 // suffix = VGPR register-file size.
 extern "C" void* zerocheck_fused_sequential_bivariate_vec4_uniform_kb_128_v0_kernel() {
     return SP1_KERNEL_PTR(zerocheck_fused_sequential_bivariate_vec_uniform<4, 128, 4, 0>);
+}
+extern "C" void* zerocheck_fused_sequential_bivariate_vec4_uniform_kb_128_v8_kernel() {
+    return SP1_KERNEL_PTR(zerocheck_fused_sequential_bivariate_vec_uniform<4, 128, 4, 8>);
 }
 extern "C" void* zerocheck_fused_sequential_bivariate_vec4_uniform_kb_128_v16_kernel() {
     return SP1_KERNEL_PTR(zerocheck_fused_sequential_bivariate_vec_uniform<4, 128, 4, 16>);

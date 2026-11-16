@@ -54,9 +54,11 @@ extern "C" {
     pub fn zerocheck_fused_sequential_uniform_kb_128_v0_kernel() -> KernelPtr;
     pub fn zerocheck_fused_sequential_uniform_kb_128_v32_kernel() -> KernelPtr;
     pub fn zerocheck_fused_sequential_uniform_ext_128_v0_kernel() -> KernelPtr;
+    pub fn zerocheck_fused_sequential_uniform_ext_128_v8_kernel() -> KernelPtr;
     pub fn zerocheck_fused_sequential_uniform_ext_128_v16_kernel() -> KernelPtr;
     pub fn zerocheck_fused_sequential_uniform_ext_128_v32_kernel() -> KernelPtr;
     pub fn zerocheck_fused_sequential_bivariate_vec4_uniform_kb_128_v0_kernel() -> KernelPtr;
+    pub fn zerocheck_fused_sequential_bivariate_vec4_uniform_kb_128_v8_kernel() -> KernelPtr;
     pub fn zerocheck_fused_sequential_bivariate_vec4_uniform_kb_128_v16_kernel() -> KernelPtr;
     pub fn zerocheck_fused_sequential_bivariate_vec4_uniform_kb_128_v32_kernel() -> KernelPtr;
     // Cooperative level-scheduled variant for small chunks.
@@ -221,6 +223,8 @@ extern "C" {
     // ******** Jagged sumcheck kernels ********
     pub fn jagged_two_round_sum_as_poly() -> KernelPtr;
     pub fn jagged_two_round_fix_and_sum() -> KernelPtr;
+    pub fn jagged_two_round_sum_as_poly_factored() -> KernelPtr;
+    pub fn jagged_two_round_fix_and_sum_factored() -> KernelPtr;
     pub fn padded_hadamard_fix_and_sum() -> KernelPtr;
     pub fn hadamard_fold1_grid1() -> KernelPtr;
     pub fn hadamard_fold2_grid1() -> KernelPtr;

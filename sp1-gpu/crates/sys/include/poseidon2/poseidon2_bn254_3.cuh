@@ -795,6 +795,7 @@ class Bn254 {
     static constexpr const int D = constants::D;
     // Plain partial rounds in Poseidon2::permute (see the KoalaBear parameters).
     static constexpr bool DEFERRED_PARTIAL_ROUNDS = false;
+    static constexpr bool LAZY_FULL_SBOX = false;
 
     static constexpr pF_t* INTERNAL_ROUND_CONSTANTS = constants::INTERNAL_ROUND_CONSTANTS;
     static constexpr pF_t* EXTERNAL_ROUND_CONSTANTS = constants::EXTERNAL_ROUND_CONSTANTS;

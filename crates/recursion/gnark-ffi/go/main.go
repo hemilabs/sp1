@@ -235,6 +235,14 @@ func SetGroth16R1csPrepDir(dataDir *C.char, dir *C.char) {
 	sp1.SetGpuR1csPrepDir(C.GoString(dataDir), C.GoString(dir))
 }
 
+// SetGroth16StrippedR1cs names a copy of the Groth16 R1CS in dataDir without its debug
+// information, which ProveGroth16Bn254 then reads instead; empty for none.
+//
+//export SetGroth16StrippedR1cs
+func SetGroth16StrippedR1cs(dataDir *C.char, path *C.char) {
+	sp1.SetGroth16StrippedR1cs(C.GoString(dataDir), C.GoString(path))
+}
+
 //export FreeGroth16Bn254Proof
 func FreeGroth16Bn254Proof(proof *C.C_Groth16Bn254Proof) {
 	C.free(unsafe.Pointer(proof.EncodedProof))

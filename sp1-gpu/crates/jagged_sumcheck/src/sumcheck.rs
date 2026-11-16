@@ -2,10 +2,11 @@ use sp1_gpu_cudart::{
     args,
     sys::kernels::{
         hadamard_fold1_grid1, hadamard_fold1_grid2, hadamard_fold2_grid1, hadamard_fold2_grid2,
-        jagged_two_round_fix_and_sum, jagged_two_round_sum_as_poly,
+        jagged_two_round_fix_and_sum, jagged_two_round_fix_and_sum_factored,
+        jagged_two_round_sum_as_poly, jagged_two_round_sum_as_poly_factored,
         mle_fix_last_variable_koala_bear_ext_ext_zero_padding, padded_hadamard_fix_and_sum,
     },
-    DeviceBuffer, DeviceMle, DeviceTensor, TaskScope,
+    DeviceBuffer, DeviceMle, DevicePoint, DeviceTensor, TaskScope,
 };
 
 use itertools::Itertools;
@@ -15,7 +16,7 @@ use slop_algebra::{
 };
 use slop_alloc::{Backend, HasBackend};
 use slop_challenger::FieldChallenger;
-use slop_multilinear::Mle;
+use slop_multilinear::{Mle, Point};
 use slop_sumcheck::PartialSumcheckProof;
 use slop_tensor::Tensor;
 
@@ -27,9 +28,50 @@ pub struct JaggedFirstRoundPoly<'a, A: Backend = TaskScope> {
     // pub base: Arc<Tensor<Felt, A>>,
     pub base: &'a JaggedTraceMle<Felt, A>,
     pub eq_z_col: Mle<Ext, A>,
-    pub eq_z_row: Mle<Ext, A>,
+    pub eq_z_row: EqZRow<A>,
     pub height: usize,
     pub total_number_of_variables: u32,
+}
+
+/// The eq polynomial eq(z_row, ·) of the jagged sumcheck, as one table or factored.
+pub enum EqZRow<A: Backend = TaskScope> {
+    /// The table of eq(z_row, r) over all rows r.
+    Full(Mle<Ext, A>),
+    /// eq(z_row, r) = `quad`[r >> 2] · `last`[r & 3]: the table of z_row's coordinates but the
+    /// last two, and the 4 values of the last two. Valid for the two-round kernels when every
+    /// column's height is a multiple of 8: their 4- and 8-element groups then lie in one column
+    /// at a multiple of 4 rows, so q is one product per group (see the `*Factored` kernels).
+    Factored { quad: Mle<Ext, A>, last: [Ext; 4] },
+}
+
+impl EqZRow<TaskScope> {
+    /// eq(`z_row`, ·), factored if `columns_aligned` (every column height is a multiple of 8)
+    /// and `z_row` has at least two coordinates.
+    pub fn new(z_row: &Point<Ext>, columns_aligned: bool, backend: &TaskScope) -> Self {
+        let n = z_row.dimension();
+        if !columns_aligned || n < 2 {
+            let full = DevicePoint::from_host(z_row, backend).unwrap().partial_lagrange();
+            return Self::Full(full.into());
+        }
+        let (z_hi, z_lo) = z_row.split_at(n - 2);
+        let quad = DevicePoint::from_host(&z_hi, backend).unwrap().partial_lagrange();
+        // eq(z_lo, l) for l = 2x + y: z_lo[0] goes with x, the high bit (partial_lagrange's order).
+        let [a, b]: [Ext; 2] = z_lo.to_vec().try_into().unwrap();
+        let (a0, b0) = (Ext::one() - a, Ext::one() - b);
+        Self::Factored { quad: quad.into(), last: [a0 * b0, a0 * b, a * b0, a * b] }
+    }
+}
+
+impl<A: Backend> EqZRow<A> {
+    /// # Safety
+    ///
+    /// See [std::mem::MaybeUninit::assume_init].
+    unsafe fn assume_init(&mut self) {
+        match self {
+            Self::Full(mle) => mle.assume_init(),
+            Self::Factored { quad, .. } => quad.assume_init(),
+        }
+    }
 }
 
 impl<'a, A: Backend> JaggedFirstRoundPoly<'a, A> {
@@ -37,7 +79,7 @@ impl<'a, A: Backend> JaggedFirstRoundPoly<'a, A> {
     pub fn new(
         base: &'a JaggedTraceMle<Felt, A>,
         eq_z_col: Mle<Ext, A>,
-        eq_z_row: Mle<Ext, A>,
+        eq_z_row: EqZRow<A>,
         height: usize,
     ) -> Self {
         let total_number_of_variables = (base.dense().dense.len()).next_power_of_two().ilog2();
@@ -61,14 +103,7 @@ pub struct JaggedFirstRoundPolyRaw {
     base: *const Felt,
     eq_z_col: *const Ext,
     eq_z_row: *const Ext,
-    height: usize,
-}
-
-#[repr(C)]
-pub struct JaggedFirstRoundPolyMutRaw {
-    base: *mut Felt,
-    eq_z_col: *mut Ext,
-    eq_z_row: *mut Ext,
+    eq_z_row_quad: *const Ext,
     height: usize,
 }
 
@@ -80,7 +115,14 @@ impl<'a, A: Backend> DenseData<A> for JaggedFirstRoundPoly<'a, A> {
             start_indices: self.base.start_indices.as_ptr(),
             base: self.base.dense().dense.as_ptr(),
             eq_z_col: self.eq_z_col.guts().as_ptr(),
-            eq_z_row: self.eq_z_row.guts().as_ptr(),
+            eq_z_row: match &self.eq_z_row {
+                EqZRow::Full(mle) => mle.guts().as_ptr(),
+                EqZRow::Factored { .. } => std::ptr::null(),
+            },
+            eq_z_row_quad: match &self.eq_z_row {
+                EqZRow::Full(_) => std::ptr::null(),
+                EqZRow::Factored { quad, .. } => quad.guts().as_ptr(),
+            },
             height: self.height,
         }
     }
@@ -90,10 +132,10 @@ impl<'a, A: Backend> DenseData<A> for JaggedFirstRoundPoly<'a, A> {
 pub fn generate_jagged_sumcheck_poly(
     traces: &'_ JaggedTraceMle<Felt, TaskScope>,
     eq_z_col: DeviceMle<Ext>,
-    eq_z_row: DeviceMle<Ext>,
+    eq_z_row: EqZRow,
 ) -> JaggedFirstRoundPoly<'_> {
     let half_len = traces.dense().dense.len() >> 1;
-    JaggedFirstRoundPoly::new(traces, eq_z_col.into(), eq_z_row.into(), half_len)
+    JaggedFirstRoundPoly::new(traces, eq_z_col.into(), eq_z_row, half_len)
 }
 
 /// One-pass evaluation of the two-round polynomial `h(X, Y) = Σ_i p(i, X, Y)·q(i, X, Y)`
@@ -121,21 +163,26 @@ fn two_round_sum_as_poly<'a>(poly: &JaggedFirstRoundPoly<'a>) -> [Ext; 8] {
     unsafe {
         evaluations.assume_init();
         let args = args!(evaluations.as_mut_ptr(), poly.as_ptr());
-        backend
-            .launch_kernel(
-                jagged_two_round_sum_as_poly(),
-                grid_size_x,
-                BLOCK_SIZE,
-                &args,
-                shared_mem,
-            )
-            .unwrap();
+        let kernel = match poly.eq_z_row {
+            EqZRow::Full(_) => jagged_two_round_sum_as_poly(),
+            EqZRow::Factored { .. } => jagged_two_round_sum_as_poly_factored(),
+        };
+        backend.launch_kernel(kernel, grid_size_x, BLOCK_SIZE, &args, shared_mem).unwrap();
     }
 
     // Sum the per-block partial sums of each grid value.
     let evaluations = DeviceTensor::from_raw(evaluations);
     let evaluations = evaluations.sum_dim(1).to_host().unwrap();
-    evaluations.as_slice().try_into().unwrap()
+    let mut evaluations: [Ext; 8] = evaluations.as_slice().try_into().unwrap();
+    if let EqZRow::Factored { last: [e00, e01, e10, e11], .. } = poly.eq_z_row {
+        // The combinations of q's four values that `jaggedTwoRoundSumAsPoly` multiplies by.
+        let scales =
+            [e00, e01, e00 + e01, e10, e10 + e11, e00 + e10, e01 + e11, e00 + e01 + e10 + e11];
+        for (evaluation, scale) in evaluations.iter_mut().zip(scales) {
+            *evaluation *= scale;
+        }
+    }
+    evaluations
 }
 
 /// Fold the first two sumcheck challenges into the jagged first-round poly in a single
@@ -175,23 +222,52 @@ fn fix_two_and_sum_first_rounds<'a>(
         output_p.assume_init();
         output_q.assume_init();
         evaluations.assume_init();
-        let args = args!(
-            evaluations.as_mut_ptr(),
-            poly.as_ptr(),
-            output_p.as_mut_ptr(),
-            output_q.as_mut_ptr(),
-            alpha_1,
-            alpha_2
-        );
-        backend
-            .launch_kernel(
-                jagged_two_round_fix_and_sum(),
-                grid_size_x,
-                BLOCK_SIZE,
-                &args,
-                shared_mem,
-            )
-            .unwrap();
+        match poly.eq_z_row {
+            EqZRow::Full(_) => {
+                let args = args!(
+                    evaluations.as_mut_ptr(),
+                    poly.as_ptr(),
+                    output_p.as_mut_ptr(),
+                    output_q.as_mut_ptr(),
+                    alpha_1,
+                    alpha_2
+                );
+                backend
+                    .launch_kernel(
+                        jagged_two_round_fix_and_sum(),
+                        grid_size_x,
+                        BLOCK_SIZE,
+                        &args,
+                        shared_mem,
+                    )
+                    .unwrap();
+            }
+            EqZRow::Factored { last: [e00, e01, e10, e11], .. } => {
+                // eq(z_row's last two coordinates, ·) folded with both challenges, as the
+                // full-table kernel folds q: by `alpha_1` within a pair, then by `alpha_2`.
+                let fold_y0 = e00 + alpha_1 * (e01 - e00);
+                let fold_y1 = e10 + alpha_1 * (e11 - e10);
+                let q_scale = fold_y0 + alpha_2 * (fold_y1 - fold_y0);
+                let args = args!(
+                    evaluations.as_mut_ptr(),
+                    poly.as_ptr(),
+                    output_p.as_mut_ptr(),
+                    output_q.as_mut_ptr(),
+                    alpha_1,
+                    alpha_2,
+                    q_scale
+                );
+                backend
+                    .launch_kernel(
+                        jagged_two_round_fix_and_sum_factored(),
+                        grid_size_x,
+                        BLOCK_SIZE,
+                        &args,
+                        shared_mem,
+                    )
+                    .unwrap();
+            }
+        }
     }
 
     // Sum the evaluations across all dimensions.
@@ -537,6 +613,88 @@ fn finish_jagged_sumcheck(
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use rand::{rngs::StdRng, SeedableRng};
+
+    /// The jagged sumcheck with eq(z_row, ·) factored (the `*Factored` two-round kernels) gives
+    /// the same proof as with the full table, on a random trace whose column heights are
+    /// multiples of 32.
+    #[test]
+    fn factored_eq_z_row_gives_the_same_proof() {
+        use slop_challenger::IopCtx;
+        use sp1_gpu_jagged_tracegen::test_utils::random::random_jagged_trace_mle_from_layout;
+        use sp1_gpu_utils::{AbstractChipLayoutWithHeights, TestGC};
+
+        // `from_chip_layout` pads each region with a single column, up to the stacking height:
+        // rows must reach that far for every column to stay inside the eq table.
+        const LOG_STACKING_HEIGHT: u32 = 12;
+        const MAX_LOG_ROW_COUNT: u32 = LOG_STACKING_HEIGHT;
+        let layout = AbstractChipLayoutWithHeights::new(vec![
+            ("a".into(), 2, 5, 96),
+            ("b".into(), 0, 7, 1024),
+            ("c".into(), 1, 3, 32),
+            ("d".into(), 0, 11, 544),
+        ]);
+        let prove = |factored: bool| {
+            let mut rng = StdRng::seed_from_u64(7);
+            let host = random_jagged_trace_mle_from_layout::<Felt, _>(
+                &mut rng,
+                &layout,
+                LOG_STACKING_HEIGHT,
+            );
+            let z_row = Point::<Ext>::rand(&mut rng, MAX_LOG_ROW_COUNT);
+            sp1_gpu_cudart::run_sync_in_place(|scope| {
+                let traces = host.into_device(&scope);
+                let log_col_count = traces.column_heights.len().next_power_of_two().ilog2();
+                let z_col = Point::<Ext>::rand(&mut rng, log_col_count);
+                let eq_z_col = DevicePoint::from_host(&z_col, &scope).unwrap().partial_lagrange();
+                let eq_z_row = EqZRow::new(&z_row, factored, &scope);
+                assert_eq!(matches!(eq_z_row, EqZRow::Factored { .. }), factored);
+                let poly = generate_jagged_sumcheck_poly(&traces, eq_z_col, eq_z_row);
+                let mut challenger = TestGC::default_challenger();
+                let claim = Ext::from_canonical_u32(12345);
+                let (proof, evals, _) =
+                    jagged_sumcheck(poly, &mut challenger, claim, LOG_STACKING_HEIGHT as usize);
+                let (point, eval) = &proof.point_and_eval;
+                format!(
+                    "{:?} {:?} {:?} {eval:?} {evals:?}",
+                    proof.univariate_polys,
+                    proof.claimed_sum,
+                    point.to_vec()
+                )
+            })
+            .unwrap()
+        };
+        assert_eq!(prove(false), prove(true));
+    }
+
+    /// The factored eq table: `quad`[r >> 2] · `last`[r & 3] is eq(z_row, r), the full
+    /// `partial_lagrange` table's entry r.
+    #[test]
+    fn eq_z_row_factors_match_the_full_table() {
+        let mut rng = StdRng::seed_from_u64(0x5e9);
+        for n in [2u32, 3, 7, 12] {
+            let z = Point::<Ext>::rand(&mut rng, n);
+            let (full, quad, last) = sp1_gpu_cudart::run_sync_in_place(|scope| {
+                let full: Mle<Ext, TaskScope> =
+                    DevicePoint::from_host(&z, &scope).unwrap().partial_lagrange().into();
+                let EqZRow::Factored { quad, last } = EqZRow::new(&z, true, &scope) else {
+                    panic!("two or more coordinates factor");
+                };
+                (
+                    DeviceTensor::copy_to_host(full.guts()).unwrap().into_buffer().into_vec(),
+                    DeviceTensor::copy_to_host(quad.guts()).unwrap().into_buffer().into_vec(),
+                    last,
+                )
+            })
+            .unwrap();
+            assert_eq!(full.len(), 1 << n);
+            for (r, &expected) in full.iter().enumerate() {
+                assert_eq!(quad[r >> 2] * last[r & 3], expected, "n = {n}, r = {r}");
+            }
+        }
+    }
+
     /// TODO(sync): This test requires async trait implementations (IntoDevice, MleEvaluationBackend,
     /// PartialLagrangeBackend) for TaskScope that were removed in the sync refactor.
     /// The test body is commented out because #[ignore] doesn't prevent compilation.

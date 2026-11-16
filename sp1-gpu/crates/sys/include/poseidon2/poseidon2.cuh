@@ -44,6 +44,16 @@ class Hasher {
         }
     }
 
+    // A full round's round constants and S-box.
+    __device__ static void fullRoundSbox(F_t state[Params::WIDTH], pF_t rc[Params::WIDTH]) {
+        if constexpr (Params::LAZY_FULL_SBOX) {
+            Params::lazyFullSbox(state, rc);
+        } else {
+            addExtRc(state, rc);
+            sbox(state);
+        }
+    }
+
   public:
     __device__ static void
     permute(F_t in[Params::WIDTH], F_t out[Params::WIDTH], RoundConstants_t roundConstants) {
@@ -56,8 +66,7 @@ class Hasher {
 
         int rounds_f_half = Params::ROUNDS_F >> 1;
         for (int i = 0; i < rounds_f_half; i++) {
-            addExtRc(state, roundConstants.externalRoundConstants + i * Params::WIDTH);
-            sbox(state);
+            fullRoundSbox(state, roundConstants.externalRoundConstants + i * Params::WIDTH);
             Params::externalLinearLayer(state);
         }
 
@@ -75,8 +84,7 @@ class Hasher {
         }
 
         for (int i = rounds_f_half; i < Params::ROUNDS_F; i++) {
-            addExtRc(state, roundConstants.externalRoundConstants + i * Params::WIDTH);
-            sbox(state);
+            fullRoundSbox(state, roundConstants.externalRoundConstants + i * Params::WIDTH);
             Params::externalLinearLayer(state);
         }
 

@@ -691,6 +691,18 @@ extern "C" uint32_t sp1_hip_wave64() { return 0; }
 // Nothing resets a SYCL device (gnark-ffi's reset is CUDA and HIP only).
 extern "C" size_t cuda_free_live_blocks() { return 0; }
 
+// 1 if an allocation of `size` bytes would not fit in the video memory budget with the fit margin
+// even after freeing every cached block (see cached_malloc): only live memory, which this allocator
+// cannot free, is then in the way. The device caches (upload.rs, make_room_for) are live memory
+// whose owners can drop it, which the live count they are measured by does not show: it counts
+// what was requested, not the blocks rounded up or reused at up to twice the size.
+extern "C" uint32_t sp1_sycl_allocation_overruns_budget(size_t size) {
+    const size_t headroom = device_headroom();
+    if (headroom == SIZE_MAX) return 0;
+    std::lock_guard<std::mutex> lock(g_alloc_mutex);
+    return size + FIT_MARGIN_BYTES > headroom + g_cached_bytes ? 1u : 0u;
+}
+
 // For the other SYCL sources (lib/sycl/ntt.cpp): times a submission if the kernel timing is on.
 void sp1_sycl_profile_event(const char* name, const sycl::event& e) {
     if (sp1prof::enabled()) GpuProfiler::get().add(name, e);

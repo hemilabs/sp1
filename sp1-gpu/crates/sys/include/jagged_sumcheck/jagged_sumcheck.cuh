@@ -5,6 +5,8 @@
 
 extern "C" void* jagged_two_round_sum_as_poly();
 extern "C" void* jagged_two_round_fix_and_sum();
+extern "C" void* jagged_two_round_sum_as_poly_factored();
+extern "C" void* jagged_two_round_fix_and_sum_factored();
 
 struct Hadamard {
     ext_t* p;
@@ -57,8 +59,11 @@ struct JaggedSumcheckData {
     felt_t* base;
     /// eq_z_col values
     ext_t* eqZCol;
-    /// eq_z_row values
+    /// eq_z_row values (null when factored)
     ext_t* eqZRow;
+    /// eq(z_row, ·) without its last two coordinates, when factored (else null):
+    /// eqZRow[4m + l] = eqZRowQuad[m] · eq(z_row's last two coordinates, l).
+    ext_t* eqZRowQuad;
     /// Half of the length of the base vlaues.
     size_t height;
 

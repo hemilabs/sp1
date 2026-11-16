@@ -479,6 +479,17 @@ void check(rustCudaError_t e) {
     if (e.message != success_message()) throw Error{e};
 }
 
+// The error's text. On SYCL the runtime's out-of-memory and not-ready errors are the sentinel
+// pointers 1 and 2 (lib/sycl/sycl_errors.c), not strings: printing them as strings crashed the
+// process on the first MSM that ran out of device memory, instead of falling back to the CPU.
+const char* error_text(const Error& e) {
+    const uintptr_t m = (uintptr_t)e.e.message;
+    if (m == 0) return "?";
+    if (m == 1) return "out of device memory";
+    if (m == 2) return "not ready";
+    return e.e.message;
+}
+
 // A device allocation on the prover's stream.
 template <class T>
 struct Dev {
@@ -762,7 +773,7 @@ int32_t msm_entry(void* out_affine, const void* points, const void* scalars, siz
         }
         return 0;
     } catch (const Error& e) {
-        std::fprintf(stderr, "[groth16-gpu] MSM %s failed: %s\n", name, e.e.message ? e.e.message : "?");
+        std::fprintf(stderr, "[groth16-gpu] MSM %s failed: %s\n", name, error_text(e));
         return 1;
     } catch (const std::exception& e) {
         std::fprintf(stderr, "[groth16-gpu] MSM %s failed: %s\n", name, e.what());
@@ -843,7 +854,7 @@ extern "C" int32_t sp1_groth16_compute_h(
         }
         return 0;
     } catch (const Error& e) {
-        std::fprintf(stderr, "[groth16-gpu] H failed: %s\n", e.e.message ? e.e.message : "?");
+        std::fprintf(stderr, "[groth16-gpu] H failed: %s\n", error_text(e));
         return 1;
     } catch (const std::exception& e) {
         std::fprintf(stderr, "[groth16-gpu] H failed: %s\n", e.what());

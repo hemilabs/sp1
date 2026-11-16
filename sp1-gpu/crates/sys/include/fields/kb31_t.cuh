@@ -101,6 +101,8 @@ class kb31_t {
     static const uint32_t MOD = 0x7f000001u;
     // MOD - 2
     static const uint32_t M = 0x7effffff;
+    // MOD^-1 mod 2^32 (= -M).
+    static const uint32_t MOD_INV = 0x81000001u;
     // (1<<MONTY_BITS)^2 mod MOD
     static const uint32_t RR = 0x17f7efe4u;
     // (1<<MONTY_BITS) mod MOD
@@ -201,9 +203,8 @@ class kb31_t {
 
     inline uint32_t as_canonical_u32() const {
 #ifdef SP1_SYCL
-        // val * 2^-32 mod MOD in 32-bit operations: mul() with a high word of 0.
-        uint32_t red = val * M;
-        uint32_t r = sycl::mul_hi(red, MOD) + (val != 0 ? 1u : 0u);
+        // val * 2^-32 mod MOD in 32-bit operations: mul() with a high word of 0, in (0, MOD].
+        uint32_t r = MOD - sycl::mul_hi(val * MOD_INV, MOD);
         final_sub(r);
         return r;
 #else
@@ -251,7 +252,13 @@ class kb31_t {
     friend inline kb31_t operator>>(kb31_t a, uint32_t r) { return a >>= r; }
 
     inline kb31_t& operator-=(const kb31_t b) {
-#ifdef SP1_PORTABLE
+#ifdef SP1_SYCL
+        // val - b wraps above val - b + MOD exactly when val < b: an add and an unsigned min
+        // instead of a compare, add and select (see final_sub). Both canonical (below MOD), as
+        // every kb31_t is: for a val of 2^32 - MOD or more the min could pick a wrapped sum.
+        const uint32_t d = val - b.val;
+        val = sycl::min(d, d + MOD);
+#elif defined(SP1_PORTABLE)
         bool brw = val < b.val;
         val -= b.val;
         if (brw) val += MOD;
@@ -337,6 +344,11 @@ class kb31_t {
         // of the expression below (the same result for every val: val - MOD wraps above val
         // exactly when val < MOD).
         val = __builtin_elementwise_min(val - MOD, val);
+#elif defined(SP1_SYCL)
+        // The same on Intel GPUs: a subtract and a select on its own compare. On an Arc Pro B70
+        // the KoalaBear Poseidon2 (leaf hashing) ran 10% faster than with the compare, subtract
+        // and select of the expression below.
+        val = sycl::min(val - MOD, val);
 #else
         val = val >= MOD ? val - MOD : val;
 #endif
@@ -349,12 +361,13 @@ class kb31_t {
         // 32-bit operations only. Intel GPUs emulate 64-bit integer arithmetic, and IGC
         // miscompiled the emulation in SIMD32 kernels whose sub-group was partly masked off.
         // (t + red * MOD) / 2^32 with t = val * b: the low words cancel, carrying 1 unless
-        // tl = 0, so the result is th + hi(red * MOD) + (tl != 0), below 2 * MOD.
+        // tl = 0. Subtractively instead: with m = tl * MOD^-1, lo(m * MOD) = tl exactly, so
+        // (t - m * MOD) / 2^32 = th - hi(m * MOD), above -MOD; adding MOD gives a result in
+        // (0, 2 * MOD) with no carry or compare.
         {
-            uint32_t tl = val * b.val;
-            uint32_t th = sycl::mul_hi(val, b.val);
-            uint32_t red = tl * M;
-            val = th + sycl::mul_hi(red, MOD) + (tl != 0 ? 1u : 0u);
+            const uint32_t tl = val * b.val;
+            const uint32_t th = sycl::mul_hi(val, b.val);
+            val = th + MOD - sycl::mul_hi(tl * MOD_INV, MOD);
             final_sub(val);
             return *this;
         }

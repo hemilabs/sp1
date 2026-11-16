@@ -18,7 +18,7 @@ use sp1_gpu_challenger::FromHostChallengerSync;
 use sp1_gpu_cudart::PinnedBuffer;
 use sp1_gpu_cudart::{DeviceMle, DevicePoint, TaskScope};
 use sp1_gpu_jagged_assist::prove_jagged_evaluation_sync;
-use sp1_gpu_jagged_sumcheck::{generate_jagged_sumcheck_poly, jagged_sumcheck};
+use sp1_gpu_jagged_sumcheck::{generate_jagged_sumcheck_poly, jagged_sumcheck, EqZRow};
 use sp1_gpu_jagged_tracegen::{
     copy_preprocessed_traces, full_tracegen_permit, main_tracegen_permit, preprocessed_copy_bytes,
     CudaShardProverData, TracePrefetcher,
@@ -673,7 +673,6 @@ impl<GC: IopCtx<F = Felt, EF = Ext>, PC: CudaShardProverComponents<GC>>
         );
 
         // Generate the jagged sumcheck proof.
-        let z_row_device = DevicePoint::from_host(&z_row, &backend).unwrap();
         let z_col_device = DevicePoint::from_host(&z_col, &backend).unwrap();
 
         // The overall evaluation claim of the sparse polynomial is inferred from the individual
@@ -685,8 +684,11 @@ impl<GC: IopCtx<F = Felt, EF = Ext>, PC: CudaShardProverComponents<GC>>
         let sumcheck_claims_host = sumcheck_claims.to_host_vec().unwrap();
         let sumcheck_claim = sumcheck_claims_host[0];
 
-        // Compute eq polynomials for the jagged sumcheck
-        let eq_z_row = z_row_device.partial_lagrange();
+        // Compute eq polynomials for the jagged sumcheck. eq(z_row, ·) is factored when every
+        // column height is a multiple of 8 (core chips pad to multiples of 32).
+        let columns_aligned =
+            prover_data.iter().flat_map(|data| data.row_counts.iter()).all(|&rows| rows % 8 == 0);
+        let eq_z_row = EqZRow::new(&z_row, columns_aligned, &backend);
         let eq_z_col = z_col_device.partial_lagrange();
 
         let sumcheck_poly = generate_jagged_sumcheck_poly(all_mles, eq_z_col, eq_z_row);

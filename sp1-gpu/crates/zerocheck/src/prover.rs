@@ -24,7 +24,7 @@ use slop_tensor::Tensor;
 use sp1_gpu_air::ir::{
     analyze_constraints, build_dag, chunk_dag, enumerate_lowerings, level_schedule,
     lower_column_tile, lower_sequential, rank_registers_by_use, register_overflow_accesses,
-    ChunkBudget, ChunkBytecode, ColumnTileBytecode, DagBuilder, Lowering,
+    top_degree_bytecode, ChunkBudget, ChunkBytecode, ColumnTileBytecode, DagBuilder, Lowering,
 };
 use sp1_gpu_cudart::sys::kernels::{
     zerocheck_aggregate_partials_kernel, zerocheck_aggregate_partials_strided_kernel,
@@ -41,6 +41,7 @@ use sp1_gpu_cudart::sys::kernels::{
     zerocheck_fused_sequential_bivariate_vec4_uniform_kb_128_v0_kernel,
     zerocheck_fused_sequential_bivariate_vec4_uniform_kb_128_v16_kernel,
     zerocheck_fused_sequential_bivariate_vec4_uniform_kb_128_v32_kernel,
+    zerocheck_fused_sequential_bivariate_vec4_uniform_kb_128_v8_kernel,
     zerocheck_fused_sequential_coop_ext_kernel, zerocheck_fused_sequential_coop_kb_kernel,
     zerocheck_fused_sequential_coop_wide_ext_kernel,
     zerocheck_fused_sequential_coop_wide_kb_kernel, zerocheck_fused_sequential_ext_1024_kernel,
@@ -52,6 +53,7 @@ use sp1_gpu_cudart::sys::kernels::{
     zerocheck_fused_sequential_kb_64_kernel, zerocheck_fused_sequential_uniform_ext_128_v0_kernel,
     zerocheck_fused_sequential_uniform_ext_128_v16_kernel,
     zerocheck_fused_sequential_uniform_ext_128_v32_kernel,
+    zerocheck_fused_sequential_uniform_ext_128_v8_kernel,
     zerocheck_fused_sequential_uniform_kb_128_v0_kernel,
     zerocheck_fused_sequential_uniform_kb_128_v32_kernel,
     zerocheck_geq_corrections_bivariate_kernel, zerocheck_geq_corrections_kernel,
@@ -100,6 +102,66 @@ pub(crate) struct CompiledChip {
     pub main_width: u32,
     pub prep_width: u32,
     pub chunks: Vec<CompiledChunk>,
+    /// Top-degree ("point at infinity") bytecode per chunk, parallel to
+    /// `chunks` (see `sp1_gpu_air::ir::top_degree`). `None` for ColumnTile
+    /// chunks (linear, so zero at infinity) and when the variant was not
+    /// built (`zc_inf_wanted()` off) or could not be (`inf_ok == false`).
+    pub inf_chunks: Vec<Option<ChunkBytecode>>,
+    /// Every Sequential chunk has its top-degree bytecode.
+    pub inf_ok: bool,
+}
+
+/// Maximum constraint degree in the round variable; the univariate round
+/// polynomial (without the `eq` factor of the round variable) is a cubic.
+/// Must match `sp1_hypercube::MAX_CONSTRAINT_DEGREE`.
+const ZC_MAX_CONSTRAINT_DEGREE: u32 = 3;
+
+/// How the extension-field rounds get the third value of the cubic `q`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ZcInfMode {
+    /// Evaluate the full constraint program at x = 4 (the original path).
+    Off,
+    /// `SP1_GPU_ZC_INF=1` (the default on SYCL): evaluate the leading (x^3)
+    /// coefficient of `q` with the pruned top-degree bytecode on
+    /// `Δ = t1 − t0` leaves, and reconstruct `p(4)` on the host; in the fused
+    /// bivariate rounds the same for the grid nodes with a coordinate 4.
+    On,
+    /// `SP1_GPU_ZC_INF_CHECK=1`: compute both and assert that the round
+    /// messages are identical (slow; for validation). Only for valid traces:
+    /// the reconstruction takes the constraints to vanish on the boolean
+    /// corners and p(1) from the claim, so a trace that violates a constraint
+    /// (whose proof fails either way) also trips the assertion.
+    Check,
+}
+
+/// `SP1_GPU_ZC_INF_CHECK=1` wins; otherwise `SP1_GPU_ZC_INF=0/1`, by default
+/// on for the SYCL backend (measured on the Arc Pro B70) and off elsewhere.
+pub(crate) fn zc_inf_mode() -> ZcInfMode {
+    static MODE: std::sync::OnceLock<ZcInfMode> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| {
+        // Unset or empty: None; "0": Some(false); anything else: Some(true).
+        let flag = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty()).map(|v| v != "0");
+        let inf_default = sp1_gpu_cudart::sys::BACKEND == "sycl";
+        if flag("SP1_GPU_ZC_INF_CHECK") == Some(true) {
+            ZcInfMode::Check
+        } else if flag("SP1_GPU_ZC_INF").unwrap_or(inf_default) {
+            ZcInfMode::On
+        } else {
+            ZcInfMode::Off
+        }
+    })
+}
+
+/// `SP1_GPU_ZC_STATS=1`: print per-chip full vs top-degree instruction counts
+/// in `compile_chips`.
+fn zc_stats_enabled() -> bool {
+    std::env::var("SP1_GPU_ZC_STATS").is_ok_and(|v| !v.is_empty() && v != "0")
+}
+
+/// Whether `compile_chips` builds the top-degree bytecode: when the mode
+/// (default on SYCL), the check or the stats ask for it.
+fn zc_inf_wanted() -> bool {
+    zc_inf_mode() != ZcInfMode::Off || zc_stats_enabled()
 }
 
 /// Index of the synthesized GKR chunk inside `chunks`. Used by the launcher
@@ -127,6 +189,10 @@ where
     A: MachineAir<Felt> + for<'a> Air<DagBuilder<'a>>,
 {
     let t_compile = std::time::Instant::now();
+    let want_inf = zc_inf_wanted();
+    let stats = zc_stats_enabled();
+    // (full instrs, top instrs, full asserts, top asserts) over the machine.
+    let mut stats_total = (0usize, 0usize, 0usize, 0usize);
 
     let mut out = Vec::with_capacity(chips.len());
     for (i, chip) in chips.iter().enumerate() {
@@ -136,6 +202,8 @@ where
         let chunks_meta = chunk_dag(&infos, &budget);
 
         let mut compiled_chunks: Vec<CompiledChunk> = Vec::new();
+        let mut inf_chunks: Vec<Option<ChunkBytecode>> = Vec::new();
+        let mut inf_ok = want_inf;
         for chunk in &chunks_meta {
             let lowerings = enumerate_lowerings(chunk, &infos, &dag);
             // Prefer ColumnTile if it applies; fall back to Sequential.
@@ -148,6 +216,8 @@ where
                     // `bc.terms[*].alpha_idx` stays chip-relative; the
                     // cluster shift is applied at launch.
                     compiled_chunks.push(CompiledChunk::ColumnTile(bc));
+                    // Linear in the columns: contributes nothing at infinity.
+                    inf_chunks.push(None);
                     placed = true;
                 }
             }
@@ -187,7 +257,7 @@ where
                 );
                 if std::env::var("SP1_GPU_DEBUG_MAXREG").is_ok() {
                     let (accesses, overflow) =
-                        register_overflow_accesses(&bc, ZEROCHECK_VRF_DEFAULT as u16);
+                        register_overflow_accesses(&bc, zerocheck_vrf_size() as u16);
                     eprintln!(
                         "compile chip={} max_reg={} n_instrs={} n_asserts={} n_leaves={} \
                          regfile_accesses={} overflow_accesses={}",
@@ -201,7 +271,75 @@ where
                     );
                 }
                 compiled_chunks.push(CompiledChunk::Sequential(bc));
+
+                // Top-degree ("point at infinity") variant, same chunk.
+                let inf = if want_inf {
+                    match top_degree_bytecode(chunk, &infos, &dag, ZC_MAX_CONSTRAINT_DEGREE) {
+                        Ok(mut ib) => {
+                            if zerocheck_uniform_enabled() {
+                                rank_registers_by_use(&mut ib);
+                            }
+                            if ib.max_reg <= MAX_FUSED_REGS {
+                                Some(ib)
+                            } else {
+                                tracing::warn!(
+                                    "chip {}: top-degree chunk max_reg={} exceeds the fused-kernel \
+                                     cap; the x = 4 evaluation is used instead",
+                                    air.name(),
+                                    ib.max_reg,
+                                );
+                                inf_ok = false;
+                                None
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                "chip {}: no top-degree zerocheck bytecode ({e:?}); \
+                                 SP1_GPU_ZC_INF falls back to the x = 4 evaluation",
+                                air.name()
+                            );
+                            inf_ok = false;
+                            None
+                        }
+                    }
+                } else {
+                    None
+                };
+                inf_chunks.push(inf);
             }
+        }
+
+        if stats {
+            let (mut fi, mut ti, mut fa, mut ta, mut n_ct) = (0usize, 0usize, 0usize, 0usize, 0);
+            for (c, inf) in compiled_chunks.iter().zip(inf_chunks.iter()) {
+                match c {
+                    CompiledChunk::Sequential(bc) => {
+                        fi += bc.instrs.len();
+                        fa += bc.asserts.len();
+                        if let Some(ib) = inf {
+                            ti += ib.instrs.len();
+                            ta += ib.asserts.len();
+                        }
+                    }
+                    CompiledChunk::ColumnTile(_) => n_ct += 1,
+                }
+            }
+            eprintln!(
+                "zc-stats chip={} full_instrs={} top_instrs={} ratio={:.3} full_asserts={} \
+                 top_asserts={} column_tile_chunks={} inf_ok={}",
+                air.name(),
+                fi,
+                ti,
+                if fi > 0 { ti as f64 / fi as f64 } else { 0.0 },
+                fa,
+                ta,
+                n_ct,
+                inf_ok,
+            );
+            stats_total.0 += fi;
+            stats_total.1 += ti;
+            stats_total.2 += fa;
+            stats_total.3 += ta;
         }
 
         // Inline-GKR carrier selection. The first Sequential chunk of the
@@ -237,7 +375,23 @@ where
             main_width,
             prep_width,
             chunks: compiled_chunks,
+            inf_chunks,
+            inf_ok,
         });
+    }
+    if stats {
+        let (fi, ti, fa, ta) = stats_total;
+        eprintln!(
+            "zc-stats TOTAL chips={} full_instrs={} top_instrs={} ratio={:.3} full_asserts={} \
+             top_asserts={} (unweighted by chip height; the Ext-round cost of a chip scales \
+             with its row count)",
+            out.len(),
+            fi,
+            ti,
+            if fi > 0 { ti as f64 / fi as f64 } else { 0.0 },
+            fa,
+            ta,
+        );
     }
     if std::env::var("SP1_GPU_ZEROCHECK_TIMING").is_ok() {
         tracing::info!("compile_chips: {} chips in {:?}", out.len(), t_compile.elapsed());
@@ -287,6 +441,12 @@ pub struct ChunkStaticC {
     pub coop_assert_slots: *const u16,
     pub coop_n_levels: u32,
     pub coop_n_phys: u32,
+    /// Device pointer to this chunk's top-degree ("point at infinity")
+    /// descriptor, or null. Non-null only in `SeqTierStatic::static_linked_buf`,
+    /// which the univariate launches use under `SP1_GPU_ZC_INF`: their
+    /// eval-slot-2 blocks then evaluate the leading coefficient instead of
+    /// x = 4. See `ChunkStatic::inf` in `sequential.cuh`.
+    pub inf: *const ChunkStaticC,
 }
 
 /// Per-chip GKR widths held on device. Indexed by `chip_idx`; shard-static
@@ -508,6 +668,9 @@ pub(crate) struct CompiledChipDevice {
     pub main_width: u32,
     pub prep_width: u32,
     pub chunks: Vec<ChunkDeviceBufs>,
+    /// Top-degree variants, parallel to `chunks` (see `CompiledChip`).
+    pub inf_chunks: Vec<Option<ChunkDeviceBufs>>,
+    pub inf_ok: bool,
 }
 
 /// The whole machine's compiled v2 bytecode, uploaded once (at prover
@@ -596,6 +759,8 @@ pub(crate) fn upload_compiled_bytecode(
         coop_n_phys: u32,
     }
     let mut chip_offsets: Vec<Vec<ChunkOffsets>> = Vec::with_capacity(compiled.len());
+    // Top-degree variants, parallel to `chip_offsets`.
+    let mut chip_inf_offsets: Vec<Vec<Option<ChunkOffsets>>> = Vec::with_capacity(compiled.len());
 
     // Append `src` to `dst`, returning the (offset, len) of the appended run.
     fn extend_flat<T: Copy>(dst: &mut Vec<T>, src: &[T]) -> (usize, usize) {
@@ -604,52 +769,59 @@ pub(crate) fn upload_compiled_bytecode(
         (off, src.len())
     }
 
-    for chip in &compiled {
-        let mut chunks = Vec::with_capacity(chip.chunks.len());
-        for c in chip.chunks.iter() {
-            chunks.push(match c {
-                CompiledChunk::Sequential(bc) => {
-                    let pos: Vec<u16> = bc.asserts.iter().map(|&(i, _)| i).collect();
-                    let alphas: Vec<u32> = bc.asserts.iter().map(|&(_, a)| a).collect();
-                    let sched = level_schedule(bc);
-                    ChunkOffsets {
-                        coop_code: extend_flat(&mut flat_coop_code, &sched.code).0,
-                        coop_level_starts: extend_flat(&mut flat_coop_u16, &sched.level_starts),
-                        coop_assert_slots: extend_flat(&mut flat_coop_u16, &sched.assert_slots).0,
-                        coop_n_phys: sched.n_phys as u32,
-                        kind: ChunkKind::Sequential,
-                        leaves: extend_flat(&mut flat_leaves, &bc.leaves),
-                        consts: extend_flat(&mut flat_consts, &bc.consts),
-                        publics: extend_flat(&mut flat_publics, &bc.publics),
-                        instrs: extend_flat(&mut flat_instrs, &bc.instrs),
-                        assert_pos: extend_flat(&mut flat_assert_pos, &pos),
-                        assert_alphas: extend_flat(&mut flat_assert_alphas, &alphas),
-                        terms: (flat_terms.len(), 0),
-                        max_reg: bc.max_reg,
-                        gkr_main_width: bc.gkr_main_width,
-                        gkr_prep_width: bc.gkr_prep_width,
-                    }
-                }
-                CompiledChunk::ColumnTile(bc) => ChunkOffsets {
-                    kind: ChunkKind::ColumnTile,
+    // Appends one chunk's arrays to the flat vecs.
+    let mut push_chunk = |c: &CompiledChunk| -> ChunkOffsets {
+        match c {
+            CompiledChunk::Sequential(bc) => {
+                let pos: Vec<u16> = bc.asserts.iter().map(|&(i, _)| i).collect();
+                let alphas: Vec<u32> = bc.asserts.iter().map(|&(_, a)| a).collect();
+                let sched = level_schedule(bc);
+                ChunkOffsets {
+                    coop_code: extend_flat(&mut flat_coop_code, &sched.code).0,
+                    coop_level_starts: extend_flat(&mut flat_coop_u16, &sched.level_starts),
+                    coop_assert_slots: extend_flat(&mut flat_coop_u16, &sched.assert_slots).0,
+                    coop_n_phys: sched.n_phys as u32,
+                    kind: ChunkKind::Sequential,
                     leaves: extend_flat(&mut flat_leaves, &bc.leaves),
                     consts: extend_flat(&mut flat_consts, &bc.consts),
                     publics: extend_flat(&mut flat_publics, &bc.publics),
-                    instrs: (flat_instrs.len(), 0),
-                    assert_pos: (flat_assert_pos.len(), 0),
-                    assert_alphas: (flat_assert_alphas.len(), 0),
-                    terms: extend_flat(&mut flat_terms, &bc.terms),
-                    max_reg: 0,
-                    gkr_main_width: 0,
-                    gkr_prep_width: 0,
-                    coop_code: flat_coop_code.len(),
-                    coop_level_starts: (flat_coop_u16.len(), 0),
-                    coop_assert_slots: flat_coop_u16.len(),
-                    coop_n_phys: 0,
-                },
-            });
+                    instrs: extend_flat(&mut flat_instrs, &bc.instrs),
+                    assert_pos: extend_flat(&mut flat_assert_pos, &pos),
+                    assert_alphas: extend_flat(&mut flat_assert_alphas, &alphas),
+                    terms: (flat_terms.len(), 0),
+                    max_reg: bc.max_reg,
+                    gkr_main_width: bc.gkr_main_width,
+                    gkr_prep_width: bc.gkr_prep_width,
+                }
+            }
+            CompiledChunk::ColumnTile(bc) => ChunkOffsets {
+                kind: ChunkKind::ColumnTile,
+                leaves: extend_flat(&mut flat_leaves, &bc.leaves),
+                consts: extend_flat(&mut flat_consts, &bc.consts),
+                publics: extend_flat(&mut flat_publics, &bc.publics),
+                instrs: (flat_instrs.len(), 0),
+                assert_pos: (flat_assert_pos.len(), 0),
+                assert_alphas: (flat_assert_alphas.len(), 0),
+                terms: extend_flat(&mut flat_terms, &bc.terms),
+                max_reg: 0,
+                gkr_main_width: 0,
+                gkr_prep_width: 0,
+                coop_code: flat_coop_code.len(),
+                coop_level_starts: (flat_coop_u16.len(), 0),
+                coop_assert_slots: flat_coop_u16.len(),
+                coop_n_phys: 0,
+            },
         }
+    };
+    for chip in &compiled {
+        let chunks = chip.chunks.iter().map(&mut push_chunk).collect();
         chip_offsets.push(chunks);
+        let inf_chunks = chip
+            .inf_chunks
+            .iter()
+            .map(|ib| ib.as_ref().map(|bc| push_chunk(&CompiledChunk::Sequential(bc.clone()))))
+            .collect();
+        chip_inf_offsets.push(inf_chunks);
     }
 
     // ---- Upload the seven flat buffers (≥1 element so the base pointer is
@@ -701,7 +873,31 @@ pub(crate) fn upload_compiled_bytecode(
 
     let mut device_chips = Vec::with_capacity(compiled.len());
     let mut chip_index = BTreeMap::new();
-    for (chip, offsets) in compiled.iter().zip(chip_offsets.iter()) {
+    // SAFETY: as below — every offset lies within its flat buffer.
+    let to_device = |o: &ChunkOffsets| ChunkDeviceBufs {
+        kind: o.kind,
+        leaves: unsafe { leaves_base.add(o.leaves.0) },
+        consts: unsafe { consts_base.add(o.consts.0) },
+        publics: unsafe { publics_base.add(o.publics.0) },
+        instrs: unsafe { instrs_base.add(o.instrs.0) },
+        assert_pos: unsafe { assert_pos_base.add(o.assert_pos.0) },
+        assert_alphas: unsafe { assert_alphas_base.add(o.assert_alphas.0) },
+        terms: unsafe { terms_base.add(o.terms.0) },
+        max_reg: o.max_reg,
+        n_instrs: o.instrs.1 as u32,
+        n_asserts: o.assert_pos.1 as u32,
+        gkr_main_width: o.gkr_main_width,
+        gkr_prep_width: o.gkr_prep_width,
+        n_terms: o.terms.1 as u32,
+        coop_code: unsafe { coop_code_base.add(o.coop_code) },
+        coop_level_starts: unsafe { coop_u16_base.add(o.coop_level_starts.0) },
+        coop_assert_slots: unsafe { coop_u16_base.add(o.coop_assert_slots) },
+        coop_n_levels: o.coop_level_starts.1.saturating_sub(1) as u32,
+        coop_n_phys: o.coop_n_phys,
+    };
+    for ((chip, offsets), inf_offsets) in
+        compiled.iter().zip(chip_offsets.iter()).zip(chip_inf_offsets.iter())
+    {
         // SAFETY: each `o.<arr>.0` is the start offset into its corresponding
         // flat buffer, computed during the upload pass above by running a
         // prefix-sum over per-chunk lengths. By construction every offset
@@ -709,36 +905,16 @@ pub(crate) fn upload_compiled_bytecode(
         // for a zero-length chunk is permitted by `pointer::add`'s contract),
         // and the resulting pointer is only ever dereferenced on the GPU
         // through `ChunkDeviceBufs`, whose Send/Sync impl is justified above.
-        let chunks = offsets
-            .iter()
-            .map(|o| ChunkDeviceBufs {
-                kind: o.kind,
-                leaves: unsafe { leaves_base.add(o.leaves.0) },
-                consts: unsafe { consts_base.add(o.consts.0) },
-                publics: unsafe { publics_base.add(o.publics.0) },
-                instrs: unsafe { instrs_base.add(o.instrs.0) },
-                assert_pos: unsafe { assert_pos_base.add(o.assert_pos.0) },
-                assert_alphas: unsafe { assert_alphas_base.add(o.assert_alphas.0) },
-                terms: unsafe { terms_base.add(o.terms.0) },
-                max_reg: o.max_reg,
-                n_instrs: o.instrs.1 as u32,
-                n_asserts: o.assert_pos.1 as u32,
-                gkr_main_width: o.gkr_main_width,
-                gkr_prep_width: o.gkr_prep_width,
-                n_terms: o.terms.1 as u32,
-                coop_code: unsafe { coop_code_base.add(o.coop_code) },
-                coop_level_starts: unsafe { coop_u16_base.add(o.coop_level_starts.0) },
-                coop_assert_slots: unsafe { coop_u16_base.add(o.coop_assert_slots) },
-                coop_n_levels: o.coop_level_starts.1.saturating_sub(1) as u32,
-                coop_n_phys: o.coop_n_phys,
-            })
-            .collect();
+        let chunks = offsets.iter().map(&to_device).collect();
+        let inf_chunks = inf_offsets.iter().map(|o| o.as_ref().map(to_device)).collect();
         chip_index.insert(chip.name.clone(), device_chips.len());
         device_chips.push(CompiledChipDevice {
             chip_idx: chip.chip_idx,
             main_width: chip.main_width,
             prep_width: chip.prep_width,
             chunks,
+            inf_chunks,
+            inf_ok: chip.inf_ok,
         });
     }
 
@@ -877,6 +1053,41 @@ pub(crate) struct SeqTierStatic {
     /// Device buffer holding `static_host`; uploaded once per shard, reused
     /// every round.
     pub static_buf: Option<Buffer<ChunkStaticC, TaskScope>>,
+
+    // ---- Top-degree ("point at infinity") variants, `SP1_GPU_ZC_INF` ----
+    /// Whether the variants below were built (all chips `inf_ok` and the
+    /// mode is on). When false the univariate rounds evaluate x = 4.
+    pub inf_built: bool,
+    /// Top-degree descriptor per chunk, parallel to `static_host` (empty
+    /// when `!inf_built`). Same `chip_idx` / alpha offset, no inline GKR;
+    /// `n_asserts == 0` for chunks without a constraint of top degree.
+    pub static_inf_host: Vec<ChunkStaticC>,
+    /// Worst-case `max_reg` over `static_inf_host`.
+    pub max_reg_inf: u16,
+    /// Device copy of `static_inf_host` (kept alive for `static_linked_buf`).
+    pub _static_inf_buf: Option<Buffer<ChunkStaticC, TaskScope>>,
+    /// `static_host` with each `inf` pointing into `_static_inf_buf`.
+    pub static_linked_buf: Option<Buffer<ChunkStaticC, TaskScope>>,
+}
+
+impl SeqTierStatic {
+    /// Whether chunk `i` (and, if built, its top-degree variant, which the
+    /// same cooperative launch runs for eval slot 2) fits a cooperative
+    /// kernel's limits `fits`. A variant without assertions exits before
+    /// touching shared memory.
+    fn coop_pair_fits(&self, i: usize, fits: fn(&ChunkStaticC) -> bool) -> bool {
+        fits(&self.static_host[i])
+            && self.static_inf_host.get(i).is_none_or(|c| c.n_asserts == 0 || fits(c))
+    }
+
+    /// The `max_reg` the univariate kernel template must cover.
+    fn launch_max_reg(&self, inf: bool) -> u16 {
+        if inf {
+            self.max_reg.max(self.max_reg_inf)
+        } else {
+            self.max_reg
+        }
+    }
 }
 
 /// Per-trace-element-type kernel selection. Round 0 uses `K = Felt`; rounds
@@ -972,6 +1183,7 @@ impl EvalKernels<Ext> for TaskScope {
         Some(unsafe {
             match zerocheck_vrf_size() {
                 0 => zerocheck_fused_sequential_uniform_ext_128_v0_kernel(),
+                8 => zerocheck_fused_sequential_uniform_ext_128_v8_kernel(),
                 16 => zerocheck_fused_sequential_uniform_ext_128_v16_kernel(),
                 _ => zerocheck_fused_sequential_uniform_ext_128_v32_kernel(),
             }
@@ -1361,12 +1573,27 @@ fn rdna_defaults() -> bool {
         && unsafe { sp1_gpu_cudart::sys::runtime::sp1_hip_wave64() } == 0
 }
 
+/// SYCL (Xe2): the register files are vectors indexed by the uniform register number, kept in
+/// GRF with indirect addressing; the overflow is a per-lane private array whose lanes lie 2 KB
+/// apart (16 cache lines per access). With 128 GRF, 16 ext registers (64 GRF) and 8 four-node
+/// registers fit without spilling; 32 ext and 16 four-node registers spill. On an Arc Pro B70
+/// (sha2 core shards) the ext kernel takes 472 ms against 705 ms with all registers private,
+/// and the bivariate kernel 572 ms against 614 ms (bit-identical partials).
+const ZEROCHECK_SYCL_VRF_DEFAULT: u32 = 16;
+const ZEROCHECK_SYCL_BIV_VRF_DEFAULT: u32 = 8;
+
 /// Registers the wave-uniform G = 4 bivariate kernel keeps in VGPRs
-/// (`SP1_GPU_ZEROCHECK_BIV_VRF` ∈ {0, 16, 32}).
+/// (`SP1_GPU_ZEROCHECK_BIV_VRF` ∈ {0, 8, 16, 32}).
 pub(crate) fn zerocheck_biv_vrf_size() -> u32 {
-    let default = if rdna_defaults() { 0 } else { ZEROCHECK_BIV_VRF_DEFAULT };
+    let default = if rdna_defaults() {
+        0
+    } else if sp1_gpu_cudart::sys::BACKEND == "sycl" {
+        ZEROCHECK_SYCL_BIV_VRF_DEFAULT
+    } else {
+        ZEROCHECK_BIV_VRF_DEFAULT
+    };
     match env_u32("SP1_GPU_ZEROCHECK_BIV_VRF", default) {
-        v @ (0 | 16 | 32) => v,
+        v @ (0 | 8 | 16 | 32) => v,
         _ => default,
     }
 }
@@ -1375,15 +1602,21 @@ pub(crate) fn zerocheck_biv_vrf_size() -> u32 {
 const ZEROCHECK_VRF_DEFAULT: u32 = 32;
 
 /// Registers the wave-uniform kernel keeps in VGPRs (`SP1_GPU_ZEROCHECK_VRF`
-/// ∈ {0, 16, 32}; 0 keeps the whole register file in scratch). 0 when the
-/// wave-uniform kernel is off.
+/// ∈ {0, 8, 16, 32}; 0 keeps the whole register file in scratch). 0 when the
+/// wave-uniform kernel is off. The base-field kernel has 0 and 32 only: any other
+/// non-zero size runs it with 32.
 pub(crate) fn zerocheck_vrf_size() -> u32 {
     if !zerocheck_uniform_enabled() {
         return 0;
     }
-    let default = if rdna_defaults() { 16 } else { ZEROCHECK_VRF_DEFAULT };
+    let default = if rdna_defaults() || sp1_gpu_cudart::sys::BACKEND == "sycl" {
+        // ZEROCHECK_SYCL_VRF_DEFAULT on SYCL; RDNA's tuned value happens to be the same.
+        ZEROCHECK_SYCL_VRF_DEFAULT
+    } else {
+        ZEROCHECK_VRF_DEFAULT
+    };
     match env_u32("SP1_GPU_ZEROCHECK_VRF", default) {
-        v @ (0 | 16 | 32) => v,
+        v @ (0 | 8 | 16 | 32) => v,
         _ => default,
     }
 }
@@ -1432,7 +1665,41 @@ fn build_seq_tiers(
         coop_wide_max_levels: 0,
         coop_wide_max_phys: 0,
         static_buf: None,
+        inf_built: false,
+        static_inf_host: Vec::new(),
+        max_reg_inf: 0,
+        _static_inf_buf: None,
+        static_linked_buf: None,
     });
+
+    // Top-degree variants: only when asked for and every chip has them (the
+    // leading coefficient must cover all chips of the round, or none).
+    let build_inf = zc_inf_mode() != ZcInfMode::Off && compiled.iter().all(|c| c.inf_ok);
+    if zc_inf_mode() != ZcInfMode::Off && !build_inf {
+        tracing::warn!("SP1_GPU_ZC_INF: a chip lacks top-degree bytecode; evaluating x = 4");
+    }
+    // Descriptor for "nothing at infinity" (never dereferenced: the kernels
+    // exit on `n_asserts == 0` before reading any pointer).
+    let empty_inf = |chip_idx: u32| ChunkStaticC {
+        instrs: std::ptr::null(),
+        leaves: std::ptr::null(),
+        consts: std::ptr::null(),
+        publics: std::ptr::null(),
+        assert_pos: std::ptr::null(),
+        assert_alphas: std::ptr::null(),
+        n_instrs: 0,
+        n_asserts: 0,
+        chip_idx,
+        gkr_main_width: 0,
+        gkr_prep_width: 0,
+        chip_alpha_offset: chip_alpha_offset[chip_idx as usize],
+        coop_code: std::ptr::null(),
+        coop_level_starts: std::ptr::null(),
+        coop_assert_slots: std::ptr::null(),
+        coop_n_levels: 0,
+        coop_n_phys: 0,
+        inf: std::ptr::null(),
+    };
 
     for chip in compiled.iter() {
         let chip_idx = chip.chip_idx;
@@ -1440,7 +1707,7 @@ fn build_seq_tiers(
         // sequential kernel skips the in-line column sweep (the decoupled
         // kernel handles them).
         let decoupled = chip_uses_decoupled_gkr(chip.main_width, chip.prep_width);
-        for chunk in chip.chunks.iter() {
+        for (j, chunk) in chip.chunks.iter().enumerate() {
             if !matches!(chunk.kind, ChunkKind::Sequential) {
                 continue;
             }
@@ -1466,7 +1733,37 @@ fn build_seq_tiers(
                 coop_assert_slots: chunk.coop_assert_slots,
                 coop_n_levels: chunk.coop_n_levels,
                 coop_n_phys: chunk.coop_n_phys,
+                inf: std::ptr::null(),
             });
+            if build_inf {
+                let v = chip.inf_chunks[j].as_ref().expect("inf_ok chip without top-degree chunk");
+                tiers[tier].max_reg_inf = tiers[tier].max_reg_inf.max(v.max_reg);
+                tiers[tier].static_inf_host.push(if v.n_asserts == 0 {
+                    empty_inf(chip_idx)
+                } else {
+                    ChunkStaticC {
+                        instrs: v.instrs,
+                        leaves: v.leaves,
+                        consts: v.consts,
+                        publics: v.publics,
+                        assert_pos: v.assert_pos,
+                        assert_alphas: v.assert_alphas,
+                        n_instrs: v.n_instrs,
+                        n_asserts: v.n_asserts,
+                        chip_idx,
+                        // The GKR batch is linear: zero at infinity.
+                        gkr_main_width: 0,
+                        gkr_prep_width: 0,
+                        chip_alpha_offset: chip_alpha_offset[chip_idx as usize],
+                        coop_code: v.coop_code,
+                        coop_level_starts: v.coop_level_starts,
+                        coop_assert_slots: v.coop_assert_slots,
+                        coop_n_levels: v.coop_n_levels,
+                        coop_n_phys: v.coop_n_phys,
+                        inf: std::ptr::null(),
+                    }
+                });
+            }
         }
     }
 
@@ -1491,23 +1788,59 @@ fn build_seq_tiers(
             coop_assert_slots: std::ptr::null(),
             coop_n_levels: 0,
             coop_n_phys: 0,
+            inf: std::ptr::null(),
         });
+        if build_inf {
+            // Its inline GKR sweep is linear: zero at infinity.
+            tiers[0].static_inf_host.push(empty_inf(chip.chip_idx));
+        }
     }
 
     for tier in tiers.iter_mut() {
-        for c in tier.static_host.iter().filter(|c| coop_fits(c)) {
-            tier.coop_max_instrs = tier.coop_max_instrs.max(c.n_instrs);
-            tier.coop_max_levels = tier.coop_max_levels.max(c.coop_n_levels);
-            tier.coop_max_phys = tier.coop_max_phys.max(c.coop_n_phys);
-        }
-        for c in tier.static_host.iter().filter(|c| coop_wide_fits(c)) {
-            tier.coop_wide_max_instrs = tier.coop_wide_max_instrs.max(c.n_instrs);
-            tier.coop_wide_max_levels = tier.coop_wide_max_levels.max(c.coop_n_levels);
-            tier.coop_wide_max_phys = tier.coop_wide_max_phys.max(c.coop_n_phys);
+        tier.inf_built = build_inf;
+        // The cooperative launch runs a chunk's top-degree variant in its
+        // eval-slot-2 blocks with the same shared-memory sizing, so the
+        // eligibility and the maxima cover both. Identical to the original
+        // computation when the variants are not built.
+        for i in 0..tier.static_host.len() {
+            let fits = tier.coop_pair_fits(i, coop_fits);
+            let wide_fits = tier.coop_pair_fits(i, coop_wide_fits);
+            let mut pair = vec![tier.static_host[i]];
+            pair.extend(tier.static_inf_host.get(i).filter(|c| c.n_asserts > 0).copied());
+            for c in &pair {
+                if fits {
+                    tier.coop_max_instrs = tier.coop_max_instrs.max(c.n_instrs);
+                    tier.coop_max_levels = tier.coop_max_levels.max(c.coop_n_levels);
+                    tier.coop_max_phys = tier.coop_max_phys.max(c.coop_n_phys);
+                }
+                if wide_fits {
+                    tier.coop_wide_max_instrs = tier.coop_wide_max_instrs.max(c.n_instrs);
+                    tier.coop_wide_max_levels = tier.coop_wide_max_levels.max(c.coop_n_levels);
+                    tier.coop_wide_max_phys = tier.coop_wide_max_phys.max(c.coop_n_phys);
+                }
+            }
         }
         if !tier.static_host.is_empty() {
             tier.static_buf =
                 Some(DeviceBuffer::from_host_slice(&tier.static_host, scope).unwrap().into_inner());
+            if build_inf {
+                debug_assert_eq!(tier.static_inf_host.len(), tier.static_host.len());
+                let inf_buf = DeviceBuffer::from_host_slice(&tier.static_inf_host, scope)
+                    .unwrap()
+                    .into_inner();
+                let inf_base = inf_buf.as_ptr();
+                let linked: Vec<ChunkStaticC> = tier
+                    .static_host
+                    .iter()
+                    .enumerate()
+                    // SAFETY: `i < static_inf_host.len()`, the length of
+                    // `inf_buf`; the pointer is only dereferenced on the GPU.
+                    .map(|(i, c)| ChunkStaticC { inf: unsafe { inf_base.add(i) }, ..*c })
+                    .collect();
+                tier.static_linked_buf =
+                    Some(DeviceBuffer::from_host_slice(&linked, scope).unwrap().into_inner());
+                tier._static_inf_buf = Some(inf_buf);
+            }
         }
     }
     tiers
@@ -1831,9 +2164,55 @@ pub(crate) fn evaluate_zerocheck<'b, K: Field>(
 where
     TaskScope: EvalKernels<K>,
 {
+    let inf_ready = poly.seq_tiers.iter().all(|t| t.inf_built);
+    match zc_inf_mode() {
+        ZcInfMode::On if inf_ready => {
+            let totals = evaluate_zerocheck_totals(poly, true);
+            round_message_from_leading_coefficient(poly, totals)
+        }
+        ZcInfMode::Check if inf_ready => {
+            let reference = evaluate_zerocheck_totals(poly, false);
+            let totals = evaluate_zerocheck_totals(poly, true);
+            let expected = round_message_from_evals(poly, reference);
+            let msg = round_message_from_leading_coefficient(poly, totals);
+            assert_eq!(
+                (reference[0], reference[1]),
+                (totals[0], totals[1]),
+                "SP1_GPU_ZC_INF_CHECK: q(0), q(2) differ between the x = 4 and infinity launches"
+            );
+            assert_eq!(
+                msg, expected,
+                "SP1_GPU_ZC_INF_CHECK: round message from the leading coefficient differs \
+                 from the x = 4 evaluation (lead coeff {:?})",
+                totals[2]
+            );
+            msg
+        }
+        _ => {
+            let totals = evaluate_zerocheck_totals(poly, false);
+            round_message_from_evals(poly, totals)
+        }
+    }
+}
+
+/// The eq-weighted, lambda-RLC'ed round sums of one univariate round,
+/// excluding the eq factor of the round variable and `eq_adjustment`: with
+/// `q` the cubic `x ↦ Σ_rows eq_rest · (constraints + GKR batch − geq
+/// correction)(row at x)`, returns `[q(0), q(2), q(4)]`, or with `inf`
+/// `[q(0), q(2), lead(q)]` where `lead(q)` is the x^3 coefficient — computed
+/// by the chunks' top-degree bytecode in the eval-slot-2 blocks (see
+/// `ChunkStatic::inf`); the GKR batch, ColumnTile chunks and geq correction
+/// are at most linear in x and contribute nothing to it.
+fn evaluate_zerocheck_totals<'b, K: Field>(
+    poly: &mut ZeroCheckJaggedPoly<'b, K>,
+    inf: bool,
+) -> [Ext; 3]
+where
+    TaskScope: EvalKernels<K>,
+{
     let backend = poly.data.backend();
-    // Three evaluation points per univariate round (degree-2 polynomial
-    // recovered by Lagrange interpolation downstream).
+    // Three evaluation points per univariate round (cubic `q` recovered with
+    // the claim and the root of the round variable's eq factor downstream).
     const NUM_EVAL_POINT: usize = 3;
     // Cap on grid x-dim for the ColumnTile fallback. Beyond this, blocks
     // oversubscribe SMs and the per-block reduce overhead dominates.
@@ -1849,8 +2228,7 @@ where
     // overhead is amortised the same way). Tile size = block_size * this.
     const ROWS_PER_THREAD: u32 = 4;
 
-    let (rest, last) = poly.zeta.split_at(poly.zeta.dimension() - 1);
-    let last = *last[0];
+    let (rest, _) = poly.zeta.split_at(poly.zeta.dimension() - 1);
     let rest_point = DevicePoint::from_host(&rest, backend).unwrap();
     let partial_lagrange = rest_point.partial_lagrange();
     let rest_point_dim = rest.dimension() as u32;
@@ -1866,7 +2244,7 @@ where
         _ => BLOCK_SIZE_LOW_REG,
     };
     let block_size_for = |tier: usize| -> u32 {
-        if poly.seq_tiers[tier].max_reg > 128 {
+        if poly.seq_tiers[tier].launch_max_reg(inf) > 128 {
             BLOCK_SIZE_HIGH_REG
         } else {
             block_size_low_reg
@@ -1946,11 +2324,13 @@ where
                     && rows <= coop_max_rows
                     && (cost >= coop_min_cost || rows <= COOP_SMALL_ROWS)
                 {
-                    if coop_wide == 2 && coop_wide_fits(c) {
+                    // `coop_pair_fits` also checks the top-degree variant
+                    // (if built), which the same launch runs for slot 2.
+                    if coop_wide == 2 && tier.coop_pair_fits(i, coop_wide_fits) {
                         cand.push((cost, i, 2u8));
-                    } else if coop_fits(c) {
+                    } else if tier.coop_pair_fits(i, coop_fits) {
                         cand.push((cost, i, 1u8));
-                    } else if coop_wide >= 1 && coop_wide_fits(c) {
+                    } else if coop_wide >= 1 && tier.coop_pair_fits(i, coop_wide_fits) {
                         cand.push((cost, i, 2u8));
                     }
                 }
@@ -2065,6 +2445,11 @@ where
         coop_wide_slot[t] = total_slots;
         total_slots += coop_wide_tiers[t].len() * NUM_EVAL_POINT;
     }
+    // Slots below `seq_end` come from the Sequential kernels; with `inf`
+    // their eval-slot-2 entries hold leading-coefficient partials, while the
+    // other producers' slot-2 entries (x = 4 values, or unwritten) are not
+    // used.
+    let seq_end = total_slots;
     let mut ct_slots: Vec<(usize, u32)> = Vec::with_capacity(ct_launches.len());
     let ct_block_size: u32 = 128; // unchanged for ColumnTile fallback
     for &(_, chunk, row_count) in &ct_launches {
@@ -2110,8 +2495,14 @@ where
         all.extend_from_slice(&coop_tiers[t]);
         all.extend_from_slice(&coop_wide_tiers[t]);
         let dispatch_ptr = refill_buffer(&mut poly.cached_seq_dispatch[t], &all, backend).as_ptr();
-        let static_ptr = poly.seq_tiers[t].static_buf.as_ref().unwrap().as_ptr();
-        let max_reg = poly.seq_tiers[t].max_reg;
+        // With `inf`, the descriptors whose `inf` links to the top-degree
+        // variants: eval slot 2 then holds the leading coefficient.
+        let static_ptr = if inf {
+            poly.seq_tiers[t].static_linked_buf.as_ref().unwrap().as_ptr()
+        } else {
+            poly.seq_tiers[t].static_buf.as_ref().unwrap().as_ptr()
+        };
+        let max_reg = poly.seq_tiers[t].launch_max_reg(inf);
         if n_main > 0 {
             let out_ptr = unsafe { shared_output_ptr.add(tier_slot[t]) };
             let shmem_bytes = (bs as usize / 32).max(1) * std::mem::size_of::<Ext>();
@@ -2307,10 +2698,14 @@ where
                 rest_point_dim,
                 out_ptr
             );
+            // With `inf` the x = 4 blocks (z = 2) are not launched: the GKR
+            // batch is linear, so it contributes nothing to the leading
+            // coefficient, and their slots are ignored by the aggregation.
+            let n_z = if inf { 2 } else { 3 };
             backend
                 .launch_kernel(
                     <TaskScope as EvalKernels<K>>::gkr_sweep_kernel(),
-                    (gkr_dispatch.len() as u32, 1, 3),
+                    (gkr_dispatch.len() as u32, 1, n_z),
                     (GKR_BLOCK_SIZE, 1, 1),
                     &args,
                     shmem_bytes,
@@ -2330,19 +2725,28 @@ where
     //
     // `total_slots` is guaranteed a multiple of 3 (every slot range above
     // is `n * NUM_EVAL_POINT`).
+    //
+    // With `inf` the two slot ranges are reduced separately (Sequential
+    // `[0, seq_end)` into totals 0..3, the rest into totals 3..6) so that
+    // only the Sequential kernels' slot 2 enters the leading coefficient.
+    let ranges: Vec<(usize, usize)> =
+        if inf { vec![(0, seq_end), (seq_end, total_slots)] } else { vec![(0, total_slots)] };
     let mut totals_buf: Tensor<Ext, TaskScope> =
-        Tensor::with_sizes_in([NUM_EVAL_POINT], backend.clone());
+        Tensor::with_sizes_in([NUM_EVAL_POINT * ranges.len()], backend.clone());
     unsafe {
         totals_buf.assume_init();
     }
-    {
+    for (r, &(start, end)) in ranges.iter().enumerate() {
         const AGG_BLOCK_SIZE: u32 = 256;
         let shmem_bytes = (AGG_BLOCK_SIZE as usize / 32) * std::mem::size_of::<Ext>();
+        // SAFETY: `start <= end <= total_slots <= shared_output.len()` and
+        // `r * 3 + 3 <= totals_buf.len()`; a range with `start == end` reads
+        // nothing (the kernel then writes zeros).
         unsafe {
             let args = args!(
-                shared_output_ptr as *const Ext,
-                (total_slots as u32),
-                totals_buf.as_mut_ptr()
+                shared_output_ptr.add(start) as *const Ext,
+                ((end - start) as u32),
+                totals_buf.as_mut_ptr().add(r * NUM_EVAL_POINT)
             );
             backend
                 .launch_kernel(
@@ -2356,13 +2760,42 @@ where
         }
     }
 
-    // ---- Single host sync + copy of 3 totals ----
+    // ---- Single host sync + copy of the totals ----
     let totals_vec: Vec<Ext> = unsafe { totals_buf.into_buffer().copy_into_host_vec() };
-    let totals: [Ext; NUM_EVAL_POINT] = [totals_vec[0], totals_vec[1], totals_vec[2]];
+    let totals: [Ext; NUM_EVAL_POINT] = if inf {
+        // q(0), q(2): every producer; lead(q): the Sequential kernels only.
+        [totals_vec[0] + totals_vec[3], totals_vec[1] + totals_vec[4], totals_vec[2]]
+    } else {
+        [totals_vec[0], totals_vec[1], totals_vec[2]]
+    };
     // `shared_output` is no longer needed; drop it after the sync so the
     // device allocation can be freed.
     drop(shared_output);
+    totals
+}
 
+/// The coordinate of `zeta` bound in this round (its last one).
+fn round_eq_point<K: Field>(poly: &ZeroCheckJaggedPoly<'_, K>) -> Ext {
+    let (_, last) = poly.zeta.split_at(poly.zeta.dimension() - 1);
+    *last[0]
+}
+
+/// The round message `p(x) = eq(last, x) · eq_adjustment · q(x)` (degree 4)
+/// from `totals = [q(0), q(2), q(4)]`, the claim `p(0) + p(1)` and the root of
+/// the eq factor.
+fn round_message_from_evals<K: Field>(
+    poly: &ZeroCheckJaggedPoly<'_, K>,
+    totals: [Ext; 3],
+) -> UnivariatePolynomial<Ext> {
+    message_from_evals(round_eq_point(poly), poly.eq_adjustment, poly.claim, totals)
+}
+
+fn message_from_evals(
+    last: Ext,
+    eq_adjustment: Ext,
+    claim: Ext,
+    totals: [Ext; 3],
+) -> UnivariatePolynomial<Ext> {
     // Apply last_var_eq and eq_adjustment (mirror v1's evaluate_zerocheck).
     let mut xs =
         vec![Ext::from_canonical_u32(0), Ext::from_canonical_u32(2), Ext::from_canonical_u32(4)];
@@ -2371,16 +2804,67 @@ where
         .zip(totals.iter())
         .map(|(&x, &t)| {
             let last_var_eq = (Ext::one() - x) * (Ext::one() - last) + x * last;
-            t * last_var_eq * poly.eq_adjustment
+            t * last_var_eq * eq_adjustment
         })
         .collect();
 
     xs.push(Ext::from_canonical_u32(1));
-    ys.push(poly.claim - ys[0]);
+    ys.push(claim - ys[0]);
 
     xs.push((last - Ext::one()) / (last + last - Ext::one()));
     ys.push(Ext::zero());
 
+    interpolate_univariate_polynomial(&xs, &ys)
+}
+
+/// The same round message from `totals = [q(0), q(2), lead(q)]` (`lead` = the
+/// x^3 coefficient of the cubic `q`).
+///
+/// `p(x) = e(x) · a · q(x)` with `e(x) = (1 − x)(1 − last) + x·last` and
+/// `a = eq_adjustment` is a quartic with known values `p(0)`, `p(2)`,
+/// `p(1) = claim − p(0)`, `p(r) = 0` (`r` the root of `e`) and leading
+/// coefficient `c = (2·last − 1) · a · lead(q)`. Hence, with `L` the cubic
+/// through those four points,
+///
+/// `p(4) = L(4) + c · (4 − 0)(4 − 1)(4 − 2)(4 − r)`,
+///
+/// and the message is interpolated from exactly the five points the x = 4
+/// path uses: `p(4)` is the same field element whenever `q` is a cubic and
+/// the claim is consistent, so the round message is bit-identical. (Field
+/// arithmetic is exact; `L` needs `r ∉ {0, 1, 2}`, as the x = 4 path does.)
+fn round_message_from_leading_coefficient<K: Field>(
+    poly: &ZeroCheckJaggedPoly<'_, K>,
+    totals: [Ext; 3],
+) -> UnivariatePolynomial<Ext> {
+    message_from_leading_coefficient(round_eq_point(poly), poly.eq_adjustment, poly.claim, totals)
+}
+
+fn message_from_leading_coefficient(
+    last: Ext,
+    eq_adjustment: Ext,
+    claim: Ext,
+    totals: [Ext; 3],
+) -> UnivariatePolynomial<Ext> {
+    let [q0, q2, lead] = totals;
+    let (zero, one, two, four) = (
+        Ext::from_canonical_u32(0),
+        Ext::one(),
+        Ext::from_canonical_u32(2),
+        Ext::from_canonical_u32(4),
+    );
+    let last_var_eq = |x: Ext| (Ext::one() - x) * (Ext::one() - last) + x * last;
+    let p0 = q0 * last_var_eq(zero) * eq_adjustment;
+    let p2 = q2 * last_var_eq(two) * eq_adjustment;
+    let p1 = claim - p0;
+    let root = (last - Ext::one()) / (last + last - Ext::one());
+    let lead_p = (last + last - Ext::one()) * eq_adjustment * lead;
+    let cubic = interpolate_univariate_polynomial(&[zero, one, two, root], &[p0, p1, p2, zero]);
+    let p4 =
+        cubic.eval_at_point(four) + lead_p * (four * (four - one) * (four - two) * (four - root));
+
+    // Same points, same order as `round_message_from_evals`.
+    let xs = vec![zero, two, four, one, root];
+    let ys = vec![p0, p2, p4, p1, zero];
     interpolate_univariate_polynomial(&xs, &ys)
 }
 
@@ -2480,7 +2964,10 @@ fn bivariate_nodes_per_pass() -> u32 {
 
 /// The tiered bivariate kernel and its blocks per dispatch tile: the node-vectorised kernels run
 /// the `12 / G` node passes of a tile in adjacent blocks, the scalar kernels all 12 in one block.
-fn bivariate_sequential_kernel_for(max_reg_in_tier: u16) -> (KernelPtr, u32) {
+///
+/// With `inf` (only for G ∈ {1, 4}, see `bivariate_inf_supported`) the G = 4
+/// kernels run `BIVARIATE_INF_PASSES` = 4 passes per tile (bivariate.cuh).
+fn bivariate_sequential_kernel_for(max_reg_in_tier: u16, inf: bool) -> (KernelPtr, u32) {
     if max_reg_in_tier <= 128 {
         let g = bivariate_nodes_per_pass();
         let kernel = match g {
@@ -2488,6 +2975,7 @@ fn bivariate_sequential_kernel_for(max_reg_in_tier: u16) -> (KernelPtr, u32) {
             4 if zerocheck_uniform_enabled() => Some(unsafe {
                 match zerocheck_biv_vrf_size() {
                     0 => zerocheck_fused_sequential_bivariate_vec4_uniform_kb_128_v0_kernel(),
+                    8 => zerocheck_fused_sequential_bivariate_vec4_uniform_kb_128_v8_kernel(),
                     16 => zerocheck_fused_sequential_bivariate_vec4_uniform_kb_128_v16_kernel(),
                     _ => zerocheck_fused_sequential_bivariate_vec4_uniform_kb_128_v32_kernel(),
                 }
@@ -2497,7 +2985,8 @@ fn bivariate_sequential_kernel_for(max_reg_in_tier: u16) -> (KernelPtr, u32) {
             _ => None,
         };
         if let Some(kernel) = kernel {
-            return (kernel, 12 / g);
+            debug_assert!(!inf || g == 4);
+            return (kernel, if inf { BIVARIATE_INF_PASSES } else { 12 / g });
         }
     }
     let kernel = unsafe {
@@ -2531,8 +3020,78 @@ fn bivariate_sequential_kernel_for(max_reg_in_tier: u16) -> (KernelPtr, u32) {
 ///
 /// The caller must ensure no active chip has a ColumnTile chunk — those only have a univariate
 /// kernel — and that the poly has at least two variables.
+/// Passes per tile of the G = 4 bivariate kernels in `inf_mode`. Must match
+/// `BIVARIATE_INF_PASSES` in bivariate.cuh.
+const BIVARIATE_INF_PASSES: u32 = 4;
+
+/// The point-at-infinity layout exists for the scalar and G = 4 bivariate
+/// kernels only (the default G = 4; `SP1_GPU_ZEROCHECK_BIV_G` = 2 / 12 keep
+/// the x = 4 nodes).
+fn bivariate_inf_supported() -> bool {
+    matches!(bivariate_nodes_per_pass(), 1 | 4)
+}
+
+/// Value at 4 of the cubic with values `f0, f1, f2` at 0, 1, 2 and leading
+/// (x^3) coefficient `lead`: `f(4) = 3·f0 − 8·f1 + 6·f2 + 24·lead`
+/// (Lagrange weights of {0, 1, 2} at 4 are 3, −8, 6; `4·3·2 = 24`).
+fn cubic_at_four(f0: Ext, f1: Ext, f2: Ext, lead: Ext) -> Ext {
+    Ext::from_canonical_u32(3) * f0 - Ext::from_canonical_u32(8) * f1
+        + Ext::from_canonical_u32(6) * f2
+        + Ext::from_canonical_u32(24) * lead
+}
+
+/// Rebuild the grid nodes with a coordinate 4 (index 3) from the finite nodes
+/// and the leading coefficients of the bicubic `Q`: `lx[iy]` = x^3
+/// coefficient of `Q(·, y_iy)`, `ly[ix]` = y^3 coefficient of `Q(x_ix, ·)`
+/// (`iy, ix < 3`), `lxy` = x^3·y^3 coefficient. Exact: `Q(·, y)` is a cubic
+/// with known values at 0, 1, 2 and known leading coefficient, likewise in y,
+/// and the x^3 coefficient `Lx(y)` of `Q` is itself a cubic in y with leading
+/// coefficient `lxy`, which gives `Lx(4)` for the last node.
+fn fill_grid_from_infinity(grid: &mut [[Ext; 4]; 4], lx: [Ext; 3], ly: [Ext; 3], lxy: Ext) {
+    for (iy, &lead) in lx.iter().enumerate() {
+        grid[3][iy] = cubic_at_four(grid[0][iy], grid[1][iy], grid[2][iy], lead);
+    }
+    for (row, &lead) in grid.iter_mut().zip(ly.iter()) {
+        row[3] = cubic_at_four(row[0], row[1], row[2], lead);
+    }
+    let lx4 = cubic_at_four(lx[0], lx[1], lx[2], lxy);
+    grid[3][3] = cubic_at_four(grid[0][3], grid[1][3], grid[2][3], lx4);
+}
+
 pub(crate) fn evaluate_zerocheck_bivariate(
     poly: &mut ZeroCheckJaggedPoly<'_, Felt>,
+) -> [[Ext; 4]; 4] {
+    let inf_ready = poly.seq_tiers.iter().all(|t| t.inf_built) && bivariate_inf_supported();
+    match zc_inf_mode() {
+        ZcInfMode::On if inf_ready => evaluate_zerocheck_bivariate_grid(poly, true),
+        ZcInfMode::Check if inf_ready => {
+            let reference = evaluate_zerocheck_bivariate_grid(poly, false);
+            let grid = evaluate_zerocheck_bivariate_grid(poly, true);
+            // Both round messages are functions of the grid alone (plus
+            // `zeta`, `eq_adjustment` and the challenge), so equal grids give
+            // identical messages.
+            assert_eq!(
+                grid, reference,
+                "SP1_GPU_ZC_INF_CHECK: bivariate grid from the infinity nodes differs from \
+                 the x = 4 / y = 4 evaluation"
+            );
+            grid
+        }
+        _ => evaluate_zerocheck_bivariate_grid(poly, false),
+    }
+}
+
+/// The grid of [`evaluate_zerocheck_bivariate`]. With `inf`, the constraint
+/// kernels evaluate the 7 nodes with a coordinate 4 as leading coefficients
+/// with the chunks' top-degree bytecode (bivariate.cuh), and the x = 4 / y = 4
+/// grid values are rebuilt exactly by `fill_grid_from_infinity`. The geq
+/// correction and the GKR batch are bilinear in (x, y), so they contribute
+/// nothing to those coefficients: the geq partials of the infinity nodes are
+/// aggregated separately and dropped, and the GKR extension is added at the
+/// finite nodes only.
+fn evaluate_zerocheck_bivariate_grid(
+    poly: &mut ZeroCheckJaggedPoly<'_, Felt>,
+    inf: bool,
 ) -> [[Ext; 4]; 4] {
     let backend = poly.data.backend();
     // The 12 non-boolean grid nodes evaluated by the constraint + geq kernels, and the 4 boolean
@@ -2558,7 +3117,7 @@ pub(crate) fn evaluate_zerocheck_bivariate(
     let chip_layouts_ptr = poly.chip_layouts_dev.as_ptr();
 
     let block_size_for = |tier: usize| -> u32 {
-        if poly.seq_tiers[tier].max_reg > 128 {
+        if poly.seq_tiers[tier].launch_max_reg(inf) > 128 {
             BLOCK_SIZE_HIGH_REG
         } else {
             BLOCK_SIZE_LOW_REG
@@ -2656,11 +3215,16 @@ pub(crate) fn evaluate_zerocheck_bivariate(
         let bs = block_size_for(t);
         let dispatch_ptr =
             refill_buffer(&mut poly.cached_seq_dispatch[t], &dispatch_tiers[t], backend).as_ptr();
-        let static_ptr = poly.seq_tiers[t].static_buf.as_ref().unwrap().as_ptr();
-        let max_reg = poly.seq_tiers[t].max_reg;
+        // With `inf`, the descriptors linked to their top-degree variants.
+        let static_ptr = if inf {
+            poly.seq_tiers[t].static_linked_buf.as_ref().unwrap().as_ptr()
+        } else {
+            poly.seq_tiers[t].static_buf.as_ref().unwrap().as_ptr()
+        };
+        let max_reg = poly.seq_tiers[t].launch_max_reg(inf);
         let out_ptr = unsafe { node_partials_ptr.add(tier_slot[t]) };
         let shmem_bytes = (bs as usize / 32).max(1) * std::mem::size_of::<Ext>();
-        let (kernel, blocks_per_tile) = bivariate_sequential_kernel_for(max_reg);
+        let (kernel, blocks_per_tile) = bivariate_sequential_kernel_for(max_reg, inf);
         unsafe {
             let args = args!(
                 dispatch_ptr,
@@ -2672,7 +3236,8 @@ pub(crate) fn evaluate_zerocheck_bivariate(
                 partial_lagrange.as_ptr(),
                 poly.powers_of_lambda.as_ptr(),
                 rest_point_dim,
-                out_ptr
+                out_ptr,
+                (inf as u32)
             );
             backend
                 .launch_kernel(
@@ -2748,19 +3313,39 @@ pub(crate) fn evaluate_zerocheck_bivariate(
     // ---- Device-side aggregation into 16 totals ----
     //
     // `totals[0..12]` are the node totals (constraint + geq), `totals[12..16]`
-    // the corner GKR totals.
-    let mut totals_buf: Tensor<Ext, TaskScope> =
-        Tensor::with_sizes_in([NUM_NODES + NUM_CORNERS], backend.clone());
+    // the corner GKR totals. With `inf`, `totals[0..12]` cover the constraint
+    // kernels only and `totals[16..28]` the geq corrections (whose infinity
+    // node values are dropped: the correction is bilinear).
+    let n_totals = NUM_NODES + NUM_CORNERS + if inf { NUM_NODES } else { 0 };
+    let mut totals_buf: Tensor<Ext, TaskScope> = Tensor::with_sizes_in([n_totals], backend.clone());
     unsafe {
         totals_buf.assume_init();
     }
     {
         const AGG_BLOCK_SIZE: u32 = 256;
         let shmem_bytes = (AGG_BLOCK_SIZE as usize / 32) * std::mem::size_of::<Ext>();
+        let constraint_end = if inf { geq_slot } else { node_slots };
         unsafe {
+            if inf {
+                let args = args!(
+                    node_partials_ptr.add(geq_slot) as *const Ext,
+                    ((node_slots - geq_slot) as u32),
+                    (NUM_NODES as u32),
+                    totals_buf.as_mut_ptr().add(NUM_NODES + NUM_CORNERS)
+                );
+                backend
+                    .launch_kernel(
+                        zerocheck_aggregate_partials_strided_kernel(),
+                        (NUM_NODES as u32, 1, 1),
+                        (AGG_BLOCK_SIZE, 1, 1),
+                        &args,
+                        shmem_bytes,
+                    )
+                    .unwrap();
+            }
             let args = args!(
                 node_partials_ptr as *const Ext,
-                (node_slots as u32),
+                (constraint_end as u32),
                 (NUM_NODES as u32),
                 totals_buf.as_mut_ptr()
             );
@@ -2811,11 +3396,26 @@ pub(crate) fn evaluate_zerocheck_bivariate(
     grid[0][1] = gkr_01;
     grid[1][0] = gkr_10;
     grid[1][1] = gkr_11;
+    // With `inf`: the leading coefficients of the infinity nodes (index 3 =
+    // the node 4 in `ZEROCHECK_NODE_XS`).
+    let (mut lx, mut ly, mut lxy) = ([Ext::zero(); 3], [Ext::zero(); 3], Ext::zero());
     for (e, &(ix, iy)) in ZEROCHECK_CONSTRAINT_NODES.iter().enumerate() {
+        if inf && (ix == 3 || iy == 3) {
+            match (ix, iy) {
+                (3, 3) => lxy = totals[e],
+                (3, iy) => lx[iy] = totals[e],
+                (ix, _) => ly[ix] = totals[e],
+            }
+            continue;
+        }
         let x = Ext::from_canonical_u32(ZEROCHECK_NODE_XS[ix]);
         let y = Ext::from_canonical_u32(ZEROCHECK_NODE_XS[iy]);
         let gkr_eval = gkr_00 + gkr_x * x + gkr_y * y + gkr_xy * (x * y);
-        grid[ix][iy] = totals[e] + gkr_eval;
+        let geq = if inf { totals[NUM_NODES + NUM_CORNERS + e] } else { Ext::zero() };
+        grid[ix][iy] = totals[e] + geq + gkr_eval;
+    }
+    if inf {
+        fill_grid_from_infinity(&mut grid, lx, ly, lxy);
     }
     grid
 }
@@ -3509,6 +4109,81 @@ mod layout_tracker_tests {
 mod tests {
     use super::*;
     use serial_test::serial;
+
+    /// `fill_grid_from_infinity` reproduces the x = 4 / y = 4 values of random
+    /// bicubics from their finite grid values and leading coefficients.
+    #[test]
+    fn grid_from_infinity_matches_bicubic() {
+        use slop_algebra::AbstractExtensionField;
+        let mut state = 0x9e37_79b9u64;
+        let mut ext = || {
+            Ext::from_base_fn(|_| {
+                state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                Felt::from_canonical_u32(((state >> 33) as u32) % 0x7f00_0001)
+            })
+        };
+        for _ in 0..16 {
+            let c: [[Ext; 4]; 4] = std::array::from_fn(|_| std::array::from_fn(|_| ext()));
+            // Q(x, y) = Σ c[i][j] x^i y^j.
+            let q = |x: Ext, y: Ext| {
+                (0..4)
+                    .flat_map(|i| {
+                        (0..4).map(move |j| c[i][j] * x.exp_u64(i as u64) * y.exp_u64(j as u64))
+                    })
+                    .sum::<Ext>()
+            };
+            let nodes = ZEROCHECK_NODE_XS.map(Ext::from_canonical_u32);
+            let expected: [[Ext; 4]; 4] =
+                std::array::from_fn(|ix| std::array::from_fn(|iy| q(nodes[ix], nodes[iy])));
+            let mut grid = expected;
+            for row in grid.iter_mut() {
+                row[3] = Ext::zero();
+            }
+            grid[3] = [Ext::zero(); 4];
+            // x^3 coefficient of Q(·, y) = Σ_j c[3][j] y^j; likewise in y.
+            let lx = std::array::from_fn(|iy| {
+                (0..4).map(|j| c[3][j] * nodes[iy].exp_u64(j as u64)).sum::<Ext>()
+            });
+            let ly = std::array::from_fn(|ix| {
+                (0..4).map(|i| c[i][3] * nodes[ix].exp_u64(i as u64)).sum::<Ext>()
+            });
+            fill_grid_from_infinity(&mut grid, lx, ly, c[3][3]);
+            assert_eq!(grid, expected);
+        }
+    }
+
+    /// The round message from `[q(0), q(2), lead(q)]` equals the one from
+    /// `[q(0), q(2), q(4)]` for random cubics `q` and an honest claim.
+    #[test]
+    fn leading_coefficient_message_matches_x4_message() {
+        use slop_algebra::AbstractExtensionField;
+        let mut state = 0x2545_f491u64;
+        let mut ext = || {
+            Ext::from_base_fn(|_| {
+                state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                Felt::from_canonical_u32(((state >> 33) as u32) % 0x7f00_0001)
+            })
+        };
+        for _ in 0..64 {
+            let c = [ext(), ext(), ext(), ext()];
+            let (last, eq_adjustment) = (ext(), ext());
+            let q = |x: Ext| c[0] + x * (c[1] + x * (c[2] + x * c[3]));
+            let e = |x: Ext| (Ext::one() - x) * (Ext::one() - last) + x * last;
+            let p = |x: Ext| e(x) * eq_adjustment * q(x);
+            let claim = p(Ext::zero()) + p(Ext::one());
+            let (two, four) = (Ext::from_canonical_u32(2), Ext::from_canonical_u32(4));
+            let expected =
+                message_from_evals(last, eq_adjustment, claim, [q(Ext::zero()), q(two), q(four)]);
+            let msg = message_from_leading_coefficient(
+                last,
+                eq_adjustment,
+                claim,
+                [q(Ext::zero()), q(two), c[3]],
+            );
+            assert_eq!(msg, expected);
+            assert_eq!(msg.eval_at_point(four), p(four));
+        }
+    }
 
     /// The tuned zerocheck defaults apply on HIP and SYCL but not on CUDA, and the env overrides
     /// work on every backend.
