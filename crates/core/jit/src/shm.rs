@@ -170,8 +170,11 @@ impl Semaphore {
         }
     }
 
+    // `fetch_update` is `try_update` from Rust 1.95 on, which deprecates the old name; the
+    // workspace declares 1.88.
+    #[allow(deprecated)]
     fn try_wait(&self) -> bool {
-        self.count().try_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1)).is_ok()
+        self.count().fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1)).is_ok()
     }
 
     fn post(&self) {

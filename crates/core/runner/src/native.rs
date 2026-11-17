@@ -565,6 +565,9 @@ fn child_exit_error(status: &std::process::ExitStatus, monitor: &MonitorState) -
 /// Test hook: with `SP1_EXECUTOR_KILL_INJECT=N` the memory monitor kills the next `N` executor
 /// children at their first sample, as if over the limit, so that the recovery from a killed
 /// execution can be run end to end. Unset (the default), it does nothing.
+// `fetch_update` is `try_update` from Rust 1.95 on, which deprecates the old name; the workspace
+// declares 1.88.
+#[allow(deprecated)]
 fn take_kill_inject() -> bool {
     static REMAINING: std::sync::OnceLock<AtomicU64> = std::sync::OnceLock::new();
     REMAINING
@@ -572,7 +575,7 @@ fn take_kill_inject() -> bool {
             let n = std::env::var("SP1_EXECUTOR_KILL_INJECT").ok().and_then(|s| s.parse().ok());
             AtomicU64::new(n.unwrap_or(0))
         })
-        .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
         .is_ok()
 }
 
