@@ -144,7 +144,7 @@ gnark's CPU Groth16 prover peaks at ~16 GiB on the v6.1.0 circuit. So:
 | Variable | Default | Effect |
 | --- | --- | --- |
 | `SP1_GROTH16_SLOTS` | one per 48 GiB of RAM in binaries that host the helper; else off | Final wraps at once per host (Groth16 and PLONK); `0` turns the queue off. Every prover on a host must agree. |
-| `SP1_GROTH16_QUEUE_DIR` | `/run/lock` if writable, else `/dev/shm` | Where the slots are. Chosen per process: set it on every prover if they differ in what they can write. |
+| `SP1_GROTH16_QUEUE_DIR` | `/run/lock` if writable, else `/dev/shm` (or `SP1_SHM_DIR`) | Where the slots are. Chosen per process: set it on every prover if they differ in what they can write. |
 | `SP1_GROTH16_CPU_HELPER` | this binary, then `groth16_cpu_helper` beside it or on `PATH` | The CPU helper to run; a wrong path is an error. |
 | `SP1_GROTH16_IN_PROCESS` | off | `1`/`true`: prove in-process, keeping ~12 GiB cached for the next proof. |
 | `SP1_GROTH16_HELPER_TIMEOUT_SECS` | 1800 | Kills a hung wrap helper (Groth16 or PLONK); `0` for no limit. |
@@ -152,7 +152,8 @@ gnark's CPU Groth16 prover peaks at ~16 GiB on the v6.1.0 circuit. So:
 | `SP1_GROTH16_GPU` | decided per proof | `1`/`true` forces the GPU prover, `0`/`false` the CPU prover. |
 | `SP1_GROTH16_GPU_HELPER` | beside the binary, then `PATH` | `groth16_gpu_helper` (`--features native,cuda`). |
 | `SP1_GROTH16_STREAM_SRS` | on below 20 GiB of GPU memory | `1`/`true`: the GPU prover uploads each G1 point set for its MSM and frees it after, instead of keeping all four (~4 GB) on the card; its peak drops enough to run beside the shard prover on a 16 GB card. `0`/`false` keeps them. |
-| `SP1_GROTH16_PK_CACHE`, `_DISABLE` | `/dev/shm` | The GPU prover's proving key (~9 GB, exported once). |
+| `SP1_GROTH16_PK_CACHE`, `_DISABLE` | `/dev/shm` (or `SP1_SHM_DIR`) | The GPU prover's proving key (~9 GB, exported once). |
+| `SP1_SHM_DIR` | `/dev/shm` | Stands in for `/dev/shm` wherever the final-wrap provers use it: their caches' default root (`SP1_GROTH16_PK_CACHE`, `SP1_GPU_R1CS_PREP_CACHE`, `SP1_PLONK_GPU_CACHE`, `SP1_GPU_PLONK_PREP_CACHE`), the queue's fallback, and every proof's own files (witnesses, the GPU helper's FIFOs), which then go there even beside a cache placed elsewhere. A private directory keeps each process's proof files to itself. The executor's shared memory never uses `/dev/shm`. |
 | `SP1_GPU_RESET_BEFORE_WRAP` | off | `1`/`true`: reset the GPU before a GPU wrap helper that would not fit otherwise. Only for a process that exits after its proof: after a reset it refuses to prove again. |
 | `GOMEMLIMIT` | set per helper where memory is short | An operator's value is kept, and applies to this process's own Go runtime too. |
 

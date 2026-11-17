@@ -2,7 +2,8 @@
 //! directories beside them.
 //!
 //! The Groth16 provers derive large, deterministic files from a circuit, keyed by its vkey hash:
-//! - the GPU-format proving key (~9 GB, minutes to export), by default under `/dev/shm`;
+//! - the GPU-format proving key (~9 GB, minutes to export), by default under `/dev/shm` (or
+//!   `SP1_SHM_DIR`, see [`default_root`]);
 //! - the GPU R1CS solver's prep-circuit artifacts, likewise;
 //! - the CPU prover's stripped circuit (~1.5 GB), on disk beside the circuit artifacts.
 //!
@@ -275,11 +276,12 @@ pub(crate) fn proof_tempdir(root: Option<&Path>, prefix: &str) -> Result<ProofDi
 
 /// [`proof_tempdir`] beside the cache at `cache`, where the cache's root (`SP1_GROTH16_PK_CACHE`,
 /// `SP1_PLONK_GPU_CACHE`) puts the GPU path's large files: out of a small `/dev/shm`, say. Under
-/// the default root without a cache (it is disabled), or where none can be made beside it (a
-/// cache mounted read-only, say). The default root is swept too, of directories made there before
-/// the cache moved, or by such a fallback.
+/// the default root without a cache (it is disabled), where none can be made beside it (a cache
+/// mounted read-only, say), or where `SP1_SHM_DIR` names the place for each proof's files. The
+/// default root is swept too, of directories made there before the cache moved, or by such a
+/// fallback.
 pub(crate) fn proof_tempdir_beside(cache: Option<&Path>, prefix: &str) -> Result<ProofDir> {
-    let Some(root) = cache.and_then(Path::parent) else {
+    let Some(root) = beside_root(cache, shm_dir().is_some()) else {
         return proof_tempdir(None, prefix);
     };
     if root != default_root() {
@@ -289,6 +291,12 @@ pub(crate) fn proof_tempdir_beside(cache: Option<&Path>, prefix: &str) -> Result
         tracing::warn!("{e:#}; using {} instead", default_root().display());
         proof_tempdir(None, prefix)
     })
+}
+
+/// Where [`proof_tempdir_beside`] makes a proof's directory: beside the cache at `cache`, unless
+/// there is none or `SP1_SHM_DIR` is set (`shm_dir_set`). `None` is the default root.
+fn beside_root(cache: Option<&Path>, shm_dir_set: bool) -> Option<&Path> {
+    cache.and_then(Path::parent).filter(|_| !shm_dir_set)
 }
 
 /// Removes `<root>/<prefix><pid>_*` directories that their owners have abandoned: this host's (or
@@ -352,15 +360,34 @@ fn host_tag() -> Option<&'static str> {
     .as_deref()
 }
 
-/// `/dev/shm` where it exists, otherwise the system temp directory: where the GPU path's large
-/// per-circuit caches and per-proof files go unless configured otherwise.
+/// Where the GPU path's large per-circuit caches and per-proof files go unless configured
+/// otherwise: `SP1_SHM_DIR` if set, else `/dev/shm` where it exists, else the system temp
+/// directory.
+///
+/// `SP1_SHM_DIR` replaces `/dev/shm` everywhere the final-wrap provers would use it: as this
+/// default, and for every proof's own files (witnesses, the GPU helper's FIFOs) even where a
+/// cache's own variable puts the cache elsewhere. A process given one of its own, such as a
+/// private temporary directory, then shares none of its proofs' files with another process.
 pub(crate) fn default_root() -> PathBuf {
+    default_root_from(shm_dir())
+}
+
+/// [`default_root`], given `SP1_SHM_DIR`.
+fn default_root_from(shm_dir: Option<PathBuf>) -> PathBuf {
+    if let Some(dir) = shm_dir {
+        return dir;
+    }
     let shm = Path::new("/dev/shm");
     if shm.is_dir() {
         shm.to_path_buf()
     } else {
         std::env::temp_dir()
     }
+}
+
+/// `SP1_SHM_DIR`, if set (see [`default_root`]).
+fn shm_dir() -> Option<PathBuf> {
+    std::env::var_os("SP1_SHM_DIR").filter(|dir| !dir.is_empty()).map(PathBuf::from)
 }
 
 fn parent_and_name(dir: &Path) -> Result<(&Path, String)> {
@@ -429,6 +456,21 @@ mod tests {
             .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
             .filter(|n| n.contains(".staging."))
             .collect()
+    }
+
+    /// `SP1_SHM_DIR` stands in for `/dev/shm`: as the default root, and for every proof's own
+    /// directory, even beside a cache placed elsewhere.
+    #[test]
+    fn the_shm_dir_replaces_dev_shm() {
+        let mine = PathBuf::from("/somewhere/private");
+        assert_eq!(default_root_from(Some(mine.clone())), mine);
+        let unset = default_root_from(None);
+        assert!(unset == Path::new("/dev/shm") || unset == std::env::temp_dir(), "{unset:?}");
+
+        let cache = Path::new("/caches/sp1_groth16_pk_cache_00");
+        assert_eq!(beside_root(Some(cache), false), Some(Path::new("/caches")));
+        assert_eq!(beside_root(Some(cache), true), None);
+        assert_eq!(beside_root(None, false), None);
     }
 
     #[test]

@@ -66,6 +66,19 @@ impl<T: Copy> MaybeCowMemory<T> {
         }
     }
 
+    /// zk-miner: host resident bytes committed by the allocated page table(s) — the RSS proxy the
+    /// in-band memory limit bounds. In COW mode both the forked copy and the shared original hold
+    /// pages, so both count.
+    #[inline]
+    fn allocated_bytes(&self) -> u64 {
+        match self {
+            Self::Cow { copy, original } => {
+                copy.allocated_bytes().saturating_add(original.allocated_bytes())
+            }
+            Self::Owned { memory } => memory.allocated_bytes(),
+        }
+    }
+
     /// Get an entry for the given address.
     pub fn entry(&mut self, addr: u64) -> (Entry<'_, T>, bool) {
         assert!(addr.is_multiple_of(8), "Address must be a multiple of 8");
@@ -158,6 +171,10 @@ pub struct LimitedMemory<T: Copy> {
     // When last error exists, all read / write operation will be
     // redirected to this dummy value.
     dummy_value: T,
+    // zk-miner: the memory limit in BYTES, enforced against the allocated PAGE bytes (host RSS), not
+    // the per-entry counter in `limiter` — a sparse-touch guest commits ~6 MiB of RSS per touched page
+    // while adding ~1 to the entry counter, so the entry counter never bounds its RSS. `None` = no limit.
+    memory_limit_bytes: Option<u64>,
 }
 
 fn c(last_error: &RefCell<Option<ExecutionError>>, result: Result<(), ExecutionError>) {
@@ -176,6 +193,22 @@ impl<T: Copy + Default> LimitedMemory<T> {
             before_cow: None,
             last_error: None.into(),
             dummy_value: T::default(),
+            memory_limit_bytes: memory_limit,
+        }
+    }
+
+    /// zk-miner: trip `TooMuchMemory` once the allocated page table commits more host RSS than the
+    /// memory limit. Called once per instruction from the chunk loop (where `self.memory` is not
+    /// mutably borrowed); O(1) (`page_table.len()`). Sets the sticky `last_error`, so the chunk loop
+    /// surfaces it as an in-band decline with the worker ALIVE — the same clean `TooMuchMemory` the
+    /// native executor's RSS monitor produced, instead of leaving the balloon for the worker's
+    /// process-level self-guard to contain by aborting. Idempotent; honours the error short-circuit.
+    #[inline]
+    pub fn enforce_page_limit(&self) {
+        if let Some(limit) = self.memory_limit_bytes {
+            if self.memory.allocated_bytes() > limit {
+                c(&self.last_error, Err(ExecutionError::TooMuchMemory()));
+            }
         }
     }
 

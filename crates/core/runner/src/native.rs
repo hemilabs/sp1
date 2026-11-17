@@ -6,14 +6,17 @@ use sp1_core_executor::{
 use sp1_core_executor_runner_binary::{Input, Output};
 use sp1_jit::{
     memory::SharedMemory,
-    shm::{ShmTraceRing, TraceResult},
+    shm::{send_fds, ShmTraceRing, TraceResult},
     trace_capacity, MemValue, MinimalTrace, TraceChunkRaw,
 };
 use sp1_primitives::consts::MAX_JIT_LOG_ADDR;
 use std::{
     collections::VecDeque,
     io::{BufRead, BufReader, BufWriter, Write},
-    os::unix::process::ExitStatusExt,
+    os::{
+        fd::{AsFd, OwnedFd},
+        unix::{net::UnixStream, process::ExitStatusExt},
+    },
     process::{Child, Command, Stdio},
     ptr::NonNull,
     sync::{
@@ -62,7 +65,7 @@ impl MinimalExecutorRunner {
         memory_limit: u64,
         shm_slot_size: usize,
     ) -> Self {
-        let id = new_shm_id();
+        let id = new_run_id();
         let input = Input {
             program,
             is_debug,
@@ -159,13 +162,21 @@ impl MinimalExecutorRunner {
         }
 
         if self.process.is_none() {
+            // The child's stdin is one end of a Unix socket pair. Through it go the descriptors
+            // of the memory it shares with this process, first, which it has no other way to
+            // open (the memory has no name, and this process holds it close-on-exec), then its
+            // input.
+            let (stdin, child_stdin) = UnixStream::pair().map_err(|e| {
+                ExecutionError::Other(format!("failed to create the child's stdin: {e}"))
+            })?;
+            let mut command = Command::new(crate::binary::get_binary_path());
+            command.stdin(Stdio::from(OwnedFd::from(child_stdin)));
+
             // Start the process
             let memory_limit = if take_kill_inject() { 0 } else { self.input.memory_limit };
-            let (mut child, monitor) =
-                spawn_restricted(Command::new(crate::binary::get_binary_path()), memory_limit)
-                    .map_err(|e| {
-                        ExecutionError::Other(format!("failed to spawn child process: {e}"))
-                    })?;
+            let (mut child, monitor) = spawn_restricted(command, memory_limit).map_err(|e| {
+                ExecutionError::Other(format!("failed to spawn child process: {e}"))
+            })?;
 
             // Start draining stderr before sending input. The input write is blocking, so a
             // child that fills its stderr pipe first would deadlock the exchange; draining
@@ -182,16 +193,22 @@ impl MinimalExecutorRunner {
                 }
             });
 
-            // Send the program input. If the child died during startup (e.g. OOM-killed) the
-            // pipe breaks; surface its exit cause instead of panicking on the write.
+            // Send the shared memory and the program input. If the child died during startup
+            // (e.g. OOM-killed) the socket breaks; surface its exit cause instead of panicking on
+            // the write. Then the socket is closed, as the pipe was.
             let send_result = {
-                let stdin = child.stdin.take().expect("open stdin");
-                let mut writer = BufWriter::new(stdin);
-                match bincode::serialize_into(&mut writer, &self.input) {
-                    Ok(()) => writer.flush().map_err(|e| e.to_string()),
-                    Err(e) => Err(e.to_string()),
-                }
+                let fds: Vec<_> = std::iter::once(self.memory.as_fd())
+                    .chain(self.consumer.as_ref().map(AsFd::as_fd))
+                    .collect();
+                send_fds(stdin.as_fd(), &fds).map_err(|e| e.to_string()).and_then(|()| {
+                    let mut writer = BufWriter::new(&stdin);
+                    match bincode::serialize_into(&mut writer, &self.input) {
+                        Ok(()) => writer.flush().map_err(|e| e.to_string()),
+                        Err(e) => Err(e.to_string()),
+                    }
+                })
             };
+            drop(stdin);
             if let Err(send_err) = send_result {
                 // The write almost always fails because the child already died. Kill defensively
                 // in case it didn't, so the reap can't block; then collect its exit status and logs.
@@ -252,6 +269,20 @@ impl MinimalExecutorRunner {
                         self.output = Some(Err(error.clone()));
                         return Err(error);
                     }
+                    TraceResult::Invalid(what) => {
+                        // What the runner wrote is out of step with the ring and cannot be used, so
+                        // its run ends here, with its logs.
+                        let (mut child, log_thread, monitor) = self.process.take().unwrap();
+                        monitor.stop.store(true, Ordering::SeqCst);
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        log_thread.join().expect("wait for log thread to finish");
+                        let error = ExecutionError::Other(format!(
+                            "the executor runner broke the trace ring's protocol: {what}"
+                        ));
+                        self.output = Some(Err(error.clone()));
+                        return Err(error);
+                    }
                     TraceResult::Timeout => {
                         // Consumer times out, we will need to check if child process is still running.
                         if let Some(status) =
@@ -268,7 +299,7 @@ impl MinimalExecutorRunner {
                             log_thread.join().expect("wait for log thread to finish");
                             // Child process is terminated, let's find out why
                             if status.signal() == Some(libc::SIGBUS) {
-                                tracing::warn!("SIGBUS signal is received, there is a chance /dev/shm is full!");
+                                tracing::warn!("SIGBUS signal is received, there is a chance the host ran out of memory for the shared memory!");
                             }
                             let error = child_exit_error(&status, &monitor);
                             self.output = Some(Err(error.clone()));
@@ -439,11 +470,9 @@ impl MinimalExecutorRunner {
         // Like the JIT executor's reset: the next run reads only the input it is given.
         self.input.input.clear();
 
-        // Recreate the shared memory and the trace ring under a fresh id. Under the old id the
-        // new objects would be the old ones' names, and dropping the old owners (when the fields
-        // are overwritten below, or later by a trace chunk still holding the ring) would unlink
-        // them, so the next child could not open them.
-        self.input.id = new_shm_id();
+        // New shared memory and trace ring for the next child, and a fresh id for its logs. The
+        // old ones go when nothing holds them (a trace chunk may still hold the old ring).
+        self.input.id = new_run_id();
         let (memory, consumer) = create(&self.input);
         self.memory = memory;
         self.consumer = consumer;
@@ -468,8 +497,8 @@ fn redirect_output(consumers: &OutputConsumers, line: &str) -> bool {
     publish_output_line(sender, content)
 }
 
-/// A new, process-unique id for the shared memory objects of an executor.
-fn new_shm_id() -> String {
+/// A new, process-unique id for a run of the executor, which names it in logs.
+fn new_run_id() -> String {
     format!("sp1_{}", URL_SAFE.encode(uuid::Uuid::new_v4().as_bytes()))
 }
 
@@ -479,13 +508,13 @@ fn create(input: &Input) -> (SharedMemory, Option<ShmTraceRing>) {
     let transpiler =
         MinimalTranspiler::new(input.max_memory_size, input.is_debug, input.max_trace_size);
     let memory_buffer_size = transpiler.memory_buffer_size();
-    let memory = SharedMemory::create_readonly(&input.id, memory_buffer_size)
-        .expect("create shm file for memory");
+    let memory =
+        SharedMemory::create_readonly(memory_buffer_size).expect("create shm file for memory");
 
     let trace_buf_size = trace_capacity(input.max_trace_size);
     let consumer = if trace_buf_size > 0 {
         Some(
-            ShmTraceRing::create(&input.id, input.shm_slot_size, trace_buf_size)
+            ShmTraceRing::create(input.shm_slot_size, trace_buf_size)
                 .expect("create shm file for traces"),
         )
     } else {
@@ -536,6 +565,9 @@ fn child_exit_error(status: &std::process::ExitStatus, monitor: &MonitorState) -
 /// Test hook: with `SP1_EXECUTOR_KILL_INJECT=N` the memory monitor kills the next `N` executor
 /// children at their first sample, as if over the limit, so that the recovery from a killed
 /// execution can be run end to end. Unset (the default), it does nothing.
+// `fetch_update` is `try_update` from Rust 1.95 on, which deprecates the old name; the workspace
+// declares 1.88.
+#[allow(deprecated)]
 fn take_kill_inject() -> bool {
     static REMAINING: std::sync::OnceLock<AtomicU64> = std::sync::OnceLock::new();
     REMAINING
@@ -543,16 +575,17 @@ fn take_kill_inject() -> bool {
             let n = std::env::var("SP1_EXECUTOR_KILL_INJECT").ok().and_then(|s| s.parse().ok());
             AtomicU64::new(n.unwrap_or(0))
         })
-        .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
         .is_ok()
 }
 
-/// Spawns a process with piped I/O and an RSS memory monitor thread.
+/// Spawns a process with piped output (its stdin is the caller's to set) and an RSS memory
+/// monitor thread.
 fn spawn_restricted(
     mut cmd: Command,
     limit_bytes: u64,
 ) -> std::io::Result<(Child, Arc<MonitorState>)> {
-    cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
 
     // Disable core dumps for the child by temporarily zeroing RLIMIT_CORE in the
     // parent (inherited via posix_spawn). Avoids pre_exec which forces fork().

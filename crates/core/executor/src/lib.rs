@@ -25,6 +25,13 @@
 #[allow(missing_docs)]
 pub mod build;
 
+/// Whether THIS build selected the native x86-64 JIT executor. Mirrors the `sp1_use_native_executor`
+/// cfg that `build::detect_executor` emits, exposed as a plain const so a downstream (the zk-miner
+/// worker) can assert at startup that it got the intended, uniform execution path — i.e. that the
+/// `SP1_USE_PORTABLE_EXECUTOR` build-time switch took effect — rather than discovering a divergent
+/// build at runtime. `false` on every build that runs the portable executor.
+pub const USES_NATIVE_X86_EXECUTOR: bool = cfg!(sp1_use_native_executor);
+
 mod air;
 mod context;
 mod debug;
@@ -87,12 +94,12 @@ pub use state::*;
 pub use utils::*;
 
 pub use sp1_hypercube::SP1RecursionProof;
-/// For a process that exits without running destructors: see [`sp1_jit::shm::unlink_owned_shm`].
+/// Nothing to do, kept for callers: see [`sp1_jit::shm::unlink_owned_shm`].
 #[cfg(unix)]
 pub use sp1_jit::shm::unlink_owned_shm;
 
-/// No-op: POSIX shared memory (and so `sp1_jit::shm`) exists only on unix, so there is nothing
-/// to unlink here.
+/// No-op: the executor's shared memory (`sp1_jit::shm`) exists only on unix, and has no names to
+/// remove there either.
 #[cfg(not(unix))]
 pub fn unlink_owned_shm() {}
 

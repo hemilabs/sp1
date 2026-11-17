@@ -62,6 +62,18 @@ pub struct MinimalExecutor<M: ExecutionMode> {
     next_clk: u64,
     exit_code: u32,
     max_trace_size: Option<u64>,
+    /// zk-miner: optional cycle-based trace-chunk cut, honouring the native runner's
+    /// `set_max_chunk_cycles` API. When `Some(m)`, a chunk is also closed once `m` global cycles have
+    /// elapsed since the previous chunk boundary, in addition to the trace-size cut. (Not bit-exact
+    /// with native, which cuts only at jump/ecall boundaries; portable may cut after any instruction.
+    /// Still proof-neutral under a fleet-wide-portable deployment: splicing re-forms byte-identical
+    /// shards regardless of where chunks are cut.)
+    /// This lets the proving path cut the FIRST chunk early (as native does at 2^23) so the GPU
+    /// pipeline starts sooner; splicing re-forms byte-identical shards regardless of cadence, so it
+    /// is proof-neutral. `None` (the default, and the measure/gas path) is a cheap no-op.
+    max_chunk_cycles: Option<u64>,
+    /// `global_clk` at the start of the current trace chunk; the cycle-cut compares against it.
+    chunk_start_global_clk: u64,
     public_values_stream: Vec<u8>,
     public_value_digest: [u32; PUBLIC_VALUE_DIGEST_WORDS],
     hints: Vec<(u64, Vec<u8>)>,
@@ -411,6 +423,33 @@ impl<M: ExecutionMode> SyscallContext for MinimalExecutor<M> {
 }
 
 impl<M: ExecutionMode> MinimalExecutor<M> {
+    /// zk-miner: set the optional cycle-based trace-chunk cut (parity with the native runner).
+    /// `Some(0)` is treated as `None` (disabled), matching the native runner's filter.
+    #[inline]
+    pub fn set_max_chunk_cycles(&mut self, cycles: Option<u64>) {
+        self.max_chunk_cycles = cycles.filter(|&c| c > 0);
+    }
+
+    /// zk-miner: whether the current chunk has run at least `max_chunk_cycles` cycles since its
+    /// start. Cheap `None` short-circuit on the measure/gas path and whenever the cut is disabled.
+    #[allow(clippy::inline_always)]
+    #[inline(always)]
+    fn check_chunk_cycles_exceeded(&self) -> bool {
+        // chunk_start_global_clk must always track <= global_clk (it is re-anchored at every chunk
+        // boundary; global_clk is monotonic). If a future reset()/executor-reuse path (today reset()
+        // is `todo!()` and the cache-reuse path is gated off for per-submitter ELFs) zeroes global_clk
+        // without zeroing chunk_start_global_clk, the wrapping_sub below would underflow to a huge
+        // value and cut EVERY instruction. Catch that regression in debug/test builds.
+        debug_assert!(
+            self.chunk_start_global_clk <= self.global_clk,
+            "chunk_start_global_clk ({}) > global_clk ({}): reset both together",
+            self.chunk_start_global_clk,
+            self.global_clk
+        );
+        matches!(self.max_chunk_cycles, Some(m)
+            if self.global_clk.wrapping_sub(self.chunk_start_global_clk) >= m)
+    }
+
     /// Create a new minimal executor with memory limit. This shall only be used
     /// by `sp1_core_executor_runner`.
     #[must_use]
@@ -448,6 +487,8 @@ impl<M: ExecutionMode> MinimalExecutor<M> {
             page_prots,
             traces: None,
             max_trace_size,
+            max_chunk_cycles: None,
+            chunk_start_global_clk: 0,
             public_values_stream: Vec::new(),
             public_value_digest: [0; PUBLIC_VALUE_DIGEST_WORDS],
             hints: Vec::new(),
@@ -984,6 +1025,9 @@ macro_rules! impl_execute_chunk {
         /// Execute the program. Returning a trace chunk if the program has not completed.
         #[allow(clippy::redundant_closure_for_method_calls)]
         pub fn try_execute_chunk(&mut self) -> Result<Option<TraceChunkRaw>, ExecutionError> {
+            // zk-miner: in-band host-RSS limit — trip TooMuchMemory on the page bytes allocated by
+            // the previous chunk's final instruction (see LimitedMemory::enforce_page_limit).
+            self.memory.enforce_page_limit();
             if self.memory.has_last_error() {
                 return Err(self.memory.last_error());
             }
@@ -1007,6 +1051,9 @@ macro_rules! impl_execute_chunk {
             }
 
             while !self.execute_instruction() {
+                // zk-miner: in-band host-RSS limit, checked each instruction (O(1)); a ballooning
+                // guest declines as a clean TooMuchMemory with the worker alive, not via a crash.
+                self.memory.enforce_page_limit();
                 if self.memory.has_last_error() {
                     return Err(self.memory.last_error());
                 }
@@ -1064,7 +1111,14 @@ impl MinimalExecutor<crate::SupervisorMode> {
         }
 
         self.post_instruction_update();
-        self.is_done() || self.check_trace_buffer_exceeded()
+        // zk-miner: close the chunk on is_done / trace-size / cycle-cut (parity with native). On any
+        // chunk boundary, re-anchor the per-chunk cycle counter so the next chunk measures from here.
+        let stop =
+            self.is_done() || self.check_trace_buffer_exceeded() || self.check_chunk_cycles_exceeded();
+        if stop {
+            self.chunk_start_global_clk = self.global_clk;
+        }
+        stop
     }
 
     #[inline]
@@ -1189,7 +1243,14 @@ impl MinimalExecutor<crate::UserMode> {
         }
 
         self.post_instruction_update();
-        self.is_done() || self.check_trace_buffer_exceeded()
+        // zk-miner: close the chunk on is_done / trace-size / cycle-cut (parity with native). On any
+        // chunk boundary, re-anchor the per-chunk cycle counter so the next chunk measures from here.
+        let stop =
+            self.is_done() || self.check_trace_buffer_exceeded() || self.check_chunk_cycles_exceeded();
+        if stop {
+            self.chunk_start_global_clk = self.global_clk;
+        }
+        stop
     }
 
     /// Execute a load instruction with page protection checking.

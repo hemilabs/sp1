@@ -21,20 +21,14 @@ use sp1_recursion_compiler::{
 /// prover's memory pool gives its idle reserve back (~25 GiB free on an RTX 5090).
 pub const PLONK_GPU_HELPER_VRAM_BYTES: u64 = 23 << 30;
 
-/// Create a temp directory in /dev/shm (tmpfs) on Linux, falling back to the
-/// default temp dir on other platforms. Mirrors the helper in groth16_bn254.rs.
+/// Create a temp directory in /dev/shm (tmpfs) where it exists, or `SP1_SHM_DIR`, falling back
+/// to the default temp dir (see `gpu_cache::default_root`). Mirrors the helper in groth16_bn254.rs.
 #[cfg(feature = "native")]
 fn shm_tempdir() -> tempfile::TempDir {
-    #[cfg(target_os = "linux")]
-    {
-        let shm = std::path::Path::new("/dev/shm");
-        if shm.exists() {
-            return tempfile::Builder::new()
-                .tempdir_in(shm)
-                .expect("failed to create temp dir in /dev/shm");
-        }
-    }
-    tempfile::TempDir::new().expect("failed to create temp dir")
+    let root = crate::gpu_cache::default_root();
+    tempfile::Builder::new()
+        .tempdir_in(&root)
+        .unwrap_or_else(|e| panic!("failed to create temp dir in {}: {e}", root.display()))
 }
 
 /// Whether this process has the CUDA runtime loaded (`gpu_device::runtime_name`; false off
@@ -54,14 +48,10 @@ fn plonk_gpu_cache_dir(vkey_hash_hex: &str) -> Option<std::path::PathBuf> {
     if std::env::var_os("SP1_PLONK_GPU_CACHE_DISABLE").is_some() {
         return None;
     }
-    let root = std::env::var("SP1_PLONK_GPU_CACHE").ok().unwrap_or_else(|| {
-        if std::path::Path::new("/dev/shm").exists() {
-            "/dev/shm".to_string()
-        } else {
-            std::env::temp_dir().to_string_lossy().into_owned()
-        }
-    });
-    Some(std::path::PathBuf::from(root).join(format!("sp1_plonk_gpu_cache_{vkey_hash_hex}")))
+    let root = std::env::var_os("SP1_PLONK_GPU_CACHE")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(crate::gpu_cache::default_root);
+    Some(root.join(format!("sp1_plonk_gpu_cache_{vkey_hash_hex}")))
 }
 
 /// [`plonk_gpu_cache_dir`] for the circuit in `build_dir`. `None` too where its vk is unreadable.
@@ -248,14 +238,10 @@ fn plonk_prep_cache_dir(vkey_hash_hex: &str) -> Option<std::path::PathBuf> {
     if std::env::var_os("SP1_GPU_PLONK_PREP_CACHE_DISABLE").is_some() {
         return None;
     }
-    let root = std::env::var("SP1_GPU_PLONK_PREP_CACHE").ok().unwrap_or_else(|| {
-        if std::path::Path::new("/dev/shm").exists() {
-            "/dev/shm".to_string()
-        } else {
-            std::env::temp_dir().to_string_lossy().into_owned()
-        }
-    });
-    Some(std::path::PathBuf::from(root).join(format!("sp1_plonk_prep_circuit_{vkey_hash_hex}")))
+    let root = std::env::var_os("SP1_GPU_PLONK_PREP_CACHE")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(crate::gpu_cache::default_root);
+    Some(root.join(format!("sp1_plonk_prep_circuit_{vkey_hash_hex}")))
 }
 
 #[cfg(feature = "native")]

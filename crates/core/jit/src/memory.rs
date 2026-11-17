@@ -4,7 +4,7 @@ use std::{
     fs::File,
     io,
     ops::{Deref, DerefMut},
-    os::fd::AsRawFd,
+    os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd},
 };
 
 /// JIT memory fulfilled using anonymous memory
@@ -94,18 +94,23 @@ fn create_anonymous_file(size: usize) -> File {
     unsafe { File::from_raw_fd(fd) }
 }
 
-/// JIT memory fulfilled using shared memory
+/// JIT memory fulfilled using shared memory: the native executor's memory, which it shares with
+/// the runner process it starts.
 pub struct SharedMemory {
     handle: Option<ShmMemory>,
 }
 
 impl SharedMemory {
-    pub fn create_readonly(id: &str, memory_size: usize) -> io::Result<Self> {
-        Ok(Self { handle: Some(ShmMemory::create_readonly(id, memory_size)?) })
+    /// New memory of `memory_size` bytes, mapped read-only here. The runner maps it read-write
+    /// from its descriptor ([`AsFd`]), handed to it with `shm::send_fds`.
+    pub fn create_readonly(memory_size: usize) -> io::Result<Self> {
+        Ok(Self { handle: Some(ShmMemory::create_readonly(memory_size)?) })
     }
 
-    pub fn open_readwrite(&mut self, id: &str) -> io::Result<()> {
-        self.handle = Some(ShmMemory::open_readwrite(id)?);
+    /// Maps, read-write, the memory [`Self::create_readonly`] made in the process that started
+    /// this one, from the descriptor it handed over.
+    pub fn open_readwrite(&mut self, fd: OwnedFd) -> io::Result<()> {
+        self.handle = Some(ShmMemory::from_fd_readwrite(fd)?);
         Ok(())
     }
 }
@@ -113,6 +118,12 @@ impl SharedMemory {
 impl AsRawFd for SharedMemory {
     fn as_raw_fd(&self) -> i32 {
         self.handle.as_ref().unwrap().as_raw_fd()
+    }
+}
+
+impl AsFd for SharedMemory {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        self.handle.as_ref().unwrap().as_fd()
     }
 }
 
