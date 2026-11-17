@@ -76,6 +76,9 @@ pub enum TraceResult {
     Finished,              // Clean Exit
     Crashed(CrashDetails), // Dirty Exit (Segfault)
     Timeout,               // No Data yet
+    /// The producer broke the ring's protocol (its indices say it wrote slots it could not have):
+    /// its run is not used, and nothing of the ring was handed out.
+    Invalid(&'static str),
 }
 
 // --- SEMAPHORES ---
@@ -384,14 +387,31 @@ pub fn recv_fds(socket: BorrowedFd<'_>) -> io::Result<Vec<OwnedFd>> {
 }
 
 // --- THE RING ---
+//
+// The header is in memory both processes map read-write, so neither relies on it for what it knows:
+// each process keeps the ring's geometry (`capacity`, `slot_size`) from its own `create`/`from_fd`,
+// and the consumer keeps its own count of the slots it has taken and given back: it reads only
+// `write_idx` and `finished` from the header, checks `write_idx` against its own counts, and reads
+// only within its own mapping, whatever the header says.
 
 struct InnerRing {
     file: File,
-    _mmap: MmapMut,
+    mmap: MmapMut,
     header: *mut RingHeader,
     data_start: *mut u8,
+    /// Slots in the ring, as this process made or opened it.
+    capacity: usize,
+    /// Bytes per slot (rounded up to 2 MB), as this process made or opened it.
+    slot_size: usize,
     sem_filled: Semaphore,
     sem_empty: Semaphore,
+
+    /// The consumer's own index of the next slot it hands out (`reserved_idx` in the header is a
+    /// copy of it).
+    reserved: AtomicUsize,
+    /// The consumer's own index of the oldest slot still held (`read_idx` in the header is a copy
+    /// of it). Advanced only under `pending_completions`.
+    read: AtomicUsize,
 
     // Reorder Buffer: Stores indices that are finished but waiting for sequential gap to close.
     pending_completions: Mutex<BinaryHeap<Reverse<usize>>>,
@@ -466,17 +486,18 @@ impl InnerRing {
         // Push completion to heap
         heap.push(Reverse(completed_idx));
 
-        let mut current_read = unsafe { (*self.header).read_idx.load(Ordering::Acquire) };
+        let mut current_read = self.read.load(Ordering::Acquire);
 
         // Drain sequential items
         while let Some(Reverse(min_idx)) = heap.peek() {
             if *min_idx == current_read {
                 heap.pop();
+                current_read = current_read.wrapping_add(1);
+                self.read.store(current_read, Ordering::Release);
                 unsafe {
-                    (*self.header).read_idx.fetch_add(1, Ordering::Release);
+                    (*self.header).read_idx.store(current_read, Ordering::Release);
                 }
                 self.sem_empty.post();
-                current_read += 1;
             } else {
                 break;
             }
@@ -514,10 +535,19 @@ impl ShmTraceRing {
     }
 
     fn init(file: File, capacity: usize, slot_size: usize, is_owner: bool) -> io::Result<Self> {
+        if capacity == 0 || slot_size == 0 {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "an empty trace ring"));
+        }
         // Force 2MB Alignment
         let aligned_size = (slot_size + HUGE_PAGE_SIZE - 1) & !(HUGE_PAGE_SIZE - 1);
 
         let mut mmap = unsafe { MmapMut::map_mut(&file)? };
+        if mmap.len() != Self::total_size(capacity, slot_size) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "the trace ring is not its size",
+            ));
+        }
 
         #[cfg(target_os = "linux")]
         unsafe {
@@ -566,11 +596,15 @@ impl ShmTraceRing {
         Ok(Self {
             inner: Arc::new(InnerRing {
                 file,
-                _mmap: mmap,
+                mmap,
                 header,
                 data_start,
+                capacity,
+                slot_size: aligned_size,
                 sem_filled,
                 sem_empty,
+                reserved: AtomicUsize::new(0),
+                read: AtomicUsize::new(0),
                 pending_completions: Mutex::new(BinaryHeap::new()),
             }),
         })
@@ -590,8 +624,9 @@ impl ShmTraceRing {
     }
 
     fn claim_write_slot(&self) -> ProducerGuard {
-        let (w, _, cap, size) = unsafe { self.load_state() };
-        let slot_idx = w % cap;
+        let w = unsafe { (*self.inner.header).write_idx.load(Ordering::Relaxed) };
+        let size = self.inner.slot_size;
+        let slot_idx = w % self.inner.capacity;
         let offset = slot_idx * size;
 
         unsafe {
@@ -665,7 +700,7 @@ impl ShmTraceRing {
                     // It is finished, but maybe semaphore count is off or we are perfectly caught up?
                     // Check if there is data left.
                     let w = (*self.inner.header).write_idx.load(Ordering::Acquire);
-                    let r = (*self.inner.header).reserved_idx.load(Ordering::Acquire);
+                    let r = self.inner.reserved.load(Ordering::Acquire);
                     if w == r {
                         return TraceResult::Finished;
                     }
@@ -690,22 +725,37 @@ impl ShmTraceRing {
     }
 
     fn claim_read_slot(&self) -> TraceResult {
+        let inner = &*self.inner;
         unsafe {
-            let h = self.inner.header;
+            let h = inner.header;
 
             // CRASH CHECK PRIORITY
             if (*h).finished.load(Ordering::Acquire) == 2 {
                 let details = (*h).crash_details;
-                self.inner.sem_filled.post(); // Wake others
+                inner.sem_filled.post(); // Wake others
                 return TraceResult::Crashed(details);
             }
 
+            // The header's copy of the geometry is the owner's, written before the producer had the
+            // ring, and nothing writes it again: a producer that did broke the protocol.
+            let geometry = (
+                std::ptr::read_volatile(&raw const (*h).capacity),
+                std::ptr::read_volatile(&raw const (*h).slot_size),
+            );
+            if geometry != (inner.capacity, inner.slot_size) {
+                return TraceResult::Invalid("the trace ring's header does not match its geometry");
+            }
+
+            // `write_idx` is the producer's word; everything else here is this process's own. Read
+            // it first: the producer cannot have written further than `capacity` slots past the
+            // oldest slot this process still holds, which only grows after this read.
             let w = (*h).write_idx.load(Ordering::Acquire);
-            let current_reserved = (*h).reserved_idx.load(Ordering::Acquire);
+            let read = inner.read.load(Ordering::Acquire);
+            let current_reserved = inner.reserved.load(Ordering::Acquire);
 
             if w == current_reserved {
                 if (*h).finished.load(Ordering::Acquire) == 1 {
-                    self.inner.sem_filled.post(); // Wake others
+                    inner.sem_filled.post(); // Wake others
                     return TraceResult::Finished;
                 }
 
@@ -714,13 +764,25 @@ impl ShmTraceRing {
                 return TraceResult::Timeout;
             }
 
-            let my_idx = (*h).reserved_idx.fetch_add(1, Ordering::Release);
+            // Written but not taken: at least one (above), and at most what the ring holds beyond
+            // the slots this process has taken and not given back.
+            let written_ahead = w.wrapping_sub(read);
+            let taken = current_reserved.wrapping_sub(read);
+            if written_ahead > inner.capacity || written_ahead <= taken {
+                return TraceResult::Invalid("the trace ring's write index is out of its range");
+            }
 
-            let cap = (*h).capacity;
-            let size = (*h).slot_size;
-            let slot_idx = my_idx % cap;
+            let my_idx = inner.reserved.fetch_add(1, Ordering::AcqRel);
+            (*h).reserved_idx.store(my_idx.wrapping_add(1), Ordering::Release);
+
+            let size = inner.slot_size;
+            let slot_idx = my_idx % inner.capacity;
             let offset = slot_idx * size;
-            let ptr = self.inner.data_start.add(offset);
+            let data_len = inner.mmap.len() - HEADER_SIZE;
+            if offset.checked_add(size).is_none_or(|end| end > data_len) {
+                return TraceResult::Invalid("a trace slot outside the ring");
+            }
+            let ptr = inner.data_start.add(offset);
 
             TraceResult::Data(ConsumerGuard {
                 inner: self.inner.clone(),
@@ -729,16 +791,6 @@ impl ShmTraceRing {
                 index: my_idx,
             })
         }
-    }
-
-    unsafe fn load_state(&self) -> (usize, usize, usize, usize) {
-        let h = self.inner.header;
-        (
-            (*h).write_idx.load(Ordering::Relaxed),
-            (*h).read_idx.load(Ordering::Relaxed),
-            (*h).capacity,
-            (*h).slot_size,
-        )
     }
 }
 
@@ -944,6 +996,70 @@ mod tests {
         assert_eq!(file.metadata().unwrap().len(), 1 << 16);
         let seals = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GET_SEALS) };
         assert_ne!(seals & libc::F_SEAL_SEAL, 0, "seals can still be added");
+    }
+
+    /// A header out of step with the ring (another slot size or capacity, a write index past what the
+    /// ring holds or behind what was taken) ends the run. Whatever the header says, the consumer
+    /// reads only slots of the ring as this process made it, and a chunk never claims more memory
+    /// reads than its slot holds.
+    #[test]
+    fn a_header_out_of_step_gets_no_read_outside_the_ring() {
+        use crate::{MinimalTrace, TraceChunkHeader, TraceChunkRaw};
+        const CAP: usize = 2;
+        let ring = ShmTraceRing::create(CAP, 4096).unwrap();
+        let fd = handed_over(&[ring.as_fd()]).pop().unwrap();
+        let producer = ShmTraceRing::from_fd(fd, CAP, 4096).unwrap();
+        let h = producer.inner.header;
+        let data =
+            ring.inner.data_start as usize..ring.inner.data_start as usize + CAP * HUGE_PAGE_SIZE;
+        let refused = |what: &str| {
+            producer.inner.sem_filled.post();
+            assert!(
+                matches!(ring.access(Duration::from_secs(5)), TraceResult::Invalid(_)),
+                "{what} is refused"
+            );
+        };
+
+        unsafe {
+            (*h).slot_size = 1 << 40;
+            (*h).reserved_idx.store(1, Ordering::Release);
+            (*h).write_idx.store(2, Ordering::Release);
+        }
+        refused("a 1 TiB slot with indices past the ring");
+        unsafe { (*h).slot_size = HUGE_PAGE_SIZE };
+        unsafe { (*h).capacity = 1 << 20 };
+        refused("another capacity");
+        unsafe { (*h).capacity = CAP };
+
+        // The geometry as made, and the indices as written above: two slots written, of which the
+        // consumer takes the first of its own count, whatever `reserved_idx` says.
+        producer.inner.sem_filled.post();
+        let chunk = match ring.access(Duration::from_secs(5)) {
+            TraceResult::Data(chunk) => chunk,
+            _ => panic!("two slots written, and the first one is not handed out"),
+        };
+        let (start, len) = (chunk.as_ptr() as usize, chunk.len());
+        assert_eq!(start, data.start, "the consumer's first slot");
+        assert_eq!(len, HUGE_PAGE_SIZE, "a slot of the size the ring was made with");
+        assert!(start + len <= data.end, "a slot inside the ring");
+        assert_eq!(chunk.iter().map(|&b| b as u64).sum::<u64>(), 0, "every byte of it reads");
+
+        // The chunk's header claims more reads than any slot could hold.
+        unsafe {
+            let header = start as *mut TraceChunkHeader;
+            std::ptr::addr_of_mut!((*header).num_mem_reads).write_unaligned(u64::MAX);
+        }
+        let room = (HUGE_PAGE_SIZE - std::mem::size_of::<TraceChunkHeader>())
+            / std::mem::size_of::<crate::MemValue>();
+        let trace = unsafe { TraceChunkRaw::from_shm(chunk) };
+        assert_eq!(trace.num_mem_reads(), room as u64);
+        trace.mem_reads().advance(room);
+        drop(trace);
+
+        unsafe { (*h).write_idx.store(1 << 40, Ordering::Release) };
+        refused("a write index far past what the ring holds");
+        unsafe { (*h).write_idx.store(0, Ordering::Release) };
+        refused("a write index behind what was taken");
     }
 
     /// Anything but what `send_fds` sends is refused, and a ring of another size is not mapped.

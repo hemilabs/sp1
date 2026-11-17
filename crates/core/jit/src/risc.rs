@@ -274,7 +274,12 @@ impl MinimalTrace for TraceChunkRaw {
     fn num_mem_reads(&self) -> u64 {
         let offset = std::mem::offset_of!(TraceChunkHeader, num_mem_reads);
 
-        unsafe { std::ptr::read_unaligned(self.as_ptr().add(offset) as *const u64) }
+        let claimed = unsafe { std::ptr::read_unaligned(self.as_ptr().add(offset) as *const u64) };
+        // The count comes from whoever made the chunk (for the native executor, another process):
+        // never more than the chunk holds.
+        let room = self.len().saturating_sub(std::mem::size_of::<TraceChunkHeader>())
+            / std::mem::size_of::<MemValue>();
+        claimed.min(room as u64)
     }
 
     fn mem_reads(&self) -> MemReads<'_> {

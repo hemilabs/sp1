@@ -269,6 +269,20 @@ impl MinimalExecutorRunner {
                         self.output = Some(Err(error.clone()));
                         return Err(error);
                     }
+                    TraceResult::Invalid(what) => {
+                        // What the runner wrote is out of step with the ring and cannot be used, so
+                        // its run ends here, with its logs.
+                        let (mut child, log_thread, monitor) = self.process.take().unwrap();
+                        monitor.stop.store(true, Ordering::SeqCst);
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        log_thread.join().expect("wait for log thread to finish");
+                        let error = ExecutionError::Other(format!(
+                            "the executor runner broke the trace ring's protocol: {what}"
+                        ));
+                        self.output = Some(Err(error.clone()));
+                        return Err(error);
+                    }
                     TraceResult::Timeout => {
                         // Consumer times out, we will need to check if child process is still running.
                         if let Some(status) =
