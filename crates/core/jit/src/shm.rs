@@ -1,32 +1,35 @@
-//! This module contains shared memory data structures written by Gemini 3.
+//! The memory the native executor shares with the runner process it starts: the guest's memory
+//! image ([`ShmMemory`]) and the trace ring ([`ShmTraceRing`]).
+//!
+//! Neither has a name. On Linux each is a memfd; elsewhere it is a POSIX shared memory object
+//! unlinked the moment it is created ([`anonymous_shared_file`]). The executor creates them and
+//! hands their descriptors to its runner over the runner's stdin, a Unix socket ([`send_fds`],
+//! [`recv_fds`]); nothing outside the two processes can open them, and the kernel frees them once
+//! the last descriptor and mapping is gone, however the processes end.
 
-use libc::{
-    c_uint, c_void, ftruncate, madvise, sem_close, sem_open, sem_post, sem_t, sem_trywait,
-    sem_unlink, sem_wait, shm_open, shm_unlink, MADV_FREE, O_CREAT, O_RDWR, S_IRUSR, S_IWUSR,
-};
+use libc::{c_void, madvise, MADV_FREE};
 use memmap2::{Mmap, MmapMut};
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
-use std::ffi::CString;
 use std::fs::File;
-use std::io::{self, Error};
+use std::io;
 use std::ops::{Deref, DerefMut};
-use std::os::fd::{AsRawFd, FromRawFd, RawFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 use std::sync::atomic::{fence, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-// POSIX Shared Memory Trace Ring
+// Shared Memory Trace Ring
 //
 // Written by Gemini 3
 //
-// A high-performance, cross-platform (Linux & macOS), Single-Producer Single-Consumer (SPSC)
-// ring buffer using POSIX Shared Memory and Named Semaphores.
+// A high-performance, Single-Producer Single-Consumer (SPSC) ring buffer in shared memory, with
+// two counting semaphores in its header.
 //
 // Features:
 // * Huge Page Optimized: Aligns slots to 2MB and uses MADV_HUGEPAGE (Linux).
 // * Lazy Allocation: Uses sparse files; physical RAM is only consumed upon writing.
-// * RAII Safety: Automatic resource cleanup (unlink) and data commit on drop.
+// * RAII Safety: The memory goes with the last descriptor and mapping of it.
 // * Hybrid Spin/Wait: Consumers spin briefly for ultra-low latency, then sleep.
 // * Crash Safe: Exposes `notify_crash()` for signal handlers.
 // * Explicit Return Types: Distinguishes between Data, Finished, Crashed, and Timeout.
@@ -58,7 +61,14 @@ struct RingHeader {
     finished: AtomicUsize,
     // We don't need atomics here because we only read it AFTER finished=2.
     crash_details: CrashDetails,
+    // Slots written and not yet taken by the consumer.
+    sem_filled: SemaphoreStorage,
+    // Slots the producer may write.
+    sem_empty: SemaphoreStorage,
 }
+
+// The header page holds the header.
+const _: () = assert!(std::mem::size_of::<RingHeader>() <= HEADER_SIZE);
 
 // --- RESULT ENUM ---
 pub enum TraceResult {
@@ -68,129 +78,320 @@ pub enum TraceResult {
     Timeout,               // No Data yet
 }
 
-// --- SEMAPHORE WRAPPER ---
-struct PosixSemaphore {
-    sem: *mut sem_t,
-}
-unsafe impl Send for PosixSemaphore {}
-unsafe impl Sync for PosixSemaphore {}
+// --- SEMAPHORES ---
 
-impl PosixSemaphore {
-    fn create(name: &str, value: u32) -> std::io::Result<Self> {
-        let c_name = CString::new(name).unwrap();
-        unsafe {
-            let sem = sem_open(c_name.as_ptr(), O_CREAT, 0o644, value);
-            if sem == libc::SEM_FAILED {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(Self { sem })
+/// A process-shared POSIX semaphore, in the ring's header (Linux).
+#[cfg(target_os = "linux")]
+type SemaphoreStorage = libc::sem_t;
+
+/// The count of a semaphore in the ring's header, which [`Semaphore`] polls: where unnamed POSIX
+/// semaphores are not available (macOS), and a named one would be reachable by its name.
+#[cfg(not(target_os = "linux"))]
+type SemaphoreStorage = std::sync::atomic::AtomicU32;
+
+/// One of the ring's semaphores. Both processes use it in place, in their mapping of the header.
+struct Semaphore {
+    sem: *mut SemaphoreStorage,
+}
+unsafe impl Send for Semaphore {}
+unsafe impl Sync for Semaphore {}
+
+#[cfg(target_os = "linux")]
+impl Semaphore {
+    /// Initializes the semaphore at `sem`, in memory shared between processes, to `value`.
+    ///
+    /// # Safety
+    ///
+    /// `sem` is valid for writes, in a shared mapping, and no process uses it yet.
+    unsafe fn init(sem: *mut SemaphoreStorage, value: u32) -> io::Result<Self> {
+        if libc::sem_init(sem, 1, value) != 0 {
+            return Err(io::Error::last_os_error());
         }
+        Ok(Self { sem })
     }
 
     fn wait(&self) {
         unsafe {
-            sem_wait(self.sem);
+            libc::sem_wait(self.sem);
         }
     }
 
     fn try_wait(&self) -> bool {
-        unsafe { sem_trywait(self.sem) == 0 }
+        unsafe { libc::sem_trywait(self.sem) == 0 }
     }
 
     fn post(&self) {
         unsafe {
-            sem_post(self.sem);
+            libc::sem_post(self.sem);
         }
     }
 
     fn wait_timeout(&self, timeout: Duration) -> bool {
         unsafe {
-            #[cfg(target_os = "linux")]
-            {
-                let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
-                libc::clock_gettime(libc::CLOCK_REALTIME, &mut ts);
+            let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+            libc::clock_gettime(libc::CLOCK_REALTIME, &mut ts);
 
-                ts.tv_sec += timeout.as_secs() as i64;
-                ts.tv_nsec += timeout.subsec_nanos() as i64;
-                if ts.tv_nsec >= 1_000_000_000 {
-                    ts.tv_sec += 1;
-                    ts.tv_nsec -= 1_000_000_000;
-                }
-
-                libc::sem_timedwait(self.sem, &ts) == 0
+            ts.tv_sec += timeout.as_secs() as i64;
+            ts.tv_nsec += timeout.subsec_nanos() as i64;
+            if ts.tv_nsec >= 1_000_000_000 {
+                ts.tv_sec += 1;
+                ts.tv_nsec -= 1_000_000_000;
             }
 
-            #[cfg(target_os = "macos")]
-            {
-                let start = std::time::Instant::now();
-                while start.elapsed() < timeout {
-                    if sem_trywait(self.sem) == 0 {
-                        return true;
-                    }
-                    std::thread::sleep(Duration::from_millis(1));
-                }
-                false
+            libc::sem_timedwait(self.sem, &ts) == 0
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+impl Semaphore {
+    /// Sets the count at `sem` to `value`.
+    ///
+    /// # Safety
+    ///
+    /// `sem` is valid for writes, in a shared mapping, and no process uses it yet.
+    unsafe fn init(sem: *mut SemaphoreStorage, value: u32) -> io::Result<Self> {
+        (*sem).store(value, Ordering::Release);
+        Ok(Self { sem })
+    }
+
+    fn count(&self) -> &SemaphoreStorage {
+        // SAFETY: `sem` points into the ring's mapping, which outlives this semaphore.
+        unsafe { &*self.sem }
+    }
+
+    fn wait(&self) {
+        while !self.try_wait() {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    fn try_wait(&self) -> bool {
+        self.count().try_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1)).is_ok()
+    }
+
+    fn post(&self) {
+        self.count().fetch_add(1, Ordering::AcqRel);
+    }
+
+    fn wait_timeout(&self, timeout: Duration) -> bool {
+        let start = std::time::Instant::now();
+        while start.elapsed() < timeout {
+            if self.try_wait() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        false
+    }
+}
+
+// --- ANONYMOUS SHARED FILES ---
+
+/// A new shared memory file of `size` bytes that has no name: a memfd. `label` only names it in
+/// `/proc/<pid>/fd` and `/proc/<pid>/maps`. Close-on-exec, so it reaches another process only when
+/// handed to it ([`send_fds`]).
+///
+/// It cannot be executed (`MFD_NOEXEC_SEAL`, from Linux 6.3, which `vm.memfd_noexec=2` requires;
+/// an older kernel refuses the flag and gets the file without it), and its size is sealed once set:
+/// neither process resizes it after this.
+#[cfg(target_os = "linux")]
+pub(crate) fn anonymous_shared_file(label: &std::ffi::CStr, size: usize) -> io::Result<File> {
+    /// `MFD_NOEXEC_SEAL`, which not every `libc` version defines.
+    const MFD_NOEXEC_SEAL: libc::c_uint = 0x0008;
+    // The system call itself, which needs no particular glibc.
+    let memfd_create = |flags: libc::c_uint| unsafe {
+        libc::syscall(libc::SYS_memfd_create, label.as_ptr(), flags) as RawFd
+    };
+    let flags = libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING;
+    let mut fd = memfd_create(flags | MFD_NOEXEC_SEAL);
+    if fd < 0 && io::Error::last_os_error().raw_os_error() == Some(libc::EINVAL) {
+        fd = memfd_create(flags);
+    }
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: a new descriptor, which nothing else owns.
+    let file = unsafe { File::from_raw_fd(fd) };
+    file.set_len(size as u64)?;
+    let seals = libc::F_SEAL_SHRINK | libc::F_SEAL_GROW | libc::F_SEAL_SEAL;
+    if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_ADD_SEALS, seals) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(file)
+}
+
+/// A new shared memory file of `size` bytes that has no name: a POSIX shared memory object under a
+/// random name, unlinked at once. Close-on-exec, so it reaches another process only when handed to
+/// it ([`send_fds`]).
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn anonymous_shared_file(_label: &std::ffi::CStr, size: usize) -> io::Result<File> {
+    use libc::{O_CREAT, O_EXCL, O_RDWR, S_IRUSR, S_IWUSR};
+    // macOS limits these names to 31 bytes.
+    let name = format!("/sp1-{}", &uuid::Uuid::new_v4().simple().to_string()[..24]);
+    let c_name = std::ffi::CString::new(name).expect("no NUL in the name");
+    let fd = unsafe {
+        libc::shm_open(
+            c_name.as_ptr(),
+            O_CREAT | O_EXCL | O_RDWR,
+            (S_IRUSR | S_IWUSR) as libc::c_uint,
+        )
+    };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    unsafe { libc::shm_unlink(c_name.as_ptr()) };
+    // SAFETY: a new descriptor, which nothing else owns.
+    let file = unsafe { File::from_raw_fd(fd) };
+    if unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    file.set_len(size as u64)?;
+    Ok(file)
+}
+
+/// Nothing to do: the executor's shared memory has no names to remove, and the kernel frees it
+/// with the last process that holds it. Kept for callers that ran it before exiting.
+pub fn unlink_owned_shm() {}
+
+// --- HANDING DESCRIPTORS TO THE RUNNER ---
+
+/// The most descriptors [`send_fds`] sends at once.
+pub const MAX_SENT_FDS: usize = 2;
+
+/// The data [`send_fds`] sends with the descriptors: a tag, then how many there are.
+const FDS_TAG: [u8; 3] = *b"SP1";
+
+#[cfg(target_os = "linux")]
+const SEND_FLAGS: libc::c_int = libc::MSG_NOSIGNAL;
+#[cfg(not(target_os = "linux"))]
+const SEND_FLAGS: libc::c_int = 0;
+
+#[cfg(target_os = "linux")]
+const RECV_FLAGS: libc::c_int = libc::MSG_CMSG_CLOEXEC;
+#[cfg(not(target_os = "linux"))]
+const RECV_FLAGS: libc::c_int = 0;
+
+/// A control message buffer for up to [`MAX_SENT_FDS`] descriptors, aligned for `cmsghdr`.
+#[repr(C, align(8))]
+struct FdsControl([u8; 64]);
+
+fn fds_space(n: usize) -> usize {
+    // SAFETY: a size computation.
+    unsafe { libc::CMSG_SPACE((n * std::mem::size_of::<RawFd>()) as u32) as usize }
+}
+
+/// Sends `fds` (at most [`MAX_SENT_FDS`]) over the connected Unix stream socket `socket`, for
+/// [`recv_fds`] at the other end. The receiver gets descriptors of its own for the same files.
+pub fn send_fds(socket: BorrowedFd<'_>, fds: &[BorrowedFd<'_>]) -> io::Result<()> {
+    assert!(fds.len() <= MAX_SENT_FDS, "at most {MAX_SENT_FDS} descriptors at once");
+    let mut data = [FDS_TAG[0], FDS_TAG[1], FDS_TAG[2], fds.len() as u8];
+    let mut iov = libc::iovec { iov_base: data.as_mut_ptr().cast(), iov_len: data.len() };
+    let mut control = FdsControl([0; 64]);
+    assert!(fds_space(MAX_SENT_FDS) <= control.0.len());
+    // SAFETY: an all-zero msghdr is a valid empty one.
+    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+    msg.msg_iov = &mut iov;
+    msg.msg_iovlen = 1;
+    if !fds.is_empty() {
+        let len = fds.len() * std::mem::size_of::<RawFd>();
+        msg.msg_control = control.0.as_mut_ptr().cast();
+        msg.msg_controllen = fds_space(fds.len()) as _;
+        // SAFETY: `msg_control` has room for one header and `len` bytes of data.
+        unsafe {
+            let cmsg = libc::CMSG_FIRSTHDR(&msg);
+            (*cmsg).cmsg_level = libc::SOL_SOCKET;
+            (*cmsg).cmsg_type = libc::SCM_RIGHTS;
+            (*cmsg).cmsg_len = libc::CMSG_LEN(len as u32) as _;
+            let out = libc::CMSG_DATA(cmsg).cast::<RawFd>();
+            for (i, fd) in fds.iter().enumerate() {
+                out.add(i).write_unaligned(fd.as_raw_fd());
             }
         }
     }
-}
-
-impl Drop for PosixSemaphore {
-    fn drop(&mut self) {
-        unsafe {
-            sem_close(self.sem);
+    loop {
+        // SAFETY: `msg` and everything it points to live across the call.
+        let sent = unsafe { libc::sendmsg(socket.as_raw_fd(), &msg, SEND_FLAGS) };
+        if sent >= 0 {
+            // A stream socket takes these few bytes, and the descriptors with them, whole.
+            return if sent as usize == data.len() {
+                Ok(())
+            } else {
+                Err(io::Error::new(io::ErrorKind::WriteZero, "the descriptors were not sent whole"))
+            };
+        }
+        let e = io::Error::last_os_error();
+        if e.kind() != io::ErrorKind::Interrupted {
+            return Err(e);
         }
     }
 }
 
-/// The shared memory objects this process created and has not unlinked yet: the name, and
-/// whether it is a trace ring (whose two semaphores go with it). Their owners unlink them on drop;
-/// a process that exits without running destructors (`std::process::exit`) calls
-/// [`unlink_owned_shm`] first, or the names stay in /dev/shm.
-static OWNED_SHM: Mutex<Vec<(String, bool)>> = Mutex::new(Vec::new());
-
-fn owned_shm() -> std::sync::MutexGuard<'static, Vec<(String, bool)>> {
-    OWNED_SHM.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
-}
-
-fn disown_shm(name: &str) {
-    let mut owned = owned_shm();
-    if let Some(i) = owned.iter().position(|(owned_name, _)| owned_name == name) {
-        owned.swap_remove(i);
-    }
-}
-
-fn unlink_shm(name: &str, is_ring: bool) {
-    let Ok(c_name) = CString::new(name) else { return };
-    unsafe { shm_unlink(c_name.as_ptr()) };
-    if is_ring {
-        let c_fill = CString::new(format!("{}_filled", name)).unwrap();
-        let c_empty = CString::new(format!("{}_empty", name)).unwrap();
-        unsafe {
-            sem_unlink(c_fill.as_ptr());
-            sem_unlink(c_empty.as_ptr());
+/// Receives what [`send_fds`] sent over the Unix stream socket `socket`: the descriptors, close-on-
+/// exec, in the order they were sent. Anything else (no descriptors, a stream that does not start
+/// with them, more than [`MAX_SENT_FDS`]) is an error.
+pub fn recv_fds(socket: BorrowedFd<'_>) -> io::Result<Vec<OwnedFd>> {
+    let mut data = [0u8; 4];
+    let mut iov = libc::iovec { iov_base: data.as_mut_ptr().cast(), iov_len: data.len() };
+    let mut control = FdsControl([0; 64]);
+    // SAFETY: an all-zero msghdr is a valid empty one.
+    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+    msg.msg_iov = &mut iov;
+    msg.msg_iovlen = 1;
+    msg.msg_control = control.0.as_mut_ptr().cast();
+    msg.msg_controllen = fds_space(MAX_SENT_FDS) as _;
+    let received = loop {
+        // SAFETY: `msg` and everything it points to live across the call.
+        let n = unsafe { libc::recvmsg(socket.as_raw_fd(), &mut msg, RECV_FLAGS) };
+        if n >= 0 {
+            break n as usize;
+        }
+        let e = io::Error::last_os_error();
+        if e.kind() != io::ErrorKind::Interrupted {
+            return Err(e);
+        }
+    };
+    // Take ownership of every descriptor that came, first, so that each is closed on any error.
+    let mut fds = Vec::new();
+    // SAFETY: the kernel filled `msg_control` with well-formed control messages.
+    unsafe {
+        let mut cmsg = libc::CMSG_FIRSTHDR(&msg);
+        while !cmsg.is_null() {
+            if (*cmsg).cmsg_level == libc::SOL_SOCKET && (*cmsg).cmsg_type == libc::SCM_RIGHTS {
+                let len = (*cmsg).cmsg_len as usize - libc::CMSG_LEN(0) as usize;
+                let first = libc::CMSG_DATA(cmsg).cast::<RawFd>();
+                for i in 0..len / std::mem::size_of::<RawFd>() {
+                    fds.push(OwnedFd::from_raw_fd(first.add(i).read_unaligned()));
+                }
+            }
+            cmsg = libc::CMSG_NXTHDR(&msg, cmsg);
         }
     }
+    let invalid = |what: &str| io::Error::new(io::ErrorKind::InvalidData, what.to_string());
+    if msg.msg_flags & libc::MSG_CTRUNC != 0 {
+        return Err(invalid("more descriptors were sent than expected"));
+    }
+    if received != data.len() || data[..3] != FDS_TAG || data[3] as usize != fds.len() {
+        return Err(invalid("the stream does not start with the executor's shared memory"));
+    }
+    #[cfg(not(target_os = "linux"))]
+    for fd in &fds {
+        if unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    Ok(fds)
 }
 
-/// Unlinks every shared memory object (and semaphore) this process created and still owns. For a
-/// process about to exit without running destructors; the owners stay usable through their open
-/// descriptors and mappings.
-pub fn unlink_owned_shm() {
-    for (name, is_ring) in std::mem::take(&mut *owned_shm()) {
-        unlink_shm(&name, is_ring);
-    }
-}
+// --- THE RING ---
 
 struct InnerRing {
-    _file: File,
+    file: File,
     _mmap: MmapMut,
     header: *mut RingHeader,
     data_start: *mut u8,
-    sem_filled: PosixSemaphore,
-    sem_empty: PosixSemaphore,
-    name: String,
-    is_owner: bool,
+    sem_filled: Semaphore,
+    sem_empty: Semaphore,
 
     // Reorder Buffer: Stores indices that are finished but waiting for sequential gap to close.
     pending_completions: Mutex<BinaryHeap<Reverse<usize>>>,
@@ -198,15 +399,6 @@ struct InnerRing {
 
 unsafe impl Send for InnerRing {}
 unsafe impl Sync for InnerRing {}
-
-impl Drop for InnerRing {
-    fn drop(&mut self) {
-        if self.is_owner {
-            disown_shm(&self.name);
-            unlink_shm(&self.name, true);
-        }
-    }
-}
 
 /// A shared memory based, ring-buffer structure. It provides trace buffers for child
 /// native executor process to write, and for parent SP1 process to read.
@@ -293,42 +485,38 @@ impl InnerRing {
 }
 
 impl ShmTraceRing {
-    // Create: accepts logical ID, creates file "/{id}_t"
-    pub fn create(id: &str, capacity: usize, slot_size: usize) -> std::io::Result<Self> {
-        Self::init(id, capacity, slot_size, true)
+    /// Creates a ring of `capacity` slots of `slot_size` bytes (rounded up to 2 MB), for this
+    /// process to consume. The producer maps it from its descriptor ([`AsFd`], [`Self::from_fd`]).
+    pub fn create(capacity: usize, slot_size: usize) -> io::Result<Self> {
+        let file = anonymous_shared_file(c"sp1-trace-ring", Self::total_size(capacity, slot_size))?;
+        Self::init(file, capacity, slot_size, true)
     }
 
-    // Open: accepts logical ID, opens file "/{id}_t"
-    pub fn open(id: &str, capacity: usize, slot_size: usize) -> std::io::Result<Self> {
-        Self::init(id, capacity, slot_size, false)
+    /// The ring [`Self::create`] made, from its descriptor, for this process to produce into.
+    /// `capacity` and `slot_size` are the ones it was created with.
+    pub fn from_fd(fd: OwnedFd, capacity: usize, slot_size: usize) -> io::Result<Self> {
+        let file = File::from(fd);
+        let expected = Self::total_size(capacity, slot_size) as u64;
+        let size = file.metadata()?.len();
+        if size != expected {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("the trace ring is {size} bytes, not {expected}"),
+            ));
+        }
+        Self::init(file, capacity, slot_size, false)
     }
 
-    fn init(id: &str, capacity: usize, slot_size: usize, is_owner: bool) -> std::io::Result<Self> {
+    fn total_size(capacity: usize, slot_size: usize) -> usize {
         // Force 2MB Alignment
         let aligned_size = (slot_size + HUGE_PAGE_SIZE - 1) & !(HUGE_PAGE_SIZE - 1);
-        // Logic: ID -> Name conversion with suffix
-        let base_name =
-            if id.starts_with('/') { format!("{}_t", id) } else { format!("/{}_t", id) };
-        let c_name = CString::new(base_name.clone()).unwrap();
-        let total_size = HEADER_SIZE + (capacity * aligned_size);
+        HEADER_SIZE + (capacity * aligned_size)
+    }
 
-        let fd = unsafe {
-            if is_owner {
-                shm_unlink(c_name.as_ptr());
-                shm_open(c_name.as_ptr(), O_CREAT | O_RDWR, (S_IRUSR | S_IWUSR) as c_uint)
-            } else {
-                shm_open(c_name.as_ptr(), O_RDWR, 0)
-            }
-        };
-        if fd < 0 {
-            return Err(std::io::Error::last_os_error());
-        }
+    fn init(file: File, capacity: usize, slot_size: usize, is_owner: bool) -> io::Result<Self> {
+        // Force 2MB Alignment
+        let aligned_size = (slot_size + HUGE_PAGE_SIZE - 1) & !(HUGE_PAGE_SIZE - 1);
 
-        if is_owner {
-            unsafe { ftruncate(fd, total_size as libc::off_t) };
-        }
-
-        let file = unsafe { File::from_raw_fd(fd) };
         let mut mmap = unsafe { MmapMut::map_mut(&file)? };
 
         #[cfg(target_os = "linux")]
@@ -352,21 +540,17 @@ impl ShmTraceRing {
             }
         }
 
-        let sem_filled_name = format!("{}_filled", base_name);
-        let sem_empty_name = format!("{}_empty", base_name);
-
-        if is_owner {
-            let c_fill = CString::new(sem_filled_name.clone()).unwrap();
-            let c_empty = CString::new(sem_empty_name.clone()).unwrap();
-            unsafe {
-                sem_unlink(c_fill.as_ptr());
-                sem_unlink(c_empty.as_ptr());
+        // The owner sets up the semaphores before any other process has the ring; the producer
+        // uses them as they are.
+        let (sem_filled, sem_empty) = unsafe {
+            let filled = &raw mut (*header).sem_filled;
+            let empty = &raw mut (*header).sem_empty;
+            if is_owner {
+                (Semaphore::init(filled, 0)?, Semaphore::init(empty, capacity as u32)?)
+            } else {
+                (Semaphore { sem: filled }, Semaphore { sem: empty })
             }
-        }
-
-        let sem_filled = PosixSemaphore::create(&sem_filled_name, 0)?;
-        let initial_empty = if is_owner { capacity as u32 } else { 0 };
-        let sem_empty = PosixSemaphore::create(&sem_empty_name, initial_empty)?;
+        };
 
         // Crash Recovery: Sync reserved_idx if consumer restarts
         if !is_owner {
@@ -379,19 +563,14 @@ impl ShmTraceRing {
             }
         }
 
-        if is_owner {
-            owned_shm().push((base_name.clone(), true));
-        }
         Ok(Self {
             inner: Arc::new(InnerRing {
-                _file: file,
+                file,
                 _mmap: mmap,
                 header,
                 data_start,
                 sem_filled,
                 sem_empty,
-                name: base_name,
-                is_owner,
                 pending_completions: Mutex::new(BinaryHeap::new()),
             }),
         })
@@ -563,30 +742,35 @@ impl ShmTraceRing {
     }
 }
 
-// # Simple POSIX Shared Memory Wrapper
+impl AsFd for ShmTraceRing {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        self.inner.file.as_fd()
+    }
+}
+
+// # Shared Memory Wrapper
 //
-// This module provides a simplified, RAII-compliant abstraction over POSIX shared memory
-// (`shm_open`) and memory mapping (`mmap`), utilizing `libc` for system calls and
-// `memmap2` for safe memory handling.
+// An RAII handle on one shared memory file and its mapping.
 //
 // ## Design & Modes
-// The `ShmMemory` struct supports two distinct lifecycles requested for this implementation:
+// The `ShmMemory` struct supports two distinct lifecycles:
 //
 // 1.  **Creation (Read-Only Map):**
-//     * Creates the shared memory object (`O_CREAT`).
-//     * Sets the size via `ftruncate`.
+//     * Creates the shared memory file ([`anonymous_shared_file`]) at its size.
 //     * Maps the memory into the process as **Read-Only**.
-//     * *Cleanup:* Unlinks (deletes) the shared memory name upon Drop.
 //
 // 2.  **Connection (Read-Write Map):**
-//     * Opens an existing shared memory object.
+//     * Takes the descriptor the creator handed over.
 //     * Maps the memory into the process as **Read-Write**.
-//     * *Cleanup:* Closes the file descriptor but leaves the shared memory name intact.
+//
+// Either way, dropping it closes the descriptor and unmaps the memory; the memory itself goes with
+// the last process that holds it.
 //
 // ## Traits
 // * **`Deref`**: Access underlying memory as `&[u8]`.
 // * **`DerefMut`**: Access underlying memory as `&mut [u8]` (Panics if map is Read-Only).
-// * **`AsRawFd`**: Exposes the underlying file descriptor for polling or other syscalls.
+// * **`AsFd`** / **`AsRawFd`**: The underlying file descriptor, to hand to the other process, or
+//   for polling or other syscalls.
 
 /// An enum to hold either a Read-Only or Read-Write memory map.
 #[derive(Debug)]
@@ -595,102 +779,38 @@ enum InnerMap {
     ReadWrite(MmapMut),
 }
 
-/// A handle to a POSIX shared memory object.
+/// A handle to a shared memory file.
 ///
 /// This struct manages the file descriptor and the memory map.
-/// It implements RAII: dropping this struct closes the FD and, if it was
-/// the creator, unlinks the shared memory name.
 pub struct ShmMemory {
-    /// We keep the name to unlink it later if needed.
-    name: String,
     /// The underlying File object (owns the FD).
     file: File,
     /// The actual memory mapping (Safe wrapper around the raw pointer).
     map: InnerMap,
-    /// If true, we execute `shm_unlink` on Drop.
-    should_unlink: bool,
 }
 
 impl ShmMemory {
     /// **Way 1: Creation.**
-    /// Creates a new shm file, sets its size, and maps it as **Read-Only**.
-    ///
-    /// Internally opens with `O_RDWR` to allow `ftruncate` (setting size),
-    /// but restricts the process memory map to Read-Only.
-    pub fn create_readonly(id: &str, size: usize) -> io::Result<Self> {
-        let (file, name, _) = Self::open_libc(id, libc::O_CREAT | libc::O_RDWR, size)?;
+    /// Creates a new shared memory file of `size` bytes and maps it as **Read-Only**.
+    pub fn create_readonly(size: usize) -> io::Result<Self> {
+        let file = anonymous_shared_file(c"sp1-memory", size)?;
 
         // Safety: We just created the file, so mapping it is valid.
         let map = unsafe { Mmap::map(&file)? };
 
-        owned_shm().push((name.clone(), false));
-        Ok(Self {
-            name,
-            file,
-            map: InnerMap::ReadOnly(map),
-            should_unlink: true, // Creator assumes responsibility for cleanup
-        })
+        Ok(Self { file, map: InnerMap::ReadOnly(map) })
     }
 
     /// **Way 2: Connection.**
-    /// Opens an existing shm file and maps it as **Read-Write**.
-    ///
-    /// Requires the file to already exist.
-    pub fn open_readwrite(id: &str) -> io::Result<Self> {
-        // Size 0 implies "do not truncate/resize".
-        let (file, name, _) = Self::open_libc(id, libc::O_RDWR, 0)?;
+    /// Maps the shared memory file [`Self::create_readonly`] made, from its descriptor, as
+    /// **Read-Write**.
+    pub fn from_fd_readwrite(fd: OwnedFd) -> io::Result<Self> {
+        let file = File::from(fd);
 
-        // Safety: We opened with O_RDWR, so mapping as MmapMut is valid.
+        // Safety: The descriptor is the creator's file, opened for reading and writing.
         let map = unsafe { MmapMut::map_mut(&file)? };
 
-        Ok(Self {
-            name,
-            file,
-            map: InnerMap::ReadWrite(map),
-            should_unlink: false, // Opener does not destroy the resource
-        })
-    }
-
-    /// Helper to handle the libc boilerplate safely.
-    /// Returns the File and a boolean indicating if it was just created.
-    fn open_libc(id: &str, flags: libc::c_int, size: usize) -> io::Result<(File, String, bool)> {
-        let name = format!("{}_m", id);
-        let clean_name = if name.starts_with('/') { name } else { format!("/{}", name) };
-        let c_id = CString::new(clean_name.as_str())
-            .map_err(|e| Error::new(io::ErrorKind::InvalidInput, e))?;
-
-        unsafe {
-            let owner_flag = if flags & libc::O_CREAT != 0 { S_IRUSR | S_IWUSR } else { 0 };
-            // 1. shm_open
-            // Mode 0o666 = Read/Write for everyone.
-            let fd = shm_open(c_id.as_ptr(), flags, owner_flag as c_uint);
-            if fd < 0 {
-                return Err(Error::last_os_error());
-            }
-
-            // Wrap in File immediately for RAII closing of the FD.
-            let file = File::from_raw_fd(fd);
-
-            // 2. If size > 0, we must ftruncate to ensure memory is allocated.
-            if size > 0 {
-                let ret = libc::ftruncate(fd, size as libc::off_t);
-                if ret < 0 {
-                    return Err(Error::last_os_error());
-                }
-            }
-
-            let created = (flags & libc::O_CREAT) != 0;
-            Ok((file, clean_name, created))
-        }
-    }
-
-    /// Manually flags this instance to NOT unlink on drop.
-    /// Useful if you want the shared memory to persist after the process exits.
-    pub fn keep_on_drop(&mut self) {
-        if self.should_unlink {
-            disown_shm(&self.name);
-        }
-        self.should_unlink = false;
+        Ok(Self { file, map: InnerMap::ReadWrite(map) })
     }
 }
 
@@ -699,6 +819,12 @@ impl ShmMemory {
 impl AsRawFd for ShmMemory {
     fn as_raw_fd(&self) -> RawFd {
         self.file.as_raw_fd()
+    }
+}
+
+impl AsFd for ShmMemory {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        self.file.as_fd()
     }
 }
 
@@ -725,43 +851,111 @@ impl DerefMut for ShmMemory {
     }
 }
 
-impl Drop for ShmMemory {
-    fn drop(&mut self) {
-        if self.should_unlink {
-            // Ignore errors here (e.g., if it was already unlinked externally)
-            disown_shm(&self.name);
-            unlink_shm(&self.name, false);
-        }
-        // self.file drops here, closing the FD automatically.
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::net::UnixStream;
 
-    fn shm_exists(name: &str) -> bool {
-        let c_name = CString::new(name).unwrap();
-        let fd = unsafe { shm_open(c_name.as_ptr(), O_RDWR, 0) };
-        if fd >= 0 {
-            unsafe { libc::close(fd) };
-        }
-        fd >= 0
+    /// A descriptor sent with [`send_fds`] and taken with [`recv_fds`], as the executor hands its
+    /// memory to its runner.
+    fn handed_over(fds: &[BorrowedFd<'_>]) -> Vec<OwnedFd> {
+        let (a, b) = UnixStream::pair().unwrap();
+        send_fds(a.as_fd(), fds).unwrap();
+        recv_fds(b.as_fd()).unwrap()
     }
 
-    /// What a process exiting through `std::process::exit` relies on: the names it still owns are
-    /// unlinked although no destructor runs.
+    /// What the runner writes through its descriptors, the executor reads through its own: the
+    /// same memory, though nothing names it.
     #[test]
-    fn unlink_owned_shm_unlinks_live_owners() {
-        let id = format!("sp1_test_{}", std::process::id());
-        let memory = ShmMemory::create_readonly(&id, 4096).unwrap();
-        let ring = ShmTraceRing::create(&id, 2, 4096).unwrap();
-        let (memory_name, ring_name) = (format!("/{id}_m"), format!("/{id}_t"));
-        assert!(shm_exists(&memory_name) && shm_exists(&ring_name));
+    fn memory_and_ring_are_shared_through_their_descriptors() {
+        let memory = ShmMemory::create_readonly(1 << 20).unwrap();
+        let ring = ShmTraceRing::create(2, 4096).unwrap();
+        let mut fds = handed_over(&[memory.as_fd(), ring.as_fd()]).into_iter();
+        let mut runner_memory = ShmMemory::from_fd_readwrite(fds.next().unwrap()).unwrap();
+        let producer = ShmTraceRing::from_fd(fds.next().unwrap(), 2, 4096).unwrap();
 
-        unlink_owned_shm();
-        assert!(!shm_exists(&memory_name) && !shm_exists(&ring_name));
-        assert!(owned_shm().iter().all(|(name, _)| name != &memory_name && name != &ring_name));
-        drop((memory, ring));
+        runner_memory[12345] = 0xa5;
+        assert_eq!(memory[12345], 0xa5);
+
+        // Two slots, then the producer must wait for the consumer.
+        for byte in [1u8, 2] {
+            let mut slot = producer.acquire();
+            slot[0] = byte;
+        }
+        let first = match ring.access(Duration::from_secs(5)) {
+            TraceResult::Data(chunk) => chunk,
+            _ => panic!("no first chunk"),
+        };
+        assert_eq!(first[0], 1);
+        drop(first);
+        let mut third = producer.acquire();
+        third[0] = 3;
+        drop(third);
+        for byte in [2u8, 3] {
+            match ring.access(Duration::from_secs(5)) {
+                TraceResult::Data(chunk) => assert_eq!(chunk[0], byte),
+                _ => panic!("no chunk {byte}"),
+            }
+        }
+        producer.mark_finished();
+        assert!(matches!(ring.access(Duration::from_millis(100)), TraceResult::Finished));
+    }
+
+    /// The other process learns of a crash through the ring.
+    #[test]
+    fn a_crash_reaches_the_consumer() {
+        let ring = ShmTraceRing::create(1, 4096).unwrap();
+        let fd = handed_over(&[ring.as_fd()]).pop().unwrap();
+        let producer = ShmTraceRing::from_fd(fd, 1, 4096).unwrap();
+        producer.notify_crash(libc::SIGSEGV, 0x1000, 2);
+        match ring.access(Duration::from_secs(5)) {
+            TraceResult::Crashed(d) => assert_eq!((d.signal, d.addr, d.operation), (11, 0x1000, 2)),
+            _ => panic!("no crash"),
+        }
+    }
+
+    /// Nothing the executor shares is a file anyone could open by name, and none of it is
+    /// inherited by a process it starts.
+    #[test]
+    fn shared_memory_has_no_name_and_is_not_inherited() {
+        let memory = ShmMemory::create_readonly(4096).unwrap();
+        let ring = ShmTraceRing::create(1, 4096).unwrap();
+        for fd in [memory.as_raw_fd(), ring.as_fd().as_raw_fd()] {
+            let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+            assert_ne!(flags & libc::FD_CLOEXEC, 0, "fd {fd} is not close-on-exec");
+            #[cfg(target_os = "linux")]
+            {
+                let target = std::fs::read_link(format!("/proc/self/fd/{fd}")).unwrap();
+                let target = target.to_string_lossy();
+                assert!(target.starts_with("/memfd:"), "fd {fd} is {target}");
+            }
+        }
+    }
+
+    /// The size of the memory is fixed: the process it is handed to cannot change it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_runner_cannot_resize_the_memory() {
+        let memory = ShmMemory::create_readonly(1 << 16).unwrap();
+        let fd = handed_over(&[memory.as_fd()]).pop().unwrap();
+        let file = File::from(fd);
+        assert!(file.set_len(4096).is_err());
+        assert!(file.set_len(1 << 20).is_err());
+        assert_eq!(file.metadata().unwrap().len(), 1 << 16);
+        let seals = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GET_SEALS) };
+        assert_ne!(seals & libc::F_SEAL_SEAL, 0, "seals can still be added");
+    }
+
+    /// Anything but what `send_fds` sends is refused, and a ring of another size is not mapped.
+    #[test]
+    fn anything_else_is_refused() {
+        let (a, b) = UnixStream::pair().unwrap();
+        use std::io::Write;
+        (&a).write_all(b"\x00\x00\x00\x01").unwrap();
+        assert!(recv_fds(b.as_fd()).is_err());
+
+        let ring = ShmTraceRing::create(2, 4096).unwrap();
+        let fd = handed_over(&[ring.as_fd()]).pop().unwrap();
+        assert!(ShmTraceRing::from_fd(fd, 3, 4096).is_err());
     }
 }

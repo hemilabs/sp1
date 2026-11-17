@@ -8,8 +8,9 @@ pub mod context;
 pub mod debug;
 pub mod instructions;
 mod macros;
-// memfd and POSIX shared memory and semaphores: for the native executor (x86-64 Linux) and the
-// standalone runner. Elsewhere the portable executor runs, and Windows has none of them.
+// memfds (POSIX shared memory off Linux) shared by descriptor: for the native executor (x86-64
+// Linux) and the standalone runner. Elsewhere the portable executor runs, and Windows has none of
+// them.
 #[cfg(unix)]
 pub mod memory;
 pub mod risc;

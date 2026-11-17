@@ -94,12 +94,12 @@ pub use state::*;
 pub use utils::*;
 
 pub use sp1_hypercube::SP1RecursionProof;
-/// For a process that exits without running destructors: see [`sp1_jit::shm::unlink_owned_shm`].
+/// Nothing to do, kept for callers: see [`sp1_jit::shm::unlink_owned_shm`].
 #[cfg(unix)]
 pub use sp1_jit::shm::unlink_owned_shm;
 
-/// No-op: POSIX shared memory (and so `sp1_jit::shm`) exists only on unix, so there is nothing
-/// to unlink here.
+/// No-op: the executor's shared memory (`sp1_jit::shm`) exists only on unix, and has no names to
+/// remove there either.
 #[cfg(not(unix))]
 pub fn unlink_owned_shm() {}
 

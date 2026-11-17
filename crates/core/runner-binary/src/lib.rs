@@ -16,6 +16,7 @@ pub struct Input {
     #[serde(with = "sp1_primitives::serde_bytes::vec_deque")]
     pub input: VecDeque<Vec<u8>>,
     pub shm_slot_size: usize,
+    /// Names this run in the executor's logs.
     pub id: String,
     pub max_memory_size: usize,
     pub memory_limit: u64,

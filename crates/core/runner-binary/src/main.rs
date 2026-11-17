@@ -54,10 +54,15 @@ pub mod signal {
 fn main() {
     use sp1_core_executor::{MinimalTranspiler, HALT_PC};
     use sp1_core_executor_runner_binary::{Input, Output};
-    use sp1_jit::{memory::SharedMemory, shm::ShmTraceRing, trace_capacity, TraceChunkHeader};
+    use sp1_jit::{
+        memory::SharedMemory,
+        shm::{recv_fds, ShmTraceRing},
+        trace_capacity, TraceChunkHeader,
+    };
     use std::{
         io::{self, BufReader, BufWriter, Write},
         ops::DerefMut,
+        os::fd::AsFd,
     };
     use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
@@ -74,13 +79,20 @@ fn main() {
         )
         .init();
 
-    let mut reader = BufReader::new(io::stdin().lock());
+    // Stdin is a Unix socket. First on it come the descriptors of the memory this process shares
+    // with the executor that started it: the memory, then the trace ring when tracing. Then the
+    // input.
+    let stdin = io::stdin();
+    let fds = recv_fds(stdin.as_fd()).expect("receive the shared memory");
+    let mut reader = BufReader::new(stdin.lock());
     let input: Input = bincode::deserialize_from(&mut reader).expect("deserializing input");
 
     let transpiler =
         MinimalTranspiler::new(input.max_memory_size, input.is_debug, input.max_trace_size);
+    assert_eq!(fds.len(), 1 + usize::from(transpiler.tracing()), "the shared memory's descriptors");
+    let mut fds = fds.into_iter();
     let mut compiled = transpiler.transpile::<SharedMemory>(input.program.as_ref());
-    compiled.memory.open_readwrite(&input.id).expect("initialize memory");
+    compiled.memory.open_readwrite(fds.next().unwrap()).expect("initialize memory");
     compiled.with_initial_memory_image(input.program.memory_image.clone());
     compiled.set_input_buffer(input.input.clone());
     compiled.set_max_chunk_cycles(input.max_chunk_cycles);
@@ -88,8 +100,9 @@ fn main() {
     if transpiler.tracing() {
         // Tracing mode is on
         let trace_buf_size = trace_capacity(input.max_trace_size);
-        let producer = ShmTraceRing::open(&input.id, input.shm_slot_size, trace_buf_size)
-            .expect("open shm file");
+        let producer =
+            ShmTraceRing::from_fd(fds.next().unwrap(), input.shm_slot_size, trace_buf_size)
+                .expect("open shm file");
         // Setup signal handler
         let _handler = crash_handler::CrashHandler::attach(Box::new(signal::CrashReporter {
             ring: producer.clone(),
