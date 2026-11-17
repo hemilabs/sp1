@@ -14,20 +14,14 @@ use sp1_recursion_compiler::{
     ir::{Config, Witness},
 };
 
-/// Create a named temp file in /dev/shm (tmpfs) on Linux, falling back to the
-/// default temp dir on other platforms.
+/// Create a named temp file in /dev/shm (tmpfs) where it exists, or `SP1_SHM_DIR`, falling back
+/// to the default temp dir (see `gpu_cache::default_root`).
 #[cfg(feature = "native")]
 fn shm_named_tempfile() -> tempfile::NamedTempFile {
-    #[cfg(target_os = "linux")]
-    {
-        let shm = std::path::Path::new("/dev/shm");
-        if shm.exists() {
-            return tempfile::Builder::new()
-                .tempfile_in(shm)
-                .expect("failed to create temp file in /dev/shm");
-        }
-    }
-    tempfile::NamedTempFile::new().expect("failed to create temp file")
+    let root = crate::gpu_cache::default_root();
+    tempfile::Builder::new()
+        .tempfile_in(&root)
+        .unwrap_or_else(|e| panic!("failed to create temp file in {}: {e}", root.display()))
 }
 
 /// Resolve a stable, per-circuit cache directory for the
@@ -39,7 +33,7 @@ fn shm_named_tempfile() -> tempfile::NamedTempFile {
 /// proves of the same vk by writing to a stable path and skipping the
 /// re-export when a complete cache is present.
 ///
-/// Cache layout (under /dev/shm or fallback temp):
+/// Cache layout (under /dev/shm, `SP1_SHM_DIR` or fallback temp):
 ///   sp1_groth16_pk_cache_<vkey_hash_hex>/
 ///     <all flat-binary files written by export_groth16_gpu_data>
 ///     .sp1_pk_cache_complete         ← marker; moves into place with the
@@ -57,14 +51,10 @@ fn pk_cache_dir(vkey_hash_hex: &str) -> Option<std::path::PathBuf> {
     if pk_cache_disabled() {
         return None;
     }
-    let root = std::env::var("SP1_GROTH16_PK_CACHE").ok().unwrap_or_else(|| {
-        if std::path::Path::new("/dev/shm").exists() {
-            "/dev/shm".to_string()
-        } else {
-            std::env::temp_dir().to_string_lossy().into_owned()
-        }
-    });
-    Some(std::path::PathBuf::from(root).join(format!("sp1_groth16_pk_cache_{vkey_hash_hex}")))
+    let root = std::env::var_os("SP1_GROTH16_PK_CACHE")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(crate::gpu_cache::default_root);
+    Some(root.join(format!("sp1_groth16_pk_cache_{vkey_hash_hex}")))
 }
 
 /// Whether `SP1_GROTH16_PK_CACHE_DISABLE` gives each proof a proving key export of its own.
@@ -245,7 +235,7 @@ pub(crate) fn find_gpu_helper() -> Option<std::path::PathBuf> {
 
 /// Cache directory for `r1cs_solve_plan prep-circuit-prod` artifacts (used
 /// by the GPU R1CS solver). One directory per circuit (keyed by vkey hash).
-/// Layout under `/dev/shm` (or `$SP1_GPU_R1CS_PREP_CACHE`):
+/// Layout under `/dev/shm` (or `$SP1_GPU_R1CS_PREP_CACHE`, or `SP1_SHM_DIR`):
 ///   sp1_groth16_prep_circuit_<vkey_hash_hex>/
 ///     coeffs.bin, layers.idx, layers_descs.bin, layers_terms.bin,
 ///     hints.idx, layers_hints.bin, hint_in_les.bin, desc_decl_idx.bin,
@@ -256,14 +246,10 @@ fn prep_circuit_cache_dir(vkey_hash_hex: &str) -> Option<std::path::PathBuf> {
     if std::env::var_os("SP1_GPU_R1CS_PREP_CACHE_DISABLE").is_some() {
         return None;
     }
-    let root = std::env::var("SP1_GPU_R1CS_PREP_CACHE").ok().unwrap_or_else(|| {
-        if std::path::Path::new("/dev/shm").exists() {
-            "/dev/shm".to_string()
-        } else {
-            std::env::temp_dir().to_string_lossy().into_owned()
-        }
-    });
-    Some(std::path::PathBuf::from(root).join(format!("sp1_groth16_prep_circuit_{vkey_hash_hex}")))
+    let root = std::env::var_os("SP1_GPU_R1CS_PREP_CACHE")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(crate::gpu_cache::default_root);
+    Some(root.join(format!("sp1_groth16_prep_circuit_{vkey_hash_hex}")))
 }
 
 #[cfg(feature = "native")]
