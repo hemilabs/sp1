@@ -875,6 +875,7 @@ impl ShmMemory {
 
         // Safety: We just created the file, so mapping it is valid.
         let map = unsafe { Mmap::map(&file)? };
+        small_pages(map.as_ptr(), map.len());
 
         Ok(Self { file, map: InnerMap::ReadOnly(map) })
     }
@@ -887,9 +888,25 @@ impl ShmMemory {
 
         // Safety: The descriptor is the creator's file, opened for reading and writing.
         let map = unsafe { MmapMut::map_mut(&file)? };
+        small_pages(map.as_ptr(), map.len());
 
         Ok(Self { file, map: InnerMap::ReadWrite(map) })
     }
+}
+
+/// Keeps a mapping of the guest's memory on 4 KiB pages, as a named `/dev/shm` object was (its
+/// tmpfs mounted without `huge=`): a memfd follows the host's shmem THP setting instead, and with
+/// huge pages a sparse guest's resident size, which the runner's memory limit is measured on,
+/// could grow up to 512 times faster than its real footprint. The trace ring asks for huge pages.
+fn small_pages(addr: *const u8, len: usize) {
+    #[cfg(target_os = "linux")]
+    // SAFETY: advice on a mapping this process holds; it changes no contents. A kernel without
+    // transparent huge pages refuses it, which is the same thing.
+    unsafe {
+        libc::madvise(addr as *mut c_void, len, libc::MADV_NOHUGEPAGE);
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = (addr, len);
 }
 
 // --- Traits Implementation ---
@@ -1007,6 +1024,22 @@ mod tests {
                 let target = target.to_string_lossy();
                 assert!(target.starts_with("/memfd:"), "fd {fd} is {target}");
             }
+        }
+    }
+
+    /// Both processes map the guest's memory on small pages, whatever the host's shmem THP setting.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_memory_is_mapped_on_small_pages() {
+        let memory = ShmMemory::create_readonly(1 << 24).unwrap();
+        let fd = handed_over(&[memory.as_fd()]).pop().unwrap();
+        let other = ShmMemory::from_fd_readwrite(fd).unwrap();
+        let smaps = std::fs::read_to_string("/proc/self/smaps").unwrap();
+        for map in [memory.as_ptr(), other.as_ptr()] {
+            let start = format!("{:x}-", map as usize);
+            let entry = smaps.split_once(&start).expect("the mapping is in smaps").1;
+            let flags = entry.lines().find(|l| l.starts_with("VmFlags:")).unwrap();
+            assert!(flags.split_whitespace().any(|f| f == "nh"), "{start}: {flags}");
         }
     }
 
