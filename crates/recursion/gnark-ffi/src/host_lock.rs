@@ -11,16 +11,19 @@ use std::io;
 use std::path::Path;
 
 /// Opens (creating if needed) a lock file every local user can lock. A file another user created
-/// is opened read-only if need be, which `flock` accepts on local filesystems (not on NFS).
+/// is opened read-only if need be, which `flock` accepts on local filesystems (not on NFS). A
+/// symbolic link at `path` is never followed: the open fails instead.
 #[cfg(unix)]
 pub(crate) fn open(path: &Path) -> io::Result<File> {
     use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    let flags = libc::O_NOFOLLOW | libc::O_CLOEXEC;
     match std::fs::OpenOptions::new()
         .read(true)
         .write(true)
         .create(true)
         .truncate(false)
         .mode(0o666)
+        .custom_flags(flags)
         .open(path)
     {
         Ok(file) => {
@@ -29,7 +32,11 @@ pub(crate) fn open(path: &Path) -> io::Result<File> {
             let _ = file.set_permissions(std::fs::Permissions::from_mode(0o666));
             Ok(file)
         }
-        Err(write_err) => File::open(path).map_err(|_| write_err),
+        Err(write_err) => std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(flags)
+            .open(path)
+            .map_err(|_| write_err),
     }
 }
 
@@ -97,4 +104,30 @@ pub(crate) fn lock(_file: &File) -> io::Result<()> {
 #[cfg(not(unix))]
 pub(crate) fn is_current(_file: &File, _path: &Path) -> bool {
     true
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    /// A symbolic link where a lock file should be is not followed, whether it points at a file
+    /// or at nothing yet: neither the file it names is opened nor one is created there.
+    #[test]
+    fn a_link_in_place_of_a_lock_file_is_not_followed() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target");
+        std::fs::write(&target, b"untouched").unwrap();
+        let missing = dir.path().join("missing");
+        for (name, to) in [("to-file", &target), ("to-nothing", &missing)] {
+            let link = dir.path().join(name);
+            std::os::unix::fs::symlink(to, &link).unwrap();
+            let err = super::open(&link).expect_err("a link is not opened");
+            assert_eq!(err.raw_os_error(), Some(libc::ELOOP), "{name}: {err}");
+        }
+        assert_eq!(std::fs::read(&target).unwrap(), b"untouched");
+        assert!(!missing.exists());
+        // A plain lock file still opens, close-on-exec.
+        let file = super::open(&dir.path().join("lock")).unwrap();
+        use std::os::fd::AsRawFd;
+        let fd_flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFD) };
+        assert_ne!(fd_flags & libc::FD_CLOEXEC, 0);
+    }
 }
