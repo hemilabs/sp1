@@ -12,7 +12,17 @@ mod server;
 struct Args {
     #[clap(long)]
     version: bool,
+    /// Print what this server can do, one capability per line ([`CAPABILITIES`]), then
+    /// `commit=<sha>` when the build knew its commit, and exit. A server older than this flag
+    /// refuses it.
+    #[clap(long)]
+    capabilities: bool,
 }
+
+/// What `--capabilities` reports, one per line. Each name is stable: a client looks for the line.
+/// - `fd-shared-memory`: the executor shares the guest's memory and trace ring with its runner
+///   through file descriptors (memfds), never through names in `/dev/shm`.
+const CAPABILITIES: &[&str] = &["fd-shared-memory"];
 
 fn main() {
     // First, before the runtime or CUDA start: when started as its own Groth16 CPU helper, prove
@@ -30,6 +40,15 @@ async fn serve() {
 
     if args.version {
         println!("{}", sp1_primitives::SP1_CRATE_VERSION);
+        return;
+    }
+    if args.capabilities {
+        for capability in CAPABILITIES {
+            println!("{capability}");
+        }
+        if let Some(commit) = option_env!("SP1_GPU_SERVER_COMMIT") {
+            println!("commit={commit}");
+        }
         return;
     }
 
