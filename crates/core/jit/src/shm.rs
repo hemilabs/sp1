@@ -1,8 +1,9 @@
 //! The memory the native executor shares with the runner process it starts: the guest's memory
 //! image ([`ShmMemory`]) and the trace ring ([`ShmTraceRing`]).
 //!
-//! Neither has a name. On Linux each is a memfd; elsewhere it is a POSIX shared memory object
-//! unlinked the moment it is created ([`anonymous_shared_file`]). The executor creates them and
+//! Neither has a name. On Linux each is a memfd; elsewhere, and on Linux where `memfd_create` is
+//! refused, it is a POSIX shared memory object unlinked the moment it is created
+//! ([`anonymous_shared_file`]). The executor creates them and
 //! hands their descriptors to its runner over the runner's stdin, a Unix socket ([`send_fds`],
 //! [`recv_fds`]); nothing outside the two processes can open them, and the kernel frees them once
 //! the last descriptor and mapping is gone, however the processes end.
@@ -198,6 +199,10 @@ impl Semaphore {
 /// It cannot be executed (`MFD_NOEXEC_SEAL`, from Linux 6.3, which `vm.memfd_noexec=2` requires;
 /// an older kernel refuses the flag and gets the file without it), and its size is sealed once set:
 /// neither process resizes it after this.
+///
+/// Where `memfd_create` itself is refused (before Linux 3.17, or by a seccomp profile that denies
+/// it), it is a POSIX shared memory object unlinked as soon as it is made ([`unlinked_shm_file`]),
+/// with a warning the first time.
 #[cfg(target_os = "linux")]
 pub(crate) fn anonymous_shared_file(label: &std::ffi::CStr, size: usize) -> io::Result<File> {
     /// `MFD_NOEXEC_SEAL`, which not every `libc` version defines.
@@ -212,7 +217,18 @@ pub(crate) fn anonymous_shared_file(label: &std::ffi::CStr, size: usize) -> io::
         fd = memfd_create(flags);
     }
     if fd < 0 {
-        return Err(io::Error::last_os_error());
+        let e = io::Error::last_os_error();
+        if matches!(e.raw_os_error(), Some(libc::ENOSYS | libc::EPERM)) {
+            static WARNED: std::sync::Once = std::sync::Once::new();
+            WARNED.call_once(|| {
+                tracing::warn!(
+                    "memfd_create is refused here ({e}): the executor shares its memory through \
+                     POSIX shared memory objects instead, each unlinked as soon as it is made"
+                )
+            });
+            return unlinked_shm_file(size);
+        }
+        return Err(e);
     }
     // SAFETY: a new descriptor, which nothing else owns.
     let file = unsafe { File::from_raw_fd(fd) };
@@ -229,6 +245,13 @@ pub(crate) fn anonymous_shared_file(label: &std::ffi::CStr, size: usize) -> io::
 /// it ([`send_fds`]).
 #[cfg(not(target_os = "linux"))]
 pub(crate) fn anonymous_shared_file(_label: &std::ffi::CStr, size: usize) -> io::Result<File> {
+    unlinked_shm_file(size)
+}
+
+/// A new POSIX shared memory object of `size` bytes, under a random name it has only between its
+/// creation and the `shm_unlink` that follows at once, and close-on-exec. Off Linux, and on Linux
+/// where `memfd_create` is refused.
+fn unlinked_shm_file(size: usize) -> io::Result<File> {
     use libc::{O_CREAT, O_EXCL, O_RDWR, S_IRUSR, S_IWUSR};
     // macOS limits these names to 31 bytes.
     let name = format!("/sp1-{}", &uuid::Uuid::new_v4().simple().to_string()[..24]);
@@ -1060,6 +1083,55 @@ mod tests {
         refused("a write index far past what the ring holds");
         unsafe { (*h).write_idx.store(0, Ordering::Release) };
         refused("a write index behind what was taken");
+    }
+
+    /// Where `memfd_create` is refused (a seccomp profile that denies it, or a kernel before 3.17),
+    /// the memory is a POSIX shared memory object that no name reaches once it is made, shared
+    /// through its descriptor as a memfd is.
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn without_memfd_create_the_memory_is_an_unlinked_shared_memory_object() {
+        for errno in [libc::EPERM, libc::ENOSYS] {
+            // On a thread of its own: a seccomp filter binds the thread that installs it.
+            let (path, shared) = std::thread::spawn(move || {
+                deny_memfd_create(errno);
+                let memory = ShmMemory::create_readonly(1 << 20).unwrap();
+                let fd = handed_over(&[memory.as_fd()]).pop().unwrap();
+                let mut other = ShmMemory::from_fd_readwrite(fd).unwrap();
+                other[4321] = 0x5a;
+                let path = std::fs::read_link(format!("/proc/self/fd/{}", memory.as_raw_fd()));
+                (path.unwrap(), memory[4321])
+            })
+            .join()
+            .unwrap();
+            let path = path.to_string_lossy().into_owned();
+            assert!(path.starts_with("/dev/shm/sp1-") && path.ends_with(" (deleted)"), "{path}");
+            assert!(!std::path::Path::new(path.trim_end_matches(" (deleted)")).exists());
+            assert_eq!(shared, 0x5a);
+        }
+    }
+
+    /// Makes `memfd_create` fail with `errno` on this thread from now on.
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    fn deny_memfd_create(errno: i32) {
+        // A classic BPF program: load the syscall number; memfd_create returns `errno`, anything
+        // else is allowed.
+        const LD_W_ABS: u16 = 0x20;
+        const JEQ_K: u16 = 0x15;
+        const RET_K: u16 = 0x06;
+        const RET_ERRNO: u32 = 0x0005_0000;
+        const RET_ALLOW: u32 = 0x7fff_0000;
+        let mut filter = [
+            libc::sock_filter { code: LD_W_ABS, jt: 0, jf: 0, k: 0 },
+            libc::sock_filter { code: JEQ_K, jt: 0, jf: 1, k: libc::SYS_memfd_create as u32 },
+            libc::sock_filter { code: RET_K, jt: 0, jf: 0, k: RET_ERRNO | errno as u32 },
+            libc::sock_filter { code: RET_K, jt: 0, jf: 0, k: RET_ALLOW },
+        ];
+        let prog = libc::sock_fprog { len: filter.len() as u16, filter: filter.as_mut_ptr() };
+        unsafe {
+            assert_eq!(libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0), 0);
+            assert_eq!(libc::prctl(libc::PR_SET_SECCOMP, libc::SECCOMP_MODE_FILTER, &prog), 0);
+        }
     }
 
     /// Anything but what `send_fds` sends is refused, and a ring of another size is not mapped.
