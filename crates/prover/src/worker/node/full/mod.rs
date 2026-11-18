@@ -339,10 +339,17 @@ impl SP1LocalNode {
             let subscriber =
                 self.inner.worker_client.subscriber(proof_id.clone()).await?.per_task();
             let status = subscriber.wait_task(task_id).await?;
+            let out_of_memory = init::take_out_of_device_memory(&proof_id);
             match status {
                 TaskStatus::Succeeded => {}
                 TaskStatus::FailedRetryable => {
                     return Err(anyhow::Error::new(RetryableProofFailure));
+                }
+                // Said, for a caller that retries a proof which ran out with a smaller shard.
+                _ if out_of_memory => {
+                    return Err(anyhow::anyhow!(
+                        "controller task failed: out of GPU memory (a device allocation failed)"
+                    ))
                 }
                 _ => return Err(anyhow::anyhow!("controller task failed")),
             }
