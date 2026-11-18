@@ -605,6 +605,40 @@ async fn run_wrap_tasks<F, Fut>(
     }
 }
 
+/// Proofs one of whose tasks failed because a device allocation did. A task's failure reaches the
+/// proof only as its status, so without this a proof that ran out of GPU memory failed as any
+/// other ("controller task failed"), and a caller that would retry it with a smaller shard could
+/// not tell. Taken (and so cleared) by the proof when it ends: [`take_out_of_device_memory`].
+static OUT_OF_DEVICE_MEMORY: std::sync::Mutex<Vec<ProofId>> = std::sync::Mutex::new(Vec::new());
+
+/// Whether a task's error or panic, as `{:?}` prints it, is a device allocation failing: slop's
+/// allocator (`AllocError { layout: .. }`, unwrapped where a tensor is made, and "allocation
+/// failed" where a raw buffer is) or the CUDA runtime's own out-of-memory error. The texts are
+/// the allocators' own, with the sizes they computed; nothing a program proven sets.
+fn is_device_allocation_failure(error: &str) -> bool {
+    error.contains("AllocError {")
+        || error.contains("allocation failed")
+        || error.contains("out of GPU memory")
+}
+
+/// Notes `proof_id` as out of device memory if `error` says a device allocation failed.
+fn note_if_out_of_device_memory(proof_id: &ProofId, error: &impl std::fmt::Debug) {
+    if is_device_allocation_failure(&format!("{error:?}")) {
+        let mut noted = OUT_OF_DEVICE_MEMORY.lock().unwrap_or_else(|e| e.into_inner());
+        if !noted.contains(proof_id) {
+            noted.push(proof_id.clone());
+        }
+    }
+}
+
+/// Whether one of `proof_id`'s tasks failed because a device allocation did, clearing the note.
+pub(crate) fn take_out_of_device_memory(proof_id: &ProofId) -> bool {
+    let mut noted = OUT_OF_DEVICE_MEMORY.lock().unwrap_or_else(|e| e.into_inner());
+    let before = noted.len();
+    noted.retain(|id| id != proof_id);
+    noted.len() != before
+}
+
 /// Runs a task that a handler would otherwise await in its own loop, so that a panic in it (a
 /// device allocation that fails, or a malformed input, say) fails the task instead of ending the
 /// handler with the task pending, and every later request waiting on it. Dropping the handler
@@ -689,6 +723,7 @@ impl TaskOutput {
             }
             Ok(Err(TaskError::Fatal(e))) => {
                 tracing::error!("task failed with fatal error: {:?}", e);
+                note_if_out_of_device_memory(&proof_id, &e);
                 let task_output = TaskOutput {
                     proof_id,
                     task_id,
@@ -701,6 +736,7 @@ impl TaskOutput {
             }
             Ok(Err(TaskError::Execution(e))) => {
                 tracing::error!("task failed with fatal error: {:?}", e);
+                note_if_out_of_device_memory(&proof_id, &e);
                 let task_output = TaskOutput {
                     proof_id,
                     task_id,
@@ -713,6 +749,7 @@ impl TaskOutput {
             }
             Err(e) => {
                 tracing::error!("task panicked: {:?}", e);
+                note_if_out_of_device_memory(&proof_id, &e);
                 // Failed, not left pending: the proof waiting on it would hang (a worker that ran
                 // out of memory panics).
                 let task_output = TaskOutput {
@@ -791,6 +828,24 @@ impl TaskOutput {
 #[cfg(test)]
 mod catching_panics_tests {
     use super::*;
+
+    /// A task that ran out of device memory marks its proof, once, and nothing else does.
+    #[test]
+    fn a_device_allocation_failure_marks_its_proof() {
+        let proof = ProofId::new("oom-proof");
+        let other = ProofId::new("other-proof");
+        let alloc = "JoinError::Panic(Id(444), \"called `Result::unwrap()` on an `Err` value:                      AllocError { layout: Layout { size: 2042420352, align: 4 (1 << 2) } }\")";
+        note_if_out_of_device_memory(&proof, &alloc);
+        note_if_out_of_device_memory(&proof, &"a device allocation failed");
+        note_if_out_of_device_memory(&other, &"guest panicked: assertion failed");
+        assert!(take_out_of_device_memory(&proof));
+        assert!(!take_out_of_device_memory(&proof), "taken once");
+        assert!(!take_out_of_device_memory(&other));
+        for oom in ["out of GPU memory", "allocation failed on evaluated: 1728053248 bytes"] {
+            assert!(is_device_allocation_failure(oom), "{oom}");
+        }
+        assert!(!is_device_allocation_failure("controller task failed"));
+    }
 
     /// A task that panics fails, rather than ending its handler with the task pending.
     #[tokio::test]
