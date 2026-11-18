@@ -1296,7 +1296,58 @@ LiveBlocks& liveBlocksOf(void* p) {
 }  // namespace
 #endif
 
+#if defined(_WIN32) && !defined(__HIPCC__)
+namespace {
+// Blocks this large or larger are checked against the memory free on the card before the pool
+// grows for them (`fits_on_the_card`). Smaller ones are not worth a query each.
+constexpr size_t kCheckedBlock = 64ull << 20;
+
+// Whether the default pool can take a block of `size` without growing past what the card has
+// free. Under Windows, at the driver's default CUDA - Sysmem Fallback Policy, a pool that grows
+// past the process's video memory budget is not refused: the driver places the memory in system
+// memory, and every kernel that touches it runs from there. On an RTX 4070 a proof that outgrew
+// the card that way took 408 s instead of 33, where with "Prefer No Sysmem Fallback" it ran out at
+// once and was retried smaller in 61 s. Refusing here gives every machine the second, whatever its
+// driver settings: `cudaMemGetInfo`'s free figure is the budget's, and memory the pool holds unused
+// is not counted against the block.
+bool fits_on_the_card(size_t size) {
+    int device = 0;
+    cudaMemPool_t pool;
+    if (cudaGetDevice(&device) != cudaSuccess ||
+        cudaDeviceGetDefaultMemPool(&pool, device) != cudaSuccess) {
+        return true;
+    }
+    uint64_t reserved = 0, used = 0;
+    if (cudaMemPoolGetAttribute(pool, cudaMemPoolAttrReservedMemCurrent, &reserved) !=
+            cudaSuccess ||
+        cudaMemPoolGetAttribute(pool, cudaMemPoolAttrUsedMemCurrent, &used) != cudaSuccess) {
+        return true;
+    }
+    const uint64_t idle = reserved > used ? reserved - used : 0;
+    if (size <= idle) {
+        return true;
+    }
+    size_t free_bytes = 0, total = 0;
+    if (cudaMemGetInfo(&free_bytes, &total) != cudaSuccess) {
+        return true;
+    }
+    return size - idle <= free_bytes;
+}
+}  // namespace
+#endif
+
 extern "C" rustCudaError_t cuda_malloc_async(void** devPtr, size_t size, cudaStream_t stream) {
+#if defined(_WIN32) && !defined(__HIPCC__)
+    // Refused rather than placed in system memory (see `fits_on_the_card`). Frees queued on other
+    // streams may still be on their way back to the pool: they are waited for once before refusing.
+    if (size >= kCheckedBlock && !fits_on_the_card(size)) {
+        (void)cudaDeviceSynchronize();
+        if (!fits_on_the_card(size)) {
+            (void)cudaGetLastError();
+            return CUDA_OUT_OF_MEMORY;
+        }
+    }
+#endif
     // An allocation failure can be recovered from (the caller may free memory and retry); CUDA_OK
     // does not leave it as the thread's last error for a later `cudaGetLastError` check.
     CUDA_OK(cudaMallocAsync(devPtr, size, stream));
