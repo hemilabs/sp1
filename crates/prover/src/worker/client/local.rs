@@ -8,6 +8,7 @@ use sp1_prover_types::{
 };
 use tokio::sync::{mpsc, watch, RwLock};
 
+use super::progress::ProgressFile;
 use crate::worker::{
     ProofId, RawTaskRequest, SubscriberBuilder, TaskId, TaskMetadata, WorkerClient,
 };
@@ -66,6 +67,8 @@ pub struct LocalWorkerClientInner {
     /// compressed proof ([`LocalWorkerClient::take_wrap_times`]). `complete_proof` drops a proof's
     /// that are left.
     wrap_tasks: std::sync::Mutex<HashMap<TaskId, WrapTask>>,
+    /// Per-proof task counts for `SP1_PROGRESS_FILE` (see `progress`).
+    progress: ProgressFile,
 }
 
 pub(crate) const MAX_LOCAL_TASK_RETRIES: u8 = 3;
@@ -114,6 +117,7 @@ impl LocalWorkerClientInner {
             retry_counts: RwLock::new(HashMap::new()),
             ended_proofs: std::sync::Mutex::new(lru::LruCache::new(ENDED_PROOFS)),
             wrap_tasks: std::sync::Mutex::new(HashMap::new()),
+            progress: ProgressFile::from_env(),
         };
         (inner, LocalWorkerClientChannels { task_receivers: task_outputs })
     }
@@ -179,6 +183,9 @@ impl LocalWorkerClient {
             .ok_or_else(|| anyhow::anyhow!("task does not exist"))?;
 
         status_tx.send(status).map_err(|_| anyhow::anyhow!("failed to send status to task"))?;
+        if matches!(status, TaskStatus::Succeeded) {
+            self.inner.progress.succeeded(&task_id);
+        }
 
         if matches!(
             status,
@@ -311,6 +318,7 @@ impl WorkerClient for LocalWorkerClient {
             // Create a db entry for the task.
             let (tx, rx) = watch::channel(TaskStatus::Pending);
             self.inner.db.write().await.insert(task_id.clone(), (tx, rx));
+            self.inner.progress.submitted(&task_id, &task.context.proof_id, kind);
             if matches!(kind, TaskType::ShrinkWrap | TaskType::Groth16Wrap | TaskType::PlonkWrap) {
                 self.inner.wrap_tasks.lock().unwrap_or_else(|e| e.into_inner()).insert(
                     task_id.clone(),
@@ -369,6 +377,7 @@ impl WorkerClient for LocalWorkerClient {
                 .remove(&proof_id)
                 .ok_or_else(|| anyhow::anyhow!("proof does not exist for id {proof_id}"))?
         };
+        self.inner.progress.ended(&proof_id);
         // Prune the db and any message channels for the proof's tasks. Two
         // short critical sections rather than one holding both writer locks
         // (avoids nesting and keeps each scope's hold time bounded by

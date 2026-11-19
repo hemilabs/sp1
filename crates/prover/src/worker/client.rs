@@ -21,8 +21,10 @@ use tokio::{
 };
 
 mod local;
+mod progress;
 
 pub use local::*;
+pub use progress::PROGRESS_FILE_ENV;
 
 use crate::worker::{ProveShardTaskRequest, TaskError};
 
