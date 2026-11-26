@@ -111,51 +111,54 @@ pub fn local_gpu_opts() -> SP1CoreOpts {
 
     let gpu_memory_gb = gpu_memory_gb();
 
-    if gpu_memory_gb < 16 {
-        panic!("Unsupported GPU memory: {gpu_memory_gb}, must be at least 16GB");
+    if gpu_memory_gb < 15 {
+        panic!("Unsupported GPU memory: {gpu_memory_gb}, must be at least 15 (an 11 GB card)");
     }
 
-    // Shard threshold tiers based on GPU memory. `gpu_memory_gb` = ceil(actual GiB) + 4, so a 16 GB
-    // card reports 20 and a 24 GB card 28.
-    let tier_threshold =
-        if gpu_memory_gb <= 20 && cfg!(windows) && sp1_gpu_cudart::sys::BACKEND == "hip" && {
-            // SAFETY: takes nothing and queries DXGI for the current device.
-            let budget = unsafe { sp1_gpu_cudart::sys::runtime::sp1_video_memory_budget() };
-            tracing::debug!("video memory budget: {:.1} GiB", budget as f64 / (1u64 << 30) as f64);
-            budget < HIP_WINDOWS_16GB_TIER_MIN_BUDGET
-        } {
-            // 16GB AMD GPUs on Windows with a tight video memory budget: Windows granted a process
-            // ~12.5 GB of an RX 9070 XT's 16, and past it WDDM moves allocations into shared system
-            // memory rather than failing them, which slowed every kernel touching them (it proved a
-            // 144M-cycle program in 15-17 s at the tier below and 12.7-13.5 s at this one).
-            1 << 26
-        } else if gpu_memory_gb <= 20
-            && (sp1_gpu_cudart::sys::BACKEND == "cuda"
+    // Shard threshold tiers based on GPU memory. `gpu_memory_gb` = ceil(actual GiB) + 4, so an 11 GB
+    // card reports 15, a 16 GB card 20 and a 24 GB card 28.
+    let tier_threshold = if gpu_memory_gb <= 15 {
+        // 11 GB cards (RTX 2080 Ti): ~134M elements a shard, with the 16 GB tier's memory
+        // savers below. 2^28 peaked at ~11.1 GiB on a 12 GB RTX 4070, more than such a card has.
+        ELEMENT_THRESHOLD - (1 << 28)
+    } else if gpu_memory_gb <= 20 && cfg!(windows) && sp1_gpu_cudart::sys::BACKEND == "hip" && {
+        // SAFETY: takes nothing and queries DXGI for the current device.
+        let budget = unsafe { sp1_gpu_cudart::sys::runtime::sp1_video_memory_budget() };
+        tracing::debug!("video memory budget: {:.1} GiB", budget as f64 / (1u64 << 30) as f64);
+        budget < HIP_WINDOWS_16GB_TIER_MIN_BUDGET
+    } {
+        // 16GB AMD GPUs on Windows with a tight video memory budget: Windows granted a process
+        // ~12.5 GB of an RX 9070 XT's 16, and past it WDDM moves allocations into shared system
+        // memory rather than failing them, which slowed every kernel touching them (it proved a
+        // 144M-cycle program in 15-17 s at the tier below and 12.7-13.5 s at this one).
+        1 << 26
+    } else if gpu_memory_gb <= 20
+        && (sp1_gpu_cudart::sys::BACKEND == "cuda"
                 // SAFETY: takes nothing and creates nothing; reads settings and device attributes.
                 || unsafe { sp1_gpu_cudart::sys::runtime::sp1_hip_arena_scatters() } != 0)
-        {
-            // 16 GB CUDA cards: 2^28 elements a shard, below the 24 GB tier's. An RTX 5060 Ti
-            // driving the desktop peaked at 12.3 GB (Windows), and proved in fewer shards than at
-            // 2^27: an RSP block (21000000) compressed in 65.0 s instead of 91.0, keccak over 20 MB
-            // in 74.3 s instead of 99.7, bench-fib compressed in 4.12 s instead of 5.05 (2^28 +
-            // 2^26 was faster still, 60.1 s for the block, but peaked at 13.9 GB).
-            //
-            // And 16 GB HIP cards whose arena assembles blocks from scattered pages: at 2^28 a
-            // shard's largest blocks (~4 GiB) found no free range that long in the single-range
-            // arena with half the card free. An RX 9070 XT proved the block in 50.0 s instead of
-            // 72.8 s. (2^28 + 2^25 and 2^28 + 2^26 proved the block in 41.4 and 39.7 s instead of
-            // 42.7, but fibonacci 20M's first shard ran out of memory at both: its codeword found
-            // too few whole free pages.)
-            1 << 28
-        } else if gpu_memory_gb <= 20 {
-            // 16 GB cards (e.g. RX 9070 XT) whose arena can't take scattered blocks: ~134M
-            // elements per shard to fit in VRAM.
-            ELEMENT_THRESHOLD - (1 << 28)
-        } else if !opts.full_size_shards && gpu_memory_gb <= 30 {
-            ELEMENT_THRESHOLD - (1 << 26) - (1 << 25) - (1 << 24)
-        } else {
-            ELEMENT_THRESHOLD
-        };
+    {
+        // 16 GB CUDA cards: 2^28 elements a shard, below the 24 GB tier's. An RTX 5060 Ti
+        // driving the desktop peaked at 12.3 GB (Windows), and proved in fewer shards than at
+        // 2^27: an RSP block (21000000) compressed in 65.0 s instead of 91.0, keccak over 20 MB
+        // in 74.3 s instead of 99.7, bench-fib compressed in 4.12 s instead of 5.05 (2^28 +
+        // 2^26 was faster still, 60.1 s for the block, but peaked at 13.9 GB).
+        //
+        // And 16 GB HIP cards whose arena assembles blocks from scattered pages: at 2^28 a
+        // shard's largest blocks (~4 GiB) found no free range that long in the single-range
+        // arena with half the card free. An RX 9070 XT proved the block in 50.0 s instead of
+        // 72.8 s. (2^28 + 2^25 and 2^28 + 2^26 proved the block in 41.4 and 39.7 s instead of
+        // 42.7, but fibonacci 20M's first shard ran out of memory at both: its codeword found
+        // too few whole free pages.)
+        1 << 28
+    } else if gpu_memory_gb <= 20 {
+        // 16 GB cards (e.g. RX 9070 XT) whose arena can't take scattered blocks: ~134M
+        // elements per shard to fit in VRAM.
+        ELEMENT_THRESHOLD - (1 << 28)
+    } else if !opts.full_size_shards && gpu_memory_gb <= 30 {
+        ELEMENT_THRESHOLD - (1 << 26) - (1 << 25) - (1 << 24)
+    } else {
+        ELEMENT_THRESHOLD
+    };
 
     // `SP1_GPU_ELEMENT_THRESHOLD` caps the tier's choice; it never replaces it.
     //

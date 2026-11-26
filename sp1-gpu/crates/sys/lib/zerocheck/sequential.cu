@@ -1218,7 +1218,19 @@ extern "C" uint32_t zerocheck_coop_smem_cap() {
 #elif defined(__HIPCC__)
     return 64 * 1024;  // LDS per workgroup on AMD
 #else
-    return 96 * 1024;
+    // 96 KB, or what the device allows a block when that is less: 64 KB on Turing (RTX 20, T4),
+    // where raising the limit to 96 KB fails and a launch that size would too.
+    static const uint32_t cap = [] {
+        int device = 0, optin = 0;
+        if (cudaGetDevice(&device) != cudaSuccess ||
+            cudaDeviceGetAttribute(&optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, device) !=
+                cudaSuccess ||
+            optin <= 0) {
+            return (uint32_t)(96 * 1024);
+        }
+        return (uint32_t)std::min<int>(96 * 1024, optin);
+    }();
+    return cap;
 #endif
 }
 
