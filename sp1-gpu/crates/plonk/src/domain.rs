@@ -12,7 +12,6 @@ use crate::fields::Fr;
 #[cfg(feature = "cuda")]
 pub(crate) mod gpu_ntt {
     use crate::fields::Fr;
-    use rayon::prelude::*;
     use std::ffi::c_void;
     use std::sync::{LazyLock, Mutex, Once};
 
@@ -158,15 +157,16 @@ pub(crate) mod gpu_ntt {
         // Pack all polynomials into a contiguous buffer (pre-faulted)
         let total = poly_count * n;
         let mut packed = {
-            let mut v = Vec::with_capacity(total);
-            unsafe { v.set_len(total) };
+            let mut v: Vec<Fr> = Vec::with_capacity(total);
             use rayon::prelude::*;
             let chunk = (total / rayon::current_num_threads().max(1)).max(4096);
-            v.par_chunks_mut(chunk).for_each(|c| {
+            v.spare_capacity_mut()[..total].par_chunks_mut(chunk).for_each(|c| {
                 for slot in c.iter_mut() {
-                    unsafe { std::ptr::write_volatile(slot as *mut Fr, Fr::ZERO) };
+                    slot.write(Fr::ZERO);
                 }
             });
+            // SAFETY: every element up to `total` was written above.
+            unsafe { v.set_len(total) };
             v
         };
         for (i, poly) in polys.iter().enumerate() {
@@ -560,23 +560,14 @@ pub(crate) mod gpu_ntt {
         }
 
         // Step 2: Download coefficients to CPU
-        let mut coeffs = Vec::with_capacity(n);
-        unsafe {
-            coeffs.set_len(n);
-        }
-        coeffs.par_chunks_mut(128).for_each(|chunk| unsafe {
-            std::ptr::write_volatile(&mut chunk[0] as *mut Fr, Fr::ZERO);
-        });
-        let err = unsafe {
-            sp1_gpu_sys::runtime::cuda_mem_copy_device_to_host(
-                coeffs.as_mut_ptr() as *mut c_void,
+        // SAFETY: `d_scratch` holds at least `n` elements on the device.
+        let coeffs = unsafe {
+            crate::domain::download_fr(
                 d_scratch,
-                byte_size_n,
+                n,
+                "D2H failed for coefficients in fused ifft+coset_fft from device",
             )
         };
-        if err != unsafe { sp1_gpu_sys::runtime::CUDA_SUCCESS_CSL } {
-            panic!("D2H failed for coefficients in fused ifft+coset_fft from device");
-        }
 
         // Step 3: Zero-pad to 4N and coset FFT
         let err = unsafe {
@@ -653,23 +644,10 @@ pub(crate) mod gpu_ntt {
             panic!("D2D copy for d_canonical failed (from_device keep_canonical)");
         }
 
-        let mut coeffs = Vec::with_capacity(n);
-        unsafe {
-            coeffs.set_len(n);
-        }
-        coeffs.par_chunks_mut(128).for_each(|chunk| unsafe {
-            std::ptr::write_volatile(&mut chunk[0] as *mut Fr, Fr::ZERO);
-        });
-        let err = unsafe {
-            sp1_gpu_sys::runtime::cuda_mem_copy_device_to_host(
-                coeffs.as_mut_ptr() as *mut c_void,
-                d_scratch,
-                byte_size_n,
-            )
+        // SAFETY: `d_scratch` holds at least `n` elements on the device.
+        let coeffs = unsafe {
+            crate::domain::download_fr(d_scratch, n, "D2H failed (from_device keep_canonical)")
         };
-        if err != unsafe { sp1_gpu_sys::runtime::CUDA_SUCCESS_CSL } {
-            panic!("D2H failed (from_device keep_canonical)");
-        }
 
         let err = unsafe {
             sp1_gpu_sys::runtime::cuda_mem_set(
@@ -736,23 +714,14 @@ pub(crate) mod gpu_ntt {
         }
 
         // Step 2: Download coefficients to CPU (pre-fault pages for DMA)
-        let mut coeffs = Vec::with_capacity(n);
-        unsafe {
-            coeffs.set_len(n);
-        }
-        coeffs.par_chunks_mut(128).for_each(|chunk| unsafe {
-            std::ptr::write_volatile(&mut chunk[0] as *mut Fr, Fr::ZERO);
-        });
-        let err = unsafe {
-            sp1_gpu_sys::runtime::cuda_mem_copy_device_to_host(
-                coeffs.as_mut_ptr() as *mut c_void,
+        // SAFETY: `d_scratch` holds at least `n` elements on the device.
+        let coeffs = unsafe {
+            crate::domain::download_fr(
                 d_scratch,
-                byte_size_n,
+                n,
+                "D2H failed for coefficients in fused ifft+coset_fft",
             )
         };
-        if err != unsafe { sp1_gpu_sys::runtime::CUDA_SUCCESS_CSL } {
-            panic!("D2H failed for coefficients in fused ifft+coset_fft");
-        }
 
         // Step 3: Zero-pad coefficients to 4N on device, then coset FFT
         let err = unsafe {
@@ -846,23 +815,10 @@ pub(crate) mod gpu_ntt {
         }
 
         // Download host coeffs (consumers like Round 4 evals still read on CPU).
-        let mut coeffs = Vec::with_capacity(n);
-        unsafe {
-            coeffs.set_len(n);
-        }
-        coeffs.par_chunks_mut(128).for_each(|chunk| unsafe {
-            std::ptr::write_volatile(&mut chunk[0] as *mut Fr, Fr::ZERO);
-        });
-        let err = unsafe {
-            sp1_gpu_sys::runtime::cuda_mem_copy_device_to_host(
-                coeffs.as_mut_ptr() as *mut c_void,
-                d_scratch,
-                byte_size_n,
-            )
+        // SAFETY: `d_scratch` holds at least `n` elements on the device.
+        let coeffs = unsafe {
+            crate::domain::download_fr(d_scratch, n, "D2H failed for coefficients (keep_canonical)")
         };
-        if err != unsafe { sp1_gpu_sys::runtime::CUDA_SUCCESS_CSL } {
-            panic!("D2H failed for coefficients (keep_canonical)");
-        }
 
         let err = unsafe {
             sp1_gpu_sys::runtime::cuda_mem_set(
@@ -932,23 +888,14 @@ pub(crate) mod gpu_ntt {
         }
 
         // Step 3: D2H download coefficients (N elements, pre-faulted per page)
-        let mut coeffs = Vec::with_capacity(n);
-        unsafe {
-            coeffs.set_len(n);
-        }
-        coeffs.par_chunks_mut(128).for_each(|chunk| unsafe {
-            std::ptr::write_volatile(&mut chunk[0] as *mut Fr, Fr::ZERO);
-        });
-        let err = unsafe {
-            sp1_gpu_sys::runtime::cuda_mem_copy_device_to_host(
-                coeffs.as_mut_ptr() as *mut c_void,
+        // SAFETY: `d_ptr` holds at least `n` elements on the device.
+        let coeffs = unsafe {
+            crate::domain::download_fr(
                 d_ptr,
-                byte_size_n,
+                n,
+                "D2H failed for coefficients in fused ifft+coset_fft_to_host",
             )
         };
-        if err != unsafe { sp1_gpu_sys::runtime::CUDA_SUCCESS_CSL } {
-            panic!("D2H failed for coefficients in fused ifft+coset_fft_to_host");
-        }
 
         // Step 4: Zero-pad to 4N on device
         let err = unsafe {
@@ -969,23 +916,14 @@ pub(crate) mod gpu_ntt {
         }
 
         // Step 6: D2H download coset evals (4N elements, pre-faulted per page)
-        let mut coset_evals = Vec::with_capacity(big_n);
-        unsafe {
-            coset_evals.set_len(big_n);
-        }
-        coset_evals.par_chunks_mut(128).for_each(|chunk| unsafe {
-            std::ptr::write_volatile(&mut chunk[0] as *mut Fr, Fr::ZERO);
-        });
-        let err = unsafe {
-            sp1_gpu_sys::runtime::cuda_mem_copy_device_to_host(
-                coset_evals.as_mut_ptr() as *mut c_void,
+        // SAFETY: `d_ptr` holds at least `big_n` elements on the device.
+        let coset_evals = unsafe {
+            crate::domain::download_fr(
                 d_ptr,
-                byte_size_4n,
+                big_n,
+                "D2H failed for coset evals in fused ifft+coset_fft_to_host",
             )
         };
-        if err != unsafe { sp1_gpu_sys::runtime::CUDA_SUCCESS_CSL } {
-            panic!("D2H failed for coset evals in fused ifft+coset_fft_to_host");
-        }
 
         (coeffs, coset_evals)
     }
@@ -1027,6 +965,34 @@ pub fn free_ntt_buffer() -> usize {
 #[cfg(feature = "cuda")]
 pub fn ntt_buffer_size() -> usize {
     gpu_ntt::ntt_buffer_size()
+}
+
+/// `len` elements copied from device memory at `src` into a new host `Vec`, panicking with `what`
+/// if the copy fails. One element of every 128 (a 4 KiB page) is written first, in parallel, so the
+/// copy does not fault the pages in one at a time; the `Vec` takes its length only once the copy
+/// has written every element.
+///
+/// # Safety
+///
+/// `src` must be a device allocation holding at least `len` elements.
+#[cfg(feature = "cuda")]
+pub(crate) unsafe fn download_fr(src: *const std::ffi::c_void, len: usize, what: &str) -> Vec<Fr> {
+    use rayon::prelude::*;
+    let mut v: Vec<Fr> = Vec::with_capacity(len);
+    v.spare_capacity_mut()[..len].par_chunks_mut(128).for_each(|chunk| {
+        chunk[0].write(Fr::ZERO);
+    });
+    let err = sp1_gpu_sys::runtime::cuda_mem_copy_device_to_host(
+        v.as_mut_ptr() as *mut std::ffi::c_void,
+        src,
+        len * std::mem::size_of::<Fr>(),
+    );
+    if err != sp1_gpu_sys::runtime::CUDA_SUCCESS_CSL {
+        panic!("{what}");
+    }
+    // SAFETY: the copy wrote all `len` elements.
+    v.set_len(len);
+    v
 }
 
 /// Compute the 2^28-th primitive root of unity for BN254 Fr.

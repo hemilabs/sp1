@@ -15,8 +15,6 @@ use crate::blinding::{
     ZERO_BLINDINGS,
 };
 use crate::domain::Domain;
-#[cfg(feature = "cuda")]
-use crate::fields::batch_inv_fr_inplace;
 use crate::fields::{batch_inv_fr, Fr};
 use crate::g1::{msm, G1Affine};
 use crate::kzg::{commit_blinding_factor, BatchOpeningProof, OpeningProof};
@@ -39,11 +37,13 @@ pub struct PlonkProver {
     /// arrays consumed by the quotient kernel. Lazily populated on first
     /// quotient call when `SP1_HIP_PLONK_STATIC_CACHE` is set. PK changes
     /// produce a new `PlonkProver` instance, naturally invalidating the cache.
+    #[cfg(feature = "cuda")]
     pub(crate) static_cache: crate::static_cache::PlonkStaticCache,
     /// Device-resident cache for canonical (N-coeff) static polys consumed
     /// by Round 5 GPU lincomb (Phase B). Lazily populated on first R5 GPU
     /// fold call when `SP1_PLONK_R5_GPU` is enabled. ~4-5 GiB depending on
     /// circuit. Lifetime tied to `PlonkProver` (per-PK).
+    #[cfg(feature = "cuda")]
     pub(crate) canonical_cache: crate::static_cache::PlonkCanonicalCache,
     /// The host arrays of `cached` registered with the driver, unregistered on drop: their memory
     /// goes back to the allocator, and registering it again (a later prover's arrays) would fail.
@@ -115,7 +115,8 @@ pub(crate) struct CachedFrData {
     big_domain: Domain,
     /// Pre-computed coset points: coset_shift * omega_4N^i
     coset_points: Vec<Fr>,
-    /// Pre-computed Z_H(x) = x^N - 1 at coset points
+    /// Pre-computed Z_H(x) = x^N - 1 at coset points (read by the CPU quotient)
+    #[cfg(not(feature = "cuda"))]
     zh_values: Vec<Fr>,
     /// Pre-computed 1/Z_H(x) at coset points (batch-inverted once)
     zh_inv: Vec<Fr>,
@@ -133,7 +134,9 @@ pub(crate) struct CachedFrData {
     /// lo_table[k] = omega_4N^k for k = 0..2^14-1
     /// hi_table[k] = omega_4N^(k*2^14) for k = 0..max(big_n/2^14, 1)-1
     /// Total ~768 KB pinned memory, replaces 4.3 GiB coset_points PCIe transfer.
+    #[cfg(feature = "cuda")]
     omega_lo_table: Vec<Fr>,
+    #[cfg(feature = "cuda")]
     omega_hi_table: Vec<Fr>,
     /// True if qm polynomial is all-zero (common in SP1 circuits).
     /// When true, we pass nullptr to the quotient kernel to skip 1 GiB PCIe streaming.
@@ -491,7 +494,8 @@ impl PlonkProver {
         // Two-level omega lookup tables for on-the-fly coset point computation.
         // lo_table[k] = omega_4N^k for k = 0..2^14-1
         // hi_table[k] = omega_4N^(k*2^14) for k = 0..max(big_n/2^14, 1)-1 (a domain under 2^14
-        // still reads hi_table[0])
+        // still reads hi_table[0]). Only the GPU kernels read them.
+        #[cfg(feature = "cuda")]
         let omega_lo_table: Vec<Fr> = {
             let mut t = vec![Fr::ONE; 1 << 14];
             for i in 1..t.len() {
@@ -499,6 +503,7 @@ impl PlonkProver {
             }
             t
         };
+        #[cfg(feature = "cuda")]
         let omega_hi_table: Vec<Fr> = {
             let omega_step = omega_4n.pow(&[1u64 << 14, 0, 0, 0]);
             let hi_len = (big_n >> 14).max(1);
@@ -560,8 +565,11 @@ impl PlonkProver {
             zh_inv: batch_inv_fr(&zh_values),
             zh_vals_4: [zh_values[0], zh_values[1], zh_values[2], zh_values[3]],
             zh_invs_4: [Fr::ZERO; 4],
+            #[cfg(not(feature = "cuda"))]
             zh_values,
+            #[cfg(feature = "cuda")]
             omega_lo_table,
+            #[cfg(feature = "cuda")]
             omega_hi_table,
             dbg_lagrange,
         };
@@ -643,7 +651,9 @@ impl PlonkProver {
             data,
             vk_commits,
             cached,
+            #[cfg(feature = "cuda")]
             static_cache: crate::static_cache::PlonkStaticCache::new(),
+            #[cfg(feature = "cuda")]
             canonical_cache: crate::static_cache::PlonkCanonicalCache::new(),
             #[cfg(feature = "cuda")]
             pinned_host,
@@ -746,9 +756,9 @@ impl PlonkProver {
         );
 
         let srs_canonical = &self.cached.srs_canonical;
-        let s1 = &self.cached.s1;
-        let s2 = &self.cached.s2;
-        let s3 = &self.cached.s3;
+        // The GPU build uploads these from `self.cached`; only the CPU grand product reads them here.
+        #[cfg(not(feature = "cuda"))]
+        let (s1, s2, s3) = (&self.cached.s1, &self.cached.s2, &self.cached.s3);
         let coset_shift = self.cached.coset_shift;
 
         // ================================================================
@@ -864,7 +874,7 @@ impl PlonkProver {
             let (d_r_upload, d_o_upload) = {
                 use std::ffi::c_void;
                 let byte_sz = n * std::mem::size_of::<Fr>();
-                let mut upload = |data: &[Fr]| -> *mut c_void {
+                let upload = |data: &[Fr]| -> *mut c_void {
                     let mut ptr: *mut c_void = std::ptr::null_mut();
                     let err =
                         unsafe { sp1_gpu_sys::runtime::cuda_malloc(&mut ptr as *mut _, byte_sz) };
@@ -1154,8 +1164,8 @@ impl PlonkProver {
                 mut d_qk_plus_pi_opt,
                 pi_bsb22_cpu_opt,
                 bsb22_coeffs_list,
-                z_c_opt,
-                d_z_opt,
+                _z_c_opt,
+                _d_z_opt,
                 commit_z_r2,
             ) = if use_gpu_quotient {
                 // ≥20 GiB path: GPU fusion.
@@ -1170,7 +1180,8 @@ impl PlonkProver {
                     let msm = persistent_lag_msm_opt
                         .take()
                         .expect("persistent_lag_msm should be available for Z commit");
-                    let c = msm.msm_device(d_z_gp as *const c_void, n).to_affine();
+                    // SAFETY: `d_z_gp` holds the grand product's `n` elements.
+                    let c = unsafe { msm.msm_device(d_z_gp as *const c_void, n) }.to_affine();
                     drop(msm); // Frees ~6.2 GiB VRAM
                     eprintln!("[T] 5. Z commit (in R2, MSM freed): {:?}", t.elapsed());
                     // Phase-1 ZK blinding (no-op when OFF).
@@ -1262,7 +1273,8 @@ impl PlonkProver {
                     let msm = persistent_lag_msm_opt
                         .take()
                         .expect("persistent_lag_msm should be available for Z commit (R2 early)");
-                    let c = msm.msm_device(d_z_gp as *const c_void, n).to_affine();
+                    // SAFETY: `d_z_gp` holds the grand product's `n` elements.
+                    let c = unsafe { msm.msm_device(d_z_gp as *const c_void, n) }.to_affine();
                     drop(msm); // Frees ~6.2 GiB VRAM before the big NTT allocations.
                     eprintln!("[T] 5. Z commit (CPU-fusion, MSM freed early): {:?}", t.elapsed());
                     // Phase-1 ZK blinding (no-op when OFF).
@@ -1277,23 +1289,14 @@ impl PlonkProver {
                         lg_n,
                         big_log,
                     );
-                let mut pi_coset_evals = Vec::with_capacity(big_n);
-                unsafe {
-                    pi_coset_evals.set_len(big_n);
-                }
-                pi_coset_evals.par_chunks_mut(128).for_each(|chunk| unsafe {
-                    std::ptr::write_volatile(&mut chunk[0] as *mut Fr, Fr::ZERO);
-                });
-                let err = unsafe {
-                    sp1_gpu_sys::runtime::cuda_mem_copy_device_to_host(
-                        pi_coset_evals.as_mut_ptr() as *mut c_void,
+                // SAFETY: `d_pi_coset.ptr` holds at least `big_n` elements on the device.
+                let pi_coset_evals = unsafe {
+                    crate::domain::download_fr(
                         d_pi_coset.ptr,
-                        byte_sz_4n,
+                        big_n,
+                        "D2H failed for pi coset evals",
                     )
                 };
-                if err != unsafe { sp1_gpu_sys::runtime::CUDA_SUCCESS_CSL } {
-                    panic!("D2H failed for pi coset evals");
-                }
                 drop(d_pi_coset);
 
                 let mut bsb22_coeffs_list = Vec::with_capacity(bsb22_polys_fr.len());
@@ -1366,19 +1369,15 @@ impl PlonkProver {
                 } else {
                     // HIP path or no device Z: D2H to host, free device, NTT from host
                     let z_host = if !d_z_gp.is_null() {
-                        let byte_sz_n = n * elem_sz;
-                        let mut z_h = Vec::with_capacity(n);
-                        unsafe {
-                            z_h.set_len(n);
-                        }
-                        unsafe {
-                            sp1_gpu_sys::runtime::cuda_mem_copy_device_to_host(
-                                z_h.as_mut_ptr() as *mut c_void,
+                        // SAFETY: `d_z_gp` holds the grand product's `n` elements.
+                        let z_h = unsafe {
+                            crate::domain::download_fr(
                                 d_z_gp as *const c_void,
-                                byte_sz_n,
-                            );
-                            sp1_gpu_sys::runtime::cuda_free(d_z_gp as *const c_void);
-                        }
+                                n,
+                                "D2H failed for the grand product z",
+                            )
+                        };
+                        unsafe { sp1_gpu_sys::runtime::cuda_free(d_z_gp as *const c_void) };
                         z_h
                     } else {
                         z_lagrange.clone()
@@ -1526,7 +1525,8 @@ impl PlonkProver {
             let msm = persistent_lag_msm_opt
                 .take()
                 .expect("persistent_lag_msm should be available for Z commit (CPU path)");
-            let c = msm.msm_device(d_z_gp as *const std::ffi::c_void, n).to_affine();
+            // SAFETY: `d_z_gp` holds the grand product's `n` elements.
+            let c = unsafe { msm.msm_device(d_z_gp as *const std::ffi::c_void, n) }.to_affine();
             drop(msm);
             eprintln!("[T] 5. Z commit: {:?}", t.elapsed());
             // Phase-1 ZK blinding (no-op when OFF).
@@ -1764,7 +1764,7 @@ impl PlonkProver {
                 let keep_lroz_device = std::env::var("SP1_PLONK_KEEP_LROZ_DEVICE")
                     .ok()
                     .map(|v| v != "0")
-                    .unwrap_or_else(|| sp1_gpu_sys::is_hip_backend());
+                    .unwrap_or_else(sp1_gpu_sys::is_hip_backend);
 
                 let _t_cfft_lro = std::time::Instant::now();
                 let lg = domain.log_size;
@@ -2476,10 +2476,9 @@ impl PlonkProver {
                 let d_h1_ptr = unsafe {
                     (d_h.ptr as *mut u8).add(stride * elem_sz) as *const std::ffi::c_void
                 };
-                let h0 = persistent_can_msm
-                    .msm_device(d_h0_ptr as *const std::ffi::c_void, stride)
-                    .to_affine();
-                let h1 = persistent_can_msm.msm_device(d_h1_ptr, stride).to_affine();
+                // SAFETY: `d_h` holds h0 and h1, `stride` elements each.
+                let h0 = unsafe { persistent_can_msm.msm_device(d_h0_ptr, stride) }.to_affine();
+                let h1 = unsafe { persistent_can_msm.msm_device(d_h1_ptr, stride) }.to_affine();
                 (h0, h1)
             } else {
                 // Host MSM fallback (streamed path)
@@ -3097,15 +3096,16 @@ impl PlonkProver {
         // Pre-fault result vector; linear_combination_into does write-first so no zeroing needed.
         let max_len = fused_polys.iter().map(|p| p.len()).max().unwrap_or(0);
         let mut result = {
-            let mut v = Vec::with_capacity(max_len);
-            unsafe { v.set_len(max_len) };
-            v.par_chunks_mut((max_len / rayon::current_num_threads().max(1)).max(4096)).for_each(
-                |c| {
+            let mut v: Vec<Fr> = Vec::with_capacity(max_len);
+            v.spare_capacity_mut()[..max_len]
+                .par_chunks_mut((max_len / rayon::current_num_threads().max(1)).max(4096))
+                .for_each(|c| {
                     for slot in c.iter_mut() {
-                        unsafe { std::ptr::write_volatile(slot as *mut Fr, Fr::ZERO) };
+                        slot.write(Fr::ZERO);
                     }
-                },
-            );
+                });
+            // SAFETY: every element up to `max_len` was written above.
+            unsafe { v.set_len(max_len) };
             v
         };
         // Phase B GPU R5 lincomb (opt-in via SP1_PLONK_R5_GPU=1): uses the
@@ -3504,6 +3504,7 @@ impl PlonkProver {
     /// Detects hot scalar values via 1% sampling, then:
     /// - If d_scalars is available: GPU-side D2D + zero + MSM (saves ~370ms H2D + clone)
     /// - Fallback: CPU clone + zero + host MSM (original path)
+    ///
     /// CPU correction (SRS sum for hot values) overlaps with GPU MSM.
     #[cfg(feature = "cuda")]
     fn commit_lagrange_depad_persistent(
@@ -3601,10 +3602,17 @@ impl PlonkProver {
             });
 
             // GPU MSM with device-side depadding (D2D copy + GPU zero + MSM)
+            // SAFETY: `d_scalars` holds the `n` evaluations on the device.
             let mut result = if hot_fr_values.is_empty() {
-                persistent.msm_device(d_scalars as *const std::ffi::c_void, n)
+                unsafe { persistent.msm_device(d_scalars as *const std::ffi::c_void, n) }
             } else {
-                persistent.msm_device_depad(d_scalars as *const std::ffi::c_void, n, &hot_fr_values)
+                unsafe {
+                    persistent.msm_device_depad(
+                        d_scalars as *const std::ffi::c_void,
+                        n,
+                        &hot_fr_values,
+                    )
+                }
             };
 
             // Wait for CPU correction and apply
@@ -4041,10 +4049,6 @@ impl PlonkProver {
         Ok(())
     }
 
-    /// Compute the quotient polynomial h(X).
-    ///
-    /// h(X) = [gate_constraint + α·permutation_constraint + α²·boundary_constraint] / Z_H(X)
-
     /// GPU quotient computation with L/R/O/Z coset evals already on device.
     ///
     /// Used by HIP and any backend where pi_bsb22 is computed via the CPU
@@ -4210,7 +4214,7 @@ impl PlonkProver {
         drop(d_z);
 
         // Coset iNTT in place on d_output_ptr (= d_l buffer).
-        let _t_ciNTT = std::time::Instant::now();
+        let t_coset_intt = std::time::Instant::now();
         let stream = unsafe { sp1_gpu_sys::runtime::DEFAULT_STREAM };
         let err = unsafe {
             sp1_gpu_sys::dft_bn254::batch_coset_iNTT_bn254(
@@ -4224,28 +4228,18 @@ impl PlonkProver {
             panic!("GPU coset iNTT failed");
         }
         unsafe { sp1_gpu_sys::runtime::cuda_device_synchronize() };
-        eprintln!("[T] 7-coset_iNTT (h_coeffs): {:?}", _t_ciNTT.elapsed());
+        eprintln!("[T] 7-coset_iNTT (h_coeffs): {:?}", t_coset_intt.elapsed());
 
         // D2H h_coeffs.
         let _t_d2h = std::time::Instant::now();
-        let output_bytes = big_n * std::mem::size_of::<Fr>();
-        let mut h_coeffs = Vec::with_capacity(big_n);
-        unsafe {
-            h_coeffs.set_len(big_n);
-        }
-        h_coeffs.par_chunks_mut(128).for_each(|chunk| unsafe {
-            std::ptr::write_volatile(&mut chunk[0] as *mut Fr, Fr::ZERO);
-        });
-        let err = unsafe {
-            sp1_gpu_sys::runtime::cuda_mem_copy_device_to_host(
-                h_coeffs.as_mut_ptr() as *mut c_void,
+        // SAFETY: `d_output_ptr` holds at least `big_n` elements on the device.
+        let h_coeffs = unsafe {
+            crate::domain::download_fr(
                 d_output_ptr,
-                output_bytes,
+                big_n,
+                "D2H failed for lroz-device quotient h_coeffs",
             )
         };
-        if err != unsafe { sp1_gpu_sys::runtime::CUDA_SUCCESS_CSL } {
-            panic!("D2H failed for lroz-device quotient h_coeffs");
-        }
         eprintln!("[T] 7-D2H (h_coeffs): {:?}", _t_d2h.elapsed());
 
         // Return d_l alive so Round 4's GPU poly-eval can evaluate h0/h1
@@ -4484,7 +4478,7 @@ impl PlonkProver {
         drop(z_shifted);
 
         // Coset iFFT on GPU
-        let _t_ciNTT = std::time::Instant::now();
+        let t_coset_intt = std::time::Instant::now();
         let stream = unsafe { sp1_gpu_sys::runtime::DEFAULT_STREAM };
         let err = unsafe {
             sp1_gpu_sys::dft_bn254::batch_coset_iNTT_bn254(
@@ -4498,27 +4492,18 @@ impl PlonkProver {
             panic!("GPU coset iNTT failed");
         }
         unsafe { sp1_gpu_sys::runtime::cuda_device_synchronize() };
-        eprintln!("[T] 7-coset_iNTT (h_coeffs): {:?}", _t_ciNTT.elapsed());
+        eprintln!("[T] 7-coset_iNTT (h_coeffs): {:?}", t_coset_intt.elapsed());
 
         // Download h_coeffs (pre-fault pages to avoid DMA page faults)
         let _t_d2h = std::time::Instant::now();
-        let mut h_coeffs = Vec::with_capacity(big_n);
-        unsafe {
-            h_coeffs.set_len(big_n);
-        }
-        h_coeffs.par_chunks_mut(128).for_each(|chunk| unsafe {
-            std::ptr::write_volatile(&mut chunk[0] as *mut Fr, Fr::ZERO);
-        });
-        let err = unsafe {
-            sp1_gpu_sys::runtime::cuda_mem_copy_device_to_host(
-                h_coeffs.as_mut_ptr() as *mut c_void,
+        // SAFETY: `d_output_ptr` holds at least `big_n` elements on the device.
+        let h_coeffs = unsafe {
+            crate::domain::download_fr(
                 d_output_ptr,
-                output_bytes,
+                big_n,
+                "D2H failed for streamed quotient h_coeffs",
             )
         };
-        if err != unsafe { sp1_gpu_sys::runtime::CUDA_SUCCESS_CSL } {
-            panic!("D2H failed for streamed quotient h_coeffs");
-        }
         unsafe { sp1_gpu_sys::runtime::cuda_free(d_output_ptr as *const c_void) };
         eprintln!("[T] 7-D2H (h_coeffs): {:?}", _t_d2h.elapsed());
 
@@ -4581,7 +4566,6 @@ impl PlonkProver {
 
         // PRE-KERNEL INPUT SNAPSHOT for diagnostic (gated)
         let kernel_dbg = std::env::var("SP1_PLONK_DEBUG_CONST_LIN").as_deref() == Ok("1");
-        let big_n_dbg = 4 * n;
         let mut kernel_check_indices: Vec<usize> = vec![];
         // Narrow boundary between PASS and FAIL: 133577408 (last PASS), 133578432 (first FAIL).
         for v in (133577400..=133578500).step_by(8) {
@@ -4918,7 +4902,7 @@ impl PlonkProver {
     }
 
     #[allow(clippy::too_many_arguments)]
-    #[cfg_attr(feature = "cuda", allow(dead_code))]
+    #[cfg(any(test, not(feature = "cuda")))]
     fn compute_quotient(
         &self,
         n: usize,
@@ -5211,6 +5195,7 @@ impl PlonkProver {
     /// Also includes BSB22 contribution: for each BSB22 commitment, the hash-to-field
     /// value is injected as a virtual public input at position
     /// nb_public_variables + commitment_constraint_indexes[i].
+    #[cfg(any(test, not(feature = "cuda")))]
     fn compute_pi_polynomial(
         &self,
         pi: &[Fr],
@@ -5403,7 +5388,6 @@ fn gpu_linear_combination_mixed(result: &mut [Fr], polys: &[PolyInput<'_>], scal
     assert_eq!(polys.len(), scalars.len());
     let n_polys = polys.len() as u32;
     let n = result.len() as u32;
-    let elem_sz = std::mem::size_of::<Fr>();
 
     // For each input: collect device pointers (uploading host ones), tracking
     // which we own and must free.
@@ -5417,7 +5401,7 @@ fn gpu_linear_combination_mixed(result: &mut [Fr], polys: &[PolyInput<'_>], scal
                 h_poly_lens.push(len as u32);
             }
             PolyInput::Host(slice) => {
-                let bytes = slice.len() * elem_sz;
+                let bytes = std::mem::size_of_val(slice);
                 let mut ptr: *mut c_void = std::ptr::null_mut();
                 let err = unsafe { sp1_gpu_sys::runtime::cuda_malloc(&mut ptr as *mut _, bytes) };
                 if err != unsafe { sp1_gpu_sys::runtime::CUDA_SUCCESS_CSL } {
@@ -5440,7 +5424,7 @@ fn gpu_linear_combination_mixed(result: &mut [Fr], polys: &[PolyInput<'_>], scal
         }
     }
 
-    let scalars_bytes = scalars.len() * elem_sz;
+    let scalars_bytes = std::mem::size_of_val(scalars);
     let mut d_scalars: *mut c_void = std::ptr::null_mut();
     unsafe {
         sp1_gpu_sys::runtime::cuda_malloc(&mut d_scalars as *mut _, scalars_bytes);
@@ -5470,7 +5454,7 @@ fn gpu_linear_combination_mixed(result: &mut [Fr], polys: &[PolyInput<'_>], scal
             lens_bytes,
         );
     }
-    let result_bytes = result.len() * elem_sz;
+    let result_bytes = std::mem::size_of_val(result);
     let mut d_result: *mut c_void = std::ptr::null_mut();
     unsafe {
         sp1_gpu_sys::runtime::cuda_malloc(&mut d_result as *mut _, result_bytes);
@@ -5499,133 +5483,6 @@ fn gpu_linear_combination_mixed(result: &mut [Fr], polys: &[PolyInput<'_>], scal
     if err != unsafe { sp1_gpu_sys::runtime::CUDA_SUCCESS_CSL } {
         panic!("gpu_linear_combination_mixed: D2H result failed");
     }
-    unsafe {
-        sp1_gpu_sys::runtime::cuda_free(d_result as *const c_void);
-        sp1_gpu_sys::runtime::cuda_free(d_poly_lens as *const c_void);
-        sp1_gpu_sys::runtime::cuda_free(d_poly_ptrs as *const c_void);
-        sp1_gpu_sys::runtime::cuda_free(d_scalars as *const c_void);
-        for p in owned_d_polys.iter() {
-            sp1_gpu_sys::runtime::cuda_free(*p as *const c_void);
-        }
-    }
-}
-
-/// Naive GPU linear combination (Phase A: H2D every poly, run kernel, D2H).
-/// Computes `result[i] = Σ_j scalars[j] * polys[j][i]` on the GPU.
-///
-/// PCIe-bound on HIP (~2.6 s upload for 17 × 512 MB at 3.4 GB/s). Expected
-/// to be SLOWER than the CPU rayon path until poly device-residency is
-/// plumbed (Phase B: keep static polys cached on device, keep per-prove
-/// L/R/O/Z canonical-form on device through R3→R5).
-///
-/// This Phase A wrapper is opt-in via `SP1_PLONK_R5_GPU=1` and exists as a
-/// correctness gate and to measure achievable kernel + plumbing wall.
-#[cfg(feature = "cuda")]
-fn gpu_linear_combination_h2d(result: &mut [Fr], polys: &[&[Fr]], scalars: &[Fr]) {
-    use std::ffi::c_void;
-    assert_eq!(polys.len(), scalars.len());
-    let n_polys = polys.len() as u32;
-    let n = result.len() as u32;
-    let elem_sz = std::mem::size_of::<Fr>();
-
-    // Allocate device buffers for each poly + upload.
-    let mut d_poly_ptrs_host: Vec<*const c_void> = Vec::with_capacity(polys.len());
-    let mut owned_d_polys: Vec<*mut c_void> = Vec::with_capacity(polys.len());
-    let mut h_poly_lens: Vec<u32> = Vec::with_capacity(polys.len());
-    for poly in polys.iter() {
-        let bytes = poly.len() * elem_sz;
-        let mut ptr: *mut c_void = std::ptr::null_mut();
-        let err = unsafe { sp1_gpu_sys::runtime::cuda_malloc(&mut ptr as *mut _, bytes) };
-        if err != unsafe { sp1_gpu_sys::runtime::CUDA_SUCCESS_CSL } {
-            panic!("gpu_linear_combination_h2d: cuda_malloc failed for poly buffer");
-        }
-        let err = unsafe {
-            sp1_gpu_sys::runtime::cuda_mem_copy_host_to_device(
-                ptr,
-                poly.as_ptr() as *const c_void,
-                bytes,
-            )
-        };
-        if err != unsafe { sp1_gpu_sys::runtime::CUDA_SUCCESS_CSL } {
-            panic!("gpu_linear_combination_h2d: H2D failed for poly buffer");
-        }
-        owned_d_polys.push(ptr);
-        d_poly_ptrs_host.push(ptr as *const c_void);
-        h_poly_lens.push(poly.len() as u32);
-    }
-
-    // Upload scalars.
-    let scalars_bytes = scalars.len() * elem_sz;
-    let mut d_scalars: *mut c_void = std::ptr::null_mut();
-    unsafe {
-        sp1_gpu_sys::runtime::cuda_malloc(&mut d_scalars as *mut _, scalars_bytes);
-        sp1_gpu_sys::runtime::cuda_mem_copy_host_to_device(
-            d_scalars,
-            scalars.as_ptr() as *const c_void,
-            scalars_bytes,
-        );
-    }
-
-    // Upload poly_ptrs (array of device pointers).
-    let ptrs_bytes = d_poly_ptrs_host.len() * std::mem::size_of::<*const c_void>();
-    let mut d_poly_ptrs: *mut c_void = std::ptr::null_mut();
-    unsafe {
-        sp1_gpu_sys::runtime::cuda_malloc(&mut d_poly_ptrs as *mut _, ptrs_bytes);
-        sp1_gpu_sys::runtime::cuda_mem_copy_host_to_device(
-            d_poly_ptrs,
-            d_poly_ptrs_host.as_ptr() as *const c_void,
-            ptrs_bytes,
-        );
-    }
-
-    // Upload poly_lens.
-    let lens_bytes = h_poly_lens.len() * std::mem::size_of::<u32>();
-    let mut d_poly_lens: *mut c_void = std::ptr::null_mut();
-    unsafe {
-        sp1_gpu_sys::runtime::cuda_malloc(&mut d_poly_lens as *mut _, lens_bytes);
-        sp1_gpu_sys::runtime::cuda_mem_copy_host_to_device(
-            d_poly_lens,
-            h_poly_lens.as_ptr() as *const c_void,
-            lens_bytes,
-        );
-    }
-
-    // Allocate result buffer.
-    let result_bytes = result.len() * elem_sz;
-    let mut d_result: *mut c_void = std::ptr::null_mut();
-    unsafe {
-        sp1_gpu_sys::runtime::cuda_malloc(&mut d_result as *mut _, result_bytes);
-    }
-
-    // Launch kernel.
-    let err = unsafe {
-        sp1_gpu_sys::plonk::bn254_gpu_fr_lincomb(
-            d_result,
-            d_poly_ptrs as *const *const c_void,
-            d_scalars as *const c_void,
-            d_poly_lens as *const c_void,
-            n_polys,
-            n,
-        )
-    };
-    if err != unsafe { sp1_gpu_sys::runtime::CUDA_SUCCESS_CSL } {
-        panic!("gpu_linear_combination_h2d: kernel launch failed");
-    }
-    unsafe { sp1_gpu_sys::runtime::cuda_device_synchronize() };
-
-    // D2H result.
-    let err = unsafe {
-        sp1_gpu_sys::runtime::cuda_mem_copy_device_to_host(
-            result.as_mut_ptr() as *mut c_void,
-            d_result,
-            result_bytes,
-        )
-    };
-    if err != unsafe { sp1_gpu_sys::runtime::CUDA_SUCCESS_CSL } {
-        panic!("gpu_linear_combination_h2d: D2H result failed");
-    }
-
-    // Free device buffers.
     unsafe {
         sp1_gpu_sys::runtime::cuda_free(d_result as *const c_void);
         sp1_gpu_sys::runtime::cuda_free(d_poly_lens as *const c_void);
