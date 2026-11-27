@@ -804,6 +804,22 @@ static void evictUntilFits(size_t need, size_t headroom) {
     }
 }
 
+#ifdef _WIN32
+// Blocks this large or larger are checked against the video memory budget before they are
+// allocated (see cachedHipMalloc); as `kCheckedBlock` for CUDA, smaller ones are not worth a query.
+constexpr size_t kCheckedHipBlock = size_t(64) << 20;
+
+// Kept free of the budget on top of a checked block (SP1_GPU_REFUSE_MARGIN_MB): 1 GiB, for the
+// smaller blocks and the runtime's own memory, which are not checked. On the RX 9070 XT with
+// nothing else on the card, a 134M-shard benchmark ran 25-30% faster on its smaller programs with
+// it than with none (which let the server fill its budget and spill a little), and the same at
+// sha256-chain; with 2 GiB it refused that card's own 134M proofs.
+static size_t refuseMarginBytes() {
+    static const size_t margin = envMib("SP1_GPU_REFUSE_MARGIN_MB", size_t(1) << 30);
+    return margin;
+}
+#endif
+
 static hipError_t cachedHipMalloc(void** p, size_t s, hipStream_t stream) {
     if (s == 0) { *p = nullptr; return hipSuccess; }
     s = roundAllocSize(s);
@@ -902,6 +918,28 @@ static hipError_t cachedHipMalloc(void** p, size_t s, hipStream_t stream) {
             evictUntilFits(s, headroom);
         }
     }
+#ifdef _WIN32
+    // Refused rather than placed in system memory, as the CUDA build refuses (`fits_on_the_card`):
+    // past this process's video memory budget the driver backs the block with shared system memory,
+    // and every kernel that touches it runs from there. On an RX 9070 XT with 2-4 GiB of the card
+    // held by another program, a 134M-shard sha256-chain proof ran at 1.4-1.7M cycles/s instead of
+    // 3.6M, with nothing reported. An out-of-memory instead lets the caller run smaller. The cached
+    // blocks are given back first (after waiting for the device), since they count against the
+    // budget.
+    if (!g_arena_on && s >= kCheckedHipBlock) {
+        size_t headroom = 0;
+        if (deviceHeadroom(&headroom) && s + refuseMarginBytes() > headroom) {
+            releaseCachedBlocks();
+            if (deviceHeadroom(&headroom) && s + refuseMarginBytes() > headroom) {
+                fprintf(stderr,
+                        "sp1-gpu: refusing a %zu MiB device allocation: %zu MiB of this process's "
+                        "video memory budget left\n",
+                        s >> 20, headroom >> 20);
+                return hipErrorOutOfMemory;
+            }
+        }
+    }
+#endif
     hipError_t err;
     {
         sp1prof::HostTimer timer("host: hipMalloc");
