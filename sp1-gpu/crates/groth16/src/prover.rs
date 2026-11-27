@@ -1053,11 +1053,14 @@ impl Groth16Prover {
             // the SDMA engine uploads G2 scalars concurrently with Krs2's
             // compute kernels (GPU kernel D2D frees the SDMA engine).
             let krs2_msm = match &h_result {
-                HResult::Device(dh) => self.g1_ctx(G1Set::Z).msm_device_with_next(
-                    dh.ptr,
-                    size_h,
-                    self.next(wire_values_b),
-                ),
+                // SAFETY: `dh` holds the quotient's `size_h` scalars on the device.
+                HResult::Device(dh) => unsafe {
+                    self.g1_ctx(G1Set::Z).msm_device_with_next(
+                        dh.ptr,
+                        size_h,
+                        self.next(wire_values_b),
+                    )
+                },
                 HResult::Host(h) => self.g1_ctx(G1Set::Z).msm(&h[..size_h]),
             };
             drop(_g);
@@ -1236,7 +1239,10 @@ impl Groth16Prover {
 
                 let t = std::time::Instant::now();
                 let krs2_msm = match &h_result {
-                    HResult::Device(dh) => self.g1_ctx(G1Set::Z).msm_device(dh.ptr, size_h),
+                    // SAFETY: `dh` holds the quotient's `size_h` scalars on the device.
+                    HResult::Device(dh) => unsafe {
+                        self.g1_ctx(G1Set::Z).msm_device(dh.ptr, size_h)
+                    },
                     HResult::Host(h) => self.g1_ctx(G1Set::Z).msm(&h[..size_h]),
                 };
                 eprintln!("[T] 5d. Krs2 MSM (N={}): {:?}", size_h, t.elapsed());

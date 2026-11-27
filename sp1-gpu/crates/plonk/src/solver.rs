@@ -213,8 +213,9 @@ impl PlonkScsSolver {
         // 3. BSB22 MSM via the same persistent MSM the production prover uses.
         //    The committed polynomial scalars are in Mont form (mont=true),
         //    matching what `msm_device` expects internally.
+        // SAFETY: `d_committed` holds the domain's committed values on the device.
         let commit_jac: G1Jacobian =
-            bsb22_msm.msm_device(d_committed, self.bsb22_domain_size as usize);
+            unsafe { bsb22_msm.msm_device(d_committed, self.bsb22_domain_size as usize) };
         let commit_jac_bn = commit_jac.to_bn254();
         if std::env::var("SP1_PLONK_GPU_SOLVER_DEBUG").is_ok() {
             eprintln!(

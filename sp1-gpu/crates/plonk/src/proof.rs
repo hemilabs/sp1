@@ -105,7 +105,7 @@ impl PlonkProof {
     /// - `BatchedProof.ClaimedValues` as `fr.Vector`:
     ///     * 4-byte big-endian `uint32` length prefix
     ///     * length × 32-byte big-endian canonical `fr.Element`
-    ///     (length is typically 7: [linearized, L, R, O, S1, S2, BSB22])
+    ///       (length is typically 7: [linearized, L, R, O, S1, S2, BSB22])
     /// - `ZShiftedOpening.H`                                      (64 bytes)
     /// - `ZShiftedOpening.ClaimedValue`                           (32 bytes)
     /// - `Bsb22Commitments` as `[]G1Affine`:

@@ -30,6 +30,7 @@
 #[cfg(feature = "cuda")]
 use std::sync::Mutex;
 
+#[cfg(feature = "cuda")]
 use crate::fields::Fr;
 
 /// Selects which static arrays to cache on device.
@@ -167,9 +168,8 @@ impl PlonkStaticCache {
         }
         inner.initialized = true;
 
-        let elem_sz = std::mem::size_of::<Fr>();
         let big_n = ql.len();
-        let array_bytes = big_n * elem_sz;
+        let array_bytes = std::mem::size_of_val(ql);
 
         // Priority order: choose arrays in the order most likely to maximise
         // PCIe savings (skip qm if all-zero — it's free already). All arrays
@@ -406,8 +406,6 @@ impl PlonkCanonicalCache {
         }
         inner.initialized = true;
 
-        let elem_sz = std::mem::size_of::<Fr>();
-
         let mut sources: Vec<(CanonicalSlot, String, &[Fr])> =
             Vec::with_capacity(9 + qcp_coeffs.len());
         sources.push((CanonicalSlot::Ql, "ql_can".to_string(), ql));
@@ -437,13 +435,13 @@ impl PlonkCanonicalCache {
             free_mem as f64 / (1u64 << 30) as f64,
             total_mem as f64 / (1u64 << 30) as f64,
             safety_margin_bytes as f64 / (1u64 << 30) as f64,
-            sources.iter().map(|(_, _, p)| p.len() * elem_sz).sum::<usize>() as f64 / (1u64 << 30) as f64,
+            sources.iter().map(|(_, _, p)| std::mem::size_of_val(*p)).sum::<usize>() as f64 / (1u64 << 30) as f64,
         );
 
         let mut cached_count = 0usize;
         let mut cached_bytes = 0usize;
         for (slot, name, src) in sources.into_iter() {
-            let bytes = src.len() * elem_sz;
+            let bytes = std::mem::size_of_val(src);
             unsafe {
                 let _ = sp1_gpu_sys::runtime::cuda_mem_get_info(
                     &mut free_mem as *mut usize,

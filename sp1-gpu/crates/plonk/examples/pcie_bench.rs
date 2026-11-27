@@ -21,9 +21,9 @@ fn main() {
         4usize << 30, // 4 GiB
     ];
 
-    println!("PCIe Bandwidth Benchmark");
-    println!("========================");
-    println!();
+    eprintln!("PCIe Bandwidth Benchmark");
+    eprintln!("========================");
+    eprintln!();
 
     // Get GPU info
     {
@@ -32,26 +32,26 @@ fn main() {
         unsafe {
             sp1_gpu_sys::runtime::cuda_mem_get_info(&mut free as *mut _, &mut total as *mut _);
         }
-        println!(
+        eprintln!(
             "GPU VRAM: {:.1} GiB total, {:.1} GiB free",
             total as f64 / (1 << 30) as f64,
             free as f64 / (1 << 30) as f64,
         );
-        println!();
+        eprintln!();
     }
 
-    println!(
+    eprintln!(
         "{:>10} {:>12} {:>12} {:>12} {:>12} {:>12}",
         "Size", "H2D (pin)", "H2D (unpin)", "D2H (pin)", "D2H (unpin)", "D2D"
     );
-    println!("{}", "-".repeat(76));
+    eprintln!("{}", "-".repeat(76));
 
     for &size in &sizes {
         // Allocate device buffer
         let mut d_ptr: *mut c_void = std::ptr::null_mut();
         let err = unsafe { sp1_gpu_sys::runtime::cuda_malloc(&mut d_ptr as *mut _, size) };
         if err != unsafe { sp1_gpu_sys::runtime::CUDA_SUCCESS_CSL } {
-            println!("{:>10} SKIP (OOM)", format_size(size));
+            eprintln!("{:>10} SKIP (OOM)", format_size(size));
             continue;
         }
 
@@ -148,7 +148,7 @@ fn main() {
             0.0
         };
 
-        println!(
+        eprintln!(
             "{:>10} {:>10.2} {:>10.2} {:>10.2} {:>10.2} {:>10.2}",
             format_size(size),
             h2d_pin / 1e9,
@@ -167,8 +167,8 @@ fn main() {
         }
     }
 
-    println!();
-    println!("All rates in GB/s (1e9 bytes/s)");
+    eprintln!();
+    eprintln!("All rates in GB/s (1e9 bytes/s)");
 }
 
 fn format_size(bytes: usize) -> String {
@@ -185,5 +185,5 @@ fn transfer_iters(size: usize) -> usize {
     // Target ~1s total transfer time for accuracy
     let target_bytes = 4usize << 30; // 4 GiB
     let iters = target_bytes / size;
-    iters.max(1).min(256)
+    iters.clamp(1, 256)
 }

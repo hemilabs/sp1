@@ -605,7 +605,11 @@ impl PersistentMsm {
     /// MSM with scalars already on GPU device memory.
     /// Skips the H2D scalar upload entirely — d_scalars must be a valid device pointer.
     /// Scalars are in Montgomery form; the GPU converts via mont_to_canonical_kernel.
-    pub fn msm_device(&self, d_scalars: *const std::ffi::c_void, n: usize) -> G1Jacobian {
+    ///
+    /// # Safety
+    ///
+    /// `d_scalars` must be a device allocation holding at least `n` scalars.
+    pub unsafe fn msm_device(&self, d_scalars: *const std::ffi::c_void, n: usize) -> G1Jacobian {
         self.msm_device_with_next(d_scalars, n, None)
     }
 
@@ -617,7 +621,11 @@ impl PersistentMsm {
     /// instead of hipMemcpy (SDMA engine), freeing the SDMA engine for the
     /// concurrent upload. The next invoke that checks `next_upload_pending`
     /// picks up the pre-uploaded scalars and skips its own H2D copy.
-    pub fn msm_device_with_next(
+    ///
+    /// # Safety
+    ///
+    /// `d_scalars` must be a device allocation holding at least `n` scalars.
+    pub unsafe fn msm_device_with_next(
         &self,
         d_scalars: *const std::ffi::c_void,
         n: usize,
@@ -679,7 +687,11 @@ impl PersistentMsm {
     /// Copies device scalars to internal buffer, zeros entries matching hot_values
     /// on GPU, then runs MSM. Saves ~300ms H2D + ~70ms CPU clone per wire.
     /// hot_values must be in Montgomery form (same as the scalars).
-    pub fn msm_device_depad(
+    ///
+    /// # Safety
+    ///
+    /// `d_scalars` must be a device allocation holding at least `n` scalars.
+    pub unsafe fn msm_device_depad(
         &self,
         d_scalars: *const std::ffi::c_void,
         n: usize,

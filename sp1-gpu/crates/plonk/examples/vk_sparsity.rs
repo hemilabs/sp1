@@ -53,7 +53,7 @@ fn analyze_polynomial(name: &str, poly: &[BN254Fr]) {
 
     // Sort by frequency (descending)
     let mut freq_vec: Vec<([u32; 8], usize)> = freq.into_iter().collect();
-    freq_vec.sort_by(|a, b| b.1.cmp(&a.1));
+    freq_vec.sort_by_key(|e| std::cmp::Reverse(e.1));
 
     let elapsed = t.elapsed();
 
